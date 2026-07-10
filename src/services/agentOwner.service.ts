@@ -8,6 +8,7 @@ import {
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import * as menuCategoryService from "./menuCategory.service";
 import * as menuItemService from "./menuItem.service";
+import { getHermesIntent, type HermesIntent } from "./hermesIntent.service";
 import { BadRequestError, ForbiddenError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
@@ -23,6 +24,7 @@ interface OwnerAgentResponse {
   data?: unknown;
   requiresConfirmation?: boolean;
   pendingActionId?: string;
+  source?: "hermes" | "rule_based";
 }
 
 interface ParsedPendingAction {
@@ -225,6 +227,122 @@ const parsePendingAction = (message: string): ParsedPendingAction | null => {
   );
 };
 
+const getStringActionValue = (
+  action: Record<string, unknown>,
+  fieldName: string
+): string | null => {
+  const value = action[fieldName];
+
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  return titleCase(value);
+};
+
+const getNumberActionValue = (
+  action: Record<string, unknown>,
+  fieldName: string
+): number | null => {
+  const value = action[fieldName];
+  const numberValue = typeof value === "number" ? value : Number(value);
+
+  if (!Number.isFinite(numberValue) || numberValue <= 0) {
+    return null;
+  }
+
+  return numberValue;
+};
+
+const mapHermesIntentToPendingAction = (
+  hermesIntent: HermesIntent
+): ParsedPendingAction | OwnerAgentResponse | null => {
+  if (hermesIntent.intent === "none") {
+    return null;
+  }
+
+  if (
+    [
+      "update_menu_item",
+      "create_promo",
+      "update_promo",
+      "create_order",
+      "update_order_status",
+      "generate_report"
+    ].includes(hermesIntent.intent)
+  ) {
+    return {
+      success: false,
+      source: "hermes",
+      message: "This action is understood but not supported yet."
+    };
+  }
+
+  if (hermesIntent.intent === "add_menu_item") {
+    const name = getStringActionValue(hermesIntent.action, "name");
+    const price = getNumberActionValue(hermesIntent.action, "price");
+    const categoryName =
+      getStringActionValue(hermesIntent.action, "categoryName") ?? defaultCategoryName;
+
+    if (!name || !price) {
+      return null;
+    }
+
+    return {
+      action: "ADD_MENU_ITEM",
+      data: {
+        name,
+        price,
+        categoryName,
+        ...(typeof hermesIntent.action.description === "string" &&
+        hermesIntent.action.description.trim()
+          ? { description: hermesIntent.action.description.trim() }
+          : {})
+      },
+      confirmationMessage: `I'm about to add ${name} for GHS ${price} under ${categoryName}. Should I save it?`
+    };
+  }
+
+  if (hermesIntent.intent === "update_price") {
+    const itemName = getStringActionValue(hermesIntent.action, "itemName");
+    const price = getNumberActionValue(hermesIntent.action, "price");
+
+    if (!itemName || !price) {
+      return null;
+    }
+
+    return {
+      action: "UPDATE_MENU_PRICE",
+      data: {
+        itemName,
+        price
+      },
+      confirmationMessage: `I'm about to change ${itemName} price to GHS ${price}. Should I save it?`
+    };
+  }
+
+  if (hermesIntent.intent === "set_availability") {
+    const itemName = getStringActionValue(hermesIntent.action, "itemName");
+    const isAvailable = hermesIntent.action.isAvailable;
+
+    if (!itemName || typeof isAvailable !== "boolean") {
+      return null;
+    }
+
+    return {
+      action: isAvailable ? "MARK_ITEM_AVAILABLE" : "MARK_ITEM_UNAVAILABLE",
+      data: {
+        itemName
+      },
+      confirmationMessage: `I'm about to mark ${itemName} as ${
+        isAvailable ? "available" : "unavailable"
+      }. Should I save it?`
+    };
+  }
+
+  return null;
+};
+
 const expireOldPendingActions = async (): Promise<void> => {
   await PendingAgentAction.updateMany(
     {
@@ -350,11 +468,14 @@ const executePendingAction = async (
     const name = String(action.data.name);
     const price = Number(action.data.price);
     const categoryName = String(action.data.categoryName ?? defaultCategoryName);
+    const description =
+      typeof action.data.description === "string" ? action.data.description : undefined;
     const category = await getOrCreateCategory(String(action.restaurantId), categoryName);
     const item = await menuItemService.addMenuItem(String(action.restaurantId), {
       categoryId: String(category._id),
       name,
-      price
+      price,
+      description
     });
     const resultMessage = `${item.name} has been added to the menu for GHS ${item.price}.`;
 
@@ -488,15 +609,43 @@ export const handleOwnerMessage = async (
     };
   }
 
-  if (isShowMenuMessage(message)) {
-    return showMenu(input.restaurantId);
+  const categories = await menuCategoryService.getCategoriesByRestaurant(input.restaurantId);
+  const menuItems = await menuItemService.getMenuItemsByRestaurant(input.restaurantId);
+  const hermesIntent = await getHermesIntent({
+    restaurant,
+    senderPhone,
+    message,
+    categories,
+    menuItems
+  });
+  const hermesAction = hermesIntent ? mapHermesIntentToPendingAction(hermesIntent) : null;
+  let parsedAction: ParsedPendingAction | null = null;
+  let source: "hermes" | "rule_based" = "rule_based";
+
+  if (hermesAction && "success" in hermesAction) {
+    return hermesAction;
   }
 
-  const parsedAction = parsePendingAction(message);
+  if (hermesAction) {
+    parsedAction = hermesAction;
+    source = "hermes";
+  }
+
+  if (!parsedAction && isShowMenuMessage(message)) {
+    return {
+      ...(await showMenu(input.restaurantId)),
+      source: "rule_based"
+    };
+  }
+
+  if (!parsedAction) {
+    parsedAction = parsePendingAction(message);
+  }
 
   if (!parsedAction) {
     return {
       success: false,
+      source,
       message: unknownMessage
     };
   }
@@ -504,7 +653,10 @@ export const handleOwnerMessage = async (
   const matchError = await ensureSingleItemMatchForPendingAction(input.restaurantId, parsedAction);
 
   if (matchError) {
-    return matchError;
+    return {
+      ...matchError,
+      source
+    };
   }
 
   const pendingAction = await createPendingAction(
@@ -515,6 +667,7 @@ export const handleOwnerMessage = async (
 
   return {
     success: true,
+    source,
     requiresConfirmation: true,
     message: parsedAction.confirmationMessage,
     pendingActionId: String(pendingAction._id),
