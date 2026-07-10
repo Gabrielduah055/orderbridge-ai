@@ -124,6 +124,14 @@ export const updateMenuItemAvailabilitySchema = z
   })
   .strict();
 
+export const agentOwnerMessageSchema = z
+  .object({
+    restaurantId: z.string().trim().min(1),
+    senderPhone: phoneSchema,
+    message: z.string().trim().min(1)
+  })
+  .strict();
+
 export const validateRequest =
   (schema: ZodSchema) =>
   (req: Request, res: Response, next: NextFunction): void => {
