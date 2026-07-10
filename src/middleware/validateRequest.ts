@@ -61,6 +61,69 @@ export const updateRestaurantPlanSchema = z
   })
   .strict();
 
+const stringArraySchema = z.array(z.string().trim().min(1)).default([]);
+
+export const createMenuCategorySchema = z
+  .object({
+    name: z.string().trim().min(1),
+    description: optionalTextSchema,
+    sortOrder: z.number().int().min(0).optional(),
+    isActive: z.boolean().default(true)
+  })
+  .strict();
+
+export const updateMenuCategorySchema = createMenuCategorySchema.partial().refine(
+  (value) => Object.keys(value).length > 0,
+  {
+    message: "At least one field is required"
+  }
+);
+
+export const reorderMenuCategoriesSchema = z
+  .object({
+    categoryOrders: z
+      .array(
+        z
+          .object({
+            categoryId: z.string().trim().min(1),
+            sortOrder: z.number().int().min(0)
+          })
+          .strict()
+      )
+      .min(1)
+  })
+  .strict();
+
+export const createMenuItemSchema = z
+  .object({
+    categoryId: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    description: optionalTextSchema,
+    price: z.number().positive(),
+    imageUrl: optionalTextSchema,
+    isAvailable: z.boolean().default(true),
+    preparationTimeMinutes: z.number().int().min(0).optional(),
+    tags: stringArraySchema,
+    allergens: stringArraySchema,
+    portionSize: optionalTextSchema,
+    isPopular: z.boolean().default(false),
+    isPromoItem: z.boolean().default(false)
+  })
+  .strict();
+
+export const updateMenuItemSchema = createMenuItemSchema.partial().refine(
+  (value) => Object.keys(value).length > 0,
+  {
+    message: "At least one field is required"
+  }
+);
+
+export const updateMenuItemAvailabilitySchema = z
+  .object({
+    isAvailable: z.boolean()
+  })
+  .strict();
+
 export const validateRequest =
   (schema: ZodSchema) =>
   (req: Request, res: Response, next: NextFunction): void => {

@@ -7,27 +7,11 @@ import type {
   RestaurantStatus,
   RestaurantUpdateInput
 } from "../types/restaurant.types";
+import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone, normalizePhoneList } from "../utils/phone.util";
 import { generateUniqueRestaurantSlug } from "../utils/slug.util";
+import { createDefaultCategoriesForRestaurant } from "./menuCategory.service";
 import { validateManagerLimit } from "./plan.service";
-
-export class NotFoundError extends Error {
-  statusCode = 404;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "NotFoundError";
-  }
-}
-
-export class BadRequestError extends Error {
-  statusCode = 400;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "BadRequestError";
-  }
-}
 
 const ensureValidObjectId = (restaurantId: string): void => {
   if (!Types.ObjectId.isValid(restaurantId)) {
@@ -66,7 +50,7 @@ export const createRestaurant = async (
 
   const slug = await generateUniqueRestaurantSlug(input.name);
 
-  return Restaurant.create({
+  const restaurant = await Restaurant.create({
     ...input,
     slug,
     plan,
@@ -75,6 +59,10 @@ export const createRestaurant = async (
     managerPhones,
     managerContacts: normalizeManagerContacts(input.managerContacts)
   });
+
+  await createDefaultCategoriesForRestaurant(restaurant._id);
+
+  return restaurant;
 };
 
 export const getRestaurants = async (): Promise<IRestaurantDocument[]> => {

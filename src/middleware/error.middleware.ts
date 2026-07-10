@@ -8,6 +8,14 @@ type HttpError = Error & {
 };
 
 export const errorMiddleware: ErrorRequestHandler = (error: HttpError, _req, res, _next) => {
+  if (error.name === "MulterError") {
+    res.status(400).json({
+      success: false,
+      message: error.message || "File upload failed"
+    });
+    return;
+  }
+
   if (error instanceof ZodError) {
     res.status(400).json({
       success: false,
