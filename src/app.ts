@@ -1,7 +1,9 @@
 import cors from "cors";
 import express, { type Request, type Response } from "express";
 import morgan from "morgan";
+import path from "path";
 import { errorMiddleware } from "./middleware/error.middleware";
+import menuRoutes from "./routes/menu.routes";
 import restaurantRoutes from "./routes/restaurant.routes";
 
 export const app = express();
@@ -9,6 +11,7 @@ export const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(morgan("dev"));
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
@@ -18,5 +21,6 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.use("/api/restaurants", restaurantRoutes);
+app.use("/api/menu", menuRoutes);
 
 app.use(errorMiddleware);
