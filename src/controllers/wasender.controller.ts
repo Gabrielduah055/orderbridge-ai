@@ -13,6 +13,7 @@ import { normalizeGhanaPhone } from "../utils/phone.util";
 
 const getWebhookSecret = (req: Request): string | undefined => {
   const headerSecret =
+    req.header("x-webhook-signature") ??
     req.header("x-wasender-webhook-secret") ??
     req.header("x-webhook-secret") ??
     req.header("x-webhook-token");
@@ -22,13 +23,69 @@ const getWebhookSecret = (req: Request): string | undefined => {
 };
 
 const isWebhookVerified = (req: Request): boolean => {
-  const expectedSecret = process.env.WASENDER_WEBHOOK_SECRET;
+  const expectedSecret = process.env.WASENDER_WEBHOOK_SECRET?.trim();
 
   if (!expectedSecret) {
     return true;
   }
 
-  return getWebhookSecret(req) === expectedSecret;
+  const incomingSecret = getWebhookSecret(req)?.trim();
+
+  if (process.env.NODE_ENV !== "production" && incomingSecret !== expectedSecret) {
+    console.warn("Wasender webhook auth failed", {
+      hasExpectedSecret: Boolean(expectedSecret),
+      hasSignatureHeader: Boolean(req.header("x-webhook-signature")),
+      hasLegacySecretHeader: Boolean(req.header("x-wasender-webhook-secret")),
+      hasQuerySecret: typeof req.query.secret === "string"
+    });
+  }
+
+  return incomingSecret === expectedSecret;
+};
+
+const getQueryString = (value: unknown): string | undefined => {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+};
+
+const buildWebhookPayload = (req: Request): Record<string, unknown> => {
+  const body = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+  const bodyQuery =
+    body.query && typeof body.query === "object" ? (body.query as Record<string, unknown>) : {};
+  const bodyParams =
+    body.params && typeof body.params === "object" ? (body.params as Record<string, unknown>) : {};
+
+  return {
+    ...body,
+    params: {
+      ...bodyParams,
+      sessionId: req.params.sessionId ?? bodyParams.sessionId
+    },
+    query: {
+      ...bodyQuery,
+      sessionId: getQueryString(req.query.sessionId) ?? bodyQuery.sessionId,
+      wasenderSessionId:
+        getQueryString(req.query.wasenderSessionId) ?? bodyQuery.wasenderSessionId,
+      whatsappSessionId:
+        getQueryString(req.query.whatsappSessionId) ?? bodyQuery.whatsappSessionId,
+      receiver: getQueryString(req.query.receiver) ?? bodyQuery.receiver,
+      whatsappNumber: getQueryString(req.query.whatsappNumber) ?? bodyQuery.whatsappNumber,
+      businessNumber: getQueryString(req.query.businessNumber) ?? bodyQuery.businessNumber
+    }
+  };
+};
+
+const shouldProcessWebhook = (webhook: NormalizedWasenderWebhook): boolean => {
+  if (webhook.fromMe) {
+    return false;
+  }
+
+  if (!webhook.event) {
+    return true;
+  }
+
+  return ["messages.received", "messages-personal.received", "messages.upsert"].includes(
+    webhook.event
+  );
 };
 
 const normalizePhone = (phone?: string): string => {
@@ -278,11 +335,15 @@ export const handleWasenderWebhook = (
       return;
     }
 
-    const webhook = normalizeIncomingWebhook(req.body);
+    const webhook = normalizeIncomingWebhook(buildWebhookPayload(req));
 
     res.status(200).json({
       success: true
     });
+
+    if (!shouldProcessWebhook(webhook)) {
+      return;
+    }
 
     void processNormalizedWebhook(webhook);
   } catch (error) {
