@@ -3,8 +3,10 @@ import express, { type Request, type Response } from "express";
 import morgan from "morgan";
 import path from "path";
 import { errorMiddleware } from "./middleware/error.middleware";
+import agentCustomerRoutes from "./routes/agentCustomer.routes";
 import agentOwnerRoutes from "./routes/agentOwner.routes";
 import menuRoutes from "./routes/menu.routes";
+import orderRoutes, { restaurantOrderRoutes } from "./routes/order.routes";
 import restaurantRoutes from "./routes/restaurant.routes";
 
 export const app = express();
@@ -21,8 +23,11 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+app.use("/api/restaurants/:restaurantId/orders", restaurantOrderRoutes);
 app.use("/api/restaurants", restaurantRoutes);
 app.use("/api/menu", menuRoutes);
+app.use("/api/orders", orderRoutes);
+app.use("/api/agent/customer", agentCustomerRoutes);
 app.use("/api/agent/owner", agentOwnerRoutes);
 
 app.use(errorMiddleware);

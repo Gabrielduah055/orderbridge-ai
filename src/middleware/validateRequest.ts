@@ -1,5 +1,11 @@
 import type { NextFunction, Request, Response } from "express";
 import { z, type ZodError, type ZodSchema } from "zod";
+import {
+  orderStatuses,
+  orderTypes,
+  paymentMethods,
+  paymentStatuses
+} from "../models/order.model";
 import { assistantTones, restaurantPlans, restaurantStatuses } from "../types/restaurant.types";
 
 const phoneSchema = z.string().trim().min(7);
@@ -128,6 +134,43 @@ export const agentOwnerMessageSchema = z
   .object({
     restaurantId: z.string().trim().min(1),
     senderPhone: phoneSchema,
+    message: z.string().trim().min(1)
+  })
+  .strict();
+
+export const createOrderSchema = z
+  .object({
+    customerName: optionalTextSchema,
+    customerPhone: phoneSchema,
+    items: z
+      .array(
+        z
+          .object({
+            menuItemId: z.string().trim().min(1),
+            quantity: z.number().int().positive()
+          })
+          .strict()
+      )
+      .min(1),
+    orderType: z.enum(orderTypes),
+    deliveryAddress: optionalTextSchema,
+    paymentMethod: z.enum(paymentMethods).default("unknown"),
+    paymentStatus: z.enum(paymentStatuses).default("unpaid"),
+    notes: optionalTextSchema
+  })
+  .strict();
+
+export const updateOrderStatusSchema = z
+  .object({
+    status: z.enum(orderStatuses)
+  })
+  .strict();
+
+export const agentCustomerMessageSchema = z
+  .object({
+    restaurantId: z.string().trim().min(1),
+    customerPhone: phoneSchema,
+    customerName: optionalTextSchema,
     message: z.string().trim().min(1)
   })
   .strict();
