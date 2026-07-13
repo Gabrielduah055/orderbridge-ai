@@ -4,5 +4,6 @@ import { handleWasenderWebhook } from "../controllers/wasender.controller";
 const router = Router();
 
 router.post("/", handleWasenderWebhook);
+router.post("/:sessionId", handleWasenderWebhook);
 
 export default router;

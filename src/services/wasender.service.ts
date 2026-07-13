@@ -3,6 +3,7 @@ import crypto from "crypto";
 export type WasenderMessageType = "text" | "image" | "document" | "unknown";
 
 export interface NormalizedWasenderWebhook {
+  event?: string;
   sessionId: string;
   from: string;
   message: string;
@@ -10,6 +11,7 @@ export interface NormalizedWasenderWebhook {
   mediaUrl?: string;
   messageId?: string;
   receiver?: string;
+  fromMe?: boolean;
   rawPayload: Record<string, unknown>;
 }
 
@@ -56,6 +58,50 @@ const firstString = (payload: unknown, paths: string[]): string | undefined => {
   return undefined;
 };
 
+const firstStringFromSources = (
+  sources: unknown[],
+  paths: string[]
+): string | undefined => {
+  for (const source of sources) {
+    const value = firstString(source, paths);
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return undefined;
+};
+
+const firstBoolean = (payload: unknown, paths: string[]): boolean | undefined => {
+  for (const path of paths) {
+    const value = getNestedValue(payload, path);
+
+    if (typeof value === "boolean") {
+      return value;
+    }
+  }
+
+  return undefined;
+};
+
+const hasNestedValue = (value: unknown, path: string): boolean => {
+  return getNestedValue(value, path) !== undefined;
+};
+
+const getPrimaryMessagePayload = (payload: Record<string, unknown>): unknown => {
+  const messages = getNestedValue(payload, "data.messages");
+
+  if (Array.isArray(messages)) {
+    return (
+      messages.find((message) => firstBoolean(message, ["key.fromMe"]) === false) ??
+      messages[0]
+    );
+  }
+
+  return messages;
+};
+
 const cleanWhatsappAddress = (value?: string): string => {
   if (!value) {
     return "";
@@ -75,7 +121,8 @@ const detectMessageType = (payload: unknown, messageText?: string): WasenderMess
     "data.messageType",
     "data.type",
     "message.type",
-    "message.messageType"
+    "message.messageType",
+    "message.messageType.type"
   ])?.toLowerCase();
 
   if (explicitType?.includes("image")) {
@@ -83,6 +130,17 @@ const detectMessageType = (payload: unknown, messageText?: string): WasenderMess
   }
 
   if (explicitType?.includes("document") || explicitType?.includes("file")) {
+    return "document";
+  }
+
+  if (hasNestedValue(payload, "message.imageMessage") || hasNestedValue(payload, "imageMessage")) {
+    return "image";
+  }
+
+  if (
+    hasNestedValue(payload, "message.documentMessage") ||
+    hasNestedValue(payload, "documentMessage")
+  ) {
     return "document";
   }
 
@@ -103,7 +161,8 @@ const buildWebhookEventId = (payload: unknown): string => {
     "data.id",
     "data.messageId",
     "message.id",
-    "key.id"
+    "key.id",
+    "data.messages.key.id"
   ]);
 
   if (explicitId) {
@@ -185,8 +244,7 @@ export const sendTextMessage = async (
   return postToWasender("/api/send-message", {
     sessionId,
     to,
-    message,
-    type: "text"
+    text: message
   });
 };
 
@@ -196,36 +254,47 @@ export const sendDocumentMessage = async (
   fileUrl: string,
   caption?: string
 ): Promise<WasenderSendResult> => {
-  return postToWasender("/api/send-document", {
+  return postToWasender("/api/send-message", {
     sessionId,
     to,
-    fileUrl,
-    caption,
-    type: "document"
+    documentUrl: fileUrl,
+    text: caption
   });
 };
 
 export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWebhook => {
   const rawPayload =
     payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-  const message = firstString(rawPayload, [
+  const messagePayload = getPrimaryMessagePayload(rawPayload);
+  const event = firstString(rawPayload, ["event", "type"]);
+  const message = firstStringFromSources([messagePayload, rawPayload], [
     "message",
     "text",
     "body",
+    "messageBody",
     "data.message",
     "data.text",
     "data.body",
+    "data.messages.messageBody",
     "message.text",
     "message.body",
     "message.conversation",
+    "message.extendedTextMessage.text",
+    "message.imageMessage.caption",
+    "message.videoMessage.caption",
+    "message.documentMessage.caption",
     "data.message.text",
     "data.message.body",
-    "data.message.conversation"
+    "data.message.conversation",
+    "data.message.messageBody"
   ]);
   const sessionId =
     firstString(rawPayload, [
       "sessionId",
       "session_id",
+      "wasenderSessionId",
+      "whatsappSessionId",
+      "whatsapp_session_id",
       "instanceId",
       "instance_id",
       "deviceId",
@@ -233,10 +302,19 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
       "data.sessionId",
       "data.session_id",
       "session.id",
-      "data.session.id"
+      "data.session.id",
+      "params.sessionId",
+      "query.sessionId",
+      "query.wasenderSessionId",
+      "query.whatsappSessionId"
     ]) ?? "";
   const from = cleanWhatsappAddress(
-    firstString(rawPayload, [
+    firstStringFromSources([messagePayload, rawPayload], [
+      "key.cleanedParticipantPn",
+      "key.cleanedSenderPn",
+      "key.senderPn",
+      "key.participant",
+      "key.remoteJid",
       "from",
       "sender",
       "senderPhone",
@@ -259,10 +337,13 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
       "data.receiver",
       "data.recipient",
       "data.businessNumber",
-      "message.to"
+      "message.to",
+      "query.receiver",
+      "query.whatsappNumber",
+      "query.businessNumber"
     ])
   );
-  const mediaUrl = firstString(rawPayload, [
+  const mediaUrl = firstStringFromSources([messagePayload, rawPayload], [
     "mediaUrl",
     "media_url",
     "fileUrl",
@@ -271,18 +352,26 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     "documentUrl",
     "data.mediaUrl",
     "data.fileUrl",
-    "message.mediaUrl"
+    "message.mediaUrl",
+    "message.imageMessage.url",
+    "message.videoMessage.url",
+    "message.documentMessage.url"
   ]);
-  const messageId = buildWebhookEventId(rawPayload);
+  const messageId =
+    firstString(messagePayload, ["key.id", "id", "messageId"]) ??
+    buildWebhookEventId(rawPayload);
+  const fromMe = firstBoolean(messagePayload, ["key.fromMe", "fromMe"]);
 
   return {
+    event,
     sessionId,
     from,
     message: message ?? "",
-    messageType: detectMessageType(rawPayload, message),
+    messageType: detectMessageType(messagePayload ?? rawPayload, message),
     mediaUrl,
     messageId,
     receiver: receiver || undefined,
+    fromMe,
     rawPayload
   };
 };
