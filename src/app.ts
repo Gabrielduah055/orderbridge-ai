@@ -8,6 +8,7 @@ import agentOwnerRoutes from "./routes/agentOwner.routes";
 import menuRoutes from "./routes/menu.routes";
 import orderRoutes, { restaurantOrderRoutes } from "./routes/order.routes";
 import restaurantRoutes from "./routes/restaurant.routes";
+import wasenderRoutes from "./routes/wasender.routes";
 
 export const app = express();
 
@@ -29,5 +30,6 @@ app.use("/api/menu", menuRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/agent/customer", agentCustomerRoutes);
 app.use("/api/agent/owner", agentOwnerRoutes);
+app.use("/api/webhooks/wasender", wasenderRoutes);
 
 app.use(errorMiddleware);

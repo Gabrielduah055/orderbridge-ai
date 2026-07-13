@@ -1,10 +1,12 @@
 export const restaurantPlans = ["starter", "growth", "premium"] as const;
 export const restaurantStatuses = ["trial", "active", "paused", "cancelled"] as const;
 export const assistantTones = ["friendly", "professional", "casual", "concise", "playful"] as const;
+export const billingStatuses = ["active", "inactive", "past_due", "cancelled"] as const;
 
 export type RestaurantPlan = (typeof restaurantPlans)[number];
 export type RestaurantStatus = (typeof restaurantStatuses)[number];
 export type AssistantTone = (typeof assistantTones)[number];
+export type BillingStatus = (typeof billingStatuses)[number];
 
 export type PlanFeatureName =
   | "maxMenuItems"
@@ -29,6 +31,8 @@ export interface RestaurantInput {
   plan?: RestaurantPlan;
   status?: RestaurantStatus;
   subscriptionRenewalDate?: Date;
+  subscriptionAmount?: number;
+  billingStatus?: BillingStatus;
   wasenderSessionId: string;
   wasenderApiToken?: string;
   whatsappNumber: string;

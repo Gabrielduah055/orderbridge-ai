@@ -6,7 +6,12 @@ import {
   paymentMethods,
   paymentStatuses
 } from "../models/order.model";
-import { assistantTones, restaurantPlans, restaurantStatuses } from "../types/restaurant.types";
+import {
+  assistantTones,
+  billingStatuses,
+  restaurantPlans,
+  restaurantStatuses
+} from "../types/restaurant.types";
 
 const phoneSchema = z.string().trim().min(7);
 const optionalTextSchema = z.string().trim().min(1).optional();
@@ -29,6 +34,8 @@ export const createRestaurantSchema = z
     plan: z.enum(restaurantPlans).default("starter"),
     status: z.enum(restaurantStatuses).default("trial"),
     subscriptionRenewalDate: z.coerce.date().optional(),
+    subscriptionAmount: z.number().min(0).optional(),
+    billingStatus: z.enum(billingStatuses).optional(),
     wasenderSessionId: z.string().trim().min(1),
     wasenderApiToken: optionalTextSchema,
     whatsappNumber: phoneSchema,
