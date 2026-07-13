@@ -1,9 +1,11 @@
 import { Schema, model, type Document } from "mongoose";
 import {
   assistantTones,
+  billingStatuses,
   restaurantPlans,
   restaurantStatuses,
   type AssistantTone,
+  type BillingStatus,
   type RestaurantPlan,
   type RestaurantStatus
 } from "../types/restaurant.types";
@@ -20,6 +22,8 @@ export interface IRestaurant {
   plan: RestaurantPlan;
   status: RestaurantStatus;
   subscriptionRenewalDate?: Date;
+  subscriptionAmount?: number;
+  billingStatus?: BillingStatus;
   wasenderSessionId: string;
   wasenderApiToken?: string;
   whatsappNumber: string;
@@ -112,6 +116,14 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     },
     subscriptionRenewalDate: {
       type: Date
+    },
+    subscriptionAmount: {
+      type: Number,
+      min: 0
+    },
+    billingStatus: {
+      type: String,
+      enum: billingStatuses
     },
     wasenderSessionId: {
       type: String,
