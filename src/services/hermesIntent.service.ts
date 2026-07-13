@@ -31,9 +31,20 @@ interface GetHermesIntentInput {
   message: string;
   categories: IMenuCategoryDocument[];
   menuItems: IMenuItemDocument[];
+  onError?: (error: Error) => void;
 }
 
-const hermesTimeoutMs = 10_000;
+const defaultHermesTimeoutMs = 45_000;
+
+const getHermesTimeoutMs = (): number => {
+  const timeoutMs = Number(process.env.HERMES_TIMEOUT_MS);
+
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return defaultHermesTimeoutMs;
+  }
+
+  return timeoutMs;
+};
 
 const getHermesConfig = (): { apiUrl: string; apiKey: string } | null => {
   const apiUrl = process.env.HERMES_API_URL;
@@ -158,6 +169,69 @@ const buildHermesPromptPayload = (input: GetHermesIntentInput) => {
   };
 };
 
+const hermesSystemPrompt = `
+You extract restaurant owner operational intent from messages.
+Return ONLY valid JSON. Do not include prose, markdown, or fenced code blocks.
+Do not execute actions. Only classify the message and fill the action payload.
+
+Expected response shape:
+{
+  "intent": "add_menu_item | update_menu_item | update_price | set_availability | create_promo | update_promo | create_order | update_order_status | generate_report | none",
+  "requires_confirmation": true,
+  "confirmed": false,
+  "action": {},
+  "reply_text": "..."
+}
+
+Use these exact action field names. Do not use snake_case.
+
+For add_menu_item:
+{
+  "name": "string",
+  "price": number,
+  "categoryName": "string",
+  "description": "string optional"
+}
+
+For update_price:
+{
+  "itemName": "string",
+  "price": number
+}
+
+For set_availability:
+{
+  "itemName": "string",
+  "isAvailable": boolean
+}
+
+For update_menu_item:
+{
+  "itemName": "string",
+  "updates": {
+    "name": "string optional",
+    "description": "string optional",
+    "categoryName": "string optional",
+    "price": number optional
+  }
+}
+
+For generate_report:
+{
+  "reportType": "daily | weekly | monthly",
+  "date": "string optional"
+}
+
+For unsupported or unclear messages:
+{
+  "intent": "none",
+  "requires_confirmation": false,
+  "confirmed": false,
+  "action": {},
+  "reply_text": "I couldn't understand that action yet."
+}
+`.trim();
+
 export const getHermesIntent = async (
   input: GetHermesIntentInput
 ): Promise<HermesIntent | null> => {
@@ -168,7 +242,7 @@ export const getHermesIntent = async (
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), hermesTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), getHermesTimeoutMs());
   const payload = buildHermesPromptPayload(input);
 
   try {
@@ -184,8 +258,7 @@ export const getHermesIntent = async (
         messages: [
           {
             role: "system",
-            content:
-              "You understand restaurant owner menu-management messages. Return only JSON with this shape: {\"intent\":\"add_menu_item | update_menu_item | update_price | set_availability | create_promo | update_promo | create_order | update_order_status | generate_report | none\",\"requires_confirmation\":true,\"confirmed\":false,\"action\":{},\"reply_text\":\"...\"}. Do not execute actions."
+            content: hermesSystemPrompt
           },
           {
             role: "user",
@@ -205,6 +278,12 @@ export const getHermesIntent = async (
 
     return parseHermesIntent(content);
   } catch (error) {
+    if (error instanceof Error) {
+      input.onError?.(error);
+    } else {
+      input.onError?.(new Error("Unknown Hermes intent extraction error"));
+    }
+
     console.error("Hermes intent extraction failed", error);
     return null;
   } finally {
