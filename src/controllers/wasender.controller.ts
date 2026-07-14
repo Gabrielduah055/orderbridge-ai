@@ -105,6 +105,45 @@ const getWasenderSendError = (result: WasenderSendResult): string => {
   return "Wasender API send failed";
 };
 
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  return "Unknown webhook processing error";
+};
+
+const getErrorDetails = (error: unknown): Record<string, unknown> => {
+  if (!error || typeof error !== "object") {
+    return {};
+  }
+
+  const details: Record<string, unknown> = {};
+  const maybeDetailedError = error as {
+    context?: unknown;
+    wasenderSendResult?: unknown;
+    stack?: unknown;
+  };
+
+  if (maybeDetailedError.context) {
+    details.context = maybeDetailedError.context;
+  }
+
+  if (maybeDetailedError.wasenderSendResult) {
+    details.wasenderSendResult = maybeDetailedError.wasenderSendResult;
+  }
+
+  if (process.env.NODE_ENV !== "production" && maybeDetailedError.stack) {
+    details.stack = maybeDetailedError.stack;
+  }
+
+  return details;
+};
+
 const assertWasenderSendSuccess = (
   result: WasenderSendResult,
   context: Record<string, unknown>
@@ -120,7 +159,10 @@ const assertWasenderSendSuccess = (
     data: result.data
   });
 
-  throw new Error(getWasenderSendError(result));
+  throw Object.assign(new Error(getWasenderSendError(result)), {
+    context,
+    wasenderSendResult: result
+  });
 };
 
 const sendTextMessageOrThrow = async (
@@ -323,6 +365,11 @@ const processNormalizedWebhook = async (
         receiver: webhook.receiver
       });
       webhookEvent.status = "failed";
+      webhookEvent.failureReason = "Restaurant not found for Wasender webhook";
+      webhookEvent.failureDetails = {
+        sessionId: webhook.sessionId,
+        receiver: webhook.receiver
+      };
       webhookEvent.processedAt = new Date();
       await webhookEvent.save();
       return;
@@ -402,6 +449,9 @@ const processNormalizedWebhook = async (
 
     console.error("Wasender webhook processing failed", error);
 
+    const failureReason = getErrorMessage(error);
+    const failureDetails = getErrorDetails(error);
+
     await WebhookEvent.updateOne(
       {
         provider: "wasender",
@@ -410,7 +460,9 @@ const processNormalizedWebhook = async (
       {
         $set: {
           status: "failed",
-          processedAt: new Date()
+          processedAt: new Date(),
+          failureReason,
+          failureDetails
         },
         $setOnInsert: {
           sessionId: webhook.sessionId,
