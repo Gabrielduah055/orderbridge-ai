@@ -12,6 +12,8 @@ export interface IWebhookEvent {
   payload: Record<string, unknown>;
   processedAt?: Date;
   status: WebhookEventStatus;
+  failureReason?: string;
+  failureDetails?: Record<string, unknown>;
 }
 
 export interface IWebhookEventDocument extends IWebhookEvent, Document {
@@ -51,6 +53,13 @@ const webhookEventSchema = new Schema<IWebhookEventDocument>(
       type: String,
       enum: webhookEventStatuses,
       default: "processing"
+    },
+    failureReason: {
+      type: String,
+      trim: true
+    },
+    failureDetails: {
+      type: Schema.Types.Mixed
     }
   },
   {
