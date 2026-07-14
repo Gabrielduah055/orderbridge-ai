@@ -15,16 +15,22 @@ export interface NormalizedWasenderWebhook {
   rawPayload: Record<string, unknown>;
 }
 
-interface WasenderSendResult {
+export interface WasenderSendResult {
   success: boolean;
   status?: number;
   data?: unknown;
   error?: string;
 }
 
-const getWasenderConfig = (): { apiUrl: string; apiKey: string } | null => {
+export interface WasenderSendOptions {
+  apiKey?: string;
+}
+
+const getWasenderConfig = (
+  options: WasenderSendOptions = {}
+): { apiUrl: string; apiKey: string } | null => {
   const apiUrl = process.env.WASENDER_API_URL;
-  const apiKey = process.env.WASENDER_API_KEY;
+  const apiKey = options.apiKey?.trim() || process.env.WASENDER_API_KEY;
 
   if (!apiUrl || !apiKey) {
     return null;
@@ -174,9 +180,10 @@ const buildWebhookEventId = (payload: unknown): string => {
 
 const postToWasender = async (
   path: string,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  options: WasenderSendOptions = {}
 ): Promise<WasenderSendResult> => {
-  const config = getWasenderConfig();
+  const config = getWasenderConfig(options);
 
   if (!config) {
     const error = "Wasender API is not configured";
@@ -194,6 +201,14 @@ const postToWasender = async (
   const url = `${config.apiUrl}${normalizedPath}`;
 
   try {
+    console.info("Wasender API send attempt", {
+      path: normalizedPath,
+      to: body.to,
+      usesRestaurantApiToken: Boolean(options.apiKey?.trim()),
+      hasText: typeof body.text === "string" && body.text.length > 0,
+      hasDocumentUrl: typeof body.documentUrl === "string" && body.documentUrl.length > 0
+    });
+
     const response = await fetch(url, {
       method: "POST",
       headers: {
@@ -207,19 +222,33 @@ const postToWasender = async (
       ? ((await response.json()) as unknown)
       : await response.text();
 
-    if (!response.ok) {
+    const explicitFailure =
+      data &&
+      typeof data === "object" &&
+      "success" in data &&
+      (data as { success?: unknown }).success === false;
+
+    if (!response.ok || explicitFailure) {
       console.error("Wasender API send failed", {
         status: response.status,
-        data
+        data,
+        to: body.to
       });
 
       return {
         success: false,
         status: response.status,
         data,
-        error: `Wasender API request failed with status ${response.status}`
+        error: explicitFailure
+          ? "Wasender API returned success=false"
+          : `Wasender API request failed with status ${response.status}`
       };
     }
+
+    console.info("Wasender API send accepted", {
+      status: response.status,
+      to: body.to
+    });
 
     return {
       success: true,
@@ -239,27 +268,31 @@ const postToWasender = async (
 export const sendTextMessage = async (
   sessionId: string,
   to: string,
-  message: string
+  message: string,
+  options: WasenderSendOptions = {}
 ): Promise<WasenderSendResult> => {
+  void sessionId;
+
   return postToWasender("/api/send-message", {
-    sessionId,
     to,
     text: message
-  });
+  }, options);
 };
 
 export const sendDocumentMessage = async (
   sessionId: string,
   to: string,
   fileUrl: string,
-  caption?: string
+  caption?: string,
+  options: WasenderSendOptions = {}
 ): Promise<WasenderSendResult> => {
+  void sessionId;
+
   return postToWasender("/api/send-message", {
-    sessionId,
     to,
     documentUrl: fileUrl,
     text: caption
-  });
+  }, options);
 };
 
 export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWebhook => {
