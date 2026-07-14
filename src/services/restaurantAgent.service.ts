@@ -40,18 +40,140 @@ interface HermesToolLoopResult {
   pendingActionId?: string;
 }
 
+interface ParsedMenuAdditionItem {
+  name: string;
+  price: number;
+  categoryName: string;
+}
+
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 
+const titleCase = (value: string): string => {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
 const isConfirmationMessage = (message: string): boolean => {
-  return ["yes", "confirm", "save it", "do it", "go ahead"].includes(
-    normalizeText(message).toLowerCase()
+  return /^(yes|yeah|yep|confirm|save it|do it|go ahead|ok|okay)\b/i.test(
+    normalizeText(message)
   );
 };
 
 const isCancellationMessage = (message: string): boolean => {
-  return ["no", "cancel", "don't save", "dont save", "stop"].includes(
-    normalizeText(message).toLowerCase()
+  return /^(no|cancel|don't save|dont save|stop)\b/i.test(normalizeText(message));
+};
+
+const stripListPrefix = (value: string): string => {
+  return normalizeText(value)
+    .replace(/^\d+[\).]?\s*/, "")
+    .replace(/^[-*]\s*/, "")
+    .replace(/[.]+$/, "")
+    .trim();
+};
+
+const normalizeCategoryName = (value: string): string => {
+  const categoryName = titleCase(value.replace(/\bmenu items?\b.*$/i, ""));
+
+  if (/^Frice Rice$/i.test(categoryName)) {
+    return "Fried Rice";
+  }
+
+  return categoryName;
+};
+
+const extractCategoryName = (line: string): string | null => {
+  const match = stripListPrefix(line).match(/^(.+?)\s+as\s+(?:a\s+)?categor(?:y|ies)\b/i);
+
+  if (!match) {
+    return null;
+  }
+
+  return normalizeCategoryName(match[1]);
+};
+
+const cleanMenuItemName = (value: string): string => {
+  return titleCase(
+    value
+      .replace(/\bwhich\s+is\b.*$/i, "")
+      .replace(/\bthat\s+is\b.*$/i, "")
+      .replace(/\s+as\s+well\b/i, "")
+      .replace(/\s+/g, " ")
   );
+};
+
+const parseMenuItemSegment = (
+  segment: string,
+  categoryName: string
+): ParsedMenuAdditionItem | null => {
+  const normalized = stripListPrefix(segment);
+  const match =
+    normalized.match(/^(.+?)\s*(?:-|:)\s*(?:ghs\s*)?(\d+(?:\.\d+)?)(?:\s*cedis?)?/i) ??
+    normalized.match(/^(.+?)\s+which\s+is\s+(?:ghs\s*)?(\d+(?:\.\d+)?)(?:\s*cedis?)?/i) ??
+    normalized.match(/^(.+?)\s+(?:ghs\s*)?(\d+(?:\.\d+)?)(?:\s*cedis?)?$/i);
+
+  if (!match) {
+    return null;
+  }
+
+  const name = cleanMenuItemName(match[1]);
+  const price = Number(match[2]);
+
+  if (!name || !Number.isFinite(price) || price <= 0) {
+    return null;
+  }
+
+  return {
+    name,
+    price,
+    categoryName
+  };
+};
+
+const parseMenuItemsLine = (
+  line: string,
+  categoryName: string
+): ParsedMenuAdditionItem[] => {
+  return stripListPrefix(line)
+    .split(/\s+\band\b\s+/i)
+    .map((segment) => parseMenuItemSegment(segment, categoryName))
+    .filter((item): item is ParsedMenuAdditionItem => Boolean(item));
+};
+
+const parseOwnerMenuAddition = (
+  message: string
+): { items: ParsedMenuAdditionItem[] } | null => {
+  const lines = message
+    .split(/\r?\n/)
+    .map(stripListPrefix)
+    .filter(Boolean);
+  let currentCategoryName: string | null = null;
+  let sawCategory = false;
+  const items: ParsedMenuAdditionItem[] = [];
+
+  for (const line of lines) {
+    const categoryName = extractCategoryName(line);
+
+    if (categoryName) {
+      currentCategoryName = categoryName;
+      sawCategory = true;
+      continue;
+    }
+
+    if (!currentCategoryName) {
+      continue;
+    }
+
+    items.push(...parseMenuItemsLine(line, currentCategoryName));
+  }
+
+  if (!sawCategory || items.length === 0) {
+    return null;
+  }
+
+  return {
+    items
+  };
 };
 
 const parseHermesAgentTurn = (content: string): HermesAgentTurn => {
@@ -431,6 +553,54 @@ export const handleRestaurantAgentMessage = async (
 
       return response;
     }
+  }
+
+  const parsedMenuAddition =
+    sender.role === "owner" ? parseOwnerMenuAddition(input.message) : null;
+
+  if (parsedMenuAddition) {
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "user",
+      content: message
+    });
+
+    const result = await executeAgentTool(
+      "add_menu_items",
+      parsedMenuAddition,
+      executionContext
+    );
+    const response = {
+      success: result.success,
+      message: result.message,
+      data:
+        result.data && typeof result.data === "object"
+          ? (result.data as Record<string, unknown>)
+          : undefined,
+      source: "hermes_tools" as const,
+      sender
+    };
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: response.message,
+      metadata: result.pendingActionId
+        ? {
+            pendingActionId: result.pendingActionId,
+            expectsConfirmation: true,
+            source: "rule_based_menu_add"
+          }
+        : {
+            source: "rule_based_menu_add"
+          }
+    });
+
+    return response;
   }
 
   if (!isHermesConfigured()) {
