@@ -55,6 +55,12 @@ test("owner can prepare a menu price update", () => {
   assert.equal(isToolAllowedForRole("update_menu_price", "owner"), true);
 });
 
+test("only owner can add menu items through tools", () => {
+  assert.equal(isToolAllowedForRole("add_menu_items", "owner"), true);
+  assert.equal(isToolAllowedForRole("add_menu_items", "manager"), false);
+  assert.equal(isToolAllowedForRole("add_menu_items", "customer"), false);
+});
+
 test("unsupported promotion tool is not exposed", () => {
   assert.equal(isToolAllowedForRole("create_promotion", "owner"), false);
   assert.equal(getAllowedToolNamesForRole("owner").includes("create_promotion"), false);

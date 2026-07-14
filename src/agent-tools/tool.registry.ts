@@ -23,6 +23,26 @@ const menuItemLookupSchema = z
     itemId: z.string().trim().min(1).optional()
   })
   .strict();
+const addMenuItemsSchema = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            name: z.string().trim().min(1),
+            price: z.number().positive(),
+            categoryName: z.string().trim().min(1).optional(),
+            description: z.string().trim().min(1).optional(),
+            isAvailable: z.boolean().optional()
+          })
+          .strict()
+      )
+      .min(1)
+      .max(30)
+  })
+  .strict();
+
+const defaultCategoryName = "Main Meals";
 
 const menuItemView = (
   item: IMenuItemDocument,
@@ -70,6 +90,62 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
       }
     : {})
 });
+
+const normalizeComparableText = (value: string): string => {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+};
+
+const normalizeDisplayText = (value: string): string => {
+  return value.trim().replace(/\s+/g, " ");
+};
+
+const getNextCategorySortOrder = async (restaurantId: string): Promise<number> => {
+  const lastCategory = await MenuCategory.findOne({ restaurantId })
+    .sort({ sortOrder: -1 })
+    .select("sortOrder");
+
+  return lastCategory ? lastCategory.sortOrder + 10 : 0;
+};
+
+const getOrCreateMenuCategory = async (restaurantId: string, categoryName: string) => {
+  const normalizedCategoryName = normalizeDisplayText(categoryName);
+  const categories = await MenuCategory.find({ restaurantId }).sort({ sortOrder: 1, createdAt: 1 });
+  const existingCategory = categories.find(
+    (category) =>
+      normalizeComparableText(category.name) === normalizeComparableText(normalizedCategoryName)
+  );
+
+  if (existingCategory) {
+    if (!existingCategory.isActive) {
+      existingCategory.isActive = true;
+      await existingCategory.save();
+    }
+
+    return existingCategory;
+  }
+
+  return MenuCategory.create({
+    restaurantId,
+    name: normalizedCategoryName,
+    sortOrder: await getNextCategorySortOrder(restaurantId),
+    isDefault: false,
+    isActive: true
+  });
+};
+
+const formatAddMenuItemsSummary = (items: z.infer<typeof addMenuItemsSchema>["items"]): string => {
+  const categoryItems = new Map<string, string[]>();
+
+  for (const item of items) {
+    const categoryName = normalizeDisplayText(item.categoryName ?? defaultCategoryName);
+    const summary = `${normalizeDisplayText(item.name)} (GHS ${item.price})`;
+    categoryItems.set(categoryName, [...(categoryItems.get(categoryName) ?? []), summary]);
+  }
+
+  return Array.from(categoryItems.entries())
+    .map(([categoryName, summaries]) => `${categoryName}: ${summaries.join(", ")}`)
+    .join("\n");
+};
 
 const findMenuItemForRestaurant = async (
   context: ToolExecutionContext,
@@ -428,6 +504,67 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           todayRevenue: todayOrders.reduce((sum, order) => sum + order.total, 0),
           pendingOrders: todayOrders.filter((order) => order.status === "pending").length,
           unavailableItems
+        }
+      };
+    }
+  },
+  add_menu_items: {
+    definition: {
+      name: "add_menu_items",
+      description:
+        "Prepare or confirm adding one or more menu items. Creates menu categories by name when needed. Requires owner confirmation.",
+      parameters: {
+        items:
+          "Array of { name, price, categoryName, description, isAvailable }. categoryName is optional and defaults to Main Meals."
+      }
+    },
+    roles: toolPermissions.add_menu_items,
+    sensitive: true,
+    schema: addMenuItemsSchema,
+    handler: async (args, context) => {
+      if (!context.confirmed) {
+        const itemCount = args.items.length;
+
+        return createPendingToolAction(
+          context,
+          "add_menu_items",
+          args,
+          [
+            `Should I add ${itemCount} menu item${itemCount === 1 ? "" : "s"}?`,
+            formatAddMenuItemsSummary(args.items)
+          ].join("\n")
+        );
+      }
+
+      const createdItems = [];
+
+      for (const item of args.items) {
+        const categoryName = normalizeDisplayText(item.categoryName ?? defaultCategoryName);
+        const category = await getOrCreateMenuCategory(context.restaurantId, categoryName);
+        const createdItem = await menuItemService.addMenuItem(context.restaurantId, {
+          categoryId: String(category._id),
+          name: normalizeDisplayText(item.name),
+          price: item.price,
+          description: item.description ? normalizeDisplayText(item.description) : undefined,
+          isAvailable: item.isAvailable ?? true
+        });
+
+        createdItems.push({
+          id: String(createdItem._id),
+          name: createdItem.name,
+          price: createdItem.price,
+          category: category.name,
+          available: createdItem.isAvailable
+        });
+      }
+
+      return {
+        success: true,
+        message: `${createdItems.length} menu item${
+          createdItems.length === 1 ? " has" : "s have"
+        } been added.`,
+        data: {
+          items: createdItems
         }
       };
     }
