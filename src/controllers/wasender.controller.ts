@@ -7,7 +7,8 @@ import {
   normalizeIncomingWebhook,
   sendDocumentMessage,
   sendTextMessage,
-  type NormalizedWasenderWebhook
+  type NormalizedWasenderWebhook,
+  type WasenderSendResult
 } from "../services/wasender.service";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
@@ -92,6 +93,73 @@ const normalizePhone = (phone?: string): string => {
   return phone ? normalizeGhanaPhone(phone) : "";
 };
 
+const getWasenderSendError = (result: WasenderSendResult): string => {
+  if (result.error) {
+    return result.error;
+  }
+
+  if (result.status) {
+    return `Wasender API request failed with status ${result.status}`;
+  }
+
+  return "Wasender API send failed";
+};
+
+const assertWasenderSendSuccess = (
+  result: WasenderSendResult,
+  context: Record<string, unknown>
+): void => {
+  if (result.success) {
+    return;
+  }
+
+  console.error("Wasender outbound send failed", {
+    ...context,
+    status: result.status,
+    error: result.error,
+    data: result.data
+  });
+
+  throw new Error(getWasenderSendError(result));
+};
+
+const sendTextMessageOrThrow = async (
+  sessionId: string,
+  to: string,
+  message: string,
+  context: Record<string, unknown>,
+  apiKey?: string
+): Promise<void> => {
+  const recipient = normalizePhone(to) || to;
+  const result = await sendTextMessage(sessionId, recipient, message, { apiKey });
+
+  assertWasenderSendSuccess(result, {
+    ...context,
+    sessionId,
+    to: recipient,
+    usesRestaurantApiToken: Boolean(apiKey?.trim())
+  });
+};
+
+const sendDocumentMessageOrThrow = async (
+  sessionId: string,
+  to: string,
+  fileUrl: string,
+  caption: string | undefined,
+  context: Record<string, unknown>,
+  apiKey?: string
+): Promise<void> => {
+  const recipient = normalizePhone(to) || to;
+  const result = await sendDocumentMessage(sessionId, recipient, fileUrl, caption, { apiKey });
+
+  assertWasenderSendSuccess(result, {
+    ...context,
+    sessionId,
+    to: recipient,
+    usesRestaurantApiToken: Boolean(apiKey?.trim())
+  });
+};
+
 const findRestaurantForWebhook = async (
   webhook: NormalizedWasenderWebhook
 ): Promise<IRestaurantDocument | null> => {
@@ -108,7 +176,7 @@ const findRestaurantForWebhook = async (
 
   return Restaurant.findOne({
     $or: query
-  });
+  }).select("+wasenderApiToken");
 };
 
 const isOwnerOrManagerSender = (
@@ -180,7 +248,8 @@ const sendReceiptIfAvailable = async (
   sessionId: string,
   to: string,
   receiptUrl?: string,
-  caption?: string
+  caption?: string,
+  apiKey?: string
 ): Promise<void> => {
   const publicReceiptUrl = getPublicReceiptUrl(receiptUrl);
 
@@ -188,7 +257,9 @@ const sendReceiptIfAvailable = async (
     return;
   }
 
-  await sendDocumentMessage(sessionId, to, publicReceiptUrl, caption);
+  await sendDocumentMessageOrThrow(sessionId, to, publicReceiptUrl, caption, {
+    action: "send_receipt"
+  }, apiKey);
 };
 
 const sendCustomerOrderSideEffects = async (
@@ -208,18 +279,23 @@ const sendCustomerOrderSideEffects = async (
     sessionId,
     webhook.from,
     order.receiptUrl,
-    `Receipt for ${order.orderNumber ?? "your order"}`
+    `Receipt for ${order.orderNumber ?? "your order"}`,
+    restaurant.wasenderApiToken
   );
 
   const ownerMessage = buildOwnerOrderNotification(order);
 
   if (ownerMessage) {
-    await sendTextMessage(sessionId, restaurant.ownerPhone, ownerMessage);
+    await sendTextMessageOrThrow(sessionId, restaurant.ownerPhone, ownerMessage, {
+      action: "send_owner_order_notification",
+      restaurantId: String(restaurant._id)
+    }, restaurant.wasenderApiToken);
     await sendReceiptIfAvailable(
       sessionId,
       restaurant.ownerPhone,
       order.receiptUrl,
-      `Receipt for ${order.orderNumber ?? "new order"}`
+      `Receipt for ${order.orderNumber ?? "new order"}`,
+      restaurant.wasenderApiToken
     );
   }
 };
@@ -257,10 +333,16 @@ const processNormalizedWebhook = async (
     }
 
     if (webhook.messageType !== "text" || !webhook.message.trim()) {
-      await sendTextMessage(
+      await sendTextMessageOrThrow(
         restaurant.wasenderSessionId,
         webhook.from,
-        "Please send a text message so I can help with your order."
+        "Please send a text message so I can help with your order.",
+        {
+          action: "send_unsupported_message_type_reply",
+          restaurantId: String(restaurant._id),
+          eventId
+        },
+        restaurant.wasenderApiToken
       );
       webhookEvent.status = "processed";
       webhookEvent.processedAt = new Date();
@@ -274,14 +356,34 @@ const processNormalizedWebhook = async (
         senderPhone: webhook.from,
         message: webhook.message
       });
-      await sendTextMessage(restaurant.wasenderSessionId, webhook.from, ownerResponse.message);
+      await sendTextMessageOrThrow(
+        restaurant.wasenderSessionId,
+        webhook.from,
+        ownerResponse.message,
+        {
+          action: "send_owner_agent_reply",
+          restaurantId: String(restaurant._id),
+          eventId
+        },
+        restaurant.wasenderApiToken
+      );
     } else {
       const customerResponse = await agentCustomerService.handleCustomerMessage({
         restaurantId: String(restaurant._id),
         customerPhone: webhook.from,
         message: webhook.message
       });
-      await sendTextMessage(restaurant.wasenderSessionId, webhook.from, customerResponse.message);
+      await sendTextMessageOrThrow(
+        restaurant.wasenderSessionId,
+        webhook.from,
+        customerResponse.message,
+        {
+          action: "send_customer_agent_reply",
+          restaurantId: String(restaurant._id),
+          eventId
+        },
+        restaurant.wasenderApiToken
+      );
       await sendCustomerOrderSideEffects(restaurant, webhook, customerResponse);
     }
 
