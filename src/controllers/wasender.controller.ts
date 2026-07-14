@@ -202,8 +202,10 @@ const sendCustomerOrderSideEffects = async (
     return;
   }
 
+  const sessionId = restaurant.wasenderSessionId;
+
   await sendReceiptIfAvailable(
-    webhook.sessionId,
+    sessionId,
     webhook.from,
     order.receiptUrl,
     `Receipt for ${order.orderNumber ?? "your order"}`
@@ -212,9 +214,9 @@ const sendCustomerOrderSideEffects = async (
   const ownerMessage = buildOwnerOrderNotification(order);
 
   if (ownerMessage) {
-    await sendTextMessage(webhook.sessionId, restaurant.ownerPhone, ownerMessage);
+    await sendTextMessage(sessionId, restaurant.ownerPhone, ownerMessage);
     await sendReceiptIfAvailable(
-      webhook.sessionId,
+      sessionId,
       restaurant.ownerPhone,
       order.receiptUrl,
       `Receipt for ${order.orderNumber ?? "new order"}`
@@ -256,7 +258,7 @@ const processNormalizedWebhook = async (
 
     if (webhook.messageType !== "text" || !webhook.message.trim()) {
       await sendTextMessage(
-        webhook.sessionId,
+        restaurant.wasenderSessionId,
         webhook.from,
         "Please send a text message so I can help with your order."
       );
@@ -272,14 +274,14 @@ const processNormalizedWebhook = async (
         senderPhone: webhook.from,
         message: webhook.message
       });
-      await sendTextMessage(webhook.sessionId, webhook.from, ownerResponse.message);
+      await sendTextMessage(restaurant.wasenderSessionId, webhook.from, ownerResponse.message);
     } else {
       const customerResponse = await agentCustomerService.handleCustomerMessage({
         restaurantId: String(restaurant._id),
         customerPhone: webhook.from,
         message: webhook.message
       });
-      await sendTextMessage(webhook.sessionId, webhook.from, customerResponse.message);
+      await sendTextMessage(restaurant.wasenderSessionId, webhook.from, customerResponse.message);
       await sendCustomerOrderSideEffects(restaurant, webhook, customerResponse);
     }
 
