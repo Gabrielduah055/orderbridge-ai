@@ -89,6 +89,7 @@ export type AgentConversationDirection = "user" | "assistant" | "tool";
 export interface AgentHistoryMessage {
   role: AgentConversationDirection;
   content: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface SaveAgentMessageInput {

@@ -584,33 +584,6 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
-  create_promotion: {
-    definition: {
-      name: "create_promotion",
-      description: "Create a restaurant promotion if promotion support is available.",
-      parameters: {
-        title: "Promotion title.",
-        description: "Promotion description."
-      }
-    },
-    roles: toolPermissions.create_promotion,
-    sensitive: true,
-    schema: z
-      .object({
-        title: z.string().trim().min(1),
-        description: z.string().trim().min(1),
-        discountType: z.string().trim().optional(),
-        discountValue: z.number().positive().optional(),
-        startDate: z.string().trim().optional(),
-        endDate: z.string().trim().optional()
-      })
-      .strict(),
-    handler: async () => ({
-      success: false,
-      code: "PROMOTIONS_UNAVAILABLE",
-      message: "Promotion support is not available in this backend yet."
-    })
-  },
   create_order: {
     definition: {
       name: "create_order",
