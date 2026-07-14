@@ -290,6 +290,10 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
   ]);
   const sessionId =
     firstString(rawPayload, [
+      "params.sessionId",
+      "query.wasenderSessionId",
+      "query.whatsappSessionId",
+      "query.sessionId",
       "sessionId",
       "session_id",
       "wasenderSessionId",
@@ -302,11 +306,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
       "data.sessionId",
       "data.session_id",
       "session.id",
-      "data.session.id",
-      "params.sessionId",
-      "query.sessionId",
-      "query.wasenderSessionId",
-      "query.whatsappSessionId"
+      "data.session.id"
     ]) ?? "";
   const from = cleanWhatsappAddress(
     firstStringFromSources([messagePayload, rawPayload], [
