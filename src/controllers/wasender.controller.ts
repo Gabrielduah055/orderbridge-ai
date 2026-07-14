@@ -1,8 +1,8 @@
 import type { NextFunction, Request, Response } from "express";
+import type { IOrderDocument } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
-import * as agentCustomerService from "../services/agentCustomer.service";
-import * as agentOwnerService from "../services/agentOwner.service";
+import { handleRestaurantAgentMessage } from "../services/restaurantAgent.service";
 import {
   normalizeIncomingWebhook,
   sendDocumentMessage,
@@ -10,6 +10,7 @@ import {
   type NormalizedWasenderWebhook,
   type WasenderSendResult
 } from "../services/wasender.service";
+import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
 const getWebhookSecret = (req: Request): string | undefined => {
@@ -221,20 +222,6 @@ const findRestaurantForWebhook = async (
   }).select("+wasenderApiToken");
 };
 
-const isOwnerOrManagerSender = (
-  restaurant: IRestaurantDocument,
-  senderPhone: string
-): boolean => {
-  const normalizedSender = normalizePhone(senderPhone);
-  const allowedPhones = [
-    restaurant.ownerPhone,
-    ...restaurant.managerPhones,
-    ...restaurant.managerContacts.map((manager) => manager.phone)
-  ].map(normalizePhone);
-
-  return allowedPhones.includes(normalizedSender);
-};
-
 const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
   if (!receiptUrl) {
     return null;
@@ -258,7 +245,7 @@ const formatCurrency = (value: number): string => {
 };
 
 const buildOwnerOrderNotification = (
-  order: NonNullable<Awaited<ReturnType<typeof agentCustomerService.handleCustomerMessage>>["data"]>["order"]
+  order: IOrderDocument | undefined
 ): string => {
   if (!order) {
     return "";
@@ -307,7 +294,7 @@ const sendReceiptIfAvailable = async (
 const sendCustomerOrderSideEffects = async (
   restaurant: IRestaurantDocument,
   webhook: NormalizedWasenderWebhook,
-  customerResponse: Awaited<ReturnType<typeof agentCustomerService.handleCustomerMessage>>
+  customerResponse: RestaurantAgentResponse
 ): Promise<void> => {
   const order = customerResponse.data?.order;
 
@@ -397,42 +384,26 @@ const processNormalizedWebhook = async (
       return;
     }
 
-    if (isOwnerOrManagerSender(restaurant, webhook.from)) {
-      const ownerResponse = await agentOwnerService.handleOwnerMessage({
+    const agentResponse = await handleRestaurantAgentMessage({
+      restaurant,
+      senderPhone: webhook.from,
+      message: webhook.message
+    });
+
+    await sendTextMessageOrThrow(
+      restaurant.wasenderSessionId,
+      webhook.from,
+      agentResponse.message,
+      {
+        action: "send_restaurant_agent_reply",
         restaurantId: String(restaurant._id),
-        senderPhone: webhook.from,
-        message: webhook.message
-      });
-      await sendTextMessageOrThrow(
-        restaurant.wasenderSessionId,
-        webhook.from,
-        ownerResponse.message,
-        {
-          action: "send_owner_agent_reply",
-          restaurantId: String(restaurant._id),
-          eventId
-        },
-        restaurant.wasenderApiToken
-      );
-    } else {
-      const customerResponse = await agentCustomerService.handleCustomerMessage({
-        restaurantId: String(restaurant._id),
-        customerPhone: webhook.from,
-        message: webhook.message
-      });
-      await sendTextMessageOrThrow(
-        restaurant.wasenderSessionId,
-        webhook.from,
-        customerResponse.message,
-        {
-          action: "send_customer_agent_reply",
-          restaurantId: String(restaurant._id),
-          eventId
-        },
-        restaurant.wasenderApiToken
-      );
-      await sendCustomerOrderSideEffects(restaurant, webhook, customerResponse);
-    }
+        eventId,
+        source: agentResponse.source,
+        senderRole: agentResponse.sender?.role
+      },
+      restaurant.wasenderApiToken
+    );
+    await sendCustomerOrderSideEffects(restaurant, webhook, agentResponse);
 
     webhookEvent.status = "processed";
     webhookEvent.processedAt = new Date();

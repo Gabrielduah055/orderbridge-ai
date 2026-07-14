@@ -12,7 +12,8 @@ export const ownerAgentActions = [
   "ADD_MENU_ITEM",
   "UPDATE_MENU_PRICE",
   "MARK_ITEM_UNAVAILABLE",
-  "MARK_ITEM_AVAILABLE"
+  "MARK_ITEM_AVAILABLE",
+  "TOOL_CALL"
 ] as const;
 
 export type PendingAgentActionStatus = (typeof pendingAgentActionStatuses)[number];
@@ -21,7 +22,11 @@ export type OwnerAgentAction = (typeof ownerAgentActions)[number];
 export interface IPendingAgentAction {
   restaurantId: Types.ObjectId;
   senderPhone: string;
+  senderRole?: string;
   action: OwnerAgentAction;
+  toolName?: string;
+  arguments?: Record<string, unknown>;
+  summary?: string;
   data: Record<string, unknown>;
   status: PendingAgentActionStatus;
   confirmationMessage: string;
@@ -53,10 +58,26 @@ const pendingAgentActionSchema = new Schema<IPendingAgentActionDocument>(
       trim: true,
       index: true
     },
+    senderRole: {
+      type: String,
+      enum: ["owner", "manager", "customer"],
+      trim: true
+    },
     action: {
       type: String,
       enum: ownerAgentActions,
       required: true
+    },
+    toolName: {
+      type: String,
+      trim: true
+    },
+    arguments: {
+      type: Schema.Types.Mixed
+    },
+    summary: {
+      type: String,
+      trim: true
     },
     data: {
       type: Schema.Types.Mixed,
