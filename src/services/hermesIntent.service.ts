@@ -1,6 +1,7 @@
 import type { IMenuCategoryDocument } from "../models/MenuCategory";
 import type { IMenuItemDocument } from "../models/MenuItem";
 import type { IRestaurantDocument } from "../models/Restaurant";
+import type { HermesChatMessage } from "../types/agent.types";
 
 export const hermesIntents = [
   "add_menu_item",
@@ -58,6 +59,10 @@ const getHermesConfig = (): { apiUrl: string; apiKey: string } | null => {
     apiUrl,
     apiKey
   };
+};
+
+export const isHermesConfigured = (): boolean => {
+  return Boolean(getHermesConfig());
 };
 
 const extractResponseText = (responseBody: unknown): string => {
@@ -289,4 +294,60 @@ export const getHermesIntent = async (
   } finally {
     clearTimeout(timeout);
   }
+};
+
+export const requestHermesChat = async (
+  messages: HermesChatMessage[],
+  options: {
+    temperature?: number;
+    onError?: (error: Error) => void;
+  } = {}
+): Promise<string | null> => {
+  const config = getHermesConfig();
+
+  if (!config) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), getHermesTimeoutMs());
+
+  try {
+    const response = await fetch(config.apiUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: process.env.HERMES_MODEL || "hermes",
+        temperature: options.temperature ?? 0.2,
+        messages
+      }),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Hermes request failed with status ${response.status}`);
+    }
+
+    const responseBody = (await response.json()) as unknown;
+
+    return extractResponseText(responseBody);
+  } catch (error) {
+    if (error instanceof Error) {
+      options.onError?.(error);
+    } else {
+      options.onError?.(new Error("Unknown Hermes chat error"));
+    }
+
+    console.error("Hermes chat request failed", error);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+export const extractHermesJsonText = (content: string): string => {
+  return extractJsonText(content);
 };

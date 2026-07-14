@@ -26,13 +26,26 @@ export interface WasenderSendOptions {
   apiKey?: string;
 }
 
+const defaultWasenderApiUrl = "https://www.wasenderapi.com";
+
 const getWasenderConfig = (
   options: WasenderSendOptions = {}
 ): { apiUrl: string; apiKey: string } | null => {
-  const apiUrl = process.env.WASENDER_API_URL;
+  const configuredApiUrl = process.env.WASENDER_API_URL?.trim();
+  const apiUrl =
+    configuredApiUrl && !configuredApiUrl.includes("/api/webhooks/wasender")
+      ? configuredApiUrl
+      : defaultWasenderApiUrl;
   const apiKey = options.apiKey?.trim() || process.env.WASENDER_API_KEY;
 
-  if (!apiUrl || !apiKey) {
+  if (configuredApiUrl?.includes("/api/webhooks/wasender")) {
+    console.warn("Ignoring invalid WASENDER_API_URL because it points to the inbound webhook", {
+      configuredApiUrl,
+      fallbackApiUrl: defaultWasenderApiUrl
+    });
+  }
+
+  if (!apiKey) {
     return null;
   }
 
