@@ -8,11 +8,8 @@ export const hermesIntents = [
   "update_menu_item",
   "update_price",
   "set_availability",
-  "create_promo",
-  "update_promo",
   "create_order",
   "update_order_status",
-  "generate_report",
   "none"
 ] as const;
 
@@ -181,7 +178,7 @@ Do not execute actions. Only classify the message and fill the action payload.
 
 Expected response shape:
 {
-  "intent": "add_menu_item | update_menu_item | update_price | set_availability | create_promo | update_promo | create_order | update_order_status | generate_report | none",
+  "intent": "add_menu_item | update_menu_item | update_price | set_availability | create_order | update_order_status | none",
   "requires_confirmation": true,
   "confirmed": false,
   "action": {},
@@ -221,19 +218,13 @@ For update_menu_item:
   }
 }
 
-For generate_report:
-{
-  "reportType": "daily | weekly | monthly",
-  "date": "string optional"
-}
-
 For unsupported or unclear messages:
 {
   "intent": "none",
   "requires_confirmation": false,
   "confirmed": false,
   "action": {},
-  "reply_text": "I couldn't understand that action yet."
+  "reply_text": "I can help with menu items, prices, availability, orders, and delivery information. Could you rephrase what you want me to do?"
 }
 `.trim();
 

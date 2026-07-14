@@ -13,6 +13,7 @@ import {
 import * as agentCustomerService from "./agentCustomer.service";
 import * as agentOwnerService from "./agentOwner.service";
 import {
+  getLatestAssistantConversationMessage,
   getRecentAgentConversationHistory,
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
@@ -33,6 +34,11 @@ import type {
 } from "../types/agent.types";
 
 const maxToolRounds = 3;
+
+interface HermesToolLoopResult {
+  message: string;
+  pendingActionId?: string;
+}
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 
@@ -96,7 +102,9 @@ Treat the owner as the main decision-maker.
 Treat managers according to manager permissions.
 Treat customers as customers and never expose owner-only business information.
 
-Use backend tools for live menu, order, restaurant, delivery and operations data.
+Use backend tools for live menu, order, restaurant and delivery data.
+Only claim you can do something when it is supported by the allowed tools below.
+Do not say you can create promos, generate reports, perform analytics, send broadcasts, or change settings unless an allowed tool explicitly supports it.
 Do not invent menu items, prices, orders, revenue, promotions, availability or restaurant settings.
 If data is unavailable, say so clearly.
 For normal conversation, reply naturally.
@@ -149,14 +157,33 @@ const toolResultToAssistantInstruction = (toolName: string, result: ToolResult):
   ].join("\n");
 };
 
+const getPendingActionIdFromResult = (result: ToolResult): string | undefined => {
+  return result.requiresConfirmation && result.pendingActionId
+    ? result.pendingActionId
+    : undefined;
+};
+
+const getLatestAssistantPendingActionId = async (
+  executionContext: ToolExecutionContext
+): Promise<string | null> => {
+  const latestAssistantMessage = await getLatestAssistantConversationMessage(
+    executionContext.restaurantId,
+    executionContext.sender.normalizedPhone
+  );
+  const pendingActionId = latestAssistantMessage?.metadata?.pendingActionId;
+
+  return typeof pendingActionId === "string" ? pendingActionId : null;
+};
+
 const runHermesToolLoop = async (
   context: RestaurantAgentContext,
   executionContext: ToolExecutionContext,
   message: string,
   history: AgentHistoryMessage[]
-): Promise<string | null> => {
+): Promise<HermesToolLoopResult | null> => {
   const toolDefinitions = getToolDefinitionsForRole(executionContext.sender.role);
   const messages = buildMessages(context, toolDefinitions, history, message);
+  let pendingActionId: string | undefined;
 
   console.info("Hermes agent request", {
     restaurantId: executionContext.restaurantId,
@@ -181,11 +208,16 @@ const runHermesToolLoop = async (
     });
 
     if (turn.type === "message") {
-      return turn.message;
+      return {
+        message: turn.message,
+        pendingActionId
+      };
     }
 
     if (round === maxToolRounds) {
-      return "I could not complete that request safely. Please try again with a more specific request.";
+      return {
+        message: "I could not complete that request safely. Please try again with a more specific request."
+      };
     }
 
     const result = await executeAgentTool(
@@ -193,6 +225,7 @@ const runHermesToolLoop = async (
       turn.arguments ?? {},
       executionContext
     );
+    pendingActionId = getPendingActionIdFromResult(result) ?? pendingActionId;
     const toolContent = JSON.stringify({
       toolName: turn.toolName,
       result
@@ -216,43 +249,86 @@ const runHermesToolLoop = async (
     });
   }
 
-  return "I could not complete that request safely. Please try again with a more specific request.";
+  return {
+    message: "I could not complete that request safely. Please try again with a more specific request."
+  };
 };
 
 const fallbackToLegacyAgent = async (
   input: RestaurantAgentMessageInput,
-  sender: ResolvedSender
+  sender: ResolvedSender,
+  saveUserMessage = true
 ): Promise<RestaurantAgentResponse> => {
+  const restaurantId = String(input.restaurant._id);
+  const message = normalizeText(input.message);
+
+  if (saveUserMessage) {
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "user",
+      content: message,
+      metadata: {
+        source: "legacy_fallback"
+      }
+    });
+  }
+
   if (sender.role === "owner" || sender.role === "manager") {
     const response = await agentOwnerService.handleOwnerMessage({
-      restaurantId: String(input.restaurant._id),
+      restaurantId,
       senderPhone: input.senderPhone,
       message: input.message
     });
-
-    return {
+    const normalizedResponse = {
       ...response,
       data:
         response.data && typeof response.data === "object"
           ? (response.data as Record<string, unknown>)
           : undefined,
-      source: "legacy_owner",
+      source: "legacy_owner" as const,
       sender
     };
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: normalizedResponse.message,
+      metadata: {
+        source: "legacy_fallback"
+      }
+    });
+
+    return normalizedResponse;
   }
 
   const response = await agentCustomerService.handleCustomerMessage({
-    restaurantId: String(input.restaurant._id),
+    restaurantId,
     customerPhone: input.senderPhone,
     customerName: sender.name,
     message: input.message
   });
-
-  return {
+  const normalizedResponse = {
     ...response,
-    source: "legacy_customer",
+    source: "legacy_customer" as const,
     sender
   };
+
+  await saveAgentConversationMessage({
+    restaurantId,
+    senderPhone: sender.normalizedPhone,
+    senderRole: sender.role,
+    direction: "assistant",
+    content: normalizedResponse.message,
+    metadata: {
+      source: "legacy_fallback"
+    }
+  });
+
+  return normalizedResponse;
 };
 
 export const handleRestaurantAgentMessage = async (
@@ -280,36 +356,80 @@ export const handleRestaurantAgentMessage = async (
   });
 
   if (isConfirmationMessage(message)) {
-    const pendingAction = await findLatestPendingToolAction(executionContext);
+    const lastPromptPendingActionId = await getLatestAssistantPendingActionId(executionContext);
+    const pendingAction = lastPromptPendingActionId
+      ? await findLatestPendingToolAction(executionContext)
+      : null;
 
-    if (pendingAction) {
+    if (pendingAction && String(pendingAction._id) === lastPromptPendingActionId) {
       const result = await executeConfirmedPendingToolAction(
         String(pendingAction._id),
         executionContext
       );
-
-      return {
+      const response = {
         success: result.success,
         message: result.message,
         data: result.data && typeof result.data === "object" ? (result.data as Record<string, unknown>) : undefined,
-        source: "hermes_tools",
+        source: "hermes_tools" as const,
         sender
       };
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message
+      });
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: response.message,
+        metadata: {
+          confirmedPendingActionId: String(pendingAction._id)
+        }
+      });
+
+      return response;
     }
   }
 
   if (isCancellationMessage(message)) {
-    const pendingAction = await findLatestPendingToolAction(executionContext);
+    const lastPromptPendingActionId = await getLatestAssistantPendingActionId(executionContext);
+    const pendingAction = lastPromptPendingActionId
+      ? await findLatestPendingToolAction(executionContext)
+      : null;
 
-    if (pendingAction) {
+    if (pendingAction && String(pendingAction._id) === lastPromptPendingActionId) {
       const result = await cancelPendingToolAction(executionContext);
-
-      return {
+      const response = {
         success: result.success,
         message: result.message,
-        source: "hermes_tools",
+        source: "hermes_tools" as const,
         sender
       };
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message
+      });
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: response.message,
+        metadata: {
+          cancelledPendingActionId: String(pendingAction._id)
+        }
+      });
+
+      return response;
     }
   }
 
@@ -330,10 +450,10 @@ export const handleRestaurantAgentMessage = async (
     content: message
   });
 
-  const hermesMessage = await runHermesToolLoop(context, executionContext, message, history);
+  const hermesResult = await runHermesToolLoop(context, executionContext, message, history);
 
-  if (!hermesMessage) {
-    return fallbackToLegacyAgent(input, sender);
+  if (!hermesResult) {
+    return fallbackToLegacyAgent(input, sender, false);
   }
 
   await saveAgentConversationMessage({
@@ -341,12 +461,18 @@ export const handleRestaurantAgentMessage = async (
     senderPhone: sender.normalizedPhone,
     senderRole: sender.role,
     direction: "assistant",
-    content: hermesMessage
+    content: hermesResult.message,
+    metadata: hermesResult.pendingActionId
+      ? {
+          pendingActionId: hermesResult.pendingActionId,
+          expectsConfirmation: true
+        }
+      : undefined
   });
 
   return {
     success: true,
-    message: hermesMessage,
+    message: hermesResult.message,
     source: "hermes_tools",
     sender
   };

@@ -28,6 +28,18 @@ export const getRecentAgentConversationHistory = async (
 
   return messages.reverse().map((message) => ({
     role: message.direction,
-    content: message.content
+    content: message.content,
+    metadata: message.metadata
   }));
+};
+
+export const getLatestAssistantConversationMessage = async (
+  restaurantId: string,
+  senderPhone: string
+) => {
+  return AgentConversationMessage.findOne({
+    restaurantId,
+    senderPhone,
+    direction: "assistant"
+  }).sort({ createdAt: -1 });
 };

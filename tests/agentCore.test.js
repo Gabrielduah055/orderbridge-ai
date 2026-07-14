@@ -3,7 +3,8 @@ const test = require("node:test");
 
 const { resolveSenderIdentity } = require("../dist/services/senderIdentity.service");
 const {
-  isToolAllowedForRole
+  isToolAllowedForRole,
+  getAllowedToolNamesForRole
 } = require("../dist/agent-tools/tool.permissions");
 
 const restaurant = {
@@ -52,4 +53,9 @@ test("customers and managers cannot update menu prices", () => {
 
 test("owner can prepare a menu price update", () => {
   assert.equal(isToolAllowedForRole("update_menu_price", "owner"), true);
+});
+
+test("unsupported promotion tool is not exposed", () => {
+  assert.equal(isToolAllowedForRole("create_promotion", "owner"), false);
+  assert.equal(getAllowedToolNamesForRole("owner").includes("create_promotion"), false);
 });

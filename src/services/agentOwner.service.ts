@@ -38,7 +38,7 @@ interface ParsedPendingAction {
 
 const defaultCategoryName = "Main Meals";
 const unknownMessage =
-  "I couldn't understand that yet. Try: add jollof rice 45, show menu, change jollof rice price to 50, or mark tilapia unavailable.";
+  "I can help with menu items, prices, availability, orders, and delivery information. Could you rephrase what you want me to do?";
 
 const escapeRegExp = (value: string): string => {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -345,24 +345,24 @@ const mapHermesIntentToPendingAction = (
     return {
       success: false,
       source: "hermes",
-      message: hermesIntent.reply_text || "I couldn't understand that action yet."
+      message:
+        hermesIntent.reply_text ||
+        "I can help with menu items, prices, availability, orders, and delivery information. Could you rephrase what you want me to do?"
     };
   }
 
   if (
     [
       "update_menu_item",
-      "create_promo",
-      "update_promo",
       "create_order",
-      "update_order_status",
-      "generate_report"
+      "update_order_status"
     ].includes(hermesIntent.intent)
   ) {
     return {
       success: false,
       source: "hermes",
-      message: "This action is understood but not supported yet."
+      message:
+        "I understand the request, but I cannot complete that action through the emergency fallback right now."
     };
   }
 
