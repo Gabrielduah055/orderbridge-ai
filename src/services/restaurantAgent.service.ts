@@ -10,6 +10,7 @@ import {
   isHermesConfigured,
   requestHermesChat
 } from "./hermesIntent.service";
+import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
 import * as agentCustomerService from "./agentCustomer.service";
 import * as agentOwnerService from "./agentOwner.service";
 import {
@@ -553,6 +554,48 @@ export const handleRestaurantAgentMessage = async (
 
       return response;
     }
+  }
+
+  if (isHermesAgentConfigured()) {
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "user",
+      content: message,
+      metadata: {
+        source: "hermes_agent"
+      }
+    });
+
+    const hermesAgentResult = await sendHermesAgentMessage(input.restaurant, sender, message);
+
+    if (hermesAgentResult) {
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: hermesAgentResult.message,
+        metadata: {
+          source: "hermes_agent",
+          responseId: hermesAgentResult.responseId
+        }
+      });
+
+      return {
+        success: true,
+        message: hermesAgentResult.message,
+        data: hermesAgentResult.data,
+        source: "hermes_tools",
+        sender
+      };
+    }
+
+    console.warn("Hermes agent unavailable, falling back to legacy agent flow", {
+      restaurantId,
+      senderRole: sender.role
+    });
   }
 
   const parsedMenuAddition =
