@@ -125,11 +125,12 @@ const tools = [
     inputSchema: toolInputSchema(
       {
         itemName: { type: "string" },
+        item_name: { type: "string" },
         itemId: { type: "string" },
         price: { type: "number" },
-        newPrice: { type: "number" }
-      },
-      ["price"]
+        newPrice: { type: "number" },
+        new_price: { type: "number" }
+      }
     )
   },
   {
@@ -138,9 +139,11 @@ const tools = [
     inputSchema: toolInputSchema(
       {
         itemName: { type: "string" },
+        item_name: { type: "string" },
         itemId: { type: "string" },
         available: { type: "boolean" },
-        isAvailable: { type: "boolean" }
+        isAvailable: { type: "boolean" },
+        is_available: { type: "boolean" }
       }
     )
   },
@@ -184,16 +187,22 @@ const normalizeToolArguments = (
   const { contextToken: _contextToken, ...toolArgs } = args;
 
   if (mcpToolName === "update_price") {
+    const { price, new_price: newPriceAlias, item_name: itemNameAlias, ...rest } = toolArgs;
+
     return {
-      ...toolArgs,
-      newPrice: toolArgs.newPrice ?? toolArgs.price
+      ...rest,
+      itemName: rest.itemName ?? itemNameAlias,
+      newPrice: rest.newPrice ?? newPriceAlias ?? price
     };
   }
 
   if (mcpToolName === "set_availability") {
+    const { isAvailable, is_available: isAvailableAlias, item_name: itemNameAlias, ...rest } = toolArgs;
+
     return {
-      ...toolArgs,
-      available: toolArgs.available ?? toolArgs.isAvailable
+      ...rest,
+      itemName: rest.itemName ?? itemNameAlias,
+      available: rest.available ?? isAvailable ?? isAvailableAlias
     };
   }
 
