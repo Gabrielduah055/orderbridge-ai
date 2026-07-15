@@ -12,6 +12,7 @@ import {
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { generateOrderReceipt } from "./receipt.service";
+import { sendTextMessage } from "./wasender.service";
 
 interface CreateOrderItemInput {
   menuItemId: string;
@@ -48,13 +49,68 @@ const ensurePositiveQuantity = (quantity: number): void => {
 
 const getRestaurantOrThrow = async (restaurantId: string) => {
   ensureValidObjectId(restaurantId, "restaurantId");
-  const restaurant = await Restaurant.findById(restaurantId);
+  const restaurant = await Restaurant.findById(restaurantId).select("+wasenderApiToken");
 
   if (!restaurant) {
     throw new NotFoundError("Restaurant not found");
   }
 
   return restaurant;
+};
+
+const formatCurrency = (value: number): string => {
+  return `GHS ${value.toFixed(2)}`;
+};
+
+export const buildOwnerOrderNotification = (order: IOrderDocument): string => {
+  const items = order.items
+    .map((item) => `- ${item.quantity} x ${item.name} (${formatCurrency(item.totalPrice)})`)
+    .join("\n");
+  const deliveryAddress =
+    order.orderType === "delivery" && order.deliveryAddress
+      ? `\nDelivery address: ${order.deliveryAddress}`
+      : "";
+
+  return [
+    "New customer order confirmed",
+    `Order: ${order.orderNumber ?? String(order._id)}`,
+    `Customer: ${order.customerName || "Guest"} (${order.customerPhone})`,
+    `Type: ${order.orderType}`,
+    "Items:",
+    items,
+    `Total: ${formatCurrency(order.total)}`,
+    deliveryAddress
+  ]
+    .filter(Boolean)
+    .join("\n");
+};
+
+const notifyOwnerOfNewOrder = async (
+  restaurant: Awaited<ReturnType<typeof getRestaurantOrThrow>>,
+  order: IOrderDocument
+): Promise<void> => {
+  if (!restaurant.ownerPhone) {
+    return;
+  }
+
+  const result = await sendTextMessage(
+    restaurant.wasenderSessionId,
+    restaurant.ownerPhone,
+    buildOwnerOrderNotification(order),
+    {
+      apiKey: restaurant.wasenderApiToken
+    }
+  );
+
+  if (!result.success) {
+    console.error("Owner order notification failed", {
+      restaurantId: String(restaurant._id),
+      orderId: String(order._id),
+      status: result.status,
+      error: result.error,
+      data: result.data
+    });
+  }
 };
 
 const getOrderOrThrow = async (orderId: string): Promise<IOrderDocument> => {
@@ -168,7 +224,7 @@ export const createOrder = async (
   const deliveryFee = calculateDeliveryFee(input.orderType);
   const total = subtotal + deliveryFee;
 
-  return Order.create({
+  const order = await Order.create({
     restaurantId,
     customerName: input.customerName,
     customerPhone: input.customerPhone,
@@ -183,6 +239,10 @@ export const createOrder = async (
     paymentStatus: input.paymentStatus ?? "unpaid",
     notes: input.notes
   });
+
+  await notifyOwnerOfNewOrder(restaurant, order);
+
+  return order;
 };
 
 export const getOrdersByRestaurant = async (

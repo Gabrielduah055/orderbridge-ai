@@ -240,39 +240,6 @@ const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
   return `${publicUrl}${receiptUrl.startsWith("/") ? receiptUrl : `/${receiptUrl}`}`;
 };
 
-const formatCurrency = (value: number): string => {
-  return `GHS ${value.toFixed(2)}`;
-};
-
-const buildOwnerOrderNotification = (
-  order: IOrderDocument | undefined
-): string => {
-  if (!order) {
-    return "";
-  }
-
-  const items = order.items
-    .map((item) => `- ${item.quantity} x ${item.name} (${formatCurrency(item.totalPrice)})`)
-    .join("\n");
-  const deliveryAddress =
-    order.orderType === "delivery" && order.deliveryAddress
-      ? `\nDelivery address: ${order.deliveryAddress}`
-      : "";
-
-  return [
-    "New customer order confirmed",
-    `Order: ${order.orderNumber ?? String(order._id)}`,
-    `Customer: ${order.customerName || "Guest"} (${order.customerPhone})`,
-    `Type: ${order.orderType}`,
-    "Items:",
-    items,
-    `Total: ${formatCurrency(order.total)}`,
-    deliveryAddress
-  ]
-    .filter(Boolean)
-    .join("\n");
-};
-
 const sendReceiptIfAvailable = async (
   sessionId: string,
   to: string,
@@ -312,21 +279,13 @@ const sendCustomerOrderSideEffects = async (
     restaurant.wasenderApiToken
   );
 
-  const ownerMessage = buildOwnerOrderNotification(order);
-
-  if (ownerMessage) {
-    await sendTextMessageOrThrow(sessionId, restaurant.ownerPhone, ownerMessage, {
-      action: "send_owner_order_notification",
-      restaurantId: String(restaurant._id)
-    }, restaurant.wasenderApiToken);
-    await sendReceiptIfAvailable(
-      sessionId,
-      restaurant.ownerPhone,
-      order.receiptUrl,
-      `Receipt for ${order.orderNumber ?? "new order"}`,
-      restaurant.wasenderApiToken
-    );
-  }
+  await sendReceiptIfAvailable(
+    sessionId,
+    restaurant.ownerPhone,
+    order.receiptUrl,
+    `Receipt for ${order.orderNumber ?? "new order"}`,
+    restaurant.wasenderApiToken
+  );
 };
 
 const processNormalizedWebhook = async (
