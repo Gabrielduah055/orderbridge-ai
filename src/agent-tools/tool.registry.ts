@@ -6,6 +6,15 @@ import { Order, orderStatuses, type IOrderDocument, type OrderStatus } from "../
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
+import {
+  addItemToDraft,
+  buildDraftView,
+  findMenuItemMatch,
+  getMissingDraftFields,
+  getOrCreateDraft,
+  removeItemFromDraft,
+  resetDraftState
+} from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { toolPermissions, type ToolName } from "./tool.permissions";
@@ -21,6 +30,29 @@ const menuItemLookupSchema = z
   .object({
     itemName: z.string().trim().min(1).optional(),
     itemId: z.string().trim().min(1).optional()
+  })
+  .strict();
+const startOrderSchema = z
+  .object({
+    customerName: z.string().trim().min(1).optional()
+  })
+  .strict();
+const addOrderItemByNameSchema = z
+  .object({
+    itemName: z.string().trim().min(1),
+    quantity: z.number().int().positive().optional()
+  })
+  .strict();
+const removeOrderItemByNameSchema = z
+  .object({
+    itemName: z.string().trim().min(1)
+  })
+  .strict();
+const updateOrderDraftSchema = z
+  .object({
+    customerName: z.string().trim().min(1).optional(),
+    orderType: z.enum(["pickup", "delivery"]).optional(),
+    deliveryAddress: z.string().trim().min(1).optional()
   })
   .strict();
 const addMenuItemsSchema = z
@@ -759,6 +791,242 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Order created successfully.",
         data: safeOrderView(order)
+      };
+    }
+  },
+  start_order: {
+    definition: {
+      name: "start_order",
+      description: "Start or resume the current customer's order draft.",
+      parameters: {
+        customerName: "Optional customer name to record on the draft."
+      }
+    },
+    roles: toolPermissions.start_order,
+    schema: startOrderSchema,
+    handler: async (args, context) => {
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        context.sender.normalizedPhone,
+        args.customerName
+      );
+
+      return {
+        success: true,
+        message:
+          draft.cartItems.length > 0
+            ? "Resumed the existing order draft."
+            : `Started a new order draft for ${context.restaurant.name}.`,
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  add_order_item_by_name: {
+    definition: {
+      name: "add_order_item_by_name",
+      description:
+        "Add a menu item to the order draft by name. Resolves the name to a real menu item server-side.",
+      parameters: {
+        itemName: "Menu item name as the customer said it.",
+        quantity: "Optional quantity, defaults to 1."
+      }
+    },
+    roles: toolPermissions.add_order_item_by_name,
+    schema: addOrderItemByNameSchema,
+    handler: async (args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const match = await findMenuItemMatch(context.restaurantId, args.itemName);
+
+      if (match.status === "none") {
+        return {
+          success: false,
+          code: "MENU_ITEM_NOT_FOUND",
+          message: match.message
+        };
+      }
+
+      if (match.status === "multiple") {
+        return {
+          success: false,
+          code: "MULTIPLE_MENU_ITEMS_FOUND",
+          message: match.message,
+          data: {
+            candidates: match.matches.map((item) => ({
+              name: item.name,
+              price: item.price
+            }))
+          }
+        };
+      }
+
+      const quantity = args.quantity ?? 1;
+      addItemToDraft(draft, match.item, quantity);
+      draft.currentStep = "choosing_items";
+      await draft.save();
+
+      return {
+        success: true,
+        message: `Added ${quantity} x ${match.item.name} to the order draft.`,
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  remove_order_item_by_name: {
+    definition: {
+      name: "remove_order_item_by_name",
+      description: "Remove a menu item from the order draft by name.",
+      parameters: {
+        itemName: "Menu item name as the customer said it."
+      }
+    },
+    roles: toolPermissions.remove_order_item_by_name,
+    schema: removeOrderItemByNameSchema,
+    handler: async (args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const message = removeItemFromDraft(draft, args.itemName);
+      await draft.save();
+
+      return {
+        success: true,
+        message,
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  update_order_draft: {
+    definition: {
+      name: "update_order_draft",
+      description:
+        "Update customer name, order type (pickup/delivery), and/or delivery address on the order draft. Call whenever the customer provides any of this, in any order.",
+      parameters: {
+        customerName: "Optional customer name.",
+        orderType: "Optional: pickup or delivery.",
+        deliveryAddress: "Optional delivery address, required if orderType is delivery."
+      }
+    },
+    roles: toolPermissions.update_order_draft,
+    schema: updateOrderDraftSchema,
+    handler: async (args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+
+      if (args.orderType === "delivery" && !context.restaurant.deliveryEnabled) {
+        return {
+          success: false,
+          code: "DELIVERY_NOT_AVAILABLE",
+          message: "Delivery is not enabled for this restaurant. Offer pickup instead."
+        };
+      }
+
+      if (args.customerName) {
+        draft.customerName = args.customerName;
+      }
+
+      if (args.orderType) {
+        draft.orderType = args.orderType;
+
+        if (args.orderType === "pickup") {
+          draft.deliveryAddress = undefined;
+        }
+      }
+
+      if (args.deliveryAddress) {
+        draft.deliveryAddress = args.deliveryAddress;
+      }
+
+      await draft.save();
+
+      return {
+        success: true,
+        message: "Order draft updated.",
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  get_order_draft: {
+    definition: {
+      name: "get_order_draft",
+      description:
+        "Read the current order draft: items, customer name, order type, address, totals, and which fields are still missing before it can be confirmed.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_order_draft,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+
+      return {
+        success: true,
+        message:
+          draft.cartItems.length > 0
+            ? "Current order draft retrieved."
+            : "The order draft is currently empty.",
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  confirm_order_draft: {
+    definition: {
+      name: "confirm_order_draft",
+      description:
+        "Finalize the order draft into a real order. Requires items, order type, customer name, and (for delivery) a delivery address to already be set. Confirm the summary with the customer before calling this.",
+      parameters: {}
+    },
+    roles: toolPermissions.confirm_order_draft,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const missingFields = getMissingDraftFields(draft);
+
+      if (missingFields.length > 0) {
+        return {
+          success: false,
+          code: "ORDER_DRAFT_INCOMPLETE",
+          message: `The order draft is missing: ${missingFields.join(", ")}.`,
+          data: buildDraftView(draft, context.restaurant)
+        };
+      }
+
+      const order = await orderService.createOrder(context.restaurantId, {
+        customerName: draft.customerName,
+        customerPhone: draft.customerPhone,
+        items: draft.cartItems.map((item) => ({
+          menuItemId: String(item.menuItemId),
+          quantity: item.quantity
+        })),
+        orderType: draft.orderType!,
+        deliveryAddress: draft.deliveryAddress,
+        paymentMethod: "unknown",
+        paymentStatus: "unpaid"
+      });
+
+      resetDraftState(draft);
+      await draft.save();
+
+      return {
+        success: true,
+        message: "Order placed successfully.",
+        data: {
+          order: safeOrderView(order)
+        }
+      };
+    }
+  },
+  cancel_order_draft: {
+    definition: {
+      name: "cancel_order_draft",
+      description: "Clear the current order draft without creating an order.",
+      parameters: {}
+    },
+    roles: toolPermissions.cancel_order_draft,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      resetDraftState(draft);
+      await draft.save();
+
+      return {
+        success: true,
+        message: "Order draft cleared."
       };
     }
   },

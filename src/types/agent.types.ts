@@ -64,25 +64,9 @@ export interface RestaurantAgentResponse {
     order?: IOrderDocument;
     [key: string]: unknown;
   };
-  source?: "hermes_tools" | "legacy_owner" | "legacy_customer";
+  source?: "hermes_agent" | "hermes_tools" | "legacy_owner" | "legacy_customer";
   sender?: ResolvedSender;
 }
-
-export type HermesChatMessage = {
-  role: "system" | "user" | "assistant";
-  content: string;
-};
-
-export type HermesAgentTurn =
-  | {
-      type: "message";
-      message: string;
-    }
-  | {
-      type: "tool_call";
-      toolName: string;
-      arguments?: Record<string, unknown>;
-    };
 
 export type AgentConversationDirection = "user" | "assistant" | "tool";
 

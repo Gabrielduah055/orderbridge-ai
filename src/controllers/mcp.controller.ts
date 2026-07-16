@@ -1,7 +1,13 @@
 import type { Request, Response } from "express";
-import { executeAgentTool } from "../agent-tools/tool.executor";
+import { Types } from "mongoose";
+import {
+  cancelPendingToolAction,
+  executeAgentTool,
+  executeConfirmedPendingToolAction,
+  findLatestPendingToolAction
+} from "../agent-tools/tool.executor";
 import { Restaurant } from "../models/Restaurant";
-import { verifyHermesContextToken } from "../services/hermesAgent.service";
+import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import type { ResolvedSender } from "../types/agent.types";
 
 type JsonRpcId = string | number | null;
@@ -23,9 +29,17 @@ const toolNameByMcpName: Record<string, string> = {
   add_menu_items: "add_menu_items",
   update_price: "update_menu_price",
   set_availability: "set_item_availability",
-  create_order: "create_order",
   get_orders: "get_today_orders",
-  get_today_orders: "get_today_orders"
+  get_today_orders: "get_today_orders",
+  start_order: "start_order",
+  add_order_item_by_name: "add_order_item_by_name",
+  remove_order_item_by_name: "remove_order_item_by_name",
+  update_order_draft: "update_order_draft",
+  get_order_draft: "get_order_draft",
+  confirm_order_draft: "confirm_order_draft",
+  cancel_order_draft: "cancel_order_draft",
+  confirm_pending_action: "confirm_pending_action",
+  cancel_pending_action: "cancel_pending_action"
 };
 
 const jsonRpcResult = (id: JsonRpcId | undefined, result: unknown) => ({
@@ -50,42 +64,35 @@ const getBearerToken = (req: Request): string | null => {
   return match?.[1]?.trim() ?? null;
 };
 
-const getAllowedMcpTokens = (): string[] => {
-  return [
-    process.env.MCP_SHARED_SECRET,
-    process.env.HERMES_MCP_TOKEN,
-    process.env.HERMES_API_SERVER_KEY
-  ]
+export const getAllowedMcpTokens = (): string[] => {
+  return [process.env.MCP_SHARED_SECRET]
     .map((value) => value?.trim())
     .filter((value): value is string => Boolean(value));
 };
 
-const isMcpRequestAuthorized = (req: Request): boolean => {
+export const isMcpBearerTokenAuthorized = (bearerToken: string | null): boolean => {
   const allowedTokens = getAllowedMcpTokens();
-
-  if (allowedTokens.length === 0 && process.env.NODE_ENV !== "production") {
-    return true;
-  }
-
-  const bearerToken = getBearerToken(req);
 
   return Boolean(bearerToken && allowedTokens.includes(bearerToken));
 };
 
+const isMcpRequestAuthorized = (req: Request): boolean =>
+  isMcpBearerTokenAuthorized(getBearerToken(req));
+
 const toolInputSchema = (properties: Record<string, unknown>, required: string[] = []) => ({
   type: "object",
   properties: {
-    contextToken: {
+    sessionKey: {
       type: "string",
-      description: "Required signed backend context token from the current Hermes response input."
+      description: "Required stable Hermes session key in the format restaurantId:normalizedSenderPhone."
     },
     ...properties
   },
-  required: ["contextToken", ...required],
+  required: ["sessionKey", ...required],
   additionalProperties: false
 });
 
-const tools = [
+export const mcpTools = [
   {
     name: "get_menu",
     description: "Read the restaurant menu for the current sender.",
@@ -148,34 +155,83 @@ const tools = [
     )
   },
   {
-    name: "create_order",
-    description: "Customer-only. Create an order from explicit menu item IDs and quantities.",
+    name: "get_orders",
+    description: "Owner/manager. Read today's orders summary.",
+    inputSchema: toolInputSchema({})
+  },
+  {
+    name: "start_order",
+    description:
+      "Customer-only. Start or resume this customer's order draft. Call this first when a customer wants to order.",
+    inputSchema: toolInputSchema({
+      customerName: { type: "string" },
+      customer_name: { type: "string" }
+    })
+  },
+  {
+    name: "add_order_item_by_name",
+    description:
+      "Customer-only. Add a menu item to the customer's order draft by name. The backend resolves the name and stores it. If ambiguous, returns candidates instead of adding anything.",
     inputSchema: toolInputSchema(
       {
-        customerName: { type: "string" },
-        items: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              menuItemId: { type: "string" },
-              quantity: { type: "number" }
-            },
-            required: ["menuItemId", "quantity"],
-            additionalProperties: false
-          }
-        },
-        orderType: { type: "string", enum: ["pickup", "delivery"] },
-        deliveryAddress: { type: "string" },
-        notes: { type: "string" }
-      },
-      ["items", "orderType"]
+        itemName: { type: "string" },
+        item_name: { type: "string" },
+        quantity: { type: "number" }
+      }
     )
   },
   {
-    name: "get_orders",
-    description: "Owner/manager. Read today's orders summary.",
+    name: "remove_order_item_by_name",
+    description: "Customer-only. Remove a menu item from the order draft by name.",
+    inputSchema: toolInputSchema(
+      {
+        itemName: { type: "string" },
+        item_name: { type: "string" }
+      }
+    )
+  },
+  {
+    name: "update_order_draft",
+    description:
+      "Customer-only. Update customer name, order type (pickup/delivery), and/or delivery address on the current order draft. Call whenever the customer gives any of this information, in any order.",
+    inputSchema: toolInputSchema({
+      customerName: { type: "string" },
+      customer_name: { type: "string" },
+      orderType: { type: "string", enum: ["pickup", "delivery"] },
+      order_type: { type: "string", enum: ["pickup", "delivery"] },
+      deliveryAddress: { type: "string" },
+      delivery_address: { type: "string" }
+    })
+  },
+  {
+    name: "get_order_draft",
+    description:
+      "Customer-only. Read back the current order draft and which fields are still missing before it can be confirmed.",
+    inputSchema: toolInputSchema({})
+  },
+  {
+    name: "confirm_order_draft",
+    description:
+      "Customer-only. Finalize the order draft into a real order once items, order type, delivery address if delivery, and customer name are all present. Confirm with the customer before calling this.",
+    inputSchema: toolInputSchema({})
+  },
+  {
+    name: "cancel_order_draft",
+    description: "Customer-only. Clear the current order draft.",
+    inputSchema: toolInputSchema({})
+  },
+  {
+    name: "confirm_pending_action",
+    description:
+      "Confirm the latest pending backend action for this session after the user has explicitly confirmed it.",
+    inputSchema: toolInputSchema({
+      pendingActionId: { type: "string" },
+      pending_action_id: { type: "string" }
+    })
+  },
+  {
+    name: "cancel_pending_action",
+    description: "Cancel the latest pending backend action for this session.",
     inputSchema: toolInputSchema({})
   }
 ];
@@ -184,7 +240,7 @@ const normalizeToolArguments = (
   mcpToolName: string,
   args: Record<string, unknown>
 ): Record<string, unknown> => {
-  const { contextToken: _contextToken, ...toolArgs } = args;
+  const { sessionKey: _sessionKey, ...toolArgs } = args;
 
   if (mcpToolName === "update_price") {
     const { price, new_price: newPriceAlias, item_name: itemNameAlias, ...rest } = toolArgs;
@@ -206,13 +262,75 @@ const normalizeToolArguments = (
     };
   }
 
+  if (mcpToolName === "start_order") {
+    const { customer_name: customerNameAlias, ...rest } = toolArgs;
+
+    return {
+      ...rest,
+      customerName: rest.customerName ?? customerNameAlias
+    };
+  }
+
+  if (mcpToolName === "add_order_item_by_name" || mcpToolName === "remove_order_item_by_name") {
+    const { item_name: itemNameAlias, ...rest } = toolArgs;
+
+    return {
+      ...rest,
+      itemName: rest.itemName ?? itemNameAlias
+    };
+  }
+
+  if (mcpToolName === "update_order_draft") {
+    const {
+      customer_name: customerNameAlias,
+      order_type: orderTypeAlias,
+      delivery_address: deliveryAddressAlias,
+      ...rest
+    } = toolArgs;
+
+    return {
+      ...rest,
+      customerName: rest.customerName ?? customerNameAlias,
+      orderType: rest.orderType ?? orderTypeAlias,
+      deliveryAddress: rest.deliveryAddress ?? deliveryAddressAlias
+    };
+  }
+
   return toolArgs;
 };
 
-const getContextToken = (args: Record<string, unknown>): string | null => {
-  return typeof args.contextToken === "string" && args.contextToken.trim()
-    ? args.contextToken.trim()
+const getSessionKey = (args: Record<string, unknown>): string | null => {
+  return typeof args.sessionKey === "string" && args.sessionKey.trim()
+    ? args.sessionKey.trim()
     : null;
+};
+
+const parseSessionKey = (
+  sessionKey: string
+): { restaurantId: string; senderPhone: string } | null => {
+  const separatorIndex = sessionKey.indexOf(":");
+
+  if (separatorIndex <= 0 || separatorIndex === sessionKey.length - 1) {
+    return null;
+  }
+
+  const restaurantId = sessionKey.slice(0, separatorIndex).trim();
+  const senderPhone = sessionKey.slice(separatorIndex + 1).trim();
+
+  if (!Types.ObjectId.isValid(restaurantId) || !senderPhone) {
+    return null;
+  }
+
+  return {
+    restaurantId,
+    senderPhone
+  };
+};
+
+const normalizePendingActionId = (rawArgs: Record<string, unknown>): string | null => {
+  const value = rawArgs.pendingActionId ?? rawArgs.pending_action_id;
+
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 };
 
 const callTool = async (params: McpToolCallParams) => {
@@ -230,18 +348,18 @@ const callTool = async (params: McpToolCallParams) => {
     };
   }
 
-  const contextToken = getContextToken(rawArgs);
-  const tokenPayload = contextToken ? verifyHermesContextToken(contextToken) : null;
+  const sessionKey = getSessionKey(rawArgs);
+  const sessionContext = sessionKey ? parseSessionKey(sessionKey) : null;
 
-  if (!tokenPayload) {
+  if (!sessionContext) {
     return {
       success: false,
-      code: "MCP_CONTEXT_INVALID",
-      message: "The tool context is invalid or expired."
+      code: "MCP_SESSION_INVALID",
+      message: "The tool session context is invalid."
     };
   }
 
-  const restaurant = await Restaurant.findById(tokenPayload.restaurantId).select("+wasenderApiToken");
+  const restaurant = await Restaurant.findById(sessionContext.restaurantId).select("+wasenderApiToken");
 
   if (!restaurant) {
     return {
@@ -251,22 +369,42 @@ const callTool = async (params: McpToolCallParams) => {
     };
   }
 
-  const sender: ResolvedSender = {
-    phone: tokenPayload.senderPhone,
-    normalizedPhone: tokenPayload.senderPhone,
-    role: tokenPayload.role,
-    verified: true
+  const sender: ResolvedSender = resolveSenderIdentity(restaurant, sessionContext.senderPhone);
+  const executionContext = {
+    restaurantId: sessionContext.restaurantId,
+    restaurant,
+    sender
   };
+
+  if (mcpToolName === "confirm_pending_action") {
+    const pendingActionId = normalizePendingActionId(rawArgs);
+    const pendingAction = pendingActionId
+      ? null
+      : await findLatestPendingToolAction(executionContext);
+    const actionId = pendingActionId ?? (pendingAction ? String(pendingAction._id) : null);
+
+    if (!actionId) {
+      return {
+        success: false,
+        code: "PENDING_ACTION_NOT_FOUND",
+        message: "There is no pending action to confirm."
+      };
+    }
+
+    return executeConfirmedPendingToolAction(
+      actionId,
+      executionContext
+    );
+  }
+
+  if (mcpToolName === "cancel_pending_action") {
+    return cancelPendingToolAction(executionContext);
+  }
 
   return executeAgentTool(
     toolNameByMcpName[mcpToolName],
     normalizeToolArguments(mcpToolName, rawArgs),
-    {
-      restaurantId: tokenPayload.restaurantId,
-      restaurant,
-      sender,
-      confirmed: true
-    }
+    executionContext
   );
 };
 
@@ -286,7 +424,7 @@ const handleJsonRpc = async (request: JsonRpcRequest) => {
 
   if (request.method === "tools/list") {
     return jsonRpcResult(request.id, {
-      tools
+      tools: mcpTools
     });
   }
 

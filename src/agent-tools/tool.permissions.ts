@@ -12,9 +12,16 @@ export const toolPermissions = {
   set_item_availability: ["owner", "manager"],
   confirm_order: ["owner", "manager"],
   update_order_status: ["owner", "manager"],
-  create_order: ["customer"],
+  create_order: [],
   cancel_order: ["owner", "manager", "customer"],
-  get_delivery_information: ["owner", "manager", "customer"]
+  get_delivery_information: ["owner", "manager", "customer"],
+  start_order: ["customer"],
+  add_order_item_by_name: ["customer"],
+  remove_order_item_by_name: ["customer"],
+  update_order_draft: ["customer"],
+  get_order_draft: ["customer"],
+  confirm_order_draft: ["customer"],
+  cancel_order_draft: ["customer"]
 } as const satisfies Record<string, SenderRole[]>;
 
 export type ToolName = keyof typeof toolPermissions;

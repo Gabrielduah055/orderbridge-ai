@@ -8,7 +8,6 @@ import {
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import * as menuCategoryService from "./menuCategory.service";
 import * as menuItemService from "./menuItem.service";
-import { getHermesIntent, type HermesIntent } from "./hermesIntent.service";
 import { BadRequestError, ForbiddenError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
@@ -24,10 +23,7 @@ interface OwnerAgentResponse {
   data?: unknown;
   requiresConfirmation?: boolean;
   pendingActionId?: string;
-  source?: "hermes" | "rule_based";
-  hermesIntent?: HermesIntent;
-  normalizedAction?: Record<string, unknown>;
-  hermesError?: string;
+  source?: "rule_based";
 }
 
 interface ParsedPendingAction {
@@ -232,203 +228,6 @@ const parsePendingAction = (message: string): ParsedPendingAction | null => {
     parseMarkUnavailable(message) ??
     parseMarkAvailable(message)
   );
-};
-
-const getStringActionValue = (
-  action: Record<string, unknown>,
-  fieldName: string
-): string | null => {
-  const value = action[fieldName];
-
-  if (typeof value !== "string" || !value.trim()) {
-    return null;
-  }
-
-  return titleCase(value);
-};
-
-const getNumberActionValue = (
-  action: Record<string, unknown>,
-  fieldName: string
-): number | null => {
-  const value = action[fieldName];
-  const numberValue = typeof value === "number" ? value : Number(value);
-
-  if (!Number.isFinite(numberValue) || numberValue <= 0) {
-    return null;
-  }
-
-  return numberValue;
-};
-
-const getBooleanActionValue = (
-  action: Record<string, unknown>,
-  fieldName: string
-): boolean | null => {
-  const value = action[fieldName];
-
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const normalized = normalizeComparableText(value);
-
-  if (["true", "yes", "available", "in stock", "instock"].includes(normalized)) {
-    return true;
-  }
-
-  if (["false", "no", "unavailable", "out of stock", "outofstock"].includes(normalized)) {
-    return false;
-  }
-
-  return null;
-};
-
-const copyActionAlias = (
-  action: Record<string, unknown>,
-  alias: string,
-  canonicalFieldName: string
-): void => {
-  if (action[canonicalFieldName] === undefined && action[alias] !== undefined) {
-    action[canonicalFieldName] = action[alias];
-  }
-};
-
-const normalizeHermesAction = (action: Record<string, unknown>): Record<string, unknown> => {
-  const normalizedAction = { ...action };
-
-  copyActionAlias(normalizedAction, "item_name", "itemName");
-  copyActionAlias(normalizedAction, "item", "itemName");
-  copyActionAlias(normalizedAction, "foodName", "itemName");
-  copyActionAlias(normalizedAction, "category_name", "categoryName");
-  copyActionAlias(normalizedAction, "available", "isAvailable");
-  copyActionAlias(normalizedAction, "availability", "isAvailable");
-
-  const isAvailable = getBooleanActionValue(normalizedAction, "isAvailable");
-
-  if (isAvailable !== null) {
-    normalizedAction.isAvailable = isAvailable;
-  }
-
-  return normalizedAction;
-};
-
-const isDevelopmentDebugEnabled = (): boolean => process.env.NODE_ENV !== "production";
-
-const getHermesErrorMessage = (error: Error | null): string | undefined => {
-  return error?.message;
-};
-
-const withDevelopmentDebug = (
-  response: OwnerAgentResponse,
-  debug: Pick<OwnerAgentResponse, "source" | "hermesIntent" | "normalizedAction" | "hermesError">
-): OwnerAgentResponse => {
-  if (!isDevelopmentDebugEnabled()) {
-    return response;
-  }
-
-  return {
-    ...response,
-    ...debug
-  };
-};
-
-const mapHermesIntentToPendingAction = (
-  hermesIntent: HermesIntent,
-  normalizedAction: Record<string, unknown>
-): ParsedPendingAction | OwnerAgentResponse | null => {
-  if (hermesIntent.intent === "none") {
-    return {
-      success: false,
-      source: "hermes",
-      message:
-        hermesIntent.reply_text ||
-        "I can help with menu items, prices, availability, orders, and delivery information. Could you rephrase what you want me to do?"
-    };
-  }
-
-  if (
-    [
-      "update_menu_item",
-      "create_order",
-      "update_order_status"
-    ].includes(hermesIntent.intent)
-  ) {
-    return {
-      success: false,
-      source: "hermes",
-      message:
-        "I understand the request, but I cannot complete that action through the emergency fallback right now."
-    };
-  }
-
-  if (hermesIntent.intent === "add_menu_item") {
-    const name = getStringActionValue(normalizedAction, "name");
-    const price = getNumberActionValue(normalizedAction, "price");
-    const categoryName =
-      getStringActionValue(normalizedAction, "categoryName") ?? defaultCategoryName;
-
-    if (!name || !price) {
-      return null;
-    }
-
-    return {
-      action: "ADD_MENU_ITEM",
-      data: {
-        name,
-        price,
-        categoryName,
-        ...(typeof normalizedAction.description === "string" &&
-        normalizedAction.description.trim()
-          ? { description: normalizedAction.description.trim() }
-          : {})
-      },
-      confirmationMessage: `I'm about to add ${name} for GHS ${price} under ${categoryName}. Should I save it?`
-    };
-  }
-
-  if (hermesIntent.intent === "update_price") {
-    const itemName = getStringActionValue(normalizedAction, "itemName");
-    const price = getNumberActionValue(normalizedAction, "price");
-
-    if (!itemName || !price) {
-      return null;
-    }
-
-    return {
-      action: "UPDATE_MENU_PRICE",
-      data: {
-        itemName,
-        price
-      },
-      confirmationMessage: `I'm about to change ${itemName} price to GHS ${price}. Should I save it?`
-    };
-  }
-
-  if (hermesIntent.intent === "set_availability") {
-    const itemName = getStringActionValue(normalizedAction, "itemName");
-    const isAvailable = getBooleanActionValue(normalizedAction, "isAvailable");
-
-    if (!itemName || isAvailable === null) {
-      return null;
-    }
-
-    return {
-      action: isAvailable ? "MARK_ITEM_AVAILABLE" : "MARK_ITEM_UNAVAILABLE",
-      data: {
-        itemName
-      },
-      confirmationMessage: `I'm about to mark ${itemName} as ${
-        isAvailable ? "available" : "unavailable"
-      }. Should I save it?`
-    };
-  }
-
-  return null;
 };
 
 const expireOldPendingActions = async (): Promise<void> => {
@@ -697,88 +496,32 @@ export const handleOwnerMessage = async (
     };
   }
 
-  const categories = await menuCategoryService.getCategoriesByRestaurant(input.restaurantId);
-  const menuItems = await menuItemService.getMenuItemsByRestaurant(input.restaurantId);
-  let hermesError: Error | null = null;
-  const hermesIntent = await getHermesIntent({
-    restaurant,
-    senderPhone,
-    message,
-    categories,
-    menuItems,
-    onError: (error) => {
-      hermesError = error;
-    }
-  });
-  const normalizedAction = hermesIntent ? normalizeHermesAction(hermesIntent.action) : undefined;
-  const hermesDebug = {
-    source: undefined as "hermes" | "rule_based" | undefined,
-    hermesIntent: hermesIntent ?? undefined,
-    normalizedAction,
-    hermesError: getHermesErrorMessage(hermesError)
-  };
-  const hermesAction = hermesIntent
-    ? mapHermesIntentToPendingAction(hermesIntent, normalizedAction ?? {})
-    : null;
   let parsedAction: ParsedPendingAction | null = null;
-  let source: "hermes" | "rule_based" = "rule_based";
 
   if (isShowMenuMessage(message)) {
-    return withDevelopmentDebug(
-      {
-        ...(await showMenu(input.restaurantId)),
-        source: "rule_based"
-      },
-      {
-        ...hermesDebug,
-        source: "rule_based"
-      }
-    );
+    return {
+      ...(await showMenu(input.restaurantId)),
+      source: "rule_based"
+    };
   }
 
-  if (hermesAction && "success" in hermesAction) {
-    return withDevelopmentDebug(hermesAction, {
-      ...hermesDebug,
-      source: "hermes"
-    });
-  }
-
-  if (hermesAction) {
-    parsedAction = hermesAction;
-    source = "hermes";
-  }
+  parsedAction = parsePendingAction(message);
 
   if (!parsedAction) {
-    parsedAction = parsePendingAction(message);
-  }
-
-  if (!parsedAction) {
-    return withDevelopmentDebug(
-      {
-        success: false,
-        source,
-        message: unknownMessage
-      },
-      {
-        ...hermesDebug,
-        source
-      }
-    );
+    return {
+      success: false,
+      source: "rule_based",
+      message: unknownMessage
+    };
   }
 
   const matchError = await ensureSingleItemMatchForPendingAction(input.restaurantId, parsedAction);
 
   if (matchError) {
-    return withDevelopmentDebug(
-      {
-        ...matchError,
-        source
-      },
-      {
-        ...hermesDebug,
-        source
-      }
-    );
+    return {
+      ...matchError,
+      source: "rule_based"
+    };
   }
 
   const pendingAction = await createPendingAction(
@@ -787,18 +530,12 @@ export const handleOwnerMessage = async (
     parsedAction
   );
 
-  return withDevelopmentDebug(
-    {
-      success: true,
-      source,
-      requiresConfirmation: true,
-      message: parsedAction.confirmationMessage,
-      pendingActionId: String(pendingAction._id),
-      data: pendingAction
-    },
-    {
-      ...hermesDebug,
-      source
-    }
-  );
+  return {
+    success: true,
+    source: "rule_based",
+    requiresConfirmation: true,
+    message: parsedAction.confirmationMessage,
+    pendingActionId: String(pendingAction._id),
+    data: pendingAction
+  };
 };
