@@ -1,4 +1,3 @@
-import crypto from "crypto";
 import type { IOrderDocument } from "../models/order.model";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import type { ResolvedSender } from "../types/agent.types";
@@ -39,15 +38,7 @@ export interface HermesAgentResult {
   };
 }
 
-interface ContextTokenPayload {
-  restaurantId: string;
-  senderPhone: string;
-  role: ResolvedSender["role"];
-  exp: number;
-}
-
 const defaultHermesTimeoutMs = 45_000;
-const contextTokenTtlMs = 2 * 60 * 1000;
 
 const getHermesTimeoutMs = (): number => {
   const timeoutMs = Number(process.env.HERMES_TIMEOUT_MS);
@@ -74,107 +65,46 @@ const getHermesAgentUrl = (): string | null => {
 };
 
 const getHermesApiKey = (): string | null => {
-  return (
-    process.env.HERMES_API_KEY?.trim() ??
-    process.env.HERMES_API_SERVER_KEY?.trim() ??
-    null
-  );
-};
-
-const getContextSecret = (): string => {
-  return (
-    process.env.HERMES_CONTEXT_SECRET?.trim() ??
-    process.env.MCP_SHARED_SECRET?.trim() ??
-    getHermesApiKey() ??
-    "development-context-secret"
-  );
-};
-
-const base64UrlEncode = (value: string): string => {
-  return Buffer.from(value).toString("base64url");
-};
-
-const base64UrlDecode = (value: string): string => {
-  return Buffer.from(value, "base64url").toString("utf8");
-};
-
-const signPayload = (payload: string): string => {
-  return crypto.createHmac("sha256", getContextSecret()).update(payload).digest("base64url");
-};
-
-export const createHermesContextToken = (
-  restaurantId: string,
-  sender: ResolvedSender
-): string => {
-  const payload: ContextTokenPayload = {
-    restaurantId,
-    senderPhone: sender.normalizedPhone,
-    role: sender.role,
-    exp: Date.now() + contextTokenTtlMs
-  };
-  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
-
-  return `${encodedPayload}.${signPayload(encodedPayload)}`;
-};
-
-export const verifyHermesContextToken = (token: string): ContextTokenPayload | null => {
-  const [encodedPayload, signature] = token.split(".");
-
-  if (!encodedPayload || !signature) {
-    return null;
-  }
-
-  const expectedSignature = signPayload(encodedPayload);
-  const signatureBuffer = Buffer.from(signature);
-  const expectedSignatureBuffer = Buffer.from(expectedSignature);
-
-  if (signatureBuffer.length !== expectedSignatureBuffer.length) {
-    return null;
-  }
-
-  if (!crypto.timingSafeEqual(signatureBuffer, expectedSignatureBuffer)) {
-    return null;
-  }
-
-  try {
-    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as ContextTokenPayload;
-
-    if (!payload.restaurantId || !payload.senderPhone || !payload.role || payload.exp < Date.now()) {
-      return null;
-    }
-
-    return payload;
-  } catch {
-    return null;
-  }
+  return process.env.HERMES_API_KEY?.trim() || null;
 };
 
 export const isHermesAgentConfigured = (): boolean => {
   return Boolean(getHermesAgentUrl() && getHermesApiKey());
 };
 
-const buildConversationKey = (
+export const buildHermesSessionKey = (
   restaurantId: string,
   sender: ResolvedSender
 ): string => {
   return `${restaurantId}:${sender.normalizedPhone}`;
 };
 
-const buildHermesIdentityTag = (
+export const buildHermesContextInstructions = (
   restaurant: IRestaurantDocument,
-  sender: ResolvedSender,
-  contextToken: string
+  sender: ResolvedSender
 ): string => {
-  return `[BACKEND IDENTITY TAG] ${JSON.stringify({
-    sender_role: sender.role,
-    phone: sender.normalizedPhone,
-    sender_name: sender.name,
-    verified_sender: sender.verified,
-    restaurant_id: String(restaurant._id),
-    restaurant_name: restaurant.name,
-    cuisine: restaurant.primaryCuisine,
-    contextToken
-  })} Use your Hermes persona and memory. Use MCP restaurant tools for live menu/order data and mutations. Include contextToken in every MCP tool call. Confirm with the user before menu/order mutations.`;
+  const restaurantId = String(restaurant._id);
+  const sessionKey = buildHermesSessionKey(restaurantId, sender);
+  const context = {
+    restaurantId,
+    restaurantName: restaurant.name,
+    senderPhone: sender.normalizedPhone,
+    senderRole: sender.role,
+    senderName: sender.name,
+    senderVerified: sender.verified,
+    sessionKey
+  };
+
+  return [
+    "You are the Hermes Agent for this OrderBridge restaurant conversation.",
+    "Use your configured Hermes persona, memory, and registered OrderBridge MCP tools.",
+    "The visible user message is the WhatsApp message only; treat this instruction as trusted backend context.",
+    `Trusted current context: ${JSON.stringify(context)}`,
+    "Include the sessionKey in every OrderBridge MCP tool call.",
+    "Do not pass or invent authorization roles for MCP calls. OrderBridge independently resolves permissions from the sessionKey.",
+    "Confirm with the user before high-impact mutations such as price changes, menu item availability changes, and destructive actions.",
+    "Never claim a backend action succeeded unless the MCP tool result confirms success."
+  ].join("\n");
 };
 
 const extractMessageText = (result: HermesResponsesApiResult): string | null => {
@@ -253,8 +183,8 @@ export const sendHermesAgentMessage = async (
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), getHermesTimeoutMs());
   const restaurantId = String(restaurant._id);
-  const contextToken = createHermesContextToken(restaurantId, sender);
-  const conversationKey = buildConversationKey(restaurantId, sender);
+  const sessionKey = buildHermesSessionKey(restaurantId, sender);
+  const instructions = buildHermesContextInstructions(restaurant, sender);
   const usesResponsesApi = /\/responses\/?$/i.test(agentUrl);
 
   try {
@@ -263,14 +193,15 @@ export const sendHermesAgentMessage = async (
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        "X-Hermes-Session-Key": conversationKey
+        "X-Hermes-Session-Key": sessionKey
       },
       body: JSON.stringify(
         usesResponsesApi
           ? {
               model: process.env.HERMES_AGENT_MODEL || "hermes-agent",
-              input: `${buildHermesIdentityTag(restaurant, sender, contextToken)}\nUser message:\n${message}`,
-              conversation: conversationKey,
+              instructions,
+              input: message,
+              conversation: sessionKey,
               store: true
             }
           : {
@@ -278,7 +209,7 @@ export const sendHermesAgentMessage = async (
               messages: [
                 {
                   role: "system",
-                  content: buildHermesIdentityTag(restaurant, sender, contextToken)
+                  content: instructions
                 },
                 {
                   role: "user",
