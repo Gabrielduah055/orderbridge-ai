@@ -2,6 +2,7 @@ import {
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
 import { executeAgentTool } from "../agent-tools/tool.executor";
+import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import type {
@@ -30,8 +31,9 @@ const isMenuRequest = (message: string): boolean => {
   const normalized = message.toLowerCase();
 
   return (
-    /\b(menu|menus)\b/.test(normalized) &&
-    /\b(show|list|see|view|display|send|what|today|available|have)\b/.test(normalized)
+    (/\b(menu|menus)\b/.test(normalized) &&
+      /\b(show|list|see|view|display|send|what|today|available|have)\b/.test(normalized)) ||
+    /\b(serve|serving|food|foods|dish|dishes)\b/.test(normalized)
   );
 };
 
@@ -118,6 +120,39 @@ const handleLocalMenuRequest = async (
   };
 };
 
+const handleLocalCustomerRequest = async (
+  input: RestaurantAgentMessageInput,
+  sender: ReturnType<typeof resolveSenderIdentity>
+): Promise<RestaurantAgentResponse> => {
+  const restaurantId = String(input.restaurant._id);
+  const result = await handleCustomerMessage({
+    restaurantId,
+    customerPhone: sender.normalizedPhone,
+    customerName: sender.name,
+    message: input.message
+  });
+
+  await saveAgentConversationMessage({
+    restaurantId,
+    senderPhone: sender.normalizedPhone,
+    senderRole: sender.role,
+    direction: "assistant",
+    content: result.message,
+    metadata: {
+      source: "legacy_customer",
+      success: result.success
+    }
+  });
+
+  return {
+    success: result.success,
+    message: result.message,
+    data: result.data,
+    source: "legacy_customer",
+    sender
+  };
+};
+
 export const handleRestaurantAgentMessage = async (
   input: RestaurantAgentMessageInput
 ): Promise<RestaurantAgentResponse> => {
@@ -144,6 +179,10 @@ export const handleRestaurantAgentMessage = async (
 
   if (isMenuRequest(message)) {
     return handleLocalMenuRequest(input, sender);
+  }
+
+  if (sender.role === "customer") {
+    return handleLocalCustomerRequest(input, sender);
   }
 
   if (!isHermesAgentConfigured()) {
