@@ -128,6 +128,37 @@ const extractChatCompletionText = (result: HermesChatCompletionResult): string |
   return typeof content === "string" && content.trim() ? content.trim() : null;
 };
 
+export const sanitizeHermesOutputText = (message: string): string => {
+  const trimmed = message.trim();
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { reply_text?: unknown };
+
+      if (typeof parsed.reply_text === "string" && parsed.reply_text.trim()) {
+        return parsed.reply_text.trim();
+      }
+    } catch {
+      return trimmed;
+    }
+  }
+
+  const withoutTrailingFence = trimmed.replace(/\n?```json\s*[\s\S]*?```\s*$/i, "").trim();
+  const jsonMarkerIndex = withoutTrailingFence.search(/\n\s*json\s*\n\s*\{/i);
+
+  if (jsonMarkerIndex >= 0) {
+    return withoutTrailingFence.slice(0, jsonMarkerIndex).trim();
+  }
+
+  const metadataJsonIndex = withoutTrailingFence.search(/\n\s*\{\s*"intent"\s*:/i);
+
+  if (metadataJsonIndex >= 0) {
+    return withoutTrailingFence.slice(0, metadataJsonIndex).trim();
+  }
+
+  return withoutTrailingFence;
+};
+
 const parseToolOutput = (output: unknown): unknown => {
   if (typeof output !== "string") {
     return output;
@@ -235,7 +266,7 @@ export const sendHermesAgentMessage = async (
     }
 
     return {
-      message: outputText,
+      message: sanitizeHermesOutputText(outputText),
       responseId: result.id,
       data: usesResponsesApi ? extractData(result as HermesResponsesApiResult) : undefined
     };
