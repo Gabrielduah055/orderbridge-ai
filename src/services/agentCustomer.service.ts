@@ -186,7 +186,7 @@ const buildOrderSummary = (session: ICustomerSessionDocument): string => {
 };
 
 const isGreetingMessage = (message: string): boolean => {
-  return ["hi", "hello", "start"].includes(message);
+  return /^(hi|hello|hey|good morning|good afternoon|good evening|start)\b/.test(message);
 };
 
 const isShowMenuMessage = (message: string): boolean => {
@@ -216,7 +216,13 @@ const getRequestedOrderType = (message: string): OrderType | null => {
 const parseAddItemMessage = (
   message: string
 ): { itemName: string; quantity: number } | null => {
-  const match = message.match(/^(?:i want|add)\s+(?:(\d+)\s+)?(.+)$/i);
+  const normalizedMessage = message.replace(
+    /^(?:(?:awesome|great|okay|ok|please|pls|yes|yeah|yh|sure|alright)[,!.]?\s+)+/i,
+    ""
+  );
+  const match = normalizedMessage.match(
+    /^(?:i want|i need|i would like|i'd like|add|can i get|give me)\s+(?:(\d+)\s+)?(.+)$/i
+  );
 
   if (!match) {
     return null;

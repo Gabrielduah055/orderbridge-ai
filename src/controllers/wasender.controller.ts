@@ -208,17 +208,23 @@ const findRestaurantForWebhook = async (
 ): Promise<IRestaurantDocument | null> => {
   const receiver = normalizePhone(webhook.receiver);
   const possibleWhatsappNumbers = [webhook.receiver, receiver].filter(Boolean);
-  const query = [
-    ...(webhook.sessionId ? [{ wasenderSessionId: webhook.sessionId }] : []),
-    ...possibleWhatsappNumbers.map((phone) => ({ whatsappNumber: phone }))
-  ];
 
-  if (query.length === 0) {
+  if (possibleWhatsappNumbers.length > 0) {
+    const restaurantByWhatsappNumber = await Restaurant.findOne({
+      $or: possibleWhatsappNumbers.map((phone) => ({ whatsappNumber: phone }))
+    }).select("+wasenderApiToken");
+
+    if (restaurantByWhatsappNumber) {
+      return restaurantByWhatsappNumber;
+    }
+  }
+
+  if (!webhook.sessionId) {
     return null;
   }
 
   return Restaurant.findOne({
-    $or: query
+    wasenderSessionId: webhook.sessionId
   }).select("+wasenderApiToken");
 };
 

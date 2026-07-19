@@ -24,6 +24,11 @@ interface McpToolCallParams {
   arguments?: Record<string, unknown>;
 }
 
+interface McpSessionContext {
+  restaurantId: string;
+  senderPhone: string;
+}
+
 const toolNameByMcpName: Record<string, string> = {
   get_menu: "get_menu",
   add_menu_items: "add_menu_items",
@@ -78,6 +83,14 @@ export const isMcpBearerTokenAuthorized = (bearerToken: string | null): boolean 
 
 const isMcpRequestAuthorized = (req: Request): boolean =>
   isMcpBearerTokenAuthorized(getBearerToken(req));
+
+const getHeaderSessionKey = (req: Request): string | null => {
+  const sessionKey =
+    req.header("x-hermes-session-key") ??
+    req.header("x-orderbridge-session-key");
+
+  return sessionKey?.trim() || null;
+};
 
 const toolInputSchema = (properties: Record<string, unknown>, required: string[] = []) => ({
   type: "object",
@@ -307,7 +320,7 @@ const getSessionKey = (args: Record<string, unknown>): string | null => {
 
 const parseSessionKey = (
   sessionKey: string
-): { restaurantId: string; senderPhone: string } | null => {
+): McpSessionContext | null => {
   const separatorIndex = sessionKey.indexOf(":");
 
   if (separatorIndex <= 0 || separatorIndex === sessionKey.length - 1) {
@@ -327,13 +340,34 @@ const parseSessionKey = (
   };
 };
 
+const getSessionContext = (
+  rawArgs: Record<string, unknown>,
+  fallbackSessionKey?: string | null
+): McpSessionContext | null => {
+  const candidates = [getSessionKey(rawArgs), fallbackSessionKey?.trim()]
+    .filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    const context = parseSessionKey(candidate);
+
+    if (context) {
+      return context;
+    }
+  }
+
+  return null;
+};
+
 const normalizePendingActionId = (rawArgs: Record<string, unknown>): string | null => {
   const value = rawArgs.pendingActionId ?? rawArgs.pending_action_id;
 
   return typeof value === "string" && value.trim() ? value.trim() : null;
 };
 
-const callTool = async (params: McpToolCallParams) => {
+const callTool = async (
+  params: McpToolCallParams,
+  fallbackSessionKey?: string | null
+) => {
   const mcpToolName = params.name;
   const rawArgs =
     params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments)
@@ -348,10 +382,15 @@ const callTool = async (params: McpToolCallParams) => {
     };
   }
 
-  const sessionKey = getSessionKey(rawArgs);
-  const sessionContext = sessionKey ? parseSessionKey(sessionKey) : null;
+  const sessionContext = getSessionContext(rawArgs, fallbackSessionKey);
 
   if (!sessionContext) {
+    console.warn("MCP tool rejected because session context is invalid", {
+      toolName: mcpToolName,
+      hasArgumentSessionKey: Boolean(getSessionKey(rawArgs)),
+      hasHeaderSessionKey: Boolean(fallbackSessionKey)
+    });
+
     return {
       success: false,
       code: "MCP_SESSION_INVALID",
@@ -408,7 +447,10 @@ const callTool = async (params: McpToolCallParams) => {
   );
 };
 
-const handleJsonRpc = async (request: JsonRpcRequest) => {
+const handleJsonRpc = async (
+  request: JsonRpcRequest,
+  fallbackSessionKey?: string | null
+) => {
   if (request.method === "initialize") {
     return jsonRpcResult(request.id, {
       protocolVersion: "2024-11-05",
@@ -429,7 +471,10 @@ const handleJsonRpc = async (request: JsonRpcRequest) => {
   }
 
   if (request.method === "tools/call") {
-    const result = await callTool((request.params ?? {}) as McpToolCallParams);
+    const result = await callTool(
+      (request.params ?? {}) as McpToolCallParams,
+      fallbackSessionKey
+    );
 
     return jsonRpcResult(request.id, {
       content: [
@@ -458,14 +503,17 @@ export const handleMcpRequest = async (req: Request, res: Response): Promise<voi
   }
 
   const body = req.body;
+  const fallbackSessionKey = getHeaderSessionKey(req);
 
   if (Array.isArray(body)) {
-    const results = await Promise.all(body.map((item) => handleJsonRpc(item as JsonRpcRequest)));
+    const results = await Promise.all(
+      body.map((item) => handleJsonRpc(item as JsonRpcRequest, fallbackSessionKey))
+    );
     res.status(200).json(results.filter(Boolean));
     return;
   }
 
-  const result = await handleJsonRpc(body as JsonRpcRequest);
+  const result = await handleJsonRpc(body as JsonRpcRequest, fallbackSessionKey);
 
   if (!result) {
     res.status(202).send();
