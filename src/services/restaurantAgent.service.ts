@@ -1,7 +1,14 @@
 import {
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
-import { executeAgentTool } from "../agent-tools/tool.executor";
+import {
+  cancelPendingToolAction,
+  executeAgentTool,
+  executeConfirmedPendingToolAction,
+  findLatestPendingToolAction
+} from "../agent-tools/tool.executor";
+import { getAiProviderName } from "./ai/ai.config";
+import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
@@ -12,6 +19,8 @@ import type {
 
 const temporaryHermesErrorMessage =
   "I'm having trouble reaching the restaurant assistant right now. Please try again in a few minutes.";
+const temporaryAgentErrorMessage =
+  "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 
@@ -35,6 +44,14 @@ const isMenuRequest = (message: string): boolean => {
       /\b(show|list|see|view|display|send|what|today|available|have)\b/.test(normalized)) ||
     /\b(serve|serving|food|foods|dish|dishes)\b/.test(normalized)
   );
+};
+
+const isConfirmationMessage = (message: string): boolean => {
+  return ["yes", "confirm", "save it", "do it"].includes(message.toLowerCase());
+};
+
+const isCancellationMessage = (message: string): boolean => {
+  return ["no", "cancel", "don't save", "dont save", "stop"].includes(message.toLowerCase());
 };
 
 const formatPrice = (price: unknown): string => {
@@ -159,6 +176,7 @@ export const handleRestaurantAgentMessage = async (
   const restaurantId = String(input.restaurant._id);
   const sender = resolveSenderIdentity(input.restaurant, input.senderPhone);
   const message = normalizeText(input.message);
+  const aiProviderName = getAiProviderName();
 
   console.info("Restaurant agent sender resolved", {
     restaurantId,
@@ -173,16 +191,117 @@ export const handleRestaurantAgentMessage = async (
     direction: "user",
     content: message,
     metadata: {
-      source: "hermes_agent"
+      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
     }
   });
 
-  if (isMenuRequest(message)) {
+  if (isMenuRequest(message) && (sender.role === "customer" || aiProviderName !== "openrouter")) {
     return handleLocalMenuRequest(input, sender);
   }
 
   if (sender.role === "customer") {
     return handleLocalCustomerRequest(input, sender);
+  }
+
+  if (aiProviderName === "openrouter" && isConfirmationMessage(message)) {
+    const executionContext = {
+      restaurantId,
+      restaurant: input.restaurant,
+      sender
+    };
+    const pendingAction = await findLatestPendingToolAction(executionContext);
+    const result = pendingAction
+      ? await executeConfirmedPendingToolAction(String(pendingAction._id), executionContext)
+      : {
+          success: false,
+          code: "PENDING_ACTION_NOT_FOUND",
+          message: "There is no pending action to confirm."
+        };
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: result.message,
+      metadata: {
+        source: "openrouter_agent",
+        deterministicAction: "confirm_pending_action",
+        success: result.success,
+        code: result.code
+      }
+    });
+
+    return {
+      success: result.success,
+      message: result.message,
+      data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+      source: "openrouter_agent",
+      sender
+    };
+  }
+
+  if (aiProviderName === "openrouter" && isCancellationMessage(message)) {
+    const result = await cancelPendingToolAction({
+      restaurantId,
+      restaurant: input.restaurant,
+      sender
+    });
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: result.message,
+      metadata: {
+        source: "openrouter_agent",
+        deterministicAction: "cancel_pending_action",
+        success: result.success,
+        code: result.code
+      }
+    });
+
+    return {
+      success: result.success,
+      message: result.message,
+      data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+      source: "openrouter_agent",
+      sender
+    };
+  }
+
+  if (aiProviderName === "openrouter") {
+    const agentResult = await runAgentOrchestrator({
+      restaurant: input.restaurant,
+      sender,
+      message
+    });
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: agentResult.message,
+      metadata: {
+        source: "openrouter_agent",
+        provider: agentResult.provider,
+        model: agentResult.model,
+        responseId: agentResult.responseId,
+        success: agentResult.success,
+        executedTools: agentResult.executedTools,
+        usage: agentResult.usage
+      }
+    });
+
+    return {
+      success: agentResult.success,
+      message: agentResult.message || temporaryAgentErrorMessage,
+      data: agentResult.data,
+      source: "openrouter_agent",
+      sender
+    };
   }
 
   if (!isHermesAgentConfigured()) {

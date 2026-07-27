@@ -62,9 +62,10 @@ export interface RestaurantAgentResponse {
   message: string;
   data?: {
     order?: IOrderDocument;
+    pendingActionId?: string;
     [key: string]: unknown;
   };
-  source?: "hermes_agent" | "hermes_tools" | "legacy_owner" | "legacy_customer";
+  source?: "openrouter_agent" | "hermes_agent" | "hermes_tools" | "legacy_owner" | "legacy_customer";
   sender?: ResolvedSender;
 }
 
