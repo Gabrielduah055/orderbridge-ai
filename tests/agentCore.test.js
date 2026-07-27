@@ -24,6 +24,10 @@ const {
 const {
   validateSelectedAiProviderConfig
 } = require("../dist/services/ai/ai.config");
+const {
+  isPendingActionConfirmationMessage,
+  isPendingActionCancellationMessage
+} = require("../dist/services/restaurantAgent.service");
 
 const restaurant = {
   ownerName: "Gabriel",
@@ -577,4 +581,43 @@ test("OpenRouter selected provider config fails clearly when missing", () => {
     restoreEnv("OPENROUTER_API_KEY", originalApiKey);
     restoreEnv("OPENROUTER_MODEL", originalModel);
   }
+});
+
+test("pending action confirmation accepts natural owner replies", () => {
+  [
+    "yes",
+    "Yes update that",
+    "yes change it",
+    "go ahead",
+    "okay proceed",
+    "save it",
+    "change it",
+    "update the price"
+  ].forEach((message) => {
+    assert.equal(isPendingActionConfirmationMessage(message), true, message);
+  });
+});
+
+test("pending action confirmation avoids new mutation requests", () => {
+  [
+    "can you change beef to 60 cedis",
+    "update beef to 60",
+    "change jollof rice to 70",
+    "show me the menu"
+  ].forEach((message) => {
+    assert.equal(isPendingActionConfirmationMessage(message), false, message);
+  });
+});
+
+test("pending action cancellation accepts natural owner replies", () => {
+  [
+    "no",
+    "no don't save",
+    "cancel that",
+    "stop",
+    "not now",
+    "leave it"
+  ].forEach((message) => {
+    assert.equal(isPendingActionCancellationMessage(message), true, message);
+  });
 });

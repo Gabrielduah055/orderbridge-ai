@@ -46,12 +46,34 @@ const isMenuRequest = (message: string): boolean => {
   );
 };
 
-const isConfirmationMessage = (message: string): boolean => {
-  return ["yes", "confirm", "save it", "do it"].includes(message.toLowerCase());
+const normalizeDecisionText = (message: string): string => {
+  return message
+    .toLowerCase()
+    .replace(/[^\w\s']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 };
 
-const isCancellationMessage = (message: string): boolean => {
-  return ["no", "cancel", "don't save", "dont save", "stop"].includes(message.toLowerCase());
+export const isPendingActionConfirmationMessage = (message: string): boolean => {
+  const normalized = normalizeDecisionText(message);
+
+  return (
+    /^(yes|yeah|yep|yup|yh|sure|correct|confirm|confirmed)\b/.test(normalized) ||
+    /^(ok|okay|alright)\s+(go ahead|proceed|save|confirm|update|change|do it)\b/.test(normalized) ||
+    /^(go ahead|proceed|save it|do it)\b/.test(normalized) ||
+    /^(update|change)\s+(it|that|the item|the price|this)\b/.test(normalized)
+  );
+};
+
+export const isPendingActionCancellationMessage = (message: string): boolean => {
+  const normalized = normalizeDecisionText(message);
+
+  return (
+    /^(no|nope|nah)\b/.test(normalized) ||
+    /^(cancel|stop|abort)\b/.test(normalized) ||
+    /^(don't|dont)\s+(save|update|change|do it|proceed)\b/.test(normalized) ||
+    /^(never mind|nevermind|not now|leave it|ignore it)\b/.test(normalized)
+  );
 };
 
 const formatPrice = (price: unknown): string => {
@@ -203,20 +225,25 @@ export const handleRestaurantAgentMessage = async (
     return handleLocalCustomerRequest(input, sender);
   }
 
-  if (aiProviderName === "openrouter" && isConfirmationMessage(message)) {
-    const executionContext = {
-      restaurantId,
-      restaurant: input.restaurant,
-      sender
-    };
-    const pendingAction = await findLatestPendingToolAction(executionContext);
-    const result = pendingAction
-      ? await executeConfirmedPendingToolAction(String(pendingAction._id), executionContext)
-      : {
-          success: false,
-          code: "PENDING_ACTION_NOT_FOUND",
-          message: "There is no pending action to confirm."
-        };
+  const executionContext = {
+    restaurantId,
+    restaurant: input.restaurant,
+    sender
+  };
+  const pendingAction =
+    aiProviderName === "openrouter"
+      ? await findLatestPendingToolAction(executionContext)
+      : null;
+
+  if (
+    aiProviderName === "openrouter" &&
+    pendingAction &&
+    isPendingActionConfirmationMessage(message)
+  ) {
+    const result = await executeConfirmedPendingToolAction(
+      String(pendingAction._id),
+      executionContext
+    );
 
     await saveAgentConversationMessage({
       restaurantId,
@@ -241,12 +268,12 @@ export const handleRestaurantAgentMessage = async (
     };
   }
 
-  if (aiProviderName === "openrouter" && isCancellationMessage(message)) {
-    const result = await cancelPendingToolAction({
-      restaurantId,
-      restaurant: input.restaurant,
-      sender
-    });
+  if (
+    aiProviderName === "openrouter" &&
+    pendingAction &&
+    isPendingActionCancellationMessage(message)
+  ) {
+    const result = await cancelPendingToolAction(executionContext);
 
     await saveAgentConversationMessage({
       restaurantId,
