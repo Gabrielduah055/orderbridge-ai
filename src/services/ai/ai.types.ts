@@ -10,6 +10,8 @@ export interface AiToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  invalidArguments?: boolean;
+  argumentParseError?: string;
 }
 
 export interface AiMessage {
@@ -83,6 +85,7 @@ export interface AgentOrchestratorResult {
     [key: string]: unknown;
   };
   responseId?: string;
+  errorCode?: string;
   provider: AiProviderName;
   model: string;
   executedTools: ExecutedAgentTool[];

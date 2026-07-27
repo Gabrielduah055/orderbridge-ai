@@ -19,6 +19,9 @@ const {
   runAgentOrchestrator
 } = require("../dist/services/ai/agentOrchestrator.service");
 const {
+  OpenRouterProvider
+} = require("../dist/services/ai/providers/openRouter.provider");
+const {
   getAgentToolDefinitionsForRole
 } = require("../dist/services/ai/agentToolDefinitions.service");
 const {
@@ -147,6 +150,22 @@ test("delivery fee resolver uses configured sources only", () => {
       source: "zone",
       resolved: true,
       zoneName: "Madina"
+    }
+  );
+});
+
+test("delivery fee resolver reports manual confirmation separately", () => {
+  assert.deepEqual(
+    resolveDeliveryFee(
+      { deliveryPricing: { type: "manual_confirmation" } },
+      "delivery",
+      "Rehoboth Church",
+      224
+    ),
+    {
+      amount: null,
+      source: "manual_confirmation",
+      resolved: false
     }
   );
 });
@@ -617,6 +636,146 @@ test("OpenRouter provider errors return a safe response from orchestrator", asyn
   );
 
   assert.equal(result.success, false);
+  assert.match(result.message, /trouble reaching the restaurant system/i);
+});
+
+test("OpenRouter provider normalizes malformed tool arguments", async () => {
+  const originalProvider = process.env.AI_PROVIDER;
+  const originalApiKey = process.env.OPENROUTER_API_KEY;
+  const originalModel = process.env.OPENROUTER_MODEL;
+  const originalFetch = global.fetch;
+
+  process.env.AI_PROVIDER = "openrouter";
+  process.env.OPENROUTER_API_KEY = "test-key";
+  process.env.OPENROUTER_MODEL = "google/gemini-3.1-flash-lite";
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      id: "or_1",
+      choices: [
+        {
+          message: {
+            tool_calls: [
+              {
+                id: "call_1",
+                function: {
+                  name: "update_order_draft",
+                  arguments: "{\"customerName\":\"Mavis\","
+                }
+              }
+            ]
+          }
+        }
+      ]
+    })
+  });
+
+  try {
+    const provider = new OpenRouterProvider();
+    const result = await provider.complete({
+      messages: [{ role: "user", content: "name is Mavis" }],
+      tools: [],
+      toolChoice: "auto"
+    });
+
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].name, "update_order_draft");
+    assert.equal(result.toolCalls[0].invalidArguments, true);
+    assert.deepEqual(result.toolCalls[0].arguments, {});
+  } finally {
+    restoreEnv("AI_PROVIDER", originalProvider);
+    restoreEnv("OPENROUTER_API_KEY", originalApiKey);
+    restoreEnv("OPENROUTER_MODEL", originalModel);
+    global.fetch = originalFetch;
+  }
+});
+
+test("OpenRouter orchestrator feeds malformed tool arguments back as tool validation", async () => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "update_order_draft",
+              arguments: {},
+              invalidArguments: true
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "Please send your name and address again.",
+        toolCalls: []
+      };
+    }
+  };
+
+  const toolRecords = [];
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: {
+        phone: "0557038547",
+        normalizedPhone: "+233557038547",
+        role: "customer",
+        verified: false
+      },
+      message: "Name is Mavis and address is Rehoboth"
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: async (message) => {
+        if (message.direction === "tool") {
+          toolRecords.push(JSON.parse(message.content));
+        }
+      },
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        throw new Error("executeTool should not be called for malformed arguments");
+      }
+    }
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(toolRecords[0].code, "TOOL_INVALID_ARGUMENTS");
+});
+
+test("OpenRouter orchestrator classifies provider timeout", async () => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    complete: async () => {
+      const error = new Error("The operation timed out");
+      error.name = "AbortError";
+      throw error;
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Show me orders"
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorCode, "PROVIDER_TIMEOUT");
   assert.match(result.message, /trouble reaching the restaurant system/i);
 });
 
