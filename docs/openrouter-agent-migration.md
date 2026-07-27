@@ -54,10 +54,12 @@ Use `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to
 
 ## Phase 6 Order Decisions
 
-Customer confirmation submits an order to the restaurant; it does not mean the restaurant has accepted it. `confirm_order_draft` returns structured data with `orderEvent: "submitted"`, `notifyOwner: true`, and `receiptRequired: false`. The saved order starts as `pending`, which means awaiting restaurant confirmation.
+Customer confirmation submits an order to the restaurant; it does not mean the restaurant has accepted it. `confirm_order_draft` returns structured data with `orderEvent: "submitted"`, `notifyOwner: true`, and `receiptRequired: false`. The saved order starts as `awaiting_restaurant_confirmation`; legacy `pending` orders are handled as the same awaiting state.
 
-Owner and manager confirmations must use `confirm_order`. A successful result returns `orderEvent: "confirmed"`, `notifyCustomer: true`, and `receiptRequired: true`. The webhook then sends the customer confirmation message, generates the receipt from the saved MongoDB order, and sends the receipt document.
+Owner and manager confirmations must use `confirm_order`. A successful result changes the order to `accepted` and returns `orderEvent: "confirmed"`, `notifyCustomer: true`, and `receiptRequired: true`. The webhook then sends the customer acceptance message, generates the receipt from the saved MongoDB order, and sends the receipt document.
 
-Owner and manager rejections must use `reject_order`. A successful result returns `orderEvent: "rejected"` and `notifyCustomer: true`; no receipt is generated. Rejections use the existing `cancelled` order status plus `restaurantRejectedAt` and optional `restaurantRejectionReason`.
+Owner and manager rejections must use `reject_order`. A successful result returns `orderEvent: "rejected"` and `notifyCustomer: true`; no receipt is generated. Rejections use `rejected` plus `restaurantRejectedAt` and optional `restaurantRejectionReason`.
+
+Customer tools must not assume quantity. If quantity is missing, the backend stores a pending item in the draft and asks for the quantity before adding the item. Delivery fees must come from `deliveryPricing`; unresolved fees keep the draft from being submitted.
 
 Webhook side effects are driven only by structured tool results, not by model prose. Order-level timestamps such as `ownerNotifiedAt`, `customerConfirmedNotificationSentAt`, `rejectionNotificationSentAt`, and `receiptSentAt` prevent duplicate sends when Wasender retries a webhook or an agent repeats a tool call.

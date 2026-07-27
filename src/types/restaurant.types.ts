@@ -7,6 +7,20 @@ export type RestaurantPlan = (typeof restaurantPlans)[number];
 export type RestaurantStatus = (typeof restaurantStatuses)[number];
 export type AssistantTone = (typeof assistantTones)[number];
 export type BillingStatus = (typeof billingStatuses)[number];
+export type DeliveryPricingType = "flat" | "zone_based" | "manual_confirmation";
+
+export interface RestaurantDeliveryPricingZoneInput {
+  name: string;
+  aliases?: string[];
+  fee: number;
+}
+
+export interface RestaurantDeliveryPricingInput {
+  type: DeliveryPricingType;
+  flatFee?: number;
+  freeDeliveryThreshold?: number;
+  zones?: RestaurantDeliveryPricingZoneInput[];
+}
 
 export type PlanFeatureName =
   | "maxMenuItems"
@@ -41,6 +55,7 @@ export interface RestaurantInput {
   deliveryEnabled?: boolean;
   deliveryAreas?: string[];
   deliveryRadiusKm?: number;
+  deliveryPricing?: RestaurantDeliveryPricingInput;
   minimumOrderValue?: number;
   allowTakeaway?: boolean;
   freeDeliveryThresholdEnabled?: boolean;

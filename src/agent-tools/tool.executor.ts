@@ -178,3 +178,17 @@ export const findLatestPendingToolAction = async (
     }
   }).sort({ createdAt: -1 });
 };
+
+export const findPendingToolActions = async (
+  context: ToolExecutionContext
+) => {
+  return PendingAgentAction.find({
+    restaurantId: context.restaurantId,
+    senderPhone: context.sender.normalizedPhone,
+    action: "TOOL_CALL",
+    status: "pending",
+    expiresAt: {
+      $gt: new Date()
+    }
+  }).sort({ createdAt: -1 });
+};

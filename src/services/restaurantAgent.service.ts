@@ -5,7 +5,8 @@ import {
   cancelPendingToolAction,
   executeAgentTool,
   executeConfirmedPendingToolAction,
-  findLatestPendingToolAction
+  findLatestPendingToolAction,
+  findPendingToolActions
 } from "../agent-tools/tool.executor";
 import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
@@ -63,6 +64,60 @@ export const isPendingActionConfirmationMessage = (message: string): boolean => 
     /^(go ahead|proceed|save it|do it)\b/.test(normalized) ||
     /^(update|change)\s+(it|that|the item|the price|this)\b/.test(normalized)
   );
+};
+
+const parseOwnerOrderDecision = (
+  message: string
+): { decision: "accept" | "reject"; orderReference: string; reason?: string } | null => {
+  const normalized = message.trim();
+  const match = normalized.match(
+    /^(?:accept|confirm(?:\s+order)?|reject|cancel)\s+(?:order\s+)?(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:\s+(.+))?$/i
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const verb = normalized.split(/\s+/)[0].toLowerCase();
+
+  return {
+    decision: verb === "reject" || verb === "cancel" ? "reject" : "accept",
+    orderReference: match[1],
+    reason: match[2]?.trim()
+  };
+};
+
+const formatPendingActionLabel = (toolName?: string, summary?: string): string => {
+  if (summary) {
+    return summary;
+  }
+
+  if (toolName === "confirm_order") {
+    return "Accept an order";
+  }
+
+  if (toolName === "reject_order") {
+    return "Reject an order";
+  }
+
+  return "Complete a pending action";
+};
+
+const buildAmbiguousPendingActionMessage = (
+  actions: Awaited<ReturnType<typeof findPendingToolActions>>
+): string => {
+  const lines = actions.map(
+    (action, index) =>
+      `${index + 1}. ${formatPendingActionLabel(action.toolName, action.summary)}`
+  );
+
+  return [
+    "I currently have more than one action awaiting confirmation:",
+    "",
+    ...lines,
+    "",
+    "Please reply with the specific order or action."
+  ].join("\n");
 };
 
 export const isPendingActionCancellationMessage = (message: string): boolean => {
@@ -299,6 +354,43 @@ export const handleRestaurantAgentMessage = async (
     restaurant: input.restaurant,
     sender
   };
+  const ownerOrderDecision =
+    sender.role === "owner" || sender.role === "manager"
+      ? parseOwnerOrderDecision(message)
+      : null;
+
+  if (ownerOrderDecision) {
+    const result = await executeAgentTool(
+      ownerOrderDecision.decision === "accept" ? "confirm_order" : "reject_order",
+      {
+        orderReference: ownerOrderDecision.orderReference,
+        reason: ownerOrderDecision.reason
+      },
+      executionContext
+    );
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: result.message,
+      metadata: {
+        source: "deterministic_owner_order_decision",
+        success: result.success,
+        code: result.code
+      }
+    });
+
+    return {
+      success: result.success,
+      message: result.message,
+      data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+      sender
+    };
+  }
+
   const pendingAction =
     aiProviderName === "openrouter"
       ? await findLatestPendingToolAction(executionContext)
@@ -309,6 +401,32 @@ export const handleRestaurantAgentMessage = async (
     pendingAction &&
     isPendingActionConfirmationMessage(message)
   ) {
+    const pendingActions = await findPendingToolActions(executionContext);
+
+    if (pendingActions.length > 1) {
+      const clarificationMessage = buildAmbiguousPendingActionMessage(pendingActions);
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: clarificationMessage,
+        metadata: {
+          source: "openrouter_agent",
+          deterministicAction: "ambiguous_pending_action",
+          pendingActionCount: pendingActions.length
+        }
+      });
+
+      return {
+        success: false,
+        message: clarificationMessage,
+        source: "openrouter_agent",
+        sender
+      };
+    }
+
     const result = await executeConfirmedPendingToolAction(
       String(pendingAction._id),
       executionContext

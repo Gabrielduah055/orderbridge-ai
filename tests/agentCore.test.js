@@ -25,6 +25,12 @@ const {
   validateSelectedAiProviderConfig
 } = require("../dist/services/ai/ai.config");
 const {
+  resolveDeliveryFee
+} = require("../dist/services/order.service");
+const {
+  parseExplicitQuantity
+} = require("../dist/services/orderDraft.service");
+const {
   buildOwnerNewOrderNotification,
   buildCustomerOrderConfirmedMessage,
   buildCustomerOrderRejectedMessage
@@ -95,6 +101,54 @@ test("customer ordering uses draft tools instead of raw create order", () => {
   assert.equal(isToolAllowedForRole("add_order_item_by_name", "customer"), true);
   assert.equal(isToolAllowedForRole("update_order_draft", "customer"), true);
   assert.equal(isToolAllowedForRole("confirm_order_draft", "customer"), true);
+});
+
+test("explicit quantity parser does not infer quantity from item name alone", () => {
+  assert.equal(parseExplicitQuantity("I want assorted fried rice"), null);
+  assert.equal(parseExplicitQuantity("I want two assorted fried rice"), 2);
+  assert.equal(parseExplicitQuantity("I want a plate of jollof"), 1);
+  assert.equal(parseExplicitQuantity("Make it 3"), 3);
+  assert.equal(parseExplicitQuantity("Add another one"), 1);
+});
+
+test("delivery fee resolver uses configured sources only", () => {
+  assert.deepEqual(resolveDeliveryFee({}, "delivery", "Crown Hospital", 120), {
+    amount: null,
+    source: "not_configured",
+    resolved: false
+  });
+  assert.deepEqual(
+    resolveDeliveryFee(
+      { deliveryPricing: { type: "flat", flatFee: 10 } },
+      "delivery",
+      "Crown Hospital",
+      120
+    ),
+    {
+      amount: 10,
+      source: "flat_fee",
+      resolved: true
+    }
+  );
+  assert.deepEqual(
+    resolveDeliveryFee(
+      {
+        deliveryPricing: {
+          type: "zone_based",
+          zones: [{ name: "Madina", aliases: ["Crown Hospital"], fee: 12 }]
+        }
+      },
+      "delivery",
+      "Near Crown Hospital",
+      120
+    ),
+    {
+      amount: 12,
+      source: "zone",
+      resolved: true,
+      zoneName: "Madina"
+    }
+  );
 });
 
 test("restaurant acceptance and rejection are owner or manager only", () => {
@@ -662,14 +716,14 @@ test("owner notification text uses real order data and pending status", () => {
     }
   );
 
-  assert.match(message, /New order received/);
+  assert.match(message, /New order awaiting your confirmation/);
   assert.match(message, /Golden Grill/);
   assert.match(message, /Order: ORD-123/);
   assert.match(message, /2 x Jollof Rice - GHS 120\.00/);
   assert.match(message, /Total: GHS 165\.00/);
-  assert.match(message, /Status: Awaiting restaurant confirmation/);
-  assert.match(message, /Confirm order ORD-123/);
-  assert.match(message, /Reject order ORD-123/);
+  assert.match(message, /Status: Awaiting confirmation/);
+  assert.match(message, /ACCEPT ORD-123/);
+  assert.match(message, /REJECT ORD-123/);
 });
 
 test("customer decision messages do not invent receipt on rejection", () => {
@@ -682,7 +736,7 @@ test("customer decision messages do not invent receipt on rejection", () => {
 
   assert.equal(
     buildCustomerOrderConfirmedMessage(restaurantRecord, order, true),
-    "Golden Grill has confirmed order ORD-123. Your receipt is attached."
+    "Good news. Golden Grill has accepted order ORD-123 and will begin preparing it. Your receipt is attached."
   );
   assert.equal(
     buildCustomerOrderRejectedMessage(restaurantRecord, order),

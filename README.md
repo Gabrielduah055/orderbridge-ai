@@ -62,17 +62,19 @@ Customer OpenRouter tools are limited to customer-safe operations: reading the r
 OrderBridge treats customer submission and restaurant acceptance as separate confirmations.
 
 1. The customer builds a draft and confirms the final summary.
-2. `confirm_order_draft` converts the draft into one real order with status `pending`.
-3. In this workflow, `pending` means awaiting restaurant confirmation.
+2. `confirm_order_draft` converts the draft into one real order with status `awaiting_restaurant_confirmation`.
+3. Legacy `pending` orders are treated as awaiting restaurant confirmation for backward compatibility.
 4. The owner is notified from real saved order data and can reply `Confirm order ORD-123` or `Reject order ORD-123`.
-5. Owner/manager confirmation changes the order to `confirmed`, notifies the customer, generates the receipt PDF, and sends it to the customer.
-6. Owner/manager rejection changes the order to `cancelled`, notifies the customer, and does not generate a confirmed-order receipt.
+5. Owner/manager confirmation changes the order to `accepted`, notifies the customer, generates the receipt PDF, and sends it to the customer.
+6. Owner/manager rejection changes the order to `rejected`, notifies the customer, and does not generate an accepted-order receipt.
 
 The backend controls order creation, status transitions, owner/customer notifications, receipt generation, receipt delivery, and idempotency. The AI chooses tools and writes conversational responses, but the webhook only triggers side effects from structured backend result flags such as `orderEvent`, `notifyOwner`, `notifyCustomer`, and `receiptRequired`.
 
 Important timestamps on orders include `customerConfirmedAt`, `ownerNotifiedAt`, `restaurantConfirmedAt`, `restaurantRejectedAt`, `customerConfirmedNotificationSentAt`, `rejectionNotificationSentAt`, `receiptGeneratedAt`, and `receiptSentAt`. These fields are used to skip duplicate notifications and duplicate receipt sends on retries.
 
-Receipt PDFs are generated only after restaurant confirmation. If receipt generation or document delivery fails, the order remains confirmed and the failure is recorded on the order for follow-up.
+Delivery fees are resolved only from restaurant configuration. Supported configuration is `deliveryPricing.type` of `flat`, `zone_based`, or `manual_confirmation`; unresolved delivery fees block final submission.
+
+Receipt PDFs are generated only after restaurant acceptance. If receipt generation or document delivery fails, the order remains accepted and the failure is recorded on the order for follow-up.
 
 ## Firebase Setup
 

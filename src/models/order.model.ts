@@ -2,8 +2,14 @@ import { Schema, model, type Document, type Types } from "mongoose";
 
 export const orderTypes = ["pickup", "delivery"] as const;
 export const orderStatuses = [
+  "collecting_details",
+  "awaiting_delivery_fee",
+  "awaiting_customer_confirmation",
+  "awaiting_restaurant_confirmation",
   "pending",
   "confirmed",
+  "accepted",
+  "rejected",
   "preparing",
   "ready",
   "out_for_delivery",
@@ -33,6 +39,8 @@ export interface IOrder {
   items: IOrderItem[];
   subtotal: number;
   deliveryFee: number;
+  deliveryFeeSource?: string;
+  deliveryFeeResolvedAt?: Date;
   total: number;
   orderType: OrderType;
   deliveryAddress?: string;
@@ -136,6 +144,13 @@ const orderSchema = new Schema<IOrderDocument>(
       required: true,
       min: 0,
       default: 0
+    },
+    deliveryFeeSource: {
+      type: String,
+      trim: true
+    },
+    deliveryFeeResolvedAt: {
+      type: Date
     },
     total: {
       type: Number,

@@ -5,6 +5,7 @@ import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import { Order, type IOrderDocument, type OrderType } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
+import { parseExplicitQuantity } from "./orderDraft.service";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
@@ -177,16 +178,17 @@ const buildCartSummary = (session: ICustomerSessionDocument): string => {
 const buildOrderSummary = (session: ICustomerSessionDocument): string => {
   const orderType = session.orderType ?? "pickup";
   const subtotal = getCartSubtotal(session);
-  const deliveryFee = orderService.calculateDeliveryFee(orderType);
+  const deliveryFee = orderType === "delivery" ? session.deliveryFee ?? 0 : 0;
   const total = subtotal + deliveryFee;
   const addressLine =
     orderType === "delivery" && session.deliveryAddress
       ? `\nDelivery address: ${session.deliveryAddress}`
       : "";
 
-  return `${buildCartSummary(session)}\nOrder type: ${orderType}${addressLine}\nDelivery fee: ${formatCurrency(
-    deliveryFee
-  )}\nTotal: ${formatCurrency(total)}`;
+  const deliveryLine =
+    orderType === "delivery" ? `\nDelivery fee: ${formatCurrency(deliveryFee)}` : "";
+
+  return `${buildCartSummary(session)}\nOrder type: ${orderType}${addressLine}${deliveryLine}\nTotal: ${formatCurrency(total)}`;
 };
 
 const isGreetingMessage = (message: string): boolean => {
@@ -219,29 +221,44 @@ const getRequestedOrderType = (message: string): OrderType | null => {
 
 const parseAddItemMessage = (
   message: string
-): { itemName: string; quantity: number } | null => {
+): { itemName: string; quantity: number | null; orderType?: OrderType; deliveryAddress?: string } | null => {
   const normalizedMessage = message.replace(
     /^(?:(?:awesome|great|okay|ok|please|pls|yes|yeah|yh|sure|alright)[,!.]?\s+)+/i,
     ""
   );
-  const match = normalizedMessage.match(
-    /^(?:i want|i need|i would like|i'd like|add|can i get|give me)\s+(?:(\d+)\s+)?(.+)$/i
+  const deliveryMatch = normalizedMessage.match(
+    /^(?:please\s+)?deliver\s+(.+?)\s+to\s+(.+)$/i
   );
+  const match =
+    deliveryMatch ??
+    normalizedMessage.match(
+      /^(?:i want|i need|i would like|i'd like|add|can i get|give me|make it)\s+(.+)$/i
+    );
 
   if (!match) {
     return null;
   }
 
-  const quantity = match[1] ? Number(match[1]) : 1;
-  const itemName = normalizeText(match[2]);
+  const quantity = parseExplicitQuantity(message);
+  const rawItemName = deliveryMatch ? match[1] : match[1];
+  const itemName = normalizeText(
+    rawItemName
+      .replace(/^\d+\s+/, "")
+      .replace(/^(one|two|three|four|five|six|seven|eight|nine|ten)\s+/i, "")
+      .replace(/^(a|an)\s+(plate|pack|portion|bowl|serving|box)\s+of\s+/i, "")
+      .replace(/^(plate|pack|packs|plates|portions|bowls|servings|boxes)\s+of\s+/i, "")
+      .replace(/^(plate|pack|packs|plates|portions|bowls|servings|boxes)\s+/i, "")
+  );
 
-  if (!Number.isInteger(quantity) || quantity <= 0 || !itemName) {
+  if (!itemName) {
     return null;
   }
 
   return {
     itemName,
-    quantity
+    quantity,
+    orderType: deliveryMatch ? "delivery" : undefined,
+    deliveryAddress: deliveryMatch ? normalizeText(match[2]) : undefined
   };
 };
 
@@ -321,6 +338,11 @@ const addItemToCart = (
   });
 };
 
+const clearPendingItem = (session: ICustomerSessionDocument): void => {
+  session.pendingMenuItemId = undefined;
+  session.pendingMenuItemName = undefined;
+};
+
 const removeItemFromCart = (
   session: ICustomerSessionDocument,
   requestedName: string
@@ -389,6 +411,55 @@ export const handleCustomerMessage = async (
     return buildResponse("Okay, I cancelled your current order.", session);
   }
 
+  if (session.currentStep === "collecting_quantity" && session.pendingMenuItemId) {
+    const quantity = parseExplicitQuantity(message);
+
+    if (!quantity) {
+      return buildResponse(
+        `How many packs of ${session.pendingMenuItemName ?? "that item"} would you like?`,
+        session
+      );
+    }
+
+    const item = await MenuItem.findOne({
+      _id: session.pendingMenuItemId,
+      restaurantId: input.restaurantId,
+      isAvailable: true
+    });
+
+    if (!item) {
+      clearPendingItem(session);
+      session.currentStep = "choosing_items";
+      await session.save();
+      return buildResponse("That item is no longer available. Please choose another item.", session);
+    }
+
+    addItemToCart(session, item, quantity);
+    clearPendingItem(session);
+    session.currentStep = "choosing_items";
+    await session.save();
+
+    return buildResponse(
+      `${quantity} x ${item.name} added.\n${buildCartSummary(
+        session
+      )}\nWould you like anything else? Reply "checkout" when you're done.`,
+      session
+    );
+  }
+
+  if (session.currentStep === "collecting_name") {
+    session.customerName = message;
+    session.currentStep = "confirming_order";
+    await session.save();
+
+    return buildResponse(
+      `Thank you, ${message}. Please review your order:\n${buildOrderSummary(
+        session
+      )}\nShould I send this to the restaurant?`,
+      session
+    );
+  }
+
   if (confirmationAliases.includes(normalizedMessage) && session.convertedOrderId) {
     const existingOrder = await Order.findOne({
       _id: session.convertedOrderId,
@@ -414,10 +485,37 @@ export const handleCustomerMessage = async (
 
   if (session.currentStep === "collecting_address") {
     session.deliveryAddress = message;
+    const fee = orderService.resolveDeliveryFee(
+      restaurant,
+      "delivery",
+      session.deliveryAddress,
+      getCartSubtotal(session)
+    );
+
+    session.deliveryFee = fee.amount ?? undefined;
+    session.deliveryFeeSource = fee.source;
+    session.deliveryFeeResolved = fee.resolved;
+
+    if (!fee.resolved) {
+      session.currentStep = "awaiting_delivery_fee";
+      await session.save();
+
+      return buildResponse(
+        `Let me confirm the delivery fee for ${session.deliveryAddress} before completing your order.`,
+        session
+      );
+    }
+
+    if (!session.customerName?.trim()) {
+      session.currentStep = "collecting_name";
+      await session.save();
+      return buildResponse("Thanks. May I have your name for the order?", session);
+    }
+
     session.currentStep = "confirming_order";
     await session.save();
     return buildResponse(
-      `${buildOrderSummary(session)}\nReply "yes" to confirm or "cancel" to cancel.`,
+      `${buildOrderSummary(session)}\nShould I send this to the restaurant?`,
       session
     );
   }
@@ -432,6 +530,8 @@ export const handleCustomerMessage = async (
       })),
       orderType: session.orderType ?? "pickup",
       deliveryAddress: session.deliveryAddress,
+      deliveryFee: session.deliveryFee,
+      deliveryFeeSource: session.deliveryFeeSource,
       paymentMethod: "unknown",
       paymentStatus: "unpaid",
       sourceDraftId: String(session._id)
@@ -443,7 +543,7 @@ export const handleCustomerMessage = async (
     await session.save();
 
     return buildResponse(
-      `Your order has been submitted to the restaurant for confirmation. Order: ${
+      `Thank you${session.customerName ? `, ${session.customerName}` : ""}. Your order has been sent to the restaurant for confirmation. I'll update you once they accept it. Order: ${
         order.orderNumber ?? String(order._id)
       }. Total: ${formatCurrency(
         order.total
@@ -474,14 +574,24 @@ export const handleCustomerMessage = async (
     if (requestedOrderType === "delivery") {
       session.currentStep = "collecting_address";
       await session.save();
-      return buildResponse("Please send your delivery address.", session);
+      return buildResponse("Where should we deliver it?", session);
     }
 
     session.currentStep = "confirming_order";
     session.deliveryAddress = undefined;
+    session.deliveryFee = 0;
+    session.deliveryFeeSource = "pickup";
+    session.deliveryFeeResolved = true;
+
+    if (!session.customerName?.trim()) {
+      session.currentStep = "collecting_name";
+      await session.save();
+      return buildResponse("Thanks. May I have your name for the order?", session);
+    }
+
     await session.save();
     return buildResponse(
-      `${buildOrderSummary(session)}\nReply "yes" to confirm or "cancel" to cancel.`,
+      `${buildOrderSummary(session)}\nShould I send this to the restaurant?`,
       session
     );
   }
@@ -531,9 +641,42 @@ export const handleCustomerMessage = async (
       return buildResponse(match.message, session);
     }
 
+    if (!addItemRequest.quantity) {
+      session.pendingMenuItemId = match.item._id;
+      session.pendingMenuItemName = match.item.name;
+      session.currentStep = "collecting_quantity";
+      await session.save();
+
+      return buildResponse(`Sure. How many packs of ${match.item.name} would you like?`, session);
+    }
+
     addItemToCart(session, match.item, addItemRequest.quantity);
+    clearPendingItem(session);
     session.currentStep = "choosing_items";
+
+    if (addItemRequest.orderType === "delivery") {
+      session.orderType = "delivery";
+      session.deliveryAddress = addItemRequest.deliveryAddress;
+      const fee = orderService.resolveDeliveryFee(
+        restaurant,
+        "delivery",
+        session.deliveryAddress,
+        getCartSubtotal(session)
+      );
+      session.deliveryFee = fee.amount ?? undefined;
+      session.deliveryFeeSource = fee.source;
+      session.deliveryFeeResolved = fee.resolved;
+      session.currentStep = fee.resolved ? "choosing_items" : "awaiting_delivery_fee";
+    }
+
     await session.save();
+
+    if (addItemRequest.orderType === "delivery" && !session.deliveryFeeResolved) {
+      return buildResponse(
+        `Added ${addItemRequest.quantity} x ${match.item.name}. Let me confirm the delivery fee for ${session.deliveryAddress} before completing your order.`,
+        session
+      );
+    }
 
     return buildResponse(
       `${addItemRequest.quantity} x ${match.item.name} added to your cart.\n${buildCartSummary(
