@@ -75,6 +75,10 @@ export interface AgentOrchestratorResult {
   message: string;
   data?: {
     order?: IOrderDocument;
+    orderEvent?: "submitted" | "confirmed" | "rejected";
+    notifyOwner?: boolean;
+    notifyCustomer?: boolean;
+    receiptRequired?: boolean;
     pendingActionId?: string;
     [key: string]: unknown;
   };

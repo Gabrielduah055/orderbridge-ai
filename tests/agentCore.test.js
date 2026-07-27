@@ -25,6 +25,11 @@ const {
   validateSelectedAiProviderConfig
 } = require("../dist/services/ai/ai.config");
 const {
+  buildOwnerNewOrderNotification,
+  buildCustomerOrderConfirmedMessage,
+  buildCustomerOrderRejectedMessage
+} = require("../dist/services/orderSideEffects.service");
+const {
   isPendingActionConfirmationMessage,
   isPendingActionCancellationMessage,
   shouldUseOpenRouterCustomerAgent
@@ -90,6 +95,15 @@ test("customer ordering uses draft tools instead of raw create order", () => {
   assert.equal(isToolAllowedForRole("add_order_item_by_name", "customer"), true);
   assert.equal(isToolAllowedForRole("update_order_draft", "customer"), true);
   assert.equal(isToolAllowedForRole("confirm_order_draft", "customer"), true);
+});
+
+test("restaurant acceptance and rejection are owner or manager only", () => {
+  assert.equal(isToolAllowedForRole("confirm_order", "owner"), true);
+  assert.equal(isToolAllowedForRole("confirm_order", "manager"), true);
+  assert.equal(isToolAllowedForRole("confirm_order", "customer"), false);
+  assert.equal(isToolAllowedForRole("reject_order", "owner"), true);
+  assert.equal(isToolAllowedForRole("reject_order", "manager"), true);
+  assert.equal(isToolAllowedForRole("reject_order", "customer"), false);
 });
 
 test("unsupported promotion tool is not exposed", () => {
@@ -597,12 +611,15 @@ test("OpenRouter orchestrator captures structured order data from confirmation t
       buildSystemPrompt: buildTestPrompt,
       executeTool: async () => ({
         success: true,
-        message: "Order placed successfully.",
+        message: "Your order has been submitted to the restaurant for confirmation.",
         data: {
           order: {
             orderNumber: "ORD-123",
             total: 90
-          }
+          },
+          orderEvent: "submitted",
+          notifyOwner: true,
+          receiptRequired: false
         }
       })
     }
@@ -610,6 +627,67 @@ test("OpenRouter orchestrator captures structured order data from confirmation t
 
   assert.equal(result.success, true);
   assert.equal(result.data.order.orderNumber, "ORD-123");
+  assert.equal(result.data.orderEvent, "submitted");
+  assert.equal(result.data.notifyOwner, true);
+  assert.equal(result.data.receiptRequired, false);
+});
+
+test("owner notification text uses real order data and pending status", () => {
+  const message = buildOwnerNewOrderNotification(
+    { name: "Golden Grill" },
+    {
+      _id: "64b000000000000000000111",
+      orderNumber: "ORD-123",
+      customerName: "Gabriel",
+      customerPhone: "+233557038547",
+      orderType: "delivery",
+      deliveryAddress: "Madina",
+      items: [
+        {
+          name: "Jollof Rice",
+          quantity: 2,
+          unitPrice: 60,
+          totalPrice: 120
+        },
+        {
+          name: "Chicken Noodles",
+          quantity: 1,
+          unitPrice: 45,
+          totalPrice: 45
+        }
+      ],
+      total: 165,
+      paymentMethod: "unknown",
+      paymentStatus: "unpaid"
+    }
+  );
+
+  assert.match(message, /New order received/);
+  assert.match(message, /Golden Grill/);
+  assert.match(message, /Order: ORD-123/);
+  assert.match(message, /2 x Jollof Rice - GHS 120\.00/);
+  assert.match(message, /Total: GHS 165\.00/);
+  assert.match(message, /Status: Awaiting restaurant confirmation/);
+  assert.match(message, /Confirm order ORD-123/);
+  assert.match(message, /Reject order ORD-123/);
+});
+
+test("customer decision messages do not invent receipt on rejection", () => {
+  const restaurantRecord = { name: "Golden Grill" };
+  const order = {
+    _id: "64b000000000000000000111",
+    orderNumber: "ORD-123",
+    restaurantRejectionReason: "Chicken is unavailable"
+  };
+
+  assert.equal(
+    buildCustomerOrderConfirmedMessage(restaurantRecord, order, true),
+    "Golden Grill has confirmed order ORD-123. Your receipt is attached."
+  );
+  assert.equal(
+    buildCustomerOrderRejectedMessage(restaurantRecord, order),
+    "Golden Grill could not accept order ORD-123 at this time. The restaurant gave this reason: Chicken is unavailable."
+  );
 });
 
 test("OpenRouter orchestrator blocks model success claim after failed tool", async () => {
@@ -674,6 +752,8 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(ownerTools.includes("get_menu"), true);
   assert.equal(ownerTools.includes("list_orders"), true);
   assert.equal(ownerTools.includes("update_menu_price"), true);
+  assert.equal(ownerTools.includes("confirm_order"), true);
+  assert.equal(ownerTools.includes("reject_order"), true);
   assert.equal(customerTools.includes("get_restaurant_profile"), true);
   assert.equal(customerTools.includes("get_menu"), true);
   assert.equal(customerTools.includes("search_menu_items"), true);
@@ -687,6 +767,8 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(customerTools.includes("cancel_order_draft"), true);
   assert.equal(customerTools.includes("get_latest_customer_order"), true);
   assert.equal(customerTools.includes("update_menu_price"), false);
+  assert.equal(customerTools.includes("confirm_order"), false);
+  assert.equal(customerTools.includes("reject_order"), false);
   assert.equal(customerTools.includes("get_sales_summary"), false);
 });
 

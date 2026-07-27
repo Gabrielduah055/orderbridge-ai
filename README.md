@@ -57,6 +57,23 @@ Hermes is still available for rollback with `AI_PROVIDER=hermes`. To keep custom
 
 Customer OpenRouter tools are limited to customer-safe operations: reading the restaurant profile, menu, delivery information, the customer's own order details/latest order, and managing that customer's own order draft. Customers cannot update prices, change availability, read revenue, or access another customer's order.
 
+## Order Confirmation Workflow
+
+OrderBridge treats customer submission and restaurant acceptance as separate confirmations.
+
+1. The customer builds a draft and confirms the final summary.
+2. `confirm_order_draft` converts the draft into one real order with status `pending`.
+3. In this workflow, `pending` means awaiting restaurant confirmation.
+4. The owner is notified from real saved order data and can reply `Confirm order ORD-123` or `Reject order ORD-123`.
+5. Owner/manager confirmation changes the order to `confirmed`, notifies the customer, generates the receipt PDF, and sends it to the customer.
+6. Owner/manager rejection changes the order to `cancelled`, notifies the customer, and does not generate a confirmed-order receipt.
+
+The backend controls order creation, status transitions, owner/customer notifications, receipt generation, receipt delivery, and idempotency. The AI chooses tools and writes conversational responses, but the webhook only triggers side effects from structured backend result flags such as `orderEvent`, `notifyOwner`, `notifyCustomer`, and `receiptRequired`.
+
+Important timestamps on orders include `customerConfirmedAt`, `ownerNotifiedAt`, `restaurantConfirmedAt`, `restaurantRejectedAt`, `customerConfirmedNotificationSentAt`, `rejectionNotificationSentAt`, `receiptGeneratedAt`, and `receiptSentAt`. These fields are used to skip duplicate notifications and duplicate receipt sends on retries.
+
+Receipt PDFs are generated only after restaurant confirmation. If receipt generation or document delivery fails, the order remains confirmed and the failure is recorded on the order for follow-up.
+
 ## Firebase Setup
 
 1. Create or open a Firebase project.

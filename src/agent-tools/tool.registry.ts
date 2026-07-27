@@ -15,14 +15,17 @@ import {
 import {
   addItemToDraft,
   buildDraftView,
+  clearConvertedDraftState,
   findActiveDraft,
   findMenuItemMatch,
   getMissingDraftFields,
   getOrCreateDraft,
   removeItemFromDraft,
-  resetDraftState
+  resetDraftState,
+  submitOrderDraft
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
+import { BadRequestError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { toolPermissions, type ToolName } from "./tool.permissions";
 
@@ -31,6 +34,11 @@ const orderLookupSchema = z
   .object({
     orderReference: z.string().trim().min(1).optional(),
     orderId: z.string().trim().min(1).optional()
+  })
+  .strict();
+const rejectOrderSchema = orderLookupSchema
+  .extend({
+    reason: z.string().trim().min(1).optional()
   })
   .strict();
 const listOrdersSchema = z
@@ -121,6 +129,14 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   orderType: order.orderType,
   total: order.total,
   createdAt: order.createdAt,
+  customerConfirmedAt: order.customerConfirmedAt,
+  ownerNotifiedAt: order.ownerNotifiedAt,
+  restaurantConfirmedAt: order.restaurantConfirmedAt,
+  restaurantRejectedAt: order.restaurantRejectedAt,
+  restaurantRejectionReason: includeCustomer ? order.restaurantRejectionReason : undefined,
+  receiptUrl: includeCustomer ? order.receiptUrl : undefined,
+  receiptGeneratedAt: order.receiptGeneratedAt,
+  receiptSentAt: order.receiptSentAt,
   items: order.items.map((item) => ({
     name: item.name,
     quantity: item.quantity,
@@ -817,7 +833,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
   confirm_order: {
     definition: {
       name: "confirm_order",
-      description: "Confirm a pending order.",
+      description:
+        "Owner/manager only. Confirm that the restaurant accepts a pending customer-submitted order.",
       parameters: { orderReference: "Order number or order ID." }
     },
     roles: toolPermissions.confirm_order,
@@ -829,12 +846,56 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return order;
       }
 
-      const result = await orderService.updateOrderStatus(String(order._id), "confirmed");
+      const result = await orderService.confirmRestaurantOrder(String(order._id));
 
       return {
         success: true,
-        message: "Order confirmed successfully.",
-        data: safeOrderView(result.order, true)
+        message: result.idempotent
+          ? "Order was already confirmed."
+          : "Order confirmed successfully. The customer will be notified.",
+        data: {
+          order: safeOrderView(result.order, true),
+          orderEvent: "confirmed",
+          notifyCustomer: true,
+          receiptRequired: true,
+          idempotent: result.idempotent
+        }
+      };
+    }
+  },
+  reject_order: {
+    definition: {
+      name: "reject_order",
+      description:
+        "Owner/manager only. Reject a pending customer-submitted order when the restaurant cannot fulfil it.",
+      parameters: {
+        orderReference: "Order number or order ID.",
+        reason: "Optional concise reason to share with the customer."
+      }
+    },
+    roles: toolPermissions.reject_order,
+    schema: rejectOrderSchema,
+    handler: async (args, context) => {
+      const order = await findOrderForRestaurant(context, args);
+
+      if ("success" in order) {
+        return order;
+      }
+
+      const result = await orderService.rejectRestaurantOrder(String(order._id), args.reason);
+
+      return {
+        success: true,
+        message: result.idempotent
+          ? "Order was already rejected."
+          : "Order rejected. The customer will be notified.",
+        data: {
+          order: safeOrderView(result.order, true),
+          orderEvent: "rejected",
+          notifyCustomer: true,
+          receiptRequired: false,
+          idempotent: result.idempotent
+        }
       };
     }
   },
@@ -865,7 +926,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: `Order status updated to ${result.order.status}.`,
-        data: safeOrderView(result.order, true)
+        data: {
+          order: safeOrderView(result.order, true)
+        }
       };
     }
   },
@@ -905,8 +968,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       return {
         success: true,
-        message: "Order created successfully.",
-        data: safeOrderView(order)
+        message: "Order submitted to the restaurant for confirmation.",
+        data: {
+          order: safeOrderView(order),
+          orderEvent: "submitted",
+          notifyOwner: true,
+          receiptRequired: false
+        }
       };
     }
   },
@@ -1087,10 +1155,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (args.customerName) {
+        clearConvertedDraftState(draft);
         draft.customerName = args.customerName;
       }
 
       if (args.orderType) {
+        clearConvertedDraftState(draft);
         draft.orderType = args.orderType;
 
         if (args.orderType === "pickup") {
@@ -1099,6 +1169,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (args.deliveryAddress) {
+        clearConvertedDraftState(draft);
         draft.deliveryAddress = args.deliveryAddress;
       }
 
@@ -1146,6 +1217,24 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     schema: emptySchema,
     handler: async (_args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+
+      if (draft.convertedOrderId) {
+        const result = await submitOrderDraft(context.restaurant, context.sender.normalizedPhone);
+
+        return {
+          success: true,
+          message: "Your order has already been submitted to the restaurant for confirmation.",
+          data: {
+            order: safeOrderView(result.order),
+            orderEvent: "submitted",
+            orderSubmitted: true,
+            notifyOwner: true,
+            receiptRequired: false,
+            idempotent: true
+          }
+        };
+      }
+
       const missingFields = getMissingDraftFields(draft);
 
       if (missingFields.length > 0) {
@@ -1157,30 +1246,33 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         };
       }
 
-      const order = await orderService.createOrder(context.restaurantId, {
-        customerName: draft.customerName,
-        customerPhone: draft.customerPhone,
-        items: draft.cartItems.map((item) => ({
-          menuItemId: String(item.menuItemId),
-          quantity: item.quantity
-        })),
-        orderType: draft.orderType!,
-        deliveryAddress: draft.deliveryAddress,
-        paymentMethod: "unknown",
-        paymentStatus: "unpaid"
-      });
+      let result: Awaited<ReturnType<typeof submitOrderDraft>>;
 
-      resetDraftState(draft);
-      await draft.save();
+      try {
+        result = await submitOrderDraft(context.restaurant, context.sender.normalizedPhone);
+      } catch (error) {
+        if (error instanceof BadRequestError) {
+          return {
+            success: false,
+            code: "ORDER_DRAFT_INVALID",
+            message: error.message,
+            data: buildDraftView(draft, context.restaurant)
+          };
+        }
+
+        throw error;
+      }
 
       return {
         success: true,
-        message: "Order placed successfully.",
+        message: "Your order has been submitted to the restaurant for confirmation.",
         data: {
-          order: {
-            ...safeOrderView(order),
-            receiptUrl: order.receiptUrl
-          }
+          order: safeOrderView(result.order),
+          orderEvent: "submitted",
+          orderSubmitted: true,
+          notifyOwner: true,
+          receiptRequired: false,
+          idempotent: result.idempotent
         }
       };
     }
@@ -1196,6 +1288,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (_args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
       resetDraftState(draft);
+      clearConvertedDraftState(draft);
       await draft.save();
 
       return {
@@ -1244,7 +1337,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: "Order cancelled successfully.",
-        data: safeOrderView(result.order, context.sender.role !== "customer")
+        data: {
+          order: safeOrderView(result.order, context.sender.role !== "customer")
+        }
       };
     }
   },

@@ -86,6 +86,19 @@ const getImportantData = (
     if (data.order) {
       nextData.order = data.order as IOrderDocument;
     }
+
+    for (const key of [
+      "orderEvent",
+      "notifyOwner",
+      "notifyCustomer",
+      "receiptRequired",
+      "orderSubmitted",
+      "idempotent"
+    ]) {
+      if (key in data) {
+        nextData[key] = data[key];
+      }
+    }
   }
 
   if (result.pendingActionId) {

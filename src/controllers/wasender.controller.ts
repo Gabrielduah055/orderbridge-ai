@@ -1,11 +1,15 @@
 import type { NextFunction, Request, Response } from "express";
-import type { IOrderDocument } from "../models/order.model";
+import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
 import { handleRestaurantAgentMessage } from "../services/restaurantAgent.service";
 import {
+  notifyCustomerOfConfirmedOrderAndSendReceipt,
+  notifyCustomerOfRejectedOrder,
+  notifyOwnerOfSubmittedOrder
+} from "../services/orderSideEffects.service";
+import {
   normalizeIncomingWebhook,
-  sendDocumentMessage,
   sendTextMessage,
   type NormalizedWasenderWebhook,
   type WasenderSendResult
@@ -184,25 +188,6 @@ const sendTextMessageOrThrow = async (
   });
 };
 
-const sendDocumentMessageOrThrow = async (
-  sessionId: string,
-  to: string,
-  fileUrl: string,
-  caption: string | undefined,
-  context: Record<string, unknown>,
-  apiKey?: string
-): Promise<void> => {
-  const recipient = normalizePhone(to) || to;
-  const result = await sendDocumentMessage(sessionId, recipient, fileUrl, caption, { apiKey });
-
-  assertWasenderSendSuccess(result, {
-    ...context,
-    sessionId,
-    to: recipient,
-    usesRestaurantApiToken: Boolean(apiKey?.trim())
-  });
-};
-
 const findRestaurantForWebhook = async (
   webhook: NormalizedWasenderWebhook
 ): Promise<IRestaurantDocument | null> => {
@@ -228,70 +213,59 @@ const findRestaurantForWebhook = async (
   }).select("+wasenderApiToken");
 };
 
-const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
-  if (!receiptUrl) {
-    return null;
-  }
-
-  if (/^https?:\/\//i.test(receiptUrl)) {
-    return receiptUrl;
-  }
-
-  const publicUrl = process.env.APP_PUBLIC_URL?.replace(/\/$/, "");
-
-  if (!publicUrl) {
-    return null;
-  }
-
-  return `${publicUrl}${receiptUrl.startsWith("/") ? receiptUrl : `/${receiptUrl}`}`;
-};
-
-const sendReceiptIfAvailable = async (
-  sessionId: string,
-  to: string,
-  receiptUrl?: string,
-  caption?: string,
-  apiKey?: string
-): Promise<void> => {
-  const publicReceiptUrl = getPublicReceiptUrl(receiptUrl);
-
-  if (!publicReceiptUrl) {
-    return;
-  }
-
-  await sendDocumentMessageOrThrow(sessionId, to, publicReceiptUrl, caption, {
-    action: "send_receipt"
-  }, apiKey);
-};
-
 const sendCustomerOrderSideEffects = async (
   restaurant: IRestaurantDocument,
-  webhook: NormalizedWasenderWebhook,
   customerResponse: RestaurantAgentResponse
 ): Promise<void> => {
-  const order = customerResponse.data?.order;
+  const orderData = customerResponse.data?.order;
+  const orderEvent = customerResponse.data?.orderEvent;
 
-  if (!order) {
+  if (!orderData || !orderEvent) {
     return;
   }
 
-  const sessionId = restaurant.wasenderSessionId;
+  const orderId =
+    typeof orderData === "object" && "_id" in orderData
+      ? String((orderData as { _id?: unknown })._id)
+      : typeof orderData === "object" && "id" in orderData
+        ? String((orderData as { id?: unknown }).id)
+        : "";
 
-  await sendReceiptIfAvailable(
-    sessionId,
-    webhook.from,
-    order.receiptUrl,
-    `Receipt for ${order.orderNumber ?? "your order"}`,
-    restaurant.wasenderApiToken
-  );
+  if (!orderId) {
+    console.error("Order side effect skipped because structured order ID is missing", {
+      restaurantId: String(restaurant._id),
+      orderEvent
+    });
+    return;
+  }
 
-  await sendReceiptIfAvailable(
-    sessionId,
-    restaurant.ownerPhone,
-    order.receiptUrl,
-    `Receipt for ${order.orderNumber ?? "new order"}`,
-    restaurant.wasenderApiToken
-  );
+  const order = await Order.findOne({
+    _id: orderId,
+    restaurantId: restaurant._id
+  });
+
+  if (!order) {
+    console.error("Order side effect skipped because order was not found", {
+      restaurantId: String(restaurant._id),
+      orderId,
+      orderEvent
+    });
+    return;
+  }
+
+  if (orderEvent === "submitted" && customerResponse.data?.notifyOwner) {
+    await notifyOwnerOfSubmittedOrder(restaurant, order);
+    return;
+  }
+
+  if (orderEvent === "confirmed" && customerResponse.data?.notifyCustomer) {
+    await notifyCustomerOfConfirmedOrderAndSendReceipt(restaurant, order);
+    return;
+  }
+
+  if (orderEvent === "rejected" && customerResponse.data?.notifyCustomer) {
+    await notifyCustomerOfRejectedOrder(restaurant, order);
+  }
 };
 
 const processNormalizedWebhook = async (
@@ -368,7 +342,7 @@ const processNormalizedWebhook = async (
       },
       restaurant.wasenderApiToken
     );
-    await sendCustomerOrderSideEffects(restaurant, webhook, agentResponse);
+    await sendCustomerOrderSideEffects(restaurant, agentResponse);
 
     webhookEvent.status = "processed";
     webhookEvent.processedAt = new Date();

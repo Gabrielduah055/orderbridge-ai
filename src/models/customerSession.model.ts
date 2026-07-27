@@ -27,6 +27,8 @@ export interface ICustomerSession {
   currentStep: CustomerSessionStep;
   orderType: OrderType | null;
   deliveryAddress?: string;
+  convertedOrderId?: Types.ObjectId;
+  convertedAt?: Date;
   lastMessage?: string;
   expiresAt: Date;
 }
@@ -104,6 +106,13 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
     deliveryAddress: {
       type: String,
       trim: true
+    },
+    convertedOrderId: {
+      type: Schema.Types.ObjectId,
+      ref: "Order"
+    },
+    convertedAt: {
+      type: Date
     },
     lastMessage: {
       type: String,

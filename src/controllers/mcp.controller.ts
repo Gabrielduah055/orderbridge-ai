@@ -43,6 +43,8 @@ const toolNameByMcpName: Record<string, string> = {
   get_order_draft: "get_order_draft",
   confirm_order_draft: "confirm_order_draft",
   cancel_order_draft: "cancel_order_draft",
+  confirm_order: "confirm_order",
+  reject_order: "reject_order",
   confirm_pending_action: "confirm_pending_action",
   cancel_pending_action: "cancel_pending_action"
 };
@@ -227,6 +229,23 @@ export const mcpTools = [
     description:
       "Customer-only. Finalize the order draft into a real order once items, order type, delivery address if delivery, and customer name are all present. Confirm with the customer before calling this.",
     inputSchema: toolInputSchema({})
+  },
+  {
+    name: "confirm_order",
+    description: "Owner/manager only. Confirm that the restaurant accepts a pending customer-submitted order.",
+    inputSchema: toolInputSchema({
+      orderReference: { type: "string" },
+      orderId: { type: "string" }
+    })
+  },
+  {
+    name: "reject_order",
+    description: "Owner/manager only. Reject a pending customer-submitted order.",
+    inputSchema: toolInputSchema({
+      orderReference: { type: "string" },
+      orderId: { type: "string" },
+      reason: { type: "string" }
+    })
   },
   {
     name: "cancel_order_draft",
