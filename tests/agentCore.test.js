@@ -26,7 +26,8 @@ const {
 } = require("../dist/services/ai/ai.config");
 const {
   isPendingActionConfirmationMessage,
-  isPendingActionCancellationMessage
+  isPendingActionCancellationMessage,
+  shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
 
 const restaurant = {
@@ -551,6 +552,121 @@ test("OpenRouter provider errors return a safe response from orchestrator", asyn
   assert.match(result.message, /trouble reaching the restaurant system/i);
 });
 
+test("OpenRouter orchestrator captures structured order data from confirmation tool", async () => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "confirm_order_draft",
+              arguments: {}
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "Your order has been placed.",
+        toolCalls: []
+      };
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: {
+        phone: "0557038547",
+        normalizedPhone: "+233557038547",
+        role: "customer",
+        verified: false
+      },
+      message: "Confirm my order"
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => ({
+        success: true,
+        message: "Order placed successfully.",
+        data: {
+          order: {
+            orderNumber: "ORD-123",
+            total: 90
+          }
+        }
+      })
+    }
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.data.order.orderNumber, "ORD-123");
+});
+
+test("OpenRouter orchestrator blocks model success claim after failed tool", async () => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "confirm_order_draft",
+              arguments: {}
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "Done, your order has been placed.",
+        toolCalls: []
+      };
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: {
+        phone: "0557038547",
+        normalizedPhone: "+233557038547",
+        role: "customer",
+        verified: false
+      },
+      message: "Confirm my order"
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => ({
+        success: false,
+        code: "ORDER_DRAFT_INCOMPLETE",
+        message: "The order draft is missing: deliveryAddress."
+      })
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.equal(result.message, "The order draft is missing: deliveryAddress.");
+});
+
 test("OpenRouter tool definitions are role filtered", () => {
   const ownerTools = getAgentToolDefinitionsForRole("owner").map((tool) => tool.function.name);
   const customerTools = getAgentToolDefinitionsForRole("customer").map((tool) => tool.function.name);
@@ -558,8 +674,26 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(ownerTools.includes("get_menu"), true);
   assert.equal(ownerTools.includes("list_orders"), true);
   assert.equal(ownerTools.includes("update_menu_price"), true);
+  assert.equal(customerTools.includes("get_restaurant_profile"), true);
+  assert.equal(customerTools.includes("get_menu"), true);
+  assert.equal(customerTools.includes("search_menu_items"), true);
+  assert.equal(customerTools.includes("get_delivery_information"), true);
+  assert.equal(customerTools.includes("start_order"), true);
+  assert.equal(customerTools.includes("add_order_item_by_name"), true);
+  assert.equal(customerTools.includes("remove_order_item_by_name"), true);
+  assert.equal(customerTools.includes("update_order_draft"), true);
+  assert.equal(customerTools.includes("get_order_draft"), true);
+  assert.equal(customerTools.includes("confirm_order_draft"), true);
+  assert.equal(customerTools.includes("cancel_order_draft"), true);
+  assert.equal(customerTools.includes("get_latest_customer_order"), true);
   assert.equal(customerTools.includes("update_menu_price"), false);
   assert.equal(customerTools.includes("get_sales_summary"), false);
+});
+
+test("customer OpenRouter routing is controlled by explicit feature switch", () => {
+  assert.equal(shouldUseOpenRouterCustomerAgent("openrouter", true), true);
+  assert.equal(shouldUseOpenRouterCustomerAgent("openrouter", false), false);
+  assert.equal(shouldUseOpenRouterCustomerAgent("hermes", true), false);
 });
 
 test("OpenRouter selected provider config fails clearly when missing", () => {

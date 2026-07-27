@@ -1,4 +1,5 @@
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
+import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
@@ -66,12 +67,34 @@ export const getOrCreateDraft = async (
   return session.save();
 };
 
+export const findActiveDraft = async (
+  restaurantId: string,
+  customerPhone: string
+): Promise<ICustomerSessionDocument | null> => {
+  return CustomerSession.findOne({
+    restaurantId,
+    customerPhone,
+    expiresAt: {
+      $gt: new Date()
+    }
+  });
+};
+
 export const findMenuItemMatch = async (
   restaurantId: string,
   requestedName: string
 ): Promise<MenuItemMatchResult> => {
   const normalizedRequestedName = normalizeComparableText(requestedName);
-  const items = await MenuItem.find({ restaurantId });
+  const activeCategories = await MenuCategory.find({
+    restaurantId,
+    isActive: true
+  }).select("_id");
+  const items = await MenuItem.find({
+    restaurantId,
+    categoryId: {
+      $in: activeCategories.map((category) => category._id)
+    }
+  });
   const matches = items.filter((item) => {
     const normalizedItemName = normalizeComparableText(item.name);
 
@@ -139,7 +162,8 @@ export const addItemToDraft = (
 
 export const removeItemFromDraft = (
   session: ICustomerSessionDocument,
-  requestedName: string
+  requestedName: string,
+  quantity?: number
 ): string => {
   const normalizedRequestedName = normalizeComparableText(requestedName);
   const matches = session.cartItems.filter((item) => {
@@ -161,10 +185,24 @@ export const removeItemFromDraft = (
       .join(", ")}.`;
   }
 
-  session.cartItems = session.cartItems.filter(
-    (item) => String(item.menuItemId) !== String(matches[0].menuItemId)
-  );
-  return `${matches[0].name} removed from the draft.`;
+  const matchedItem = matches[0];
+  const removeQuantity = quantity ?? matchedItem.quantity;
+
+  if (!Number.isInteger(removeQuantity) || removeQuantity <= 0) {
+    return "Please provide a positive quantity to remove.";
+  }
+
+  if (removeQuantity >= matchedItem.quantity) {
+    session.cartItems = session.cartItems.filter(
+      (item) => String(item.menuItemId) !== String(matchedItem.menuItemId)
+    );
+    return `${matchedItem.name} removed from the draft.`;
+  }
+
+  matchedItem.quantity -= removeQuantity;
+  matchedItem.totalPrice = matchedItem.quantity * matchedItem.unitPrice;
+
+  return `Removed ${removeQuantity} x ${matchedItem.name} from the draft.`;
 };
 
 export const getDraftSubtotal = (session: ICustomerSessionDocument): number => {

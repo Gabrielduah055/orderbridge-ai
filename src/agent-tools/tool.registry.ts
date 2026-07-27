@@ -7,8 +7,15 @@ import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
 import {
+  buildClarificationCandidate,
+  createOrderItemClarification,
+  findActiveOrderItemClarification,
+  resolveOrderItemClarification
+} from "../services/agentClarification.service";
+import {
   addItemToDraft,
   buildDraftView,
+  findActiveDraft,
   findMenuItemMatch,
   getMissingDraftFields,
   getOrCreateDraft,
@@ -52,7 +59,8 @@ const addOrderItemByNameSchema = z
   .strict();
 const removeOrderItemByNameSchema = z
   .object({
-    itemName: z.string().trim().min(1)
+    itemName: z.string().trim().min(1),
+    quantity: z.number().int().positive().optional()
   })
   .strict();
 const updateOrderDraftSchema = z
@@ -551,6 +559,36 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  get_latest_customer_order: {
+    definition: {
+      name: "get_latest_customer_order",
+      description:
+        "Customer-only. Return the latest order for the current customer in this restaurant.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_latest_customer_order,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const order = await Order.findOne({
+        restaurantId: context.restaurantId,
+        customerPhone: context.sender.normalizedPhone
+      }).sort({ createdAt: -1 });
+
+      if (!order) {
+        return {
+          success: false,
+          code: "ORDER_NOT_FOUND",
+          message: "I could not find any orders for this customer."
+        };
+      }
+
+      return {
+        success: true,
+        message: "Latest order retrieved successfully.",
+        data: safeOrderView(order)
+      };
+    }
+  },
   get_order_details: {
     definition: {
       name: "get_order_details",
@@ -913,6 +951,42 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     schema: addOrderItemByNameSchema,
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const activeClarification = await findActiveOrderItemClarification({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone
+      });
+
+      if (activeClarification) {
+        const resolved = await resolveOrderItemClarification(activeClarification, args.itemName);
+
+        if (resolved.status === "matched") {
+          const item = await MenuItem.findOne({
+            _id: resolved.menuItemId,
+            restaurantId: context.restaurantId,
+            isAvailable: true
+          });
+
+          if (!item) {
+            return {
+              success: false,
+              code: "MENU_ITEM_NOT_FOUND",
+              message: "That menu item is no longer available."
+            };
+          }
+
+          const quantity = args.quantity ?? resolved.quantity ?? 1;
+          addItemToDraft(draft, item, quantity);
+          draft.currentStep = "choosing_items";
+          await draft.save();
+
+          return {
+            success: true,
+            message: `Added ${quantity} x ${item.name} to the order draft.`,
+            data: buildDraftView(draft, context.restaurant)
+          };
+        }
+      }
+
       const match = await findMenuItemMatch(context.restaurantId, args.itemName);
 
       if (match.status === "none") {
@@ -924,6 +998,22 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (match.status === "multiple") {
+        await createOrderItemClarification({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          senderRole: context.sender.role,
+          originalText: args.itemName,
+          quantity: args.quantity,
+          candidates: match.matches.map((item) =>
+            buildClarificationCandidate({
+              menuItemId: item._id,
+              name: item.name,
+              price: item.price,
+              available: item.isAvailable
+            })
+          )
+        });
+
         return {
           success: false,
           code: "MULTIPLE_MENU_ITEMS_FOUND",
@@ -954,14 +1044,15 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       name: "remove_order_item_by_name",
       description: "Remove a menu item from the order draft by name.",
       parameters: {
-        itemName: "Menu item name as the customer said it."
+        itemName: "Menu item name as the customer said it.",
+        quantity: "Optional quantity to remove. If omitted, remove the line item."
       }
     },
     roles: toolPermissions.remove_order_item_by_name,
     schema: removeOrderItemByNameSchema,
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
-      const message = removeItemFromDraft(draft, args.itemName);
+      const message = removeItemFromDraft(draft, args.itemName, args.quantity);
       await draft.save();
 
       return {
@@ -1030,7 +1121,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.get_order_draft,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft =
+        (await findActiveDraft(context.restaurantId, context.sender.normalizedPhone)) ??
+        (await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone));
 
       return {
         success: true,
@@ -1084,7 +1177,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Order placed successfully.",
         data: {
-          order: safeOrderView(order)
+          order: {
+            ...safeOrderView(order),
+            receiptUrl: order.receiptUrl
+          }
         }
       };
     }

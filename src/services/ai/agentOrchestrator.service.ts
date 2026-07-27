@@ -107,6 +107,25 @@ const mergeUsage = (current: AiUsage | undefined, next: AiUsage | undefined): Ai
   };
 };
 
+const looksLikeSuccessClaim = (message: string): boolean => {
+  return /\b(done|completed|confirmed|placed|updated|cancelled|successfully|has been|is now)\b/i.test(
+    message
+  );
+};
+
+const getFailedToolSuccessClaimMessage = (
+  finalMessage: string,
+  executedTools: ExecutedAgentTool[]
+): string | null => {
+  const failedTool = executedTools.find((tool) => !tool.success);
+
+  if (!failedTool || !looksLikeSuccessClaim(finalMessage)) {
+    return null;
+  }
+
+  return failedTool.message || "I couldn't complete that request.";
+};
+
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
   getHistory?: typeof getRecentAgentConversationHistory;
@@ -185,6 +204,21 @@ export const runAgentOrchestrator = async (
 
         if (!finalMessage) {
           throw new Error("Agent provider returned an empty final response.");
+        }
+
+        const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
+
+        if (failedToolMessage) {
+          return {
+            success: false,
+            message: failedToolMessage,
+            data: importantData,
+            provider: provider.name,
+            model: provider.model,
+            responseId,
+            executedTools,
+            usage
+          };
         }
 
         console.info("Restaurant agent completed", {

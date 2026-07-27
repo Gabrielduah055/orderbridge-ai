@@ -6,7 +6,7 @@ Wasender receives a text webhook, resolves the restaurant from the WhatsApp sess
 
 ## Current Customer Message Flow
 
-Customer messages still use the existing deterministic customer flow. That flow manages a customer session, reads menu data from MongoDB, builds a cart, collects pickup/delivery details, creates orders through the order service, and returns receipt data for Wasender side effects. Customer migration to OpenRouter is intentionally out of scope for this phase.
+Customer messages can now use either the existing deterministic customer flow or the OpenRouter agent orchestrator. `OPENROUTER_CUSTOMER_AGENT_ENABLED=true` routes customers through OpenRouter with customer-safe tools; `false` keeps the legacy flow. `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` enables explicit legacy fallback if the customer OpenRouter path fails.
 
 ## Current Hermes Flow
 
@@ -23,7 +23,7 @@ The migration reuses:
 
 ## Role Permissions
 
-Tools are exposed to OpenRouter only when permitted for the resolved backend sender role. Customers are not routed to OpenRouter in this phase. The model cannot provide trusted `restaurantId`, sender phone, sender role, or session context as tool arguments.
+Tools are exposed to OpenRouter only when permitted for the resolved backend sender role. Customer tools are limited to menu/profile/delivery reads, the customer's own order lookup, and order-draft operations. The model cannot provide trusted `restaurantId`, sender phone, sender role, or session context as tool arguments.
 
 ## Confirmation Flow
 
@@ -33,6 +33,8 @@ Sensitive mutation tools continue to create pending backend actions unless the b
 
 The restaurant agent saves inbound user messages before orchestration. The OpenRouter orchestrator loads a bounded recent history window, excludes prior tool messages from provider chat history, saves tool outcomes as audit records, and the restaurant agent saves the final assistant response.
 
+For customers, active order drafts and pending clarification records are included as trusted context. Transactional state comes from MongoDB-backed draft and clarification records, not from chat history alone.
+
 ## Risks And Mitigations
 
 - Model fabrication: mitigated by system rules and real backend tools for operational facts.
@@ -40,11 +42,12 @@ The restaurant agent saves inbound user messages before orchestration. The OpenR
 - Tool misuse: mitigated by role-filtered tool exposure plus executor permission checks.
 - Infinite tool loops: mitigated by `OPENROUTER_MAX_TOOL_ROUNDS`.
 - Provider outage: returns a safe failure message and does not silently fall back to Hermes when `AI_PROVIDER=openrouter`.
+- Customer ambiguity: mitigated by short-lived `AgentClarification` records scoped to restaurant and customer phone.
 
 ## Target OpenRouter Architecture
 
-Incoming WhatsApp message -> trusted backend context -> recent history -> OpenRouter provider -> model tool call -> local `executeAgentTool` -> Zod validation and role checks -> Mongo-backed services -> tool result returned to model -> concise final WhatsApp response.
+Incoming WhatsApp message -> trusted backend context -> recent history plus active draft/clarification state -> OpenRouter provider -> model tool call -> local `executeAgentTool` -> Zod validation and role checks -> Mongo-backed services -> tool result returned to model -> concise final WhatsApp response.
 
 ## Migration And Rollback
 
-Use `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to enable the new owner/manager agent. Set `AI_PROVIDER=hermes` to return to the legacy Hermes path. Customer routing remains unchanged.
+Use `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to enable the OpenRouter agent. Set `OPENROUTER_CUSTOMER_AGENT_ENABLED=true` to migrate customer conversations. Set `AI_PROVIDER=hermes` to return owner/manager conversations to the legacy Hermes path. Set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false` to keep customer conversations on the legacy parser.
