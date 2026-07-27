@@ -1,8 +1,10 @@
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
+import { Order, type IOrderDocument } from "../models/order.model";
 import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
+import { BadRequestError } from "../utils/httpErrors";
 
 const sessionTtlMs = 2 * 60 * 60 * 1000;
 
@@ -31,6 +33,11 @@ export const resetDraftState = (session: ICustomerSessionDocument): void => {
   session.currentStep = "idle";
   session.orderType = null;
   session.deliveryAddress = undefined;
+};
+
+export const clearConvertedDraftState = (session: ICustomerSessionDocument): void => {
+  session.convertedOrderId = undefined;
+  session.convertedAt = undefined;
 };
 
 export const getOrCreateDraft = async (
@@ -141,6 +148,8 @@ export const addItemToDraft = (
   item: IMenuItemDocument,
   quantity: number
 ): void => {
+  clearConvertedDraftState(session);
+
   const existingItem = session.cartItems.find(
     (cartItem) => String(cartItem.menuItemId) === String(item._id)
   );
@@ -254,6 +263,64 @@ export const buildDraftView = (
     deliveryFee,
     total: subtotal + deliveryFee,
     missingFields,
-    readyToConfirm: missingFields.length === 0
+    readyToConfirm: missingFields.length === 0,
+    convertedOrderId: session.convertedOrderId ? String(session.convertedOrderId) : undefined
+  };
+};
+
+export const submitOrderDraft = async (
+  restaurant: IRestaurantDocument,
+  customerPhone: string
+): Promise<{ order: IOrderDocument; idempotent: boolean; draft: ICustomerSessionDocument }> => {
+  const restaurantId = String(restaurant._id);
+  const draft = await getOrCreateDraft(restaurantId, customerPhone);
+
+  if (draft.convertedOrderId) {
+    const existingOrder = await Order.findOne({
+      _id: draft.convertedOrderId,
+      restaurantId,
+      customerPhone: draft.customerPhone
+    });
+
+    if (existingOrder) {
+      return {
+        order: existingOrder,
+        idempotent: true,
+        draft
+      };
+    }
+
+    clearConvertedDraftState(draft);
+  }
+
+  const missingFields = getMissingDraftFields(draft);
+
+  if (missingFields.length > 0) {
+    throw new BadRequestError(`The order draft is missing: ${missingFields.join(", ")}.`);
+  }
+
+  const order = await orderService.createOrder(restaurantId, {
+    customerName: draft.customerName,
+    customerPhone: draft.customerPhone,
+    items: draft.cartItems.map((item) => ({
+      menuItemId: String(item.menuItemId),
+      quantity: item.quantity
+    })),
+    orderType: draft.orderType!,
+    deliveryAddress: draft.deliveryAddress,
+    paymentMethod: "unknown",
+    paymentStatus: "unpaid",
+    sourceDraftId: String(draft._id)
+  });
+
+  resetDraftState(draft);
+  draft.convertedOrderId = order._id;
+  draft.convertedAt = new Date();
+  await draft.save();
+
+  return {
+    order,
+    idempotent: false,
+    draft
   };
 };

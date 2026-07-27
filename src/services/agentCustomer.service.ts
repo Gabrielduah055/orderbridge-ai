@@ -2,7 +2,7 @@ import { Types } from "mongoose";
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
-import { type IOrderDocument, type OrderType } from "../models/order.model";
+import { Order, type IOrderDocument, type OrderType } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
@@ -23,6 +23,10 @@ interface CustomerAgentResponse {
     cart?: ICustomerSessionDocument["cartItems"];
     menu?: unknown;
     order?: IOrderDocument;
+    orderEvent?: "submitted" | "confirmed" | "rejected";
+    notifyOwner?: boolean;
+    notifyCustomer?: boolean;
+    receiptRequired?: boolean;
   };
 }
 
@@ -379,8 +383,33 @@ export const handleCustomerMessage = async (
 
   if (cancellationAliases.includes(normalizedMessage)) {
     resetSessionState(session);
+    session.convertedOrderId = undefined;
+    session.convertedAt = undefined;
     await session.save();
     return buildResponse("Okay, I cancelled your current order.", session);
+  }
+
+  if (confirmationAliases.includes(normalizedMessage) && session.convertedOrderId) {
+    const existingOrder = await Order.findOne({
+      _id: session.convertedOrderId,
+      restaurantId: input.restaurantId,
+      customerPhone: session.customerPhone
+    });
+
+    if (existingOrder) {
+      return buildResponse(
+        `Your order has already been submitted to the restaurant for confirmation. Order: ${
+          existingOrder.orderNumber ?? String(existingOrder._id)
+        }.`,
+        session,
+        {
+          order: existingOrder,
+          orderEvent: "submitted",
+          notifyOwner: true,
+          receiptRequired: false
+        }
+      );
+    }
   }
 
   if (session.currentStep === "collecting_address") {
@@ -404,19 +433,27 @@ export const handleCustomerMessage = async (
       orderType: session.orderType ?? "pickup",
       deliveryAddress: session.deliveryAddress,
       paymentMethod: "unknown",
-      paymentStatus: "unpaid"
+      paymentStatus: "unpaid",
+      sourceDraftId: String(session._id)
     });
 
     resetSessionState(session);
+    session.convertedOrderId = order._id;
+    session.convertedAt = new Date();
     await session.save();
 
     return buildResponse(
-      `Your order has been placed. Order ID: ${String(order._id)}. Total: ${formatCurrency(
+      `Your order has been submitted to the restaurant for confirmation. Order: ${
+        order.orderNumber ?? String(order._id)
+      }. Total: ${formatCurrency(
         order.total
       )}.`,
       session,
       {
-        order
+        order,
+        orderEvent: "submitted",
+        notifyOwner: true,
+        receiptRequired: false
       }
     );
   }
@@ -486,6 +523,8 @@ export const handleCustomerMessage = async (
   const addItemRequest = parseAddItemMessage(message);
 
   if (addItemRequest) {
+    session.convertedOrderId = undefined;
+    session.convertedAt = undefined;
     const match = await findMenuItemMatch(input.restaurantId, addItemRequest.itemName);
 
     if (match.status !== "matched") {

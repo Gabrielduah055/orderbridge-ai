@@ -40,8 +40,25 @@ export interface IOrder {
   paymentMethod: PaymentMethod;
   paymentStatus: PaymentStatus;
   notes?: string;
+  sourceDraftId?: Types.ObjectId;
   receiptUrl?: string;
   receiptGeneratedAt?: Date;
+  receiptGenerationFailedAt?: Date;
+  receiptGenerationFailureReason?: string;
+  receiptSentAt?: Date;
+  receiptDeliveryFailedAt?: Date;
+  receiptDeliveryFailureReason?: string;
+  customerConfirmedAt?: Date;
+  ownerNotifiedAt?: Date;
+  ownerNotificationFailedAt?: Date;
+  ownerNotificationFailureReason?: string;
+  restaurantConfirmedAt?: Date;
+  restaurantRejectedAt?: Date;
+  restaurantRejectionReason?: string;
+  customerConfirmedNotificationSentAt?: Date;
+  rejectionNotificationSentAt?: Date;
+  customerNotificationFailedAt?: Date;
+  customerNotificationFailureReason?: string;
   orderNumber?: string;
 }
 
@@ -153,12 +170,71 @@ const orderSchema = new Schema<IOrderDocument>(
       type: String,
       trim: true
     },
+    sourceDraftId: {
+      type: Schema.Types.ObjectId,
+      ref: "CustomerSession",
+      unique: true,
+      sparse: true
+    },
     receiptUrl: {
       type: String,
       trim: true
     },
     receiptGeneratedAt: {
       type: Date
+    },
+    receiptGenerationFailedAt: {
+      type: Date
+    },
+    receiptGenerationFailureReason: {
+      type: String,
+      trim: true
+    },
+    receiptSentAt: {
+      type: Date
+    },
+    receiptDeliveryFailedAt: {
+      type: Date
+    },
+    receiptDeliveryFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerConfirmedAt: {
+      type: Date
+    },
+    ownerNotifiedAt: {
+      type: Date
+    },
+    ownerNotificationFailedAt: {
+      type: Date
+    },
+    ownerNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    restaurantConfirmedAt: {
+      type: Date
+    },
+    restaurantRejectedAt: {
+      type: Date
+    },
+    restaurantRejectionReason: {
+      type: String,
+      trim: true
+    },
+    customerConfirmedNotificationSentAt: {
+      type: Date
+    },
+    rejectionNotificationSentAt: {
+      type: Date
+    },
+    customerNotificationFailedAt: {
+      type: Date
+    },
+    customerNotificationFailureReason: {
+      type: String,
+      trim: true
     },
     orderNumber: {
       type: String,

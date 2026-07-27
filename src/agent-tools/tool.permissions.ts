@@ -14,6 +14,7 @@ export const toolPermissions = {
   update_menu_price: ["owner"],
   set_item_availability: ["owner", "manager"],
   confirm_order: ["owner", "manager"],
+  reject_order: ["owner", "manager"],
   update_order_status: ["owner", "manager"],
   create_order: [],
   cancel_order: ["owner", "manager", "customer"],

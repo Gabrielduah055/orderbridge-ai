@@ -264,7 +264,7 @@ const drawReceiptHeader = (
 
 const drawOrderMeta = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
   drawLabelValue(doc, "Order no.", order.orderNumber, { boldValue: true });
-  drawLabelValue(doc, "Date", formatDateTime(order.createdAt));
+  drawLabelValue(doc, "Date", formatDateTime(order.restaurantConfirmedAt ?? order.createdAt));
   drawLabelValue(doc, "Customer", order.customerName || "Guest");
   drawLabelValue(doc, "Phone", order.customerPhone);
   drawLabelValue(doc, "Type", titleCase(order.orderType), { boldValue: true });
