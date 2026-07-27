@@ -27,6 +27,30 @@ const safeFallbackMessage =
 const maxRoundsFallbackMessage =
   "I couldn't complete that request safely. Please try a simpler request or contact support.";
 
+const classifyOrchestratorError = (error: unknown): string => {
+  if (!(error instanceof Error)) {
+    return "INTERNAL_ERROR";
+  }
+
+  if (error.name === "AbortError" || /\babort|timeout|timed out\b/i.test(error.message)) {
+    return "PROVIDER_TIMEOUT";
+  }
+
+  if (/OpenRouter request failed with status/i.test(error.message)) {
+    return "OPENROUTER_HTTP_ERROR";
+  }
+
+  if (/did not include a message|did not include text or tool calls|empty final response/i.test(error.message)) {
+    return "PROVIDER_EMPTY_RESPONSE";
+  }
+
+  if (/JSON|parse|malformed/i.test(error.message)) {
+    return "MALFORMED_TOOL_ARGUMENTS";
+  }
+
+  return "INTERNAL_ERROR";
+};
+
 const trustedArgumentNames = new Set([
   "restaurantId",
   "restaurant_id",
@@ -267,13 +291,20 @@ export const runAgentOrchestrator = async (
       for (const toolCall of response.toolCalls) {
         const toolName = toolCall.name;
         const safeArguments = stripTrustedModelArguments(toolCall.arguments);
-        const result = permittedToolNames.has(toolName)
-          ? await executeTool(toolName, safeArguments)
-          : {
+        const result = toolCall.invalidArguments
+          ? {
               success: false,
-              code: "TOOL_FORBIDDEN",
-              message: "That tool is not available for the current sender role."
-            };
+              code: "TOOL_INVALID_ARGUMENTS",
+              message:
+                "The tool arguments were malformed. Please retry the tool call with valid JSON arguments."
+            }
+          : permittedToolNames.has(toolName)
+            ? await executeTool(toolName, safeArguments)
+            : {
+                success: false,
+                code: "TOOL_FORBIDDEN",
+                message: "That tool is not available for the current sender role."
+              };
 
         executedTools.push({
           name: toolName,
@@ -298,7 +329,8 @@ export const runAgentOrchestrator = async (
             toolName,
             success: result.success,
             code: result.code,
-            requiresConfirmation: result.requiresConfirmation
+            requiresConfirmation: result.requiresConfirmation,
+            invalidArguments: toolCall.invalidArguments
           }
         });
 
@@ -322,6 +354,8 @@ export const runAgentOrchestrator = async (
       usage
     };
   } catch (error) {
+    const errorCode = classifyOrchestratorError(error);
+
     console.error("Restaurant agent orchestration failed", {
       provider: provider.name,
       model: provider.model,
@@ -330,6 +364,7 @@ export const runAgentOrchestrator = async (
       conversationKey,
       requestedToolNames: executedTools.map((tool) => tool.name),
       latencyMs: Date.now() - startedAt,
+      errorCode,
       error: error instanceof Error ? error.message : "Unknown agent orchestration error"
     });
 
@@ -337,6 +372,7 @@ export const runAgentOrchestrator = async (
       success: false,
       message: safeFallbackMessage,
       data: importantData,
+      errorCode,
       provider: provider.name,
       model: provider.model,
       responseId,

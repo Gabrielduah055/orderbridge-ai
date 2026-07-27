@@ -31,24 +31,47 @@ interface OpenRouterChatResult {
   };
 }
 
-const parseToolArguments = (value: unknown): Record<string, unknown> => {
+const parseToolArguments = (
+  value: unknown,
+  toolName: string
+): Pick<AiToolCall, "arguments" | "invalidArguments" | "argumentParseError"> => {
   if (!value) {
-    return {};
+    return { arguments: {} };
   }
 
   if (typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
+    return { arguments: value as Record<string, unknown> };
   }
 
   if (typeof value !== "string" || !value.trim()) {
-    return {};
+    return { arguments: {} };
   }
 
-  const parsed = JSON.parse(value) as unknown;
+  try {
+    const parsed = JSON.parse(value) as unknown;
 
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>)
-    : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? { arguments: parsed as Record<string, unknown> }
+      : {
+          arguments: {},
+          invalidArguments: true,
+          argumentParseError: "Tool arguments JSON did not parse to an object."
+        };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown JSON parse error";
+
+    console.warn("OpenRouter tool argument parsing failed", {
+      provider: "openrouter",
+      toolName,
+      error: message
+    });
+
+    return {
+      arguments: {},
+      invalidArguments: true,
+      argumentParseError: message
+    };
+  }
 };
 
 const normalizeToolCalls = (toolCalls?: OpenRouterToolCall[]): AiToolCall[] => {
@@ -60,10 +83,12 @@ const normalizeToolCalls = (toolCalls?: OpenRouterToolCall[]): AiToolCall[] => {
         return null;
       }
 
+      const parsedArguments = parseToolArguments(toolCall.function?.arguments, name);
+
       return {
         id: toolCall.id ?? `tool_call_${index}`,
         name,
-        arguments: parseToolArguments(toolCall.function?.arguments)
+        ...parsedArguments
       };
     })
     .filter((toolCall): toolCall is AiToolCall => Boolean(toolCall));

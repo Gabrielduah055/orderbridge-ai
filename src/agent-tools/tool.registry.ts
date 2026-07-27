@@ -1234,8 +1234,27 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       return {
         success: true,
-        message: "Order draft updated.",
-        data: buildDraftView(draft, context.restaurant)
+        code:
+          draft.orderType === "delivery" && !draft.deliveryFeeResolved
+            ? draft.deliveryFeeSource === "manual_confirmation"
+              ? "DELIVERY_FEE_REQUIRES_OWNER_CONFIRMATION"
+              : "DELIVERY_FEE_NOT_CONFIGURED"
+            : undefined,
+        message:
+          draft.orderType === "delivery" && !draft.deliveryFeeResolved
+            ? "I have your name and address. The restaurant still needs to confirm the delivery fee before I can submit the order."
+            : "Order draft updated.",
+        data: {
+          ...buildDraftView(draft, context.restaurant),
+          deliveryFeeStatus:
+            draft.orderType === "delivery" && !draft.deliveryFeeResolved
+              ? {
+                  resolved: false,
+                  source: draft.deliveryFeeSource,
+                  requiresOwnerConfirmation: draft.deliveryFeeSource === "manual_confirmation"
+                }
+              : undefined
+        }
       };
     }
   },
