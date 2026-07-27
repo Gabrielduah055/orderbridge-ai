@@ -10,10 +10,9 @@ import {
 } from "../services/orderSideEffects.service";
 import {
   normalizeIncomingWebhook,
-  sendTextMessage,
   type NormalizedWasenderWebhook,
-  type WasenderSendResult
 } from "../services/wasender.service";
+import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
 import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
@@ -98,18 +97,6 @@ const normalizePhone = (phone?: string): string => {
   return phone ? normalizeGhanaPhone(phone) : "";
 };
 
-const getWasenderSendError = (result: WasenderSendResult): string => {
-  if (result.error) {
-    return result.error;
-  }
-
-  if (result.status) {
-    return `Wasender API request failed with status ${result.status}`;
-  }
-
-  return "Wasender API send failed";
-};
-
 const getErrorMessage = (error: unknown): string => {
   if (error instanceof Error) {
     return error.message;
@@ -149,28 +136,7 @@ const getErrorDetails = (error: unknown): Record<string, unknown> => {
   return details;
 };
 
-const assertWasenderSendSuccess = (
-  result: WasenderSendResult,
-  context: Record<string, unknown>
-): void => {
-  if (result.success) {
-    return;
-  }
-
-  console.error("Wasender outbound send failed", {
-    ...context,
-    status: result.status,
-    error: result.error,
-    data: result.data
-  });
-
-  throw Object.assign(new Error(getWasenderSendError(result)), {
-    context,
-    wasenderSendResult: result
-  });
-};
-
-const sendTextMessageOrThrow = async (
+const enqueueTextMessageOrThrow = async (
   sessionId: string,
   to: string,
   message: string,
@@ -178,13 +144,22 @@ const sendTextMessageOrThrow = async (
   apiKey?: string
 ): Promise<void> => {
   const recipient = normalizePhone(to) || to;
-  const result = await sendTextMessage(sessionId, recipient, message, { apiKey });
-
-  assertWasenderSendSuccess(result, {
-    ...context,
+  await enqueueWasenderMessage({
+    restaurantId: typeof context.restaurantId === "string" ? context.restaurantId : undefined,
     sessionId,
     to: recipient,
-    usesRestaurantApiToken: Boolean(apiKey?.trim())
+    type: "text",
+    text: message,
+    apiKey,
+    idempotencyKey:
+      typeof context.eventId === "string" && typeof context.action === "string"
+        ? `${context.action}:${context.eventId}:${recipient}`
+        : undefined,
+    metadata: {
+      ...context,
+      recipientType: "webhook_sender",
+      usesRestaurantApiToken: Boolean(apiKey?.trim())
+    }
   });
 };
 
@@ -306,7 +281,7 @@ const processNormalizedWebhook = async (
     }
 
     if (webhook.messageType !== "text" || !webhook.message.trim()) {
-      await sendTextMessageOrThrow(
+      await enqueueTextMessageOrThrow(
         restaurant.wasenderSessionId,
         webhook.from,
         "Please send a text message so I can help with your order.",
@@ -329,7 +304,7 @@ const processNormalizedWebhook = async (
       message: webhook.message
     });
 
-    await sendTextMessageOrThrow(
+    await enqueueTextMessageOrThrow(
       restaurant.wasenderSessionId,
       webhook.from,
       agentResponse.message,

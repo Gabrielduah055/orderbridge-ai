@@ -2,9 +2,9 @@ import { type IOrderDocument } from "../models/order.model";
 import { type IRestaurantDocument } from "../models/Restaurant";
 import { generateOrderReceipt } from "./receipt.service";
 import { formatGhanaCedi } from "./order.service";
-import { sendDocumentMessage, sendTextMessage, type WasenderSendResult } from "./wasender.service";
+import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
-export type SideEffectStepStatus = "success" | "failed" | "skipped" | "not_attempted";
+export type SideEffectStepStatus = "success" | "queued" | "failed" | "skipped" | "not_attempted";
 
 export interface OrderSideEffectResult {
   ownerNotification?: SideEffectStepStatus;
@@ -23,10 +23,6 @@ const getErrorMessage = (error: unknown): string => {
   }
 
   return "Unknown error";
-};
-
-const getSendFailureReason = (result: WasenderSendResult): string => {
-  return result.error || (result.status ? `Wasender status ${result.status}` : "Wasender send failed");
 };
 
 const formatTitleCase = (value: string): string => {
@@ -132,49 +128,31 @@ export const notifyOwnerOfSubmittedOrder = async (
     };
   }
 
-  const result = await sendTextMessage(
-    restaurant.wasenderSessionId,
-    restaurant.ownerPhone,
-    buildOwnerNewOrderNotification(restaurant, order),
-    {
-      apiKey: restaurant.wasenderApiToken
-    }
-  );
-
-  if (!result.success) {
-    order.ownerNotificationFailedAt = new Date();
-    order.ownerNotificationFailureReason = getSendFailureReason(result);
-    await order.save();
-
-    console.error("Owner order notification failed", {
-      restaurantId: String(restaurant._id),
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: restaurant.ownerPhone,
+    type: "text",
+    text: buildOwnerNewOrderNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `owner-order-notification:${String(order._id)}`,
+    metadata: {
+      kind: "owner_order_notification",
       orderId: String(order._id),
       orderNumber: order.orderNumber,
-      recipientType: "owner",
-      status: result.status,
-      error: result.error
-    });
+      recipientType: "owner"
+    }
+  });
 
-    return {
-      ownerNotification: "failed"
-    };
-  }
-
-  order.ownerNotifiedAt = new Date();
-  order.ownerNotificationFailedAt = undefined;
-  order.ownerNotificationFailureReason = undefined;
-  await order.save();
-
-  console.info("Owner order notification sent", {
+  console.info("Owner order notification queued", {
     restaurantId: String(restaurant._id),
     orderId: String(order._id),
     orderNumber: order.orderNumber,
-    recipientType: "owner",
-    status: result.status
+    recipientType: "owner"
   });
 
   return {
-    ownerNotification: "success"
+    ownerNotification: "queued"
   };
 };
 
@@ -188,32 +166,24 @@ export const notifyCustomerOfRejectedOrder = async (
     };
   }
 
-  const result = await sendTextMessage(
-    restaurant.wasenderSessionId,
-    order.customerPhone,
-    buildCustomerOrderRejectedMessage(restaurant, order),
-    {
-      apiKey: restaurant.wasenderApiToken
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: order.customerPhone,
+    type: "text",
+    text: buildCustomerOrderRejectedMessage(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `customer-order-rejected:${String(order._id)}`,
+    metadata: {
+      kind: "customer_order_rejected_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      recipientType: "customer"
     }
-  );
-
-  if (!result.success) {
-    order.customerNotificationFailedAt = new Date();
-    order.customerNotificationFailureReason = getSendFailureReason(result);
-    await order.save();
-
-    return {
-      customerNotification: "failed"
-    };
-  }
-
-  order.rejectionNotificationSentAt = new Date();
-  order.customerNotificationFailedAt = undefined;
-  order.customerNotificationFailureReason = undefined;
-  await order.save();
+  });
 
   return {
-    customerNotification: "success"
+    customerNotification: "queued"
   };
 };
 
@@ -246,27 +216,22 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   const canSendReceipt = Boolean(publicReceiptUrl);
 
   if (!receiptOrder.customerConfirmedNotificationSentAt) {
-    const textResult = await sendTextMessage(
-      restaurant.wasenderSessionId,
-      receiptOrder.customerPhone,
-      buildCustomerOrderConfirmedMessage(restaurant, receiptOrder, canSendReceipt),
-      {
-        apiKey: restaurant.wasenderApiToken
+    await enqueueWasenderMessage({
+      restaurantId: String(restaurant._id),
+      sessionId: restaurant.wasenderSessionId,
+      to: receiptOrder.customerPhone,
+      type: "text",
+      text: buildCustomerOrderConfirmedMessage(restaurant, receiptOrder, canSendReceipt),
+      apiKey: restaurant.wasenderApiToken,
+      idempotencyKey: `customer-order-confirmed:${String(receiptOrder._id)}`,
+      metadata: {
+        kind: "customer_order_confirmed_notification",
+        orderId: String(receiptOrder._id),
+        orderNumber: receiptOrder.orderNumber,
+        recipientType: "customer"
       }
-    );
-
-    if (textResult.success) {
-      receiptOrder.customerConfirmedNotificationSentAt = new Date();
-      receiptOrder.customerNotificationFailedAt = undefined;
-      receiptOrder.customerNotificationFailureReason = undefined;
-      result.customerNotification = "success";
-    } else {
-      receiptOrder.customerNotificationFailedAt = new Date();
-      receiptOrder.customerNotificationFailureReason = getSendFailureReason(textResult);
-      result.customerNotification = "failed";
-    }
-
-    await receiptOrder.save();
+    });
+    result.customerNotification = "queued";
   }
 
   if (receiptOrder.receiptSentAt) {
@@ -287,29 +252,23 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
     return result;
   }
 
-  const documentResult = await sendDocumentMessage(
-    restaurant.wasenderSessionId,
-    receiptOrder.customerPhone,
-    publicReceiptUrl,
-    `Receipt for ${getOrderReference(receiptOrder)}`,
-    {
-      apiKey: restaurant.wasenderApiToken
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: receiptOrder.customerPhone,
+    type: "document",
+    documentUrl: publicReceiptUrl,
+    caption: `Receipt for ${getOrderReference(receiptOrder)}`,
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `receipt-delivery:${String(receiptOrder._id)}`,
+    metadata: {
+      kind: "receipt_delivery",
+      orderId: String(receiptOrder._id),
+      orderNumber: receiptOrder.orderNumber,
+      recipientType: "customer"
     }
-  );
-
-  if (!documentResult.success) {
-    receiptOrder.receiptDeliveryFailedAt = new Date();
-    receiptOrder.receiptDeliveryFailureReason = getSendFailureReason(documentResult);
-    await receiptOrder.save();
-    result.receiptDelivery = "failed";
-    return result;
-  }
-
-  receiptOrder.receiptSentAt = new Date();
-  receiptOrder.receiptDeliveryFailedAt = undefined;
-  receiptOrder.receiptDeliveryFailureReason = undefined;
-  await receiptOrder.save();
-  result.receiptDelivery = "success";
+  });
+  result.receiptDelivery = "queued";
 
   return result;
 };

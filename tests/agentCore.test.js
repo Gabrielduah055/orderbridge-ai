@@ -31,6 +31,10 @@ const {
   resolveDeliveryFee
 } = require("../dist/services/order.service");
 const {
+  getNextSessionSendAt,
+  getWasenderRetryDelayMs
+} = require("../dist/services/wasenderQueue.service");
+const {
   parseExplicitQuantity
 } = require("../dist/services/orderDraft.service");
 const {
@@ -168,6 +172,28 @@ test("delivery fee resolver reports manual confirmation separately", () => {
       resolved: false
     }
   );
+});
+
+test("Wasender queue respects retry_after from account protection", () => {
+  assert.equal(
+    getWasenderRetryDelayMs({
+      success: false,
+      status: 429,
+      data: {
+        retry_after: 2
+      }
+    }),
+    2000
+  );
+});
+
+test("Wasender queue spaces sends per session", () => {
+  const now = new Date("2026-07-27T17:29:50.000Z");
+  const lastSentAt = new Date("2026-07-27T17:29:48.000Z");
+  const nextSendAt = getNextSessionSendAt(lastSentAt, now, 5000);
+
+  assert.equal(nextSendAt.toISOString(), "2026-07-27T17:29:53.000Z");
+  assert.equal(getNextSessionSendAt(lastSentAt, new Date("2026-07-27T17:29:54.000Z"), 5000), null);
 });
 
 test("restaurant acceptance and rejection are owner or manager only", () => {
