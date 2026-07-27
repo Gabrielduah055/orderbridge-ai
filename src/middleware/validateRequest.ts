@@ -21,6 +21,24 @@ const managerContactSchema = z
     phone: phoneSchema
   })
   .strict();
+const deliveryPricingSchema = z
+  .object({
+    type: z.enum(["flat", "zone_based", "manual_confirmation"]),
+    flatFee: z.number().min(0).optional(),
+    freeDeliveryThreshold: z.number().min(0).optional(),
+    zones: z
+      .array(
+        z
+          .object({
+            name: z.string().trim().min(1),
+            aliases: z.array(z.string().trim().min(1)).default([]),
+            fee: z.number().min(0)
+          })
+          .strict()
+      )
+      .default([])
+  })
+  .strict();
 
 export const createRestaurantSchema = z
   .object({
@@ -44,6 +62,7 @@ export const createRestaurantSchema = z
     deliveryEnabled: z.boolean().default(false),
     deliveryAreas: z.array(z.string().trim().min(1)).default([]),
     deliveryRadiusKm: z.number().min(0).optional(),
+    deliveryPricing: deliveryPricingSchema.optional(),
     minimumOrderValue: z.number().min(0).optional(),
     allowTakeaway: z.boolean().default(false),
     freeDeliveryThresholdEnabled: z.boolean().default(false),

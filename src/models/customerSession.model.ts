@@ -4,8 +4,11 @@ import { orderTypes, type OrderType } from "./order.model";
 export const customerSessionSteps = [
   "idle",
   "choosing_items",
+  "collecting_quantity",
   "choosing_order_type",
   "collecting_address",
+  "collecting_name",
+  "awaiting_delivery_fee",
   "confirming_order"
 ] as const;
 
@@ -24,9 +27,14 @@ export interface ICustomerSession {
   customerPhone: string;
   customerName?: string;
   cartItems: ICustomerSessionCartItem[];
+  pendingMenuItemId?: Types.ObjectId;
+  pendingMenuItemName?: string;
   currentStep: CustomerSessionStep;
   orderType: OrderType | null;
   deliveryAddress?: string;
+  deliveryFee?: number;
+  deliveryFeeSource?: string;
+  deliveryFeeResolved: boolean;
   convertedOrderId?: Types.ObjectId;
   convertedAt?: Date;
   lastMessage?: string;
@@ -93,6 +101,14 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
       type: [customerSessionCartItemSchema],
       default: []
     },
+    pendingMenuItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuItem"
+    },
+    pendingMenuItemName: {
+      type: String,
+      trim: true
+    },
     currentStep: {
       type: String,
       enum: customerSessionSteps,
@@ -106,6 +122,18 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
     deliveryAddress: {
       type: String,
       trim: true
+    },
+    deliveryFee: {
+      type: Number,
+      min: 0
+    },
+    deliveryFeeSource: {
+      type: String,
+      trim: true
+    },
+    deliveryFeeResolved: {
+      type: Boolean,
+      default: false
     },
     convertedOrderId: {
       type: Schema.Types.ObjectId,

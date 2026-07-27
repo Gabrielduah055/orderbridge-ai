@@ -32,6 +32,7 @@ export interface IRestaurant {
   deliveryEnabled: boolean;
   deliveryAreas: string[];
   deliveryRadiusKm?: number;
+  deliveryPricing?: RestaurantDeliveryPricing;
   minimumOrderValue?: number;
   allowTakeaway: boolean;
   freeDeliveryThresholdEnabled: boolean;
@@ -45,6 +46,19 @@ export interface IRestaurant {
 export interface RestaurantManagerContact {
   name?: string;
   phone: string;
+}
+
+export interface RestaurantDeliveryPricingZone {
+  name: string;
+  aliases?: string[];
+  fee: number;
+}
+
+export interface RestaurantDeliveryPricing {
+  type: "flat" | "zone_based" | "manual_confirmation";
+  flatFee?: number;
+  freeDeliveryThreshold?: number;
+  zones?: RestaurantDeliveryPricingZone[];
 }
 
 export interface IRestaurantDocument extends IRestaurant, Document {
@@ -159,6 +173,47 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     deliveryRadiusKm: {
       type: Number,
       min: 0
+    },
+    deliveryPricing: {
+      type: new Schema(
+        {
+          type: {
+            type: String,
+            enum: ["flat", "zone_based", "manual_confirmation"],
+            required: true
+          },
+          flatFee: {
+            type: Number,
+            min: 0
+          },
+          freeDeliveryThreshold: {
+            type: Number,
+            min: 0
+          },
+          zones: {
+            type: [
+              {
+                name: {
+                  type: String,
+                  required: true,
+                  trim: true
+                },
+                aliases: {
+                  type: [String],
+                  default: []
+                },
+                fee: {
+                  type: Number,
+                  required: true,
+                  min: 0
+                }
+              }
+            ],
+            default: []
+          }
+        },
+        { _id: false }
+      )
     },
     minimumOrderValue: {
       type: Number,

@@ -71,7 +71,7 @@ export const buildOwnerNewOrderNotification = (
       : [];
 
   return [
-    "New order received",
+    "New order awaiting your confirmation",
     "",
     `Restaurant: ${restaurant.name}`,
     `Order: ${getOrderReference(order)}`,
@@ -85,12 +85,12 @@ export const buildOwnerNewOrderNotification = (
     "",
     `Total: ${formatGhanaCedi(order.total)}`,
     `Payment: ${formatTitleCase(order.paymentMethod)} / ${formatTitleCase(order.paymentStatus)}`,
-    "Status: Awaiting restaurant confirmation",
+    "Status: Awaiting confirmation",
     "",
     "Reply:",
-    `Confirm order ${getOrderReference(order)}`,
+    `ACCEPT ${getOrderReference(order)}`,
     "or",
-    `Reject order ${getOrderReference(order)}`
+    `REJECT ${getOrderReference(order)}`
   ].join("\n");
 };
 
@@ -101,7 +101,7 @@ export const buildCustomerOrderConfirmedMessage = (
 ): string => {
   const receiptLine = receiptAttached ? " Your receipt is attached." : "";
 
-  return `${restaurant.name} has confirmed order ${getOrderReference(order)}.${receiptLine}`;
+  return `Good news${order.customerName ? `, ${order.customerName}` : ""}. ${restaurant.name} has accepted order ${getOrderReference(order)} and will begin preparing it.${receiptLine}`;
 };
 
 export const buildCustomerOrderRejectedMessage = (

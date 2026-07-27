@@ -14,14 +14,17 @@ import {
 } from "../services/agentClarification.service";
 import {
   addItemToDraft,
+  addPendingItemToDraft,
   buildDraftView,
   clearConvertedDraftState,
+  clearPendingMenuItem,
   findActiveDraft,
   findMenuItemMatch,
   getMissingDraftFields,
   getOrCreateDraft,
   removeItemFromDraft,
   resetDraftState,
+  parseExplicitQuantity,
   submitOrderDraft
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
@@ -1019,6 +1022,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     schema: addOrderItemByNameSchema,
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const explicitQuantity = args.quantity ?? parseExplicitQuantity(args.itemName);
       const activeClarification = await findActiveOrderItemClarification({
         restaurantId: context.restaurantId,
         senderPhone: context.sender.normalizedPhone
@@ -1042,8 +1046,24 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             };
           }
 
-          const quantity = args.quantity ?? resolved.quantity ?? 1;
+          const quantity = args.quantity ?? resolved.quantity;
+
+          if (!quantity) {
+            draft.pendingMenuItemId = item._id;
+            draft.pendingMenuItemName = item.name;
+            draft.currentStep = "collecting_quantity";
+            await draft.save();
+
+            return {
+              success: false,
+              code: "ORDER_ITEM_QUANTITY_REQUIRED",
+              message: `Sure. How many packs of ${item.name} would you like?`,
+              data: buildDraftView(draft, context.restaurant)
+            };
+          }
+
           addItemToDraft(draft, item, quantity);
+          clearPendingMenuItem(draft);
           draft.currentStep = "choosing_items";
           await draft.save();
 
@@ -1095,8 +1115,23 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         };
       }
 
-      const quantity = args.quantity ?? 1;
+      if (!explicitQuantity) {
+        draft.pendingMenuItemId = match.item._id;
+        draft.pendingMenuItemName = match.item.name;
+        draft.currentStep = "collecting_quantity";
+        await draft.save();
+
+        return {
+          success: false,
+          code: "ORDER_ITEM_QUANTITY_REQUIRED",
+          message: `Sure. How many packs of ${match.item.name} would you like?`,
+          data: buildDraftView(draft, context.restaurant)
+        };
+      }
+
+      const quantity = explicitQuantity;
       addItemToDraft(draft, match.item, quantity);
+      clearPendingMenuItem(draft);
       draft.currentStep = "choosing_items";
       await draft.save();
 
@@ -1121,6 +1156,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
       const message = removeItemFromDraft(draft, args.itemName, args.quantity);
+      clearPendingMenuItem(draft);
       await draft.save();
 
       return {
@@ -1165,12 +1201,33 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
         if (args.orderType === "pickup") {
           draft.deliveryAddress = undefined;
+          draft.deliveryFee = 0;
+          draft.deliveryFeeSource = "pickup";
+          draft.deliveryFeeResolved = true;
         }
       }
 
       if (args.deliveryAddress) {
         clearConvertedDraftState(draft);
         draft.deliveryAddress = args.deliveryAddress;
+      }
+
+      if (draft.orderType === "delivery") {
+        const subtotal = draft.cartItems.reduce((sum, item) => sum + item.totalPrice, 0);
+        const fee = orderService.resolveDeliveryFee(
+          context.restaurant,
+          "delivery",
+          draft.deliveryAddress,
+          subtotal
+        );
+
+        draft.deliveryFee = fee.amount ?? undefined;
+        draft.deliveryFeeSource = fee.source;
+        draft.deliveryFeeResolved = fee.resolved;
+
+        if (!fee.resolved) {
+          draft.currentStep = "awaiting_delivery_fee";
+        }
       }
 
       await draft.save();

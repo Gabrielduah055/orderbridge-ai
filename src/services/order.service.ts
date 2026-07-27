@@ -10,6 +10,7 @@ import {
   type PaymentStatus
 } from "../models/order.model";
 import { Restaurant } from "../models/Restaurant";
+import type { IRestaurantDocument } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 
 interface CreateOrderItemInput {
@@ -23,6 +24,8 @@ export interface CreateOrderInput {
   items: CreateOrderItemInput[];
   orderType: OrderType;
   deliveryAddress?: string;
+  deliveryFee?: number;
+  deliveryFeeSource?: string;
   paymentMethod?: PaymentMethod;
   paymentStatus?: PaymentStatus;
   notes?: string;
@@ -37,6 +40,13 @@ export interface UpdateOrderStatusResult {
 export interface RestaurantOrderDecisionResult {
   order: IOrderDocument;
   idempotent: boolean;
+}
+
+export interface DeliveryFeeResolution {
+  amount: number | null;
+  source: "pickup" | "flat_fee" | "free_delivery_threshold" | "zone" | "manual_confirmation" | "not_configured";
+  resolved: boolean;
+  zoneName?: string;
 }
 
 const ensureValidObjectId = (id: string, fieldName: string): void => {
@@ -124,8 +134,78 @@ const getMenuItemsForOrder = async (
   return menuItemById;
 };
 
+const normalizeComparableText = (value: string): string => value.trim().replace(/\s+/g, " ").toLowerCase();
+
+export const resolveDeliveryFee = (
+  restaurant: Pick<IRestaurantDocument, "deliveryPricing">,
+  orderType: OrderType,
+  deliveryAddress?: string,
+  subtotal = 0
+): DeliveryFeeResolution => {
+  if (orderType === "pickup") {
+    return {
+      amount: 0,
+      source: "pickup",
+      resolved: true
+    };
+  }
+
+  const pricing = restaurant.deliveryPricing;
+
+  if (!pricing) {
+    return {
+      amount: null,
+      source: "not_configured",
+      resolved: false
+    };
+  }
+
+  if (
+    pricing.freeDeliveryThreshold !== undefined &&
+    subtotal >= pricing.freeDeliveryThreshold
+  ) {
+    return {
+      amount: 0,
+      source: "free_delivery_threshold",
+      resolved: true
+    };
+  }
+
+  if (pricing.type === "flat" && typeof pricing.flatFee === "number") {
+    return {
+      amount: pricing.flatFee,
+      source: "flat_fee",
+      resolved: true
+    };
+  }
+
+  if (pricing.type === "zone_based" && deliveryAddress?.trim()) {
+    const normalizedAddress = normalizeComparableText(deliveryAddress);
+    const zone = pricing.zones?.find((candidate) => {
+      const names = [candidate.name, ...(candidate.aliases ?? [])].map(normalizeComparableText);
+
+      return names.some((name) => normalizedAddress.includes(name));
+    });
+
+    if (zone) {
+      return {
+        amount: zone.fee,
+        source: "zone",
+        resolved: true,
+        zoneName: zone.name
+      };
+    }
+  }
+
+  return {
+    amount: null,
+    source: pricing.type === "manual_confirmation" ? "manual_confirmation" : "not_configured",
+    resolved: false
+  };
+};
+
 export const calculateDeliveryFee = (orderType: OrderType): number => {
-  return orderType === "delivery" ? 10 : 0;
+  return orderType === "delivery" ? 0 : 0;
 };
 
 export const buildOrderItems = async (
@@ -174,7 +254,16 @@ export const createOrder = async (
 
   const items = await buildOrderItems(restaurantId, input.items);
   const subtotal = items.reduce((sum, item) => sum + item.totalPrice, 0);
-  const deliveryFee = calculateDeliveryFee(input.orderType);
+  const deliveryFeeResolution =
+    input.orderType === "delivery"
+      ? resolveDeliveryFee(restaurant, input.orderType, input.deliveryAddress, subtotal)
+      : resolveDeliveryFee(restaurant, input.orderType, undefined, subtotal);
+
+  if (!deliveryFeeResolution.resolved || deliveryFeeResolution.amount === null) {
+    throw new BadRequestError("Delivery fee is not resolved for this order");
+  }
+
+  const deliveryFee = input.deliveryFee ?? deliveryFeeResolution.amount;
   const total = subtotal + deliveryFee;
 
   try {
@@ -185,10 +274,12 @@ export const createOrder = async (
       items,
       subtotal,
       deliveryFee,
+      deliveryFeeSource: input.deliveryFeeSource ?? deliveryFeeResolution.source,
+      deliveryFeeResolvedAt: new Date(),
       total,
       orderType: input.orderType,
       deliveryAddress: input.orderType === "delivery" ? input.deliveryAddress : undefined,
-      status: "pending",
+      status: "awaiting_restaurant_confirmation",
       paymentMethod: input.paymentMethod ?? "unknown",
       paymentStatus: input.paymentStatus ?? "unpaid",
       notes: input.notes,
@@ -247,18 +338,18 @@ export const confirmRestaurantOrder = async (
 ): Promise<RestaurantOrderDecisionResult> => {
   const order = await getOrderOrThrow(orderId);
 
-  if (order.status === "confirmed") {
+  if (order.status === "accepted" || order.status === "confirmed") {
     return {
       order,
       idempotent: true
     };
   }
 
-  if (order.status !== "pending") {
+  if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
     throw new BadRequestError("Only pending orders can be confirmed by the restaurant");
   }
 
-  order.status = "confirmed";
+  order.status = "accepted";
   order.restaurantConfirmedAt = order.restaurantConfirmedAt ?? new Date();
   await order.save();
 
@@ -274,18 +365,18 @@ export const rejectRestaurantOrder = async (
 ): Promise<RestaurantOrderDecisionResult> => {
   const order = await getOrderOrThrow(orderId);
 
-  if (order.status === "cancelled" && order.restaurantRejectedAt) {
+  if ((order.status === "cancelled" || order.status === "rejected") && order.restaurantRejectedAt) {
     return {
       order,
       idempotent: true
     };
   }
 
-  if (order.status !== "pending") {
+  if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
     throw new BadRequestError("Only pending orders can be rejected by the restaurant");
   }
 
-  order.status = "cancelled";
+  order.status = "rejected";
   order.restaurantRejectedAt = order.restaurantRejectedAt ?? new Date();
   order.restaurantRejectionReason = reason?.trim() || order.restaurantRejectionReason;
   await order.save();

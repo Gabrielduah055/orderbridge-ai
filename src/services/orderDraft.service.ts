@@ -10,6 +10,18 @@ const sessionTtlMs = 2 * 60 * 60 * 1000;
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 const normalizeComparableText = (value: string): string => normalizeText(value).toLowerCase();
+const numberWords = new Map<string, number>([
+  ["one", 1],
+  ["two", 2],
+  ["three", 3],
+  ["four", 4],
+  ["five", 5],
+  ["six", 6],
+  ["seven", 7],
+  ["eight", 8],
+  ["nine", 9],
+  ["ten", 10]
+]);
 
 export type MenuItemMatchResult =
   | {
@@ -30,14 +42,51 @@ export const getDraftExpiry = (): Date => new Date(Date.now() + sessionTtlMs);
 
 export const resetDraftState = (session: ICustomerSessionDocument): void => {
   session.cartItems = [];
+  session.pendingMenuItemId = undefined;
+  session.pendingMenuItemName = undefined;
   session.currentStep = "idle";
   session.orderType = null;
   session.deliveryAddress = undefined;
+  session.deliveryFee = undefined;
+  session.deliveryFeeSource = undefined;
+  session.deliveryFeeResolved = false;
 };
 
 export const clearConvertedDraftState = (session: ICustomerSessionDocument): void => {
   session.convertedOrderId = undefined;
   session.convertedAt = undefined;
+};
+
+export const clearPendingMenuItem = (session: ICustomerSessionDocument): void => {
+  session.pendingMenuItemId = undefined;
+  session.pendingMenuItemName = undefined;
+};
+
+export const parseExplicitQuantity = (message: string): number | null => {
+  const normalized = normalizeComparableText(message);
+  const digitMatch = normalized.match(/\b(\d+)\b/);
+
+  if (digitMatch) {
+    const quantity = Number(digitMatch[1]);
+
+    return Number.isInteger(quantity) && quantity > 0 ? quantity : null;
+  }
+
+  for (const [word, quantity] of numberWords.entries()) {
+    if (new RegExp(`\\b${word}\\b`).test(normalized)) {
+      return quantity;
+    }
+  }
+
+  if (/\b(a|an)\s+(plate|pack|portion|bowl|serving|box)\b/.test(normalized)) {
+    return 1;
+  }
+
+  if (/\b(add another one|another one|one more)\b/.test(normalized)) {
+    return 1;
+  }
+
+  return null;
 };
 
 export const getOrCreateDraft = async (
@@ -58,6 +107,7 @@ export const getOrCreateDraft = async (
       cartItems: [],
       currentStep: "idle",
       orderType: null,
+      deliveryFeeResolved: false,
       expiresAt: getDraftExpiry()
     });
   }
@@ -169,6 +219,34 @@ export const addItemToDraft = (
   });
 };
 
+export const addPendingItemToDraft = async (
+  session: ICustomerSessionDocument,
+  restaurantId: string,
+  quantity: number
+): Promise<string> => {
+  if (!session.pendingMenuItemId) {
+    return "Please tell me which item you want to update.";
+  }
+
+  const item = await MenuItem.findOne({
+    _id: session.pendingMenuItemId,
+    restaurantId,
+    isAvailable: true
+  });
+
+  if (!item) {
+    clearPendingMenuItem(session);
+    session.currentStep = "choosing_items";
+    return "That item is no longer available. Please choose another item.";
+  }
+
+  addItemToDraft(session, item, quantity);
+  clearPendingMenuItem(session);
+  session.currentStep = "choosing_items";
+
+  return `Added ${quantity} x ${item.name} to the order draft.`;
+};
+
 export const removeItemFromDraft = (
   session: ICustomerSessionDocument,
   requestedName: string,
@@ -225,12 +303,20 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
     missing.push("items");
   }
 
+  if (session.pendingMenuItemId) {
+    missing.push("quantity");
+  }
+
   if (!session.orderType) {
     missing.push("orderType");
   }
 
   if (session.orderType === "delivery" && !session.deliveryAddress?.trim()) {
     missing.push("deliveryAddress");
+  }
+
+  if (session.orderType === "delivery" && !session.deliveryFeeResolved) {
+    missing.push("deliveryFee");
   }
 
   if (!session.customerName?.trim()) {
@@ -242,11 +328,18 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
 
 export const buildDraftView = (
   session: ICustomerSessionDocument,
-  _restaurant: IRestaurantDocument
+  restaurant: IRestaurantDocument
 ) => {
   const orderType = session.orderType;
   const subtotal = getDraftSubtotal(session);
-  const deliveryFee = orderType ? orderService.calculateDeliveryFee(orderType) : 0;
+  const deliveryFeeResolution = orderType
+    ? orderService.resolveDeliveryFee(restaurant, orderType, session.deliveryAddress, subtotal)
+    : null;
+  const deliveryFee =
+    orderType === "delivery"
+      ? session.deliveryFee ?? deliveryFeeResolution?.amount
+      : 0;
+  const resolvedDeliveryFee = typeof deliveryFee === "number" ? deliveryFee : null;
   const missingFields = getMissingDraftFields(session);
 
   return {
@@ -259,9 +352,18 @@ export const buildDraftView = (
     customerName: session.customerName,
     orderType,
     deliveryAddress: session.deliveryAddress,
+    pendingItem: session.pendingMenuItemName
+      ? {
+          name: session.pendingMenuItemName,
+          missing: "quantity"
+        }
+      : undefined,
     subtotal,
-    deliveryFee,
-    total: subtotal + deliveryFee,
+    deliveryFee: resolvedDeliveryFee,
+    deliveryFeeSource: session.deliveryFeeSource ?? deliveryFeeResolution?.source,
+    deliveryFeeResolved:
+      orderType === "pickup" ? true : orderType === "delivery" ? session.deliveryFeeResolved : false,
+    total: resolvedDeliveryFee === null ? null : subtotal + resolvedDeliveryFee,
     missingFields,
     readyToConfirm: missingFields.length === 0,
     convertedOrderId: session.convertedOrderId ? String(session.convertedOrderId) : undefined
@@ -308,6 +410,8 @@ export const submitOrderDraft = async (
     })),
     orderType: draft.orderType!,
     deliveryAddress: draft.deliveryAddress,
+    deliveryFee: draft.deliveryFee,
+    deliveryFeeSource: draft.deliveryFeeSource,
     paymentMethod: "unknown",
     paymentStatus: "unpaid",
     sourceDraftId: String(draft._id)

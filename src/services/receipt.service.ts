@@ -12,7 +12,7 @@ interface ReceiptResult {
   order: IOrderDocument;
 }
 
-const receiptEligibleStatuses: OrderStatus[] = ["confirmed", "preparing", "ready", "completed"];
+const receiptEligibleStatuses: OrderStatus[] = ["accepted", "confirmed", "preparing", "ready", "completed"];
 const receiptWidth = 242;
 const receiptMargin = 14;
 const contentWidth = receiptWidth - receiptMargin * 2;
