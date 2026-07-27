@@ -147,6 +147,7 @@ export class OpenRouterProvider implements AiProvider {
           messages: request.messages.map(toOpenRouterMessage),
           tools: request.tools,
           tool_choice: request.toolChoice ?? "auto",
+          max_tokens: config.maxOutputTokens,
           parallel_tool_calls: false
         }),
         signal: controller.signal

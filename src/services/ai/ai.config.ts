@@ -2,6 +2,7 @@ import type { AiProviderName } from "./ai.types";
 
 const defaultOpenRouterTimeoutMs = 45_000;
 const defaultMaxToolRounds = 6;
+const defaultMaxOutputTokens = 800;
 
 const cleanEnvValue = (value?: string): string | undefined => {
   const cleaned = value?.trim().replace(/;$/, "");
@@ -33,6 +34,9 @@ export const getOpenRouterConfig = () => ({
   timeoutMs: parsePositiveNumber(process.env.OPENROUTER_TIMEOUT_MS, defaultOpenRouterTimeoutMs),
   maxToolRounds: Math.floor(
     parsePositiveNumber(process.env.OPENROUTER_MAX_TOOL_ROUNDS, defaultMaxToolRounds)
+  ),
+  maxOutputTokens: Math.floor(
+    parsePositiveNumber(process.env.OPENROUTER_MAX_OUTPUT_TOKENS, defaultMaxOutputTokens)
   ),
   siteUrl: cleanEnvValue(process.env.OPENROUTER_SITE_URL),
   appName: cleanEnvValue(process.env.OPENROUTER_APP_NAME) ?? "OrderBridgeAI",
