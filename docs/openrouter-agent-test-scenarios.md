@@ -33,3 +33,21 @@
 - A request for an item that does not exist.
 - An ambiguous item name.
 - A confirmation after the pending action has expired.
+
+## Customer Requests
+
+- "Show me today's menu."
+- "What do you have under noodles?"
+- "I want two jollof and one chicken noodles."
+- "Add another jollof."
+- "Remove one jollof."
+- "Make it delivery."
+- "Deliver it to Madina, close to the station."
+- "What is in my cart?"
+- "How much is everything?"
+- "Confirm the order."
+- "Cancel it."
+- "Where is my order?"
+- "What is the status of ORD-123?"
+- "I want beef." when Beef Noodles and Beef Spaghetti both exist.
+- "the noodles one" after an active beef clarification.

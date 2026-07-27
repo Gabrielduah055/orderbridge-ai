@@ -7,7 +7,7 @@ import {
   executeConfirmedPendingToolAction,
   findLatestPendingToolAction
 } from "../agent-tools/tool.executor";
-import { getAiProviderName } from "./ai/ai.config";
+import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
@@ -79,6 +79,11 @@ export const isPendingActionCancellationMessage = (message: string): boolean => 
 const formatPrice = (price: unknown): string => {
   return typeof price === "number" && Number.isFinite(price) ? `GHS ${price}` : "Price not set";
 };
+
+export const shouldUseOpenRouterCustomerAgent = (
+  aiProviderName: string,
+  customerAgentEnabled: boolean
+): boolean => aiProviderName === "openrouter" && customerAgentEnabled;
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -199,6 +204,11 @@ export const handleRestaurantAgentMessage = async (
   const sender = resolveSenderIdentity(input.restaurant, input.senderPhone);
   const message = normalizeText(input.message);
   const aiProviderName = getAiProviderName();
+  const openRouterConfig = getOpenRouterConfig();
+  const customerOpenRouterEnabled = shouldUseOpenRouterCustomerAgent(
+    aiProviderName,
+    openRouterConfig.customerAgentEnabled
+  );
 
   console.info("Restaurant agent sender resolved", {
     restaurantId,
@@ -217,11 +227,70 @@ export const handleRestaurantAgentMessage = async (
     }
   });
 
-  if (isMenuRequest(message) && (sender.role === "customer" || aiProviderName !== "openrouter")) {
+  if (
+    isMenuRequest(message) &&
+    ((sender.role === "customer" && !customerOpenRouterEnabled) || aiProviderName !== "openrouter")
+  ) {
     return handleLocalMenuRequest(input, sender);
   }
 
   if (sender.role === "customer") {
+    if (customerOpenRouterEnabled) {
+      const agentResult = await runAgentOrchestrator({
+        restaurant: input.restaurant,
+        sender,
+        message
+      });
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: agentResult.message,
+        metadata: {
+          source: "openrouter_agent",
+          provider: agentResult.provider,
+          model: agentResult.model,
+          responseId: agentResult.responseId,
+          success: agentResult.success,
+          customerAgentEnabled: true,
+          legacyFallbackEnabled: openRouterConfig.customerLegacyFallback,
+          executedTools: agentResult.executedTools,
+          usage: agentResult.usage
+        }
+      });
+
+      console.info("Customer OpenRouter agent completed", {
+        restaurantId,
+        senderRole: sender.role,
+        provider: agentResult.provider,
+        model: agentResult.model,
+        customerAgentEnabled: true,
+        legacyFallbackEnabled: openRouterConfig.customerLegacyFallback,
+        toolNames: agentResult.executedTools.map((tool) => tool.name),
+        success: agentResult.success,
+        totalTokens: agentResult.usage?.totalTokens
+      });
+
+      if (!agentResult.success && openRouterConfig.customerLegacyFallback) {
+        console.warn("Customer OpenRouter agent failed; using explicit legacy fallback", {
+          restaurantId,
+          senderRole: sender.role
+        });
+
+        return handleLocalCustomerRequest(input, sender);
+      }
+
+      return {
+        success: agentResult.success,
+        message: agentResult.message || temporaryAgentErrorMessage,
+        data: agentResult.data,
+        source: "openrouter_agent",
+        sender
+      };
+    }
+
     return handleLocalCustomerRequest(input, sender);
   }
 

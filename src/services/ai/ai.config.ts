@@ -40,6 +40,8 @@ export const getOpenRouterConfig = () => ({
   ),
   siteUrl: cleanEnvValue(process.env.OPENROUTER_SITE_URL),
   appName: cleanEnvValue(process.env.OPENROUTER_APP_NAME) ?? "OrderBridgeAI",
+  customerAgentEnabled: process.env.OPENROUTER_CUSTOMER_AGENT_ENABLED === "true",
+  customerLegacyFallback: process.env.OPENROUTER_CUSTOMER_LEGACY_FALLBACK === "true",
   baseUrl:
     cleanEnvValue(process.env.OPENROUTER_BASE_URL)?.replace(/\/$/, "") ??
     "https://openrouter.ai/api/v1"
