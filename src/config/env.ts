@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import { validateSelectedAiProviderConfig } from "../services/ai/ai.config";
 
 dotenv.config();
 
@@ -20,6 +21,8 @@ if (!mongodbUri) {
 if (missingEnv.length > 0) {
   throw new Error(`Missing required environment variables: ${missingEnv.join(", ")}`);
 }
+
+validateSelectedAiProviderConfig();
 
 export const env = {
   port: Number(process.env.PORT),

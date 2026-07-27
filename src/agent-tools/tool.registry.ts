@@ -26,6 +26,13 @@ const orderLookupSchema = z
     orderId: z.string().trim().min(1).optional()
   })
   .strict();
+const listOrdersSchema = z
+  .object({
+    status: z.enum(orderStatuses).optional(),
+    date: z.enum(["today"]).optional(),
+    limit: z.number().int().positive().max(25).optional()
+  })
+  .strict();
 const menuItemLookupSchema = z
   .object({
     itemName: z.string().trim().min(1).optional(),
@@ -469,6 +476,77 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           totalOrders: orders.length,
           revenue: orders.reduce((sum, order) => sum + order.total, 0),
           statuses: Object.fromEntries(countByStatus)
+        }
+      };
+    }
+  },
+  list_orders: {
+    definition: {
+      name: "list_orders",
+      description:
+        "Owner/manager. List recent orders for this restaurant, optionally filtered by status and today's date.",
+      parameters: {
+        status: orderStatuses.join(" | "),
+        date: "Optional. Use today to limit the list to today's orders.",
+        limit: "Optional max number of orders, up to 25."
+      }
+    },
+    roles: toolPermissions.list_orders,
+    schema: listOrdersSchema,
+    handler: async (args, context) => {
+      const orders = await Order.find({
+        restaurantId: context.restaurantId,
+        ...(args.status ? { status: args.status } : {}),
+        ...(args.date === "today" ? { createdAt: { $gte: startOfToday() } } : {})
+      })
+        .sort({ createdAt: -1 })
+        .limit(args.limit ?? 10);
+
+      return {
+        success: true,
+        message: "Orders retrieved successfully.",
+        data: orders.map((order) => safeOrderView(order, true))
+      };
+    }
+  },
+  get_sales_summary: {
+    definition: {
+      name: "get_sales_summary",
+      description:
+        "Owner/manager. Return today's revenue and best-selling menu item from real order data.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_sales_summary,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const orders = await Order.find({
+        restaurantId: context.restaurantId,
+        createdAt: { $gte: startOfToday() }
+      });
+      const itemTotals = new Map<string, { quantity: number; revenue: number }>();
+
+      for (const order of orders) {
+        for (const item of order.items) {
+          const current = itemTotals.get(item.name) ?? { quantity: 0, revenue: 0 };
+
+          itemTotals.set(item.name, {
+            quantity: current.quantity + item.quantity,
+            revenue: current.revenue + item.totalPrice
+          });
+        }
+      }
+
+      const bestSellingItem = Array.from(itemTotals.entries())
+        .map(([name, totals]) => ({ name, ...totals }))
+        .sort((first, second) => second.quantity - first.quantity)[0];
+
+      return {
+        success: true,
+        message: "Sales summary retrieved successfully.",
+        data: {
+          totalOrders: orders.length,
+          revenue: orders.reduce((sum, order) => sum + order.total, 0),
+          bestSellingItem
         }
       };
     }

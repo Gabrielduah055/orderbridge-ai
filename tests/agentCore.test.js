@@ -15,6 +15,15 @@ const {
   isMcpBearerTokenAuthorized,
   mcpTools
 } = require("../dist/controllers/mcp.controller");
+const {
+  runAgentOrchestrator
+} = require("../dist/services/ai/agentOrchestrator.service");
+const {
+  getAgentToolDefinitionsForRole
+} = require("../dist/services/ai/agentToolDefinitions.service");
+const {
+  validateSelectedAiProviderConfig
+} = require("../dist/services/ai/ai.config");
 
 const restaurant = {
   ownerName: "Gabriel",
@@ -261,5 +270,311 @@ test("Hermes API failure returns null for safe upstream handling", async () => {
     global.fetch = originalFetch;
     process.env.HERMES_AGENT_URL = originalAgentUrl;
     process.env.HERMES_API_KEY = originalApiKey;
+  }
+});
+
+const fakeRestaurant = {
+  _id: "64b000000000000000000001",
+  name: "Test Kitchen",
+  managerContacts: [],
+  managerPhones: [],
+  ownerPhone: "+233507879374"
+};
+
+const fakeOwner = {
+  phone: "0507879374",
+  normalizedPhone: "+233507879374",
+  role: "owner",
+  verified: true,
+  name: "Gabriel"
+};
+
+const buildTestPrompt = async () => "Test system prompt";
+const getEmptyHistory = async () => [];
+const saveNoop = async () => {};
+const restoreEnv = (key, value) => {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+};
+
+test("OpenRouter owner menu request runs get_menu before final response", async () => {
+  const executed = [];
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "get_menu",
+              arguments: { availableOnly: false }
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "Here is the real menu from the backend.",
+        toolCalls: []
+      };
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Show me today's menu."
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async (toolName, args) => {
+        executed.push({ toolName, args });
+
+        return {
+          success: true,
+          message: "Menu retrieved successfully.",
+          data: [{ name: "Rice", items: [{ name: "Jollof Rice", price: 70 }] }]
+        };
+      }
+    }
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.message, "Here is the real menu from the backend.");
+  assert.deepEqual(executed, [{ toolName: "get_menu", args: { availableOnly: false } }]);
+});
+
+test("OpenRouter tool loop ignores model-supplied trusted identity arguments", async () => {
+  let receivedArgs;
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "update_menu_price",
+              arguments: {
+                restaurantId: "64b000000000000000000999",
+                senderRole: "owner",
+                itemName: "Jollof Rice",
+                newPrice: 70
+              }
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "Should I change Jollof Rice to GHS 70?",
+        toolCalls: []
+      };
+    }
+  };
+
+  await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Change Jollof Rice to GHS 70."
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async (_toolName, args) => {
+        receivedArgs = args;
+
+        return {
+          success: true,
+          requiresConfirmation: true,
+          pendingActionId: "pending_1",
+          message: "Should I change Jollof Rice to GHS 70?"
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(receivedArgs, { itemName: "Jollof Rice", newPrice: 70 });
+});
+
+test("OpenRouter customer role cannot execute owner tools through orchestrator", async () => {
+  const customer = {
+    phone: "0557038547",
+    normalizedPhone: "+233557038547",
+    role: "customer",
+    verified: false
+  };
+  let toolExecuted = false;
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: "call_1",
+              name: "update_menu_price",
+              arguments: { itemName: "Jollof Rice", newPrice: 1 }
+            }
+          ]
+        };
+      }
+
+      return {
+        text: "That action is not available for your role.",
+        toolCalls: []
+      };
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: customer,
+      message: "Change the price."
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        toolExecuted = true;
+
+        return { success: true, message: "should not run" };
+      }
+    }
+  );
+
+  assert.equal(toolExecuted, false);
+  assert.equal(result.executedTools[0].success, false);
+  assert.equal(result.executedTools[0].code, "TOOL_FORBIDDEN");
+});
+
+test("OpenRouter tool loop stops at configured maximum rounds", async () => {
+  const originalMaxRounds = process.env.OPENROUTER_MAX_TOOL_ROUNDS;
+  process.env.OPENROUTER_MAX_TOOL_ROUNDS = "2";
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    complete: async () => ({
+      toolCalls: [
+        {
+          id: `call_${Date.now()}`,
+          name: "get_menu",
+          arguments: {}
+        }
+      ]
+    })
+  };
+
+  try {
+    const result = await runAgentOrchestrator(
+      {
+        restaurant: fakeRestaurant,
+        sender: fakeOwner,
+        message: "Loop please"
+      },
+      {
+        provider,
+        getHistory: getEmptyHistory,
+        saveMessage: saveNoop,
+        buildSystemPrompt: buildTestPrompt,
+        executeTool: async () => ({
+          success: true,
+          message: "Menu retrieved successfully.",
+          data: []
+        })
+      }
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.executedTools.length, 2);
+    assert.match(result.message, /couldn't complete/i);
+  } finally {
+    restoreEnv("OPENROUTER_MAX_TOOL_ROUNDS", originalMaxRounds);
+  }
+});
+
+test("OpenRouter provider errors return a safe response from orchestrator", async () => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    complete: async () => {
+      throw new Error("timeout");
+    }
+  };
+
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Show me orders"
+    },
+    {
+      provider,
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.match(result.message, /trouble reaching the restaurant system/i);
+});
+
+test("OpenRouter tool definitions are role filtered", () => {
+  const ownerTools = getAgentToolDefinitionsForRole("owner").map((tool) => tool.function.name);
+  const customerTools = getAgentToolDefinitionsForRole("customer").map((tool) => tool.function.name);
+
+  assert.equal(ownerTools.includes("get_menu"), true);
+  assert.equal(ownerTools.includes("list_orders"), true);
+  assert.equal(ownerTools.includes("update_menu_price"), true);
+  assert.equal(customerTools.includes("update_menu_price"), false);
+  assert.equal(customerTools.includes("get_sales_summary"), false);
+});
+
+test("OpenRouter selected provider config fails clearly when missing", () => {
+  const originalProvider = process.env.AI_PROVIDER;
+  const originalApiKey = process.env.OPENROUTER_API_KEY;
+  const originalModel = process.env.OPENROUTER_MODEL;
+
+  process.env.AI_PROVIDER = "openrouter";
+  delete process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_MODEL = "google/gemini-3.1-flash-lite";
+
+  try {
+    assert.throws(
+      () => validateSelectedAiProviderConfig(),
+      /OPENROUTER_API_KEY/
+    );
+  } finally {
+    restoreEnv("AI_PROVIDER", originalProvider);
+    restoreEnv("OPENROUTER_API_KEY", originalApiKey);
+    restoreEnv("OPENROUTER_MODEL", originalModel);
   }
 });

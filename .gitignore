@@ -5,7 +5,7 @@ uploads/
 
 .env
 .env.*
-!.env.example
+.env.example
 
 npm-debug.log*
 pnpm-debug.log*

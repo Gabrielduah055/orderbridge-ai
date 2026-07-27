@@ -1,6 +1,6 @@
 # OrderBridge AI Backend
 
-OrderBridge AI is a multi-tenant WhatsApp AI restaurant ordering SaaS. This backend foundation supports the first admin feature: super admins can create and manage restaurants. WhatsApp bot flows, Hermes AI ordering, menus, orders, receipts, reports, and promotions are intentionally left for later modules.
+OrderBridge AI is a multi-tenant WhatsApp AI restaurant ordering SaaS. This backend foundation supports super admins, restaurants, menus, orders, Wasender webhooks, receipt PDFs, and a restaurant operations agent.
 
 ## Tech Stack
 
@@ -34,9 +34,23 @@ DEBUG_DB_ERRORS=false
 FIREBASE_PROJECT_ID=your-firebase-project-id
 FIREBASE_CLIENT_EMAIL=your-service-account-client-email
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=your-openrouter-api-key
+OPENROUTER_MODEL=google/gemini-3.1-flash-lite
+OPENROUTER_TIMEOUT_MS=45000
+OPENROUTER_MAX_TOOL_ROUNDS=6
+OPENROUTER_SITE_URL=
+OPENROUTER_APP_NAME=OrderBridgeAI
 ```
 
 The backend reads Firebase service account values from environment variables. `FIREBASE_PRIVATE_KEY` supports escaped newlines and is converted internally with `.replace(/\\n/g, "\n")`.
+
+## Restaurant Agent
+
+Owner and manager WhatsApp messages can use OpenRouter by setting `AI_PROVIDER=openrouter`. The backend sends the selected model only role-filtered tool definitions, then executes any requested tool locally through the existing `executeAgentTool` flow. MongoDB-backed services remain the source of truth for menu items, prices, availability, orders, revenue, and mutations.
+
+Hermes is still available for rollback with `AI_PROVIDER=hermes`. Customer messages remain on the existing customer ordering flow during this migration phase.
 
 ## Firebase Setup
 
