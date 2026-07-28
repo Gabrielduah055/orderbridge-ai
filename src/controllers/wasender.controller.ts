@@ -214,39 +214,26 @@ const findRestaurantForWebhook = async (
   }).select("+wasenderApiToken");
 };
 
-const sendCustomerOrderSideEffects = async (
-  restaurant: IRestaurantDocument,
-  customerResponse: RestaurantAgentResponse
-): Promise<void> => {
-  const orderData = customerResponse.data?.order;
-  const orderList = Array.isArray(customerResponse.data?.orders)
-    ? customerResponse.data?.orders
-    : undefined;
-  const orderEvent = customerResponse.data?.orderEvent;
+const getStructuredOrderId = (orderData: unknown): string => {
+  return typeof orderData === "object" && orderData !== null && "_id" in orderData
+    ? String((orderData as { _id?: unknown })._id)
+    : typeof orderData === "object" && orderData !== null && "id" in orderData
+      ? String((orderData as { id?: unknown }).id)
+      : "";
+};
 
-  if (orderList && orderEvent) {
-    for (const order of orderList) {
-      await sendCustomerOrderSideEffects(restaurant, {
-        ...customerResponse,
-        data: {
-          ...customerResponse.data,
-          order
-        }
-      });
-    }
-    return;
-  }
+const sendSingleCustomerOrderSideEffect = async (
+  restaurant: IRestaurantDocument,
+  customerResponse: RestaurantAgentResponse,
+  orderData: unknown
+): Promise<void> => {
+  const orderEvent = customerResponse.data?.orderEvent;
 
   if (!orderData || !orderEvent) {
     return;
   }
 
-  const orderId =
-    typeof orderData === "object" && "_id" in orderData
-      ? String((orderData as { _id?: unknown })._id)
-      : typeof orderData === "object" && "id" in orderData
-        ? String((orderData as { id?: unknown }).id)
-        : "";
+  const orderId = getStructuredOrderId(orderData);
 
   if (!orderId) {
     console.error("Order side effect skipped because structured order ID is missing", {
@@ -283,6 +270,24 @@ const sendCustomerOrderSideEffects = async (
   if (orderEvent === "rejected" && customerResponse.data?.notifyCustomer) {
     await notifyCustomerOfRejectedOrder(restaurant, order);
   }
+};
+
+export const sendCustomerOrderSideEffects = async (
+  restaurant: IRestaurantDocument,
+  customerResponse: RestaurantAgentResponse
+): Promise<void> => {
+  const orderList = Array.isArray(customerResponse.data?.orders)
+    ? customerResponse.data.orders
+    : undefined;
+
+  if (orderList) {
+    for (const orderData of orderList) {
+      await sendSingleCustomerOrderSideEffect(restaurant, customerResponse, orderData);
+    }
+    return;
+  }
+
+  await sendSingleCustomerOrderSideEffect(restaurant, customerResponse, customerResponse.data?.order);
 };
 
 const processNormalizedWebhook = async (

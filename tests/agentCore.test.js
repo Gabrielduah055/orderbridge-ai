@@ -1092,6 +1092,79 @@ test("owner selection message preserves numbered order list", () => {
   assert.match(message, /Reply 1, 2, or both/);
 });
 
+test("bulk accepted order side effects process each order exactly once", async () => {
+  const sideEffects = require("../dist/services/orderSideEffects.service");
+  const { Order } = require("../dist/models/order.model");
+  const controllerPath = require.resolve("../dist/controllers/wasender.controller");
+  const originalFindOne = Order.findOne;
+  const originalNotifyConfirmed = sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt;
+  const acceptedOrders = [
+    {
+      _id: "64b000000000000000000201",
+      orderNumber: "ORD-201",
+      customerName: "Rebecca"
+    },
+    {
+      _id: "64b000000000000000000202",
+      orderNumber: "ORD-202",
+      customerName: "Ama"
+    }
+  ];
+  const notificationCounts = new Map();
+  const receiptCounts = new Map();
+
+  delete require.cache[controllerPath];
+
+  Order.findOne = async (query) => {
+    return acceptedOrders.find((order) => String(order._id) === String(query._id)) ?? null;
+  };
+  sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = async (_restaurant, order) => {
+    notificationCounts.set(String(order._id), (notificationCounts.get(String(order._id)) ?? 0) + 1);
+    receiptCounts.set(String(order._id), (receiptCounts.get(String(order._id)) ?? 0) + 1);
+
+    return {
+      customerNotification: "queued",
+      receiptDelivery: "queued"
+    };
+  };
+
+  try {
+    const { sendCustomerOrderSideEffects } = require("../dist/controllers/wasender.controller");
+    const restaurantRecord = {
+      _id: "64b000000000000000000001",
+      name: "Golden Grill"
+    };
+    const response = {
+      success: true,
+      message: "2 orders accepted.",
+      data: {
+        orders: acceptedOrders,
+        orderEvent: "confirmed",
+        notifyCustomer: true,
+        receiptRequired: true
+      }
+    };
+    const timeout = new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("bulk side effects did not finish")), 250);
+    });
+
+    await Promise.race([sendCustomerOrderSideEffects(restaurantRecord, response), timeout]);
+
+    assert.deepEqual(
+      acceptedOrders.map((order) => notificationCounts.get(String(order._id))),
+      [1, 1]
+    );
+    assert.deepEqual(
+      acceptedOrders.map((order) => receiptCounts.get(String(order._id))),
+      [1, 1]
+    );
+  } finally {
+    Order.findOne = originalFindOne;
+    sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = originalNotifyConfirmed;
+    delete require.cache[controllerPath];
+  }
+});
+
 test("pending order expiry helpers exclude old orders", () => {
   const now = new Date("2026-07-28T12:00:00.000Z");
   const fresh = {
