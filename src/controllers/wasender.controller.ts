@@ -18,6 +18,29 @@ import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 
+const customerConversationQueues = new Map<string, Promise<void>>();
+
+export const runCustomerConversationSequentially = async <T>(
+  restaurantId: string,
+  customerPhone: string,
+  task: () => Promise<T>
+): Promise<T> => {
+  const key = `${restaurantId}:${normalizeGhanaPhone(customerPhone)}`;
+  const previous = customerConversationQueues.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(task);
+  const cleanup = next
+    .then(() => undefined, () => undefined)
+    .finally(() => {
+      if (customerConversationQueues.get(key) === cleanup) {
+        customerConversationQueues.delete(key);
+      }
+    });
+
+  customerConversationQueues.set(key, cleanup);
+
+  return next;
+};
+
 const getWebhookSecret = (req: Request): string | undefined => {
   const headerSecret =
     req.header("x-webhook-signature") ??
@@ -328,88 +351,101 @@ const processNormalizedWebhook = async (
     }
 
     const sender = resolveSenderIdentity(restaurant, webhook.from);
-    let conversationMetadata: Record<string, unknown> = {};
+    const processWebhookTurn = async (): Promise<void> => {
+      let conversationMetadata: Record<string, unknown> = {};
 
-    if (sender.role === "customer") {
-      const turnSession = await recordInboundCustomerTurn(
-        String(restaurant._id),
-        normalizeGhanaPhone(webhook.from),
-        eventId,
-        sender.name
-      );
+      if (sender.role === "customer") {
+        const turnSession = await recordInboundCustomerTurn(
+          String(restaurant._id),
+          normalizeGhanaPhone(webhook.from),
+          eventId,
+          sender.name
+        );
 
-      conversationMetadata = {
-        customerPhone: turnSession.customerPhone,
-        inboundEventId: eventId,
-        draftId: String(turnSession._id),
-        conversationVersion: turnSession.conversationVersion,
-        expectedDraftStep: turnSession.currentStep
-      };
-    }
+        conversationMetadata = {
+          customerPhone: turnSession.customerPhone,
+          inboundEventId: eventId,
+          draftId: String(turnSession._id),
+          conversationVersion: turnSession.conversationVersion,
+          expectedDraftStep: turnSession.currentStep
+        };
+      }
 
-    if (webhook.messageType !== "text" || !webhook.message.trim()) {
+      if (webhook.messageType !== "text" || !webhook.message.trim()) {
+        await enqueueTextMessageOrThrow(
+          restaurant.wasenderSessionId,
+          webhook.from,
+          "Please send a text message so I can help with your order.",
+          {
+            action: "send_unsupported_message_type_reply",
+            restaurantId: String(restaurant._id),
+            eventId,
+            ...conversationMetadata,
+            responsePurpose: "unsupported_message_type"
+          },
+          restaurant.wasenderApiToken
+        );
+        webhookEvent.status = "processed";
+        webhookEvent.processedAt = new Date();
+        await webhookEvent.save();
+        return;
+      }
+
+      const agentResponse = await handleRestaurantAgentMessage({
+        restaurant,
+        senderPhone: webhook.from,
+        message: webhook.message,
+        quotedMessageId: webhook.quotedMessageId
+      });
+
+      if (sender.role === "customer") {
+        const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
+
+        if (latestDraft) {
+          conversationMetadata = {
+            ...conversationMetadata,
+            draftId: String(latestDraft._id),
+            conversationVersion: latestDraft.conversationVersion,
+            expectedDraftStep: latestDraft.currentStep
+          };
+        }
+      }
+
       await enqueueTextMessageOrThrow(
         restaurant.wasenderSessionId,
         webhook.from,
-        "Please send a text message so I can help with your order.",
+        agentResponse.message,
         {
-          action: "send_unsupported_message_type_reply",
+          action: "send_restaurant_agent_reply",
           restaurantId: String(restaurant._id),
           eventId,
+          source: agentResponse.source,
+          senderRole: agentResponse.sender?.role,
           ...conversationMetadata,
-          responsePurpose: "unsupported_message_type"
+          responsePurpose:
+            agentResponse.sender?.role === "customer"
+              ? latestResponsePurpose(agentResponse.message)
+              : "owner_agent_reply"
         },
         restaurant.wasenderApiToken
       );
+      await sendCustomerOrderSideEffects(restaurant, agentResponse);
+
       webhookEvent.status = "processed";
       webhookEvent.processedAt = new Date();
       await webhookEvent.save();
+    };
+
+    if (sender.role === "customer") {
+      await runCustomerConversationSequentially(
+        String(restaurant._id),
+        sender.normalizedPhone,
+        processWebhookTurn
+      );
       return;
     }
 
-    const agentResponse = await handleRestaurantAgentMessage({
-      restaurant,
-      senderPhone: webhook.from,
-      message: webhook.message,
-      quotedMessageId: webhook.quotedMessageId
-    });
-
-    if (sender.role === "customer") {
-      const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
-
-      if (latestDraft) {
-        conversationMetadata = {
-          ...conversationMetadata,
-          draftId: String(latestDraft._id),
-          conversationVersion: latestDraft.conversationVersion,
-          expectedDraftStep: latestDraft.currentStep
-        };
-      }
-    }
-
-    await enqueueTextMessageOrThrow(
-      restaurant.wasenderSessionId,
-      webhook.from,
-      agentResponse.message,
-      {
-        action: "send_restaurant_agent_reply",
-        restaurantId: String(restaurant._id),
-        eventId,
-        source: agentResponse.source,
-        senderRole: agentResponse.sender?.role,
-        ...conversationMetadata,
-        responsePurpose:
-          agentResponse.sender?.role === "customer"
-            ? latestResponsePurpose(agentResponse.message)
-            : "owner_agent_reply"
-      },
-      restaurant.wasenderApiToken
-    );
-    await sendCustomerOrderSideEffects(restaurant, agentResponse);
-
-    webhookEvent.status = "processed";
-    webhookEvent.processedAt = new Date();
-    await webhookEvent.save();
+    await processWebhookTurn();
   } catch (error) {
     if (
       error &&

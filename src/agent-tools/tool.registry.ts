@@ -8,6 +8,7 @@ import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
 import {
   buildClarificationCandidate,
+  cancelPendingOrderItemClarifications,
   createOrderItemClarification,
   findActiveOrderItemClarification,
   resolveOrderItemClarification
@@ -22,6 +23,7 @@ import {
   findActiveDraft,
   findMenuItemMatch,
   findMenuItemMatchInCategory,
+  getMenuItemDisplayName,
   getMissingDraftFields,
   getDraftMissingFieldCode,
   getOrCreateDraft,
@@ -176,6 +178,11 @@ const normalizeDisplayText = (value: string): string => {
 const getMenuItemCategoryName = (item: IMenuItemDocument): string | undefined => {
   return (item as IMenuItemDocument & { categoryName?: string }).categoryName;
 };
+
+const getClarificationCandidateDisplayName = (candidate: {
+  name: string;
+  categoryName?: string;
+}): string => getMenuItemDisplayName({ name: candidate.name }, candidate.categoryName);
 
 const getNextCategorySortOrder = async (restaurantId: string): Promise<number> => {
   const lastCategory = await MenuCategory.findOne({ restaurantId })
@@ -1061,6 +1068,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             };
           }
 
+          const displayName = getMenuItemDisplayName(
+            item,
+            resolved.candidate.categoryName ?? getMenuItemCategoryName(item)
+          );
           const quantity = resolveTrustedQuantity(
             args.quantity,
             context.originalMessage ?? args.itemName,
@@ -1069,19 +1080,25 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
           if (!quantity) {
             draft.pendingMenuItemId = item._id;
-            draft.pendingMenuItemName = item.name;
+            draft.pendingMenuItemName = displayName;
             draft.currentStep = "collecting_quantity";
             clearPendingCategory(draft);
+            await cancelPendingOrderItemClarifications({
+              restaurantId: context.restaurantId,
+              senderPhone: context.sender.normalizedPhone
+            });
             await draft.save();
 
             return {
               success: false,
               code: "ORDER_ITEM_QUANTITY_REQUIRED",
-              message: `Got it, ${item.name}. How many portions would you like?`,
+              message: `Got it, ${displayName}. How many portions would you like?`,
               data: buildDraftView(draft, context.restaurant)
             };
           }
 
+          (item as IMenuItemDocument & { categoryName?: string }).categoryName =
+            resolved.candidate.categoryName ?? getMenuItemCategoryName(item);
           addItemToDraft(draft, item, quantity);
           clearPendingMenuItem(draft);
           clearPendingCategory(draft);
@@ -1090,7 +1107,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
           return {
             success: true,
-            message: `Added ${quantity} x ${item.name} to the order draft.`,
+            message: `Added ${quantity} x ${displayName} to the order draft.`,
             data: buildDraftView(draft, context.restaurant)
           };
         }
@@ -1101,17 +1118,18 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           message:
             resolved.status === "none"
               ? `Please choose one of these options: ${activeClarification.candidates
-                  .map((candidate) => candidate.name)
+                  .map(getClarificationCandidateDisplayName)
                   .join(", ")}.`
               : `Please choose one option: ${resolved.matches
-                  .map((candidate) => candidate.name)
+                  .map(getClarificationCandidateDisplayName)
                   .join(", ")}.`,
           data: {
             candidates: (resolved.status === "none"
               ? activeClarification.candidates
               : resolved.matches
             ).map((candidate) => ({
-              name: candidate.name,
+              name: getClarificationCandidateDisplayName(candidate),
+              rawName: candidate.name,
               categoryId: candidate.categoryId ? String(candidate.categoryId) : undefined,
               categoryName: candidate.categoryName,
               price: candidate.price
@@ -1128,17 +1146,25 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         );
 
         if (categoryMatch.status === "matched") {
+          const displayName = getMenuItemDisplayName(
+            categoryMatch.item,
+            getMenuItemCategoryName(categoryMatch.item) ?? draft.pendingCategoryName
+          );
           if (!explicitQuantity) {
             draft.pendingMenuItemId = categoryMatch.item._id;
-            draft.pendingMenuItemName = categoryMatch.item.name;
+            draft.pendingMenuItemName = displayName;
             draft.currentStep = "collecting_quantity";
             clearPendingCategory(draft);
+            await cancelPendingOrderItemClarifications({
+              restaurantId: context.restaurantId,
+              senderPhone: context.sender.normalizedPhone
+            });
             await draft.save();
 
             return {
               success: false,
               code: "ORDER_ITEM_QUANTITY_REQUIRED",
-              message: `Got it, ${categoryMatch.item.name}. How many portions would you like?`,
+              message: `Got it, ${displayName}. How many portions would you like?`,
               data: buildDraftView(draft, context.restaurant)
             };
           }
@@ -1147,11 +1173,15 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           clearPendingMenuItem(draft);
           clearPendingCategory(draft);
           draft.currentStep = "choosing_items";
+          await cancelPendingOrderItemClarifications({
+            restaurantId: context.restaurantId,
+            senderPhone: context.sender.normalizedPhone
+          });
           await draft.save();
 
           return {
             success: true,
-            message: `Added ${explicitQuantity} x ${categoryMatch.item.name} to the order draft.`,
+            message: `Added ${explicitQuantity} x ${displayName} to the order draft.`,
             data: buildDraftView(draft, context.restaurant)
           };
         }
@@ -1181,7 +1211,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             message: categoryMatch.message,
             data: {
               candidates: categoryMatch.matches.map((item) => ({
-                name: item.name,
+                name: getMenuItemDisplayName(
+                  item,
+                  getMenuItemCategoryName(item) ?? draft.pendingCategoryName
+                ),
+                rawName: item.name,
                 categoryId: String(item.categoryId),
                 categoryName: getMenuItemCategoryName(item) ?? draft.pendingCategoryName,
                 price: item.price
@@ -1232,7 +1266,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           message: match.message,
           data: {
             candidates: match.matches.map((item) => ({
-              name: item.name,
+              name: getMenuItemDisplayName(item, getMenuItemCategoryName(item)),
+              rawName: item.name,
               categoryId: String(item.categoryId),
               categoryName: getMenuItemCategoryName(item),
               price: item.price
@@ -1242,29 +1277,39 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (!explicitQuantity) {
+        const displayName = getMenuItemDisplayName(match.item, getMenuItemCategoryName(match.item));
         draft.pendingMenuItemId = match.item._id;
-        draft.pendingMenuItemName = match.item.name;
+        draft.pendingMenuItemName = displayName;
         draft.currentStep = "collecting_quantity";
         clearPendingCategory(draft);
+        await cancelPendingOrderItemClarifications({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone
+        });
         await draft.save();
 
         return {
           success: false,
           code: "ORDER_ITEM_QUANTITY_REQUIRED",
-          message: `Sure. How many portions of ${match.item.name} would you like?`,
+          message: `Sure. How many portions of ${displayName} would you like?`,
           data: buildDraftView(draft, context.restaurant)
         };
       }
 
       const quantity = explicitQuantity;
+      const displayName = getMenuItemDisplayName(match.item, getMenuItemCategoryName(match.item));
       addItemToDraft(draft, match.item, quantity);
       clearPendingMenuItem(draft);
       draft.currentStep = "choosing_items";
+      await cancelPendingOrderItemClarifications({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone
+      });
       await draft.save();
 
       return {
         success: true,
-        message: `Added ${quantity} x ${match.item.name} to the order draft.`,
+        message: `Added ${quantity} x ${displayName} to the order draft.`,
         data: buildDraftView(draft, context.restaurant)
       };
     }

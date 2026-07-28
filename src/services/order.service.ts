@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import {
   Order,
@@ -141,6 +142,19 @@ const getMenuItemsForOrder = async (
 };
 
 const normalizeComparableText = (value: string): string => value.trim().replace(/\s+/g, " ").toLowerCase();
+const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
+
+const getDisplayOrderItemName = (item: IMenuItemDocument, categoryName?: string): string => {
+  const itemName = normalizeText(item.name);
+  const normalizedItemName = normalizeComparableText(itemName);
+  const normalizedCategoryName = categoryName ? normalizeComparableText(categoryName) : "";
+
+  if (!normalizedCategoryName || normalizedItemName.includes(normalizedCategoryName)) {
+    return itemName;
+  }
+
+  return `${itemName} ${normalizeText(categoryName!)}`;
+};
 
 export const resolveDeliveryFee = (
   restaurant: Pick<IRestaurantDocument, "deliveryPricing">,
@@ -224,6 +238,20 @@ export const buildOrderItems = async (
 
   const normalizedItems = normalizeOrderItems(inputItems);
   const menuItemById = await getMenuItemsForOrder(restaurantId, normalizedItems);
+  const categoryIds = Array.from(
+    new Set(
+      Array.from(menuItemById.values())
+        .map((item) => String(item.categoryId))
+        .filter(Boolean)
+    )
+  );
+  const categories = await MenuCategory.find({
+    _id: {
+      $in: categoryIds
+    },
+    restaurantId
+  });
+  const categoryNameById = new Map(categories.map((category) => [String(category._id), category.name]));
 
   return normalizedItems.map((item) => {
     const menuItem = menuItemById.get(item.menuItemId);
@@ -234,7 +262,7 @@ export const buildOrderItems = async (
 
     return {
       menuItemId: menuItem._id,
-      name: menuItem.name,
+      name: getDisplayOrderItemName(menuItem, categoryNameById.get(String(menuItem.categoryId))),
       quantity: item.quantity,
       unitPrice: menuItem.price,
       totalPrice: menuItem.price * item.quantity
