@@ -10,6 +10,7 @@ export interface NormalizedWasenderWebhook {
   messageType: WasenderMessageType;
   mediaUrl?: string;
   messageId?: string;
+  quotedMessageId?: string;
   receiver?: string;
   fromMe?: boolean;
   rawPayload: Record<string, unknown>;
@@ -189,6 +190,19 @@ const buildWebhookEventId = (payload: unknown): string => {
   }
 
   return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+};
+
+export const extractWasenderProviderMessageId = (payload: unknown): string | undefined => {
+  return firstString(payload, [
+    "messageId",
+    "message_id",
+    "id",
+    "data.messageId",
+    "data.message_id",
+    "data.id",
+    "data.key.id",
+    "key.id"
+  ]);
 };
 
 const postToWasender = async (
@@ -406,6 +420,16 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
   const messageId =
     firstString(messagePayload, ["key.id", "id", "messageId"]) ??
     buildWebhookEventId(rawPayload);
+  const quotedMessageId = firstStringFromSources([messagePayload, rawPayload], [
+    "message.extendedTextMessage.contextInfo.stanzaId",
+    "extendedTextMessage.contextInfo.stanzaId",
+    "contextInfo.stanzaId",
+    "quotedMessageId",
+    "quoted_message_id",
+    "data.quotedMessageId",
+    "data.quoted_message_id",
+    "data.messages.message.extendedTextMessage.contextInfo.stanzaId"
+  ]);
   const fromMe = firstBoolean(messagePayload, ["key.fromMe", "fromMe"]);
 
   return {
@@ -416,6 +440,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     messageType: detectMessageType(messagePayload ?? rawPayload, message),
     mediaUrl,
     messageId,
+    quotedMessageId,
     receiver: receiver || undefined,
     fromMe,
     rawPayload

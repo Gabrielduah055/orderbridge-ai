@@ -28,15 +28,26 @@ const {
   validateSelectedAiProviderConfig
 } = require("../dist/services/ai/ai.config");
 const {
-  resolveDeliveryFee
+  resolveDeliveryFee,
+  isPendingOrderActionable,
+  formatRelativeOrderAge
 } = require("../dist/services/order.service");
 const {
   getNextSessionSendAt,
-  getWasenderRetryDelayMs
+  getWasenderRetryDelayMs,
+  isQueuedConversationalMessageStale
 } = require("../dist/services/wasenderQueue.service");
 const {
-  parseExplicitQuantity
+  parseExplicitQuantity,
+  getMissingDraftFields,
+  getDraftMissingFieldCode,
+  buildDraftView,
+  buildStateAwareFollowUpMessage
 } = require("../dist/services/orderDraft.service");
+const {
+  normalizeIncomingWebhook,
+  extractWasenderProviderMessageId
+} = require("../dist/services/wasender.service");
 const {
   buildOwnerNewOrderNotification,
   buildCustomerOrderConfirmedMessage,
@@ -47,6 +58,11 @@ const {
   isPendingActionCancellationMessage,
   shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
+const {
+  parseSimpleOwnerDecision,
+  parseOwnerSelectionReply,
+  buildOwnerSelectionMessage
+} = require("../dist/services/ownerOrderResolution.service");
 
 const restaurant = {
   ownerName: "Gabriel",
@@ -115,7 +131,10 @@ test("explicit quantity parser does not infer quantity from item name alone", ()
   assert.equal(parseExplicitQuantity("I want two assorted fried rice"), 2);
   assert.equal(parseExplicitQuantity("I want a plate of jollof"), 1);
   assert.equal(parseExplicitQuantity("Make it 3"), 3);
-  assert.equal(parseExplicitQuantity("Add another one"), 1);
+  assert.equal(parseExplicitQuantity("Add another one"), null);
+  assert.equal(parseExplicitQuantity("that one"), null);
+  assert.equal(parseExplicitQuantity("I will go for the GHS 60 package"), null);
+  assert.equal(parseExplicitQuantity("2 portions"), 2);
 });
 
 test("delivery fee resolver uses configured sources only", () => {
@@ -174,6 +193,58 @@ test("delivery fee resolver reports manual confirmation separately", () => {
   );
 });
 
+test("manual delivery fee stays pending without becoming zero in draft view", () => {
+  const session = {
+    cartItems: [
+      {
+        name: "Jollof Rice",
+        quantity: 1,
+        unitPrice: 60,
+        totalPrice: 60
+      }
+    ],
+    orderType: "delivery",
+    deliveryAddress: "Madina",
+    deliveryFeeSource: "manual_confirmation",
+    deliveryFeeResolved: false,
+    customerName: "Rebecca"
+  };
+  const view = buildDraftView(session, {
+    deliveryPricing: { type: "manual_confirmation" }
+  });
+
+  assert.equal(view.deliveryFee, null);
+  assert.equal(view.deliveryFeePending, true);
+  assert.equal(view.deliveryFeeLabel, "To be communicated");
+  assert.equal(view.foodTotal, 60);
+  assert.equal(view.total, 60);
+  assert.deepEqual(view.missingFields, []);
+  assert.equal(view.readyToConfirm, true);
+});
+
+test("missing customer name gets structured draft error code", () => {
+  const missing = getMissingDraftFields({
+    cartItems: [{ totalPrice: 60 }],
+    orderType: "pickup",
+    deliveryFeeResolved: true
+  });
+
+  assert.equal(missing.includes("customerName"), true);
+  assert.equal(getDraftMissingFieldCode(missing), "CUSTOMER_NAME_REQUIRED");
+});
+
+test("state-aware follow-ups use active order step", () => {
+  assert.equal(
+    buildStateAwareFollowUpMessage("collecting_quantity"),
+    "Are you still there? I just need the number of portions you would like."
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage("collecting_name"),
+    "Are you still there? I just need the name for the order."
+  );
+  assert.equal(buildStateAwareFollowUpMessage("idle"), null);
+});
+
 test("Wasender queue respects retry_after from account protection", () => {
   assert.equal(
     getWasenderRetryDelayMs({
@@ -194,6 +265,74 @@ test("Wasender queue spaces sends per session", () => {
 
   assert.equal(nextSendAt.toISOString(), "2026-07-27T17:29:53.000Z");
   assert.equal(getNextSessionSendAt(lastSentAt, new Date("2026-07-27T17:29:54.000Z"), 5000), null);
+});
+
+test("stale conversational replies are cancelled while transactional messages continue", () => {
+  const session = {
+    conversationVersion: 3,
+    currentStep: "collecting_quantity"
+  };
+
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        conversationVersion: 1,
+        expectedDraftStep: "idle",
+        responsePurpose: "greeting"
+      },
+      session
+    ),
+    true
+  );
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        conversationVersion: 3,
+        expectedDraftStep: "collecting_quantity",
+        responsePurpose: "quantity_clarification"
+      },
+      session
+    ),
+    false
+  );
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        kind: "receipt_delivery",
+        conversationVersion: 1
+      },
+      session
+    ),
+    false
+  );
+});
+
+test("Wasender normalizer extracts quoted reply and provider message IDs from known shapes", () => {
+  const webhook = normalizeIncomingWebhook({
+    event: "messages.received",
+    data: {
+      messages: {
+        key: {
+          id: "inbound-1",
+          remoteJid: "233557038547@s.whatsapp.net",
+          fromMe: false
+        },
+        message: {
+          extendedTextMessage: {
+            text: "Accept",
+            contextInfo: {
+              stanzaId: "owner-notification-1"
+            }
+          }
+        }
+      }
+    },
+    sessionId: "session-1"
+  });
+
+  assert.equal(webhook.message, "Accept");
+  assert.equal(webhook.quotedMessageId, "owner-notification-1");
+  assert.equal(extractWasenderProviderMessageId({ data: { key: { id: "sent-1" } } }), "sent-1");
 });
 
 test("restaurant acceptance and rejection are owner or manager only", () => {
@@ -881,6 +1020,9 @@ test("owner notification text uses real order data and pending status", () => {
       customerPhone: "+233557038547",
       orderType: "delivery",
       deliveryAddress: "Madina",
+      subtotal: 165,
+      deliveryFee: null,
+      deliveryFeePending: true,
       items: [
         {
           name: "Jollof Rice",
@@ -904,11 +1046,68 @@ test("owner notification text uses real order data and pending status", () => {
   assert.match(message, /New order awaiting your confirmation/);
   assert.match(message, /Golden Grill/);
   assert.match(message, /Order: ORD-123/);
+  assert.match(message, /Customer: Gabriel/);
   assert.match(message, /2 x Jollof Rice - GHS 120\.00/);
+  assert.match(message, /Delivery fee: Pending confirmation/);
+  assert.match(message, /Food total: GHS 165\.00/);
   assert.match(message, /Total: GHS 165\.00/);
   assert.match(message, /Status: Awaiting confirmation/);
-  assert.match(message, /ACCEPT ORD-123/);
-  assert.match(message, /REJECT ORD-123/);
+  assert.match(message, /Reply to this message with:/);
+  assert.match(message, /\bAccept\b/);
+  assert.match(message, /\bReject\b/);
+});
+
+test("owner simple decisions and saved selections parse safely", () => {
+  assert.equal(parseSimpleOwnerDecision("Accept"), "accept");
+  assert.equal(parseSimpleOwnerDecision("Reject"), "reject");
+  assert.equal(parseSimpleOwnerDecision("Accept ORD-123"), null);
+  assert.deepEqual(parseOwnerSelectionReply("1", 2), { type: "indexes", indexes: [1] });
+  assert.deepEqual(parseOwnerSelectionReply("both", 2), { type: "all" });
+  assert.deepEqual(parseOwnerSelectionReply("cancel", 2), { type: "cancel" });
+});
+
+test("owner selection message preserves numbered order list", () => {
+  const now = new Date("2026-07-28T12:00:00.000Z");
+  const orders = [
+    {
+      customerName: "Rebecca",
+      items: [{ name: "Jollof Rice" }],
+      subtotal: 60,
+      customerConfirmedAt: new Date("2026-07-28T11:58:00.000Z"),
+      createdAt: new Date("2026-07-28T11:58:00.000Z")
+    },
+    {
+      customerName: "Ama",
+      items: [{ name: "Fried Rice" }],
+      subtotal: 80,
+      customerConfirmedAt: new Date("2026-07-28T11:55:00.000Z"),
+      createdAt: new Date("2026-07-28T11:55:00.000Z")
+    }
+  ];
+  const message = buildOwnerSelectionMessage("accept", orders, now);
+
+  assert.match(message, /Which order should I accept/);
+  assert.match(message, /1\. Rebecca - Jollof Rice - GHS 60\.00 - 2 minutes ago/);
+  assert.match(message, /2\. Ama - Fried Rice - GHS 80\.00 - 5 minutes ago/);
+  assert.match(message, /Reply 1, 2, or both/);
+});
+
+test("pending order expiry helpers exclude old orders", () => {
+  const now = new Date("2026-07-28T12:00:00.000Z");
+  const fresh = {
+    status: "awaiting_restaurant_confirmation",
+    customerConfirmedAt: new Date("2026-07-28T11:30:00.000Z"),
+    createdAt: new Date("2026-07-28T11:30:00.000Z")
+  };
+  const old = {
+    status: "awaiting_restaurant_confirmation",
+    customerConfirmedAt: new Date("2026-07-28T10:00:00.000Z"),
+    createdAt: new Date("2026-07-28T10:00:00.000Z")
+  };
+
+  assert.equal(isPendingOrderActionable(fresh, now, 60), true);
+  assert.equal(isPendingOrderActionable(old, now, 60), false);
+  assert.equal(formatRelativeOrderAge(old, now), "2 hours ago");
 });
 
 test("customer decision messages do not invent receipt on rejection", () => {

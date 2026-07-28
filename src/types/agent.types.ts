@@ -55,6 +55,7 @@ export interface RestaurantAgentMessageInput {
   restaurant: IRestaurantDocument;
   senderPhone: string;
   message: string;
+  quotedMessageId?: string;
 }
 
 export interface RestaurantAgentResponse {
@@ -95,6 +96,8 @@ export interface ToolExecutionContext {
   restaurant: IRestaurantDocument;
   sender: ResolvedSender;
   requestId?: string;
+  originalMessage?: string;
+  quotedMessageId?: string;
   confirmed?: boolean;
 }
 

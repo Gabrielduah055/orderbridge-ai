@@ -23,6 +23,13 @@ const numberWords = new Map<string, number>([
   ["ten", 10]
 ]);
 
+const ambiguousQuantityPhrases = [
+  /\b(that|this|the)\s+one\b/,
+  /\b(another one|one more)\b/,
+  /\b(the|that|this)\s+(?:ghs\s*)?\d+(?:\.\d+)?\s+(package|pack|option|one)\b/,
+  /^(ok|okay|yes|yeah|yh|sure|alright)$/
+];
+
 export type MenuItemMatchResult =
   | {
       status: "matched";
@@ -50,6 +57,8 @@ export const resetDraftState = (session: ICustomerSessionDocument): void => {
   session.deliveryFee = undefined;
   session.deliveryFeeSource = undefined;
   session.deliveryFeeResolved = false;
+  session.lastFollowUpKey = undefined;
+  session.lastFollowUpAt = undefined;
 };
 
 export const clearConvertedDraftState = (session: ICustomerSessionDocument): void => {
@@ -64,9 +73,22 @@ export const clearPendingMenuItem = (session: ICustomerSessionDocument): void =>
 
 export const parseExplicitQuantity = (message: string): number | null => {
   const normalized = normalizeComparableText(message);
-  const digitMatch = normalized.match(/\b(\d+)\b/);
 
-  if (digitMatch) {
+  if (ambiguousQuantityPhrases.some((pattern) => pattern.test(normalized))) {
+    return null;
+  }
+
+  const digitMatches = Array.from(normalized.matchAll(/\b(\d+)\b/g));
+
+  for (const digitMatch of digitMatches) {
+    const index = digitMatch.index ?? 0;
+    const before = normalized.slice(Math.max(0, index - 12), index);
+    const after = normalized.slice(index + digitMatch[0].length, index + digitMatch[0].length + 18);
+
+    if (/\b(ghs|cedis?|gh₵)\s*$/i.test(before) || /^\s*(cedis?|package|option)\b/i.test(after)) {
+      continue;
+    }
+
     const quantity = Number(digitMatch[1]);
 
     return Number.isInteger(quantity) && quantity > 0 ? quantity : null;
@@ -82,11 +104,47 @@ export const parseExplicitQuantity = (message: string): number | null => {
     return 1;
   }
 
-  if (/\b(add another one|another one|one more)\b/.test(normalized)) {
-    return 1;
+  return null;
+};
+
+export const resolveTrustedQuantity = (
+  modelQuantity: number | undefined,
+  customerMessage?: string,
+  pendingQuantity?: number | null
+): number | null => {
+  if (pendingQuantity && Number.isInteger(pendingQuantity) && pendingQuantity > 0) {
+    return pendingQuantity;
   }
 
-  return null;
+  const explicitQuantity = customerMessage ? parseExplicitQuantity(customerMessage) : null;
+
+  if (!explicitQuantity) {
+    return null;
+  }
+
+  if (modelQuantity !== undefined && modelQuantity !== explicitQuantity) {
+    return null;
+  }
+
+  return explicitQuantity;
+};
+
+export const recordInboundCustomerTurn = async (
+  restaurantId: string,
+  customerPhone: string,
+  inboundEventId?: string,
+  customerName?: string
+): Promise<ICustomerSessionDocument> => {
+  const session = await getOrCreateDraft(restaurantId, customerPhone, customerName);
+
+  if (inboundEventId && session.lastInboundEventId === inboundEventId) {
+    return session;
+  }
+
+  session.conversationVersion = (session.conversationVersion ?? 0) + 1;
+  session.lastInboundEventId = inboundEventId;
+  session.expiresAt = getDraftExpiry();
+  return session.save();
 };
 
 export const getOrCreateDraft = async (
@@ -108,6 +166,7 @@ export const getOrCreateDraft = async (
       currentStep: "idle",
       orderType: null,
       deliveryFeeResolved: false,
+      conversationVersion: 0,
       expiresAt: getDraftExpiry()
     });
   }
@@ -315,7 +374,11 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
     missing.push("deliveryAddress");
   }
 
-  if (session.orderType === "delivery" && !session.deliveryFeeResolved) {
+  if (
+    session.orderType === "delivery" &&
+    !session.deliveryFeeResolved &&
+    session.deliveryFeeSource !== "manual_confirmation"
+  ) {
     missing.push("deliveryFee");
   }
 
@@ -324,6 +387,18 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
   }
 
   return missing;
+};
+
+export const getDraftMissingFieldCode = (missingFields: string[]): string => {
+  if (missingFields.includes("customerName")) {
+    return "CUSTOMER_NAME_REQUIRED";
+  }
+
+  if (missingFields.includes("quantity")) {
+    return "ORDER_ITEM_QUANTITY_REQUIRED";
+  }
+
+  return "ORDER_DRAFT_INCOMPLETE";
 };
 
 export const buildDraftView = (
@@ -340,6 +415,10 @@ export const buildDraftView = (
       ? session.deliveryFee ?? deliveryFeeResolution?.amount
       : 0;
   const resolvedDeliveryFee = typeof deliveryFee === "number" ? deliveryFee : null;
+  const deliveryFeePending =
+    orderType === "delivery" &&
+    !session.deliveryFeeResolved &&
+    (session.deliveryFeeSource ?? deliveryFeeResolution?.source) === "manual_confirmation";
   const missingFields = getMissingDraftFields(session);
 
   return {
@@ -360,10 +439,13 @@ export const buildDraftView = (
       : undefined,
     subtotal,
     deliveryFee: resolvedDeliveryFee,
+    deliveryFeePending,
+    deliveryFeeLabel: deliveryFeePending ? "To be communicated" : undefined,
     deliveryFeeSource: session.deliveryFeeSource ?? deliveryFeeResolution?.source,
     deliveryFeeResolved:
       orderType === "pickup" ? true : orderType === "delivery" ? session.deliveryFeeResolved : false,
-    total: resolvedDeliveryFee === null ? null : subtotal + resolvedDeliveryFee,
+    foodTotal: subtotal,
+    total: resolvedDeliveryFee === null ? (deliveryFeePending ? subtotal : null) : subtotal + resolvedDeliveryFee,
     missingFields,
     readyToConfirm: missingFields.length === 0,
     convertedOrderId: session.convertedOrderId ? String(session.convertedOrderId) : undefined
@@ -398,7 +480,9 @@ export const submitOrderDraft = async (
   const missingFields = getMissingDraftFields(draft);
 
   if (missingFields.length > 0) {
-    throw new BadRequestError(`The order draft is missing: ${missingFields.join(", ")}.`);
+    const error = new BadRequestError(`The order draft is missing: ${missingFields.join(", ")}.`);
+    error.code = getDraftMissingFieldCode(missingFields);
+    throw error;
   }
 
   const order = await orderService.createOrder(restaurantId, {
@@ -427,4 +511,27 @@ export const submitOrderDraft = async (
     idempotent: false,
     draft
   };
+};
+
+export const buildStateAwareFollowUpMessage = (
+  step: ICustomerSessionDocument["currentStep"]
+): string | null => {
+  switch (step) {
+    case "collecting_quantity":
+      return "Are you still there? I just need the number of portions you would like.";
+    case "choosing_order_type":
+      return "Are you still there? Should I prepare the order for pickup or delivery?";
+    case "collecting_address":
+      return "Are you still there? Please send the delivery location when you are ready.";
+    case "collecting_name":
+      return "Are you still there? I just need the name for the order.";
+    case "confirming_order":
+      return "Your order is ready to be submitted. Would you like me to send it to the restaurant?";
+    default:
+      return null;
+  }
+};
+
+export const buildFollowUpKey = (session: ICustomerSessionDocument): string => {
+  return `${session.currentStep}:${session.conversationVersion ?? 0}`;
 };

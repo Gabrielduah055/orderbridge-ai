@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
+import { findActiveDraft, recordInboundCustomerTurn } from "../services/orderDraft.service";
 import { handleRestaurantAgentMessage } from "../services/restaurantAgent.service";
 import {
   notifyCustomerOfConfirmedOrderAndSendReceipt,
@@ -15,6 +16,7 @@ import {
 import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
 import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import { resolveSenderIdentity } from "../services/senderIdentity.service";
 
 const getWebhookSecret = (req: Request): string | undefined => {
   const headerSecret =
@@ -136,6 +138,30 @@ const getErrorDetails = (error: unknown): Record<string, unknown> => {
   return details;
 };
 
+const latestResponsePurpose = (message: string): string => {
+  if (/welcome|hello|hi\b/i.test(message)) {
+    return "greeting";
+  }
+
+  if (/how many|number of portions|1, 2, or more/i.test(message)) {
+    return "quantity_clarification";
+  }
+
+  if (/pickup or delivery/i.test(message)) {
+    return "order_type_question";
+  }
+
+  if (/delivery location|where should we deliver|address/i.test(message)) {
+    return "address_question";
+  }
+
+  if (/may I have your name|name please/i.test(message)) {
+    return "name_question";
+  }
+
+  return "conversation";
+};
+
 const enqueueTextMessageOrThrow = async (
   sessionId: string,
   to: string,
@@ -193,7 +219,23 @@ const sendCustomerOrderSideEffects = async (
   customerResponse: RestaurantAgentResponse
 ): Promise<void> => {
   const orderData = customerResponse.data?.order;
+  const orderList = Array.isArray(customerResponse.data?.orders)
+    ? customerResponse.data?.orders
+    : undefined;
   const orderEvent = customerResponse.data?.orderEvent;
+
+  if (orderList && orderEvent) {
+    for (const order of orderList) {
+      await sendCustomerOrderSideEffects(restaurant, {
+        ...customerResponse,
+        data: {
+          ...customerResponse.data,
+          order
+        }
+      });
+    }
+    return;
+  }
 
   if (!orderData || !orderEvent) {
     return;
@@ -280,6 +322,26 @@ const processNormalizedWebhook = async (
       throw new Error("Wasender webhook missing sender phone");
     }
 
+    const sender = resolveSenderIdentity(restaurant, webhook.from);
+    let conversationMetadata: Record<string, unknown> = {};
+
+    if (sender.role === "customer") {
+      const turnSession = await recordInboundCustomerTurn(
+        String(restaurant._id),
+        normalizeGhanaPhone(webhook.from),
+        eventId,
+        sender.name
+      );
+
+      conversationMetadata = {
+        customerPhone: turnSession.customerPhone,
+        inboundEventId: eventId,
+        draftId: String(turnSession._id),
+        conversationVersion: turnSession.conversationVersion,
+        expectedDraftStep: turnSession.currentStep
+      };
+    }
+
     if (webhook.messageType !== "text" || !webhook.message.trim()) {
       await enqueueTextMessageOrThrow(
         restaurant.wasenderSessionId,
@@ -288,7 +350,9 @@ const processNormalizedWebhook = async (
         {
           action: "send_unsupported_message_type_reply",
           restaurantId: String(restaurant._id),
-          eventId
+          eventId,
+          ...conversationMetadata,
+          responsePurpose: "unsupported_message_type"
         },
         restaurant.wasenderApiToken
       );
@@ -301,8 +365,22 @@ const processNormalizedWebhook = async (
     const agentResponse = await handleRestaurantAgentMessage({
       restaurant,
       senderPhone: webhook.from,
-      message: webhook.message
+      message: webhook.message,
+      quotedMessageId: webhook.quotedMessageId
     });
+
+    if (sender.role === "customer") {
+      const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
+
+      if (latestDraft) {
+        conversationMetadata = {
+          ...conversationMetadata,
+          draftId: String(latestDraft._id),
+          conversationVersion: latestDraft.conversationVersion,
+          expectedDraftStep: latestDraft.currentStep
+        };
+      }
+    }
 
     await enqueueTextMessageOrThrow(
       restaurant.wasenderSessionId,
@@ -313,7 +391,12 @@ const processNormalizedWebhook = async (
         restaurantId: String(restaurant._id),
         eventId,
         source: agentResponse.source,
-        senderRole: agentResponse.sender?.role
+        senderRole: agentResponse.sender?.role,
+        ...conversationMetadata,
+        responsePurpose:
+          agentResponse.sender?.role === "customer"
+            ? latestResponsePurpose(agentResponse.message)
+            : "owner_agent_reply"
       },
       restaurant.wasenderApiToken
     );

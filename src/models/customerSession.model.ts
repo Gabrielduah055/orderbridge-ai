@@ -38,6 +38,10 @@ export interface ICustomerSession {
   convertedOrderId?: Types.ObjectId;
   convertedAt?: Date;
   lastMessage?: string;
+  lastInboundEventId?: string;
+  conversationVersion: number;
+  lastFollowUpKey?: string;
+  lastFollowUpAt?: Date;
   expiresAt: Date;
 }
 
@@ -145,6 +149,22 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
     lastMessage: {
       type: String,
       trim: true
+    },
+    lastInboundEventId: {
+      type: String,
+      trim: true
+    },
+    conversationVersion: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    lastFollowUpKey: {
+      type: String,
+      trim: true
+    },
+    lastFollowUpAt: {
+      type: Date
     },
     expiresAt: {
       type: Date,

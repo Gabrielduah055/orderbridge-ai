@@ -13,6 +13,7 @@ export const ownerAgentActions = [
   "UPDATE_MENU_PRICE",
   "MARK_ITEM_UNAVAILABLE",
   "MARK_ITEM_AVAILABLE",
+  "OWNER_ORDER_SELECTION",
   "TOOL_CALL"
 ] as const;
 

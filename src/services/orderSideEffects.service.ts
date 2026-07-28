@@ -33,7 +33,7 @@ const getOrderReference = (order: IOrderDocument): string => {
   return order.orderNumber ?? String(order._id);
 };
 
-const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
+export const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
   if (!receiptUrl) {
     return null;
   }
@@ -65,13 +65,22 @@ export const buildOwnerNewOrderNotification = (
     order.orderType === "delivery" && order.deliveryAddress
       ? [`Address: ${order.deliveryAddress}`]
       : [];
+  const deliveryLines =
+    order.orderType === "delivery"
+      ? [
+          order.deliveryFeePending
+            ? "Delivery fee: Pending confirmation"
+            : `Delivery fee: ${formatGhanaCedi(order.deliveryFee ?? 0)}`,
+          `Food total: ${formatGhanaCedi(order.subtotal)}`
+        ]
+      : [];
 
   return [
     "New order awaiting your confirmation",
     "",
     `Restaurant: ${restaurant.name}`,
     `Order: ${getOrderReference(order)}`,
-    `Customer: ${order.customerName || "Guest"}`,
+    `Customer: ${order.customerName || "Customer"}`,
     `Phone: ${order.customerPhone}`,
     `Type: ${formatTitleCase(order.orderType)}`,
     ...deliveryAddress,
@@ -79,14 +88,15 @@ export const buildOwnerNewOrderNotification = (
     "Items:",
     items,
     "",
+    ...deliveryLines,
     `Total: ${formatGhanaCedi(order.total)}`,
     `Payment: ${formatTitleCase(order.paymentMethod)} / ${formatTitleCase(order.paymentStatus)}`,
     "Status: Awaiting confirmation",
     "",
-    "Reply:",
-    `ACCEPT ${getOrderReference(order)}`,
-    "or",
-    `REJECT ${getOrderReference(order)}`
+    "Reply to this message with:",
+    "",
+    "Accept",
+    "Reject"
   ].join("\n");
 };
 
@@ -128,7 +138,7 @@ export const notifyOwnerOfSubmittedOrder = async (
     };
   }
 
-  await enqueueWasenderMessage({
+  const queued = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
     to: restaurant.ownerPhone,
@@ -148,6 +158,7 @@ export const notifyOwnerOfSubmittedOrder = async (
     restaurantId: String(restaurant._id),
     orderId: String(order._id),
     orderNumber: order.orderNumber,
+    queueMessageId: String(queued._id),
     recipientType: "owner"
   });
 
@@ -201,14 +212,31 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
 
   if (!order.receiptUrl) {
     try {
+      console.info("Receipt generation started", {
+        restaurantId: String(restaurant._id),
+        orderId: String(order._id),
+        orderNumber: order.orderNumber
+      });
       const receipt = await generateOrderReceipt(String(order._id));
       receiptOrder = receipt.order;
       result.receiptGeneration = "success";
+      console.info("Receipt generation succeeded", {
+        restaurantId: String(restaurant._id),
+        orderId: String(order._id),
+        orderNumber: order.orderNumber,
+        receiptUrl: receipt.receiptUrl
+      });
     } catch (error) {
       order.receiptGenerationFailedAt = new Date();
       order.receiptGenerationFailureReason = getErrorMessage(error);
       await order.save();
       result.receiptGeneration = "failed";
+      console.error("Receipt generation failed", {
+        restaurantId: String(restaurant._id),
+        orderId: String(order._id),
+        orderNumber: order.orderNumber,
+        error: order.receiptGenerationFailureReason
+      });
     }
   }
 
@@ -247,12 +275,19 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
       receiptOrder.receiptDeliveryFailedAt = new Date();
       receiptOrder.receiptDeliveryFailureReason = "Receipt public URL is not available";
       await receiptOrder.save();
+      console.error("Receipt document failed", {
+        restaurantId: String(restaurant._id),
+        orderId: String(receiptOrder._id),
+        orderNumber: receiptOrder.orderNumber,
+        error: receiptOrder.receiptDeliveryFailureReason,
+        hasAppPublicUrl: Boolean(process.env.APP_PUBLIC_URL?.trim())
+      });
     }
 
     return result;
   }
 
-  await enqueueWasenderMessage({
+  const queuedReceipt = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
     to: receiptOrder.customerPhone,
@@ -268,7 +303,34 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
       recipientType: "customer"
     }
   });
+  console.info("Receipt queued", {
+    restaurantId: String(restaurant._id),
+    orderId: String(receiptOrder._id),
+    orderNumber: receiptOrder.orderNumber,
+    queueMessageId: String(queuedReceipt._id)
+  });
   result.receiptDelivery = "queued";
 
   return result;
+};
+
+export const retryAcceptedOrderReceiptDelivery = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  if (!["accepted", "confirmed", "preparing", "ready", "completed"].includes(order.status)) {
+    return {
+      receiptGeneration: "skipped",
+      receiptDelivery: "skipped"
+    };
+  }
+
+  if (order.receiptSentAt) {
+    return {
+      receiptGeneration: order.receiptGeneratedAt ? "skipped" : "not_attempted",
+      receiptDelivery: "skipped"
+    };
+  }
+
+  return notifyCustomerOfConfirmedOrderAndSendReceipt(restaurant, order);
 };
