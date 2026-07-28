@@ -17,9 +17,11 @@ import {
   addPendingItemToDraft,
   buildDraftView,
   clearConvertedDraftState,
+  clearPendingCategory,
   clearPendingMenuItem,
   findActiveDraft,
   findMenuItemMatch,
+  findMenuItemMatchInCategory,
   getMissingDraftFields,
   getDraftMissingFieldCode,
   getOrCreateDraft,
@@ -169,6 +171,10 @@ const normalizeComparableText = (value: string): string => {
 
 const normalizeDisplayText = (value: string): string => {
   return value.trim().replace(/\s+/g, " ");
+};
+
+const getMenuItemCategoryName = (item: IMenuItemDocument): string | undefined => {
+  return (item as IMenuItemDocument & { categoryName?: string }).categoryName;
 };
 
 const getNextCategorySortOrder = async (restaurantId: string): Promise<number> => {
@@ -1065,18 +1071,20 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             draft.pendingMenuItemId = item._id;
             draft.pendingMenuItemName = item.name;
             draft.currentStep = "collecting_quantity";
+            clearPendingCategory(draft);
             await draft.save();
 
             return {
               success: false,
               code: "ORDER_ITEM_QUANTITY_REQUIRED",
-              message: `Sure. How many portions of ${item.name} would you like?`,
+              message: `Got it, ${item.name}. How many portions would you like?`,
               data: buildDraftView(draft, context.restaurant)
             };
           }
 
           addItemToDraft(draft, item, quantity);
           clearPendingMenuItem(draft);
+          clearPendingCategory(draft);
           draft.currentStep = "choosing_items";
           await draft.save();
 
@@ -1084,6 +1092,101 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             success: true,
             message: `Added ${quantity} x ${item.name} to the order draft.`,
             data: buildDraftView(draft, context.restaurant)
+          };
+        }
+
+        return {
+          success: false,
+          code: resolved.status === "none" ? "ORDER_ITEM_CLARIFICATION_NO_MATCH" : "MULTIPLE_MENU_ITEMS_FOUND",
+          message:
+            resolved.status === "none"
+              ? `Please choose one of these options: ${activeClarification.candidates
+                  .map((candidate) => candidate.name)
+                  .join(", ")}.`
+              : `Please choose one option: ${resolved.matches
+                  .map((candidate) => candidate.name)
+                  .join(", ")}.`,
+          data: {
+            candidates: (resolved.status === "none"
+              ? activeClarification.candidates
+              : resolved.matches
+            ).map((candidate) => ({
+              name: candidate.name,
+              categoryId: candidate.categoryId ? String(candidate.categoryId) : undefined,
+              categoryName: candidate.categoryName,
+              price: candidate.price
+            }))
+          }
+        };
+      }
+
+      if (draft.pendingCategoryId) {
+        const categoryMatch = await findMenuItemMatchInCategory(
+          context.restaurantId,
+          String(draft.pendingCategoryId),
+          args.itemName
+        );
+
+        if (categoryMatch.status === "matched") {
+          if (!explicitQuantity) {
+            draft.pendingMenuItemId = categoryMatch.item._id;
+            draft.pendingMenuItemName = categoryMatch.item.name;
+            draft.currentStep = "collecting_quantity";
+            clearPendingCategory(draft);
+            await draft.save();
+
+            return {
+              success: false,
+              code: "ORDER_ITEM_QUANTITY_REQUIRED",
+              message: `Got it, ${categoryMatch.item.name}. How many portions would you like?`,
+              data: buildDraftView(draft, context.restaurant)
+            };
+          }
+
+          addItemToDraft(draft, categoryMatch.item, explicitQuantity);
+          clearPendingMenuItem(draft);
+          clearPendingCategory(draft);
+          draft.currentStep = "choosing_items";
+          await draft.save();
+
+          return {
+            success: true,
+            message: `Added ${explicitQuantity} x ${categoryMatch.item.name} to the order draft.`,
+            data: buildDraftView(draft, context.restaurant)
+          };
+        }
+
+        if (categoryMatch.status === "multiple") {
+          await createOrderItemClarification({
+            restaurantId: context.restaurantId,
+            senderPhone: context.sender.normalizedPhone,
+            senderRole: context.sender.role,
+            originalText: args.itemName,
+            quantity: explicitQuantity ?? undefined,
+            candidates: categoryMatch.matches.map((item) =>
+              buildClarificationCandidate({
+                menuItemId: item._id,
+                name: item.name,
+                categoryId: item.categoryId,
+                categoryName: getMenuItemCategoryName(item) ?? draft.pendingCategoryName,
+                price: item.price,
+                available: item.isAvailable
+              })
+            )
+          });
+
+          return {
+            success: false,
+            code: "MULTIPLE_MENU_ITEMS_FOUND",
+            message: categoryMatch.message,
+            data: {
+              candidates: categoryMatch.matches.map((item) => ({
+                name: item.name,
+                categoryId: String(item.categoryId),
+                categoryName: getMenuItemCategoryName(item) ?? draft.pendingCategoryName,
+                price: item.price
+              }))
+            }
           };
         }
       }
@@ -1104,16 +1207,24 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           senderPhone: context.sender.normalizedPhone,
           senderRole: context.sender.role,
           originalText: args.itemName,
-          quantity: args.quantity,
+          quantity: explicitQuantity ?? undefined,
           candidates: match.matches.map((item) =>
             buildClarificationCandidate({
               menuItemId: item._id,
               name: item.name,
+              categoryId: item.categoryId,
+              categoryName: getMenuItemCategoryName(item),
               price: item.price,
               available: item.isAvailable
             })
           )
         });
+        if (match.category) {
+          draft.pendingCategoryId = new Types.ObjectId(match.category.id);
+          draft.pendingCategoryName = match.category.name;
+          draft.currentStep = "selecting_item_from_category";
+          await draft.save();
+        }
 
         return {
           success: false,
@@ -1122,6 +1233,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           data: {
             candidates: match.matches.map((item) => ({
               name: item.name,
+              categoryId: String(item.categoryId),
+              categoryName: getMenuItemCategoryName(item),
               price: item.price
             }))
           }
@@ -1132,6 +1245,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         draft.pendingMenuItemId = match.item._id;
         draft.pendingMenuItemName = match.item.name;
         draft.currentStep = "collecting_quantity";
+        clearPendingCategory(draft);
         await draft.save();
 
         return {

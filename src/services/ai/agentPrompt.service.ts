@@ -46,7 +46,9 @@ export const buildAgentSystemPrompt = async (
                   intent: activeClarification.intent,
                   originalText: activeClarification.originalText,
                   candidates: activeClarification.candidates.map((candidate) => ({
+                    menuItemId: String(candidate.menuItemId),
                     name: candidate.name,
+                    categoryId: candidate.categoryId ? String(candidate.categoryId) : undefined,
                     price: candidate.price,
                     categoryName: candidate.categoryName,
                     available: candidate.available

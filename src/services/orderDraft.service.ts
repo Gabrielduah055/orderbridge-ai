@@ -10,6 +10,7 @@ const sessionTtlMs = 2 * 60 * 60 * 1000;
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 const normalizeComparableText = (value: string): string => normalizeText(value).toLowerCase();
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const numberWords = new Map<string, number>([
   ["one", 1],
   ["two", 2],
@@ -43,6 +44,10 @@ export type MenuItemMatchResult =
       status: "multiple";
       message: string;
       matches: IMenuItemDocument[];
+      category?: {
+        id: string;
+        name: string;
+      };
     };
 
 export const getDraftExpiry = (): Date => new Date(Date.now() + sessionTtlMs);
@@ -51,6 +56,8 @@ export const resetDraftState = (session: ICustomerSessionDocument): void => {
   session.cartItems = [];
   session.pendingMenuItemId = undefined;
   session.pendingMenuItemName = undefined;
+  session.pendingCategoryId = undefined;
+  session.pendingCategoryName = undefined;
   session.currentStep = "idle";
   session.orderType = null;
   session.deliveryAddress = undefined;
@@ -69,6 +76,11 @@ export const clearConvertedDraftState = (session: ICustomerSessionDocument): voi
 export const clearPendingMenuItem = (session: ICustomerSessionDocument): void => {
   session.pendingMenuItemId = undefined;
   session.pendingMenuItemName = undefined;
+};
+
+export const clearPendingCategory = (session: ICustomerSessionDocument): void => {
+  session.pendingCategoryId = undefined;
+  session.pendingCategoryName = undefined;
 };
 
 export const parseExplicitQuantity = (message: string): number | null => {
@@ -204,7 +216,18 @@ export const findMenuItemMatch = async (
   const activeCategories = await MenuCategory.find({
     restaurantId,
     isActive: true
-  }).select("_id");
+  });
+  const categoryNameById = new Map(
+    activeCategories.map((category) => [String(category._id), category.name])
+  );
+  const matchingCategory = activeCategories.find((category) => {
+    const normalizedCategoryName = normalizeComparableText(category.name);
+
+    return (
+      normalizedCategoryName.includes(normalizedRequestedName) ||
+      normalizedRequestedName.includes(normalizedCategoryName)
+    );
+  });
   const items = await MenuItem.find({
     restaurantId,
     categoryId: {
@@ -219,25 +242,46 @@ export const findMenuItemMatch = async (
       normalizedRequestedName.includes(normalizedItemName)
     );
   });
+  const categoryScopedMatches = matchingCategory
+    ? items.filter((item) => String(item.categoryId) === String(matchingCategory._id))
+    : [];
+  const effectiveMatches = matches.length > 0 ? matches : categoryScopedMatches;
 
-  if (matches.length === 0) {
+  if (effectiveMatches.length === 0) {
     return {
       status: "none",
       message: `I couldn't find "${requestedName}" on the menu. Try calling get_menu to see available items.`
     };
   }
 
-  if (matches.length > 1) {
+  for (const item of effectiveMatches) {
+    (item as IMenuItemDocument & { categoryName?: string }).categoryName =
+      categoryNameById.get(String(item.categoryId));
+  }
+
+  if (effectiveMatches.length > 1) {
+    const sharedCategoryId = effectiveMatches.every(
+      (item) => String(item.categoryId) === String(effectiveMatches[0].categoryId)
+    )
+      ? String(effectiveMatches[0].categoryId)
+      : undefined;
     return {
       status: "multiple",
-      message: `Multiple items matched "${requestedName}". Ask the customer to be more specific: ${matches
+      message: `Multiple items matched "${requestedName}". Ask the customer to be more specific: ${effectiveMatches
         .map((item) => item.name)
         .join(", ")}.`,
-      matches
+      matches: effectiveMatches,
+      category:
+        sharedCategoryId && categoryNameById.get(sharedCategoryId)
+          ? {
+              id: sharedCategoryId,
+              name: categoryNameById.get(sharedCategoryId)!
+            }
+          : undefined
     };
   }
 
-  const item = matches[0];
+  const item = effectiveMatches[0];
 
   if (!item.isAvailable) {
     return {
@@ -389,6 +433,85 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
   return missing;
 };
 
+export const findMenuItemMatchInCategory = async (
+  restaurantId: string,
+  categoryId: string,
+  requestedName: string
+): Promise<MenuItemMatchResult> => {
+  const normalizedRequestedName = normalizeComparableText(
+    requestedName.replace(/\b(with|from)\b/gi, " ")
+  );
+  const category = await MenuCategory.findOne({
+    _id: categoryId,
+    restaurantId,
+    isActive: true
+  });
+
+  if (!category) {
+    return {
+      status: "none",
+      message: "That menu category is no longer available."
+    };
+  }
+
+  const items = await MenuItem.find({
+    restaurantId,
+    categoryId
+  });
+  const matches = items.filter((item) => {
+    const normalizedItemName = normalizeComparableText(item.name);
+    const normalizedWithoutCategory = normalizeComparableText(
+      item.name.replace(new RegExp(escapeRegExp(category.name), "ig"), " ")
+    );
+
+    return (
+      normalizedItemName.includes(normalizedRequestedName) ||
+      normalizedRequestedName.includes(normalizedItemName) ||
+      normalizedWithoutCategory.includes(normalizedRequestedName) ||
+      normalizedRequestedName.includes(normalizedWithoutCategory)
+    );
+  });
+
+  for (const item of matches) {
+    (item as IMenuItemDocument & { categoryName?: string }).categoryName = category.name;
+  }
+
+  if (matches.length === 0) {
+    return {
+      status: "none",
+      message: `I couldn't find "${requestedName}" under ${category.name}.`
+    };
+  }
+
+  if (matches.length > 1) {
+    return {
+      status: "multiple",
+      message: `Please choose one ${category.name} option: ${matches
+        .map((item) => item.name)
+        .join(", ")}.`,
+      matches,
+      category: {
+        id: String(category._id),
+        name: category.name
+      }
+    };
+  }
+
+  const item = matches[0];
+
+  if (!item.isAvailable) {
+    return {
+      status: "none",
+      message: `${item.name} is currently unavailable.`
+    };
+  }
+
+  return {
+    status: "matched",
+    item
+  };
+};
+
 export const getDraftMissingFieldCode = (missingFields: string[]): string => {
   if (missingFields.includes("customerName")) {
     return "CUSTOMER_NAME_REQUIRED";
@@ -435,6 +558,12 @@ export const buildDraftView = (
       ? {
           name: session.pendingMenuItemName,
           missing: "quantity"
+        }
+      : undefined,
+    pendingCategory: session.pendingCategoryName
+      ? {
+          id: session.pendingCategoryId ? String(session.pendingCategoryId) : undefined,
+          name: session.pendingCategoryName
         }
       : undefined,
     subtotal,
@@ -521,6 +650,8 @@ export const buildStateAwareFollowUpMessage = (
       return "Are you still there? I just need the number of portions you would like.";
     case "choosing_order_type":
       return "Are you still there? Should I prepare the order for pickup or delivery?";
+    case "selecting_item_from_category":
+      return "Are you still there? Please choose one of the options I listed.";
     case "collecting_address":
       return "Are you still there? Please send the delivery location when you are ready.";
     case "collecting_name":

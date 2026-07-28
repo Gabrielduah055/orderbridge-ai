@@ -10,6 +10,7 @@ export type AgentClarificationStatus = (typeof agentClarificationStatuses)[numbe
 export interface IAgentClarificationCandidate {
   menuItemId: Types.ObjectId;
   name: string;
+  categoryId?: Types.ObjectId;
   price: number;
   categoryName?: string;
   available: boolean;
@@ -44,6 +45,10 @@ const agentClarificationCandidateSchema = new Schema<IAgentClarificationCandidat
       type: String,
       required: true,
       trim: true
+    },
+    categoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuCategory"
     },
     price: {
       type: Number,

@@ -4,6 +4,7 @@ import { orderTypes, type OrderType } from "./order.model";
 export const customerSessionSteps = [
   "idle",
   "choosing_items",
+  "selecting_item_from_category",
   "collecting_quantity",
   "choosing_order_type",
   "collecting_address",
@@ -29,6 +30,8 @@ export interface ICustomerSession {
   cartItems: ICustomerSessionCartItem[];
   pendingMenuItemId?: Types.ObjectId;
   pendingMenuItemName?: string;
+  pendingCategoryId?: Types.ObjectId;
+  pendingCategoryName?: string;
   currentStep: CustomerSessionStep;
   orderType: OrderType | null;
   deliveryAddress?: string;
@@ -110,6 +113,14 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
       ref: "MenuItem"
     },
     pendingMenuItemName: {
+      type: String,
+      trim: true
+    },
+    pendingCategoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuCategory"
+    },
+    pendingCategoryName: {
       type: String,
       trim: true
     },

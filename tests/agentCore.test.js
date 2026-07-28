@@ -42,12 +42,21 @@ const {
   getMissingDraftFields,
   getDraftMissingFieldCode,
   buildDraftView,
-  buildStateAwareFollowUpMessage
+  buildStateAwareFollowUpMessage,
+  resolveTrustedQuantity
 } = require("../dist/services/orderDraft.service");
 const {
   normalizeIncomingWebhook,
   extractWasenderProviderMessageId
 } = require("../dist/services/wasender.service");
+const {
+  buildClarificationCandidate,
+  resolveOrderItemClarification
+} = require("../dist/services/agentClarification.service");
+const {
+  addPendingItemToDraft
+} = require("../dist/services/orderDraft.service");
+const { MenuItem } = require("../dist/models/MenuItem");
 const {
   buildOwnerNewOrderNotification,
   buildCustomerOrderConfirmedMessage,
@@ -137,6 +146,117 @@ test("explicit quantity parser does not infer quantity from item name alone", ()
   assert.equal(parseExplicitQuantity("2 portions"), 2);
 });
 
+test("clarification candidates preserve category context", () => {
+  const candidate = buildClarificationCandidate({
+    menuItemId: "64b000000000000000000301",
+    name: "Chicken Spaghetti",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    available: true
+  });
+
+  assert.equal(String(candidate.menuItemId), "64b000000000000000000301");
+  assert.equal(String(candidate.categoryId), "64b000000000000000000401");
+  assert.equal(candidate.categoryName, "Spaghetti");
+  assert.equal(candidate.available, true);
+});
+
+test("with chicken resolves active Spaghetti clarification without Chicken Noodles", async () => {
+  const clarification = {
+    candidates: [
+      {
+        menuItemId: "64b000000000000000000301",
+        name: "Crave Special Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 60,
+        available: true
+      },
+      {
+        menuItemId: "64b000000000000000000302",
+        name: "Beef Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 50,
+        available: true
+      },
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 45,
+        available: true
+      }
+    ],
+    save: async () => {}
+  };
+
+  const resolved = await resolveOrderItemClarification(clarification, "With chicken");
+
+  assert.equal(resolved.status, "matched");
+  assert.equal(resolved.candidate.name, "Chicken Spaghetti");
+  assert.notEqual(resolved.candidate.name, "Chicken Noodles");
+  assert.equal(resolved.quantity, undefined);
+  assert.equal(clarification.status, "resolved");
+});
+
+test("yes confirms a single clarified item but does not create quantity 1", async () => {
+  const clarification = {
+    candidates: [
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 45,
+        available: true
+      }
+    ],
+    save: async () => {}
+  };
+
+  const resolved = await resolveOrderItemClarification(
+    clarification,
+    "Yes, that is what I mean"
+  );
+
+  assert.equal(resolved.status, "matched");
+  assert.equal(resolved.candidate.name, "Chicken Spaghetti");
+  assert.equal(resolved.quantity, undefined);
+  assert.equal(parseExplicitQuantity("Yes, that is what I mean"), null);
+});
+
+test("one explicit quantity adds the pending clarified item and clears it", async () => {
+  const originalFindOne = MenuItem.findOne;
+  const session = {
+    pendingMenuItemId: "64b000000000000000000303",
+    pendingMenuItemName: "Chicken Spaghetti",
+    cartItems: [],
+    currentStep: "collecting_quantity"
+  };
+
+  MenuItem.findOne = async () => ({
+    _id: "64b000000000000000000303",
+    name: "Chicken Spaghetti",
+    price: 45,
+    isAvailable: true
+  });
+
+  try {
+    const message = await addPendingItemToDraft(session, "64b000000000000000000001", 1);
+
+    assert.equal(message, "Added 1 x Chicken Spaghetti to the order draft.");
+    assert.equal(session.cartItems.length, 1);
+    assert.equal(session.cartItems[0].quantity, 1);
+    assert.equal(session.pendingMenuItemId, undefined);
+    assert.equal(session.currentStep, "choosing_items");
+  } finally {
+    MenuItem.findOne = originalFindOne;
+  }
+});
+
 test("delivery fee resolver uses configured sources only", () => {
   assert.deepEqual(resolveDeliveryFee({}, "delivery", "Crown Hospital", 120), {
     amount: null,
@@ -220,6 +340,29 @@ test("manual delivery fee stays pending without becoming zero in draft view", ()
   assert.equal(view.total, 60);
   assert.deepEqual(view.missingFields, []);
   assert.equal(view.readyToConfirm, true);
+});
+
+test("category context survives in the customer draft view", () => {
+  const view = buildDraftView(
+    {
+      cartItems: [],
+      orderType: null,
+      deliveryFeeResolved: false,
+      pendingCategoryId: "64b000000000000000000401",
+      pendingCategoryName: "Spaghetti"
+    },
+    {}
+  );
+
+  assert.deepEqual(view.pendingCategory, {
+    id: "64b000000000000000000401",
+    name: "Spaghetti"
+  });
+});
+
+test("model-supplied quantity is not trusted without explicit customer quantity", () => {
+  assert.equal(resolveTrustedQuantity(1, "With chicken"), null);
+  assert.equal(resolveTrustedQuantity(1, "one portion"), 1);
 });
 
 test("missing customer name gets structured draft error code", () => {
@@ -1162,6 +1305,58 @@ test("bulk accepted order side effects process each order exactly once", async (
     Order.findOne = originalFindOne;
     sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = originalNotifyConfirmed;
     delete require.cache[controllerPath];
+  }
+});
+
+test("OpenRouter max-round fallback returns recoverable clarification message", async () => {
+  const originalMaxRounds = process.env.OPENROUTER_MAX_TOOL_ROUNDS;
+  process.env.OPENROUTER_MAX_TOOL_ROUNDS = "2";
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    complete: async () => ({
+      toolCalls: [
+        {
+          id: `call_${Date.now()}`,
+          name: "add_order_item_by_name",
+          arguments: { itemName: "spaghetti" }
+        }
+      ]
+    })
+  };
+
+  try {
+    const result = await runAgentOrchestrator(
+      {
+        restaurant: fakeRestaurant,
+        sender: {
+          phone: "0557038547",
+          normalizedPhone: "+233557038547",
+          role: "customer",
+          verified: false
+        },
+        message: "I want spaghetti"
+      },
+      {
+        provider,
+        getHistory: getEmptyHistory,
+        saveMessage: saveNoop,
+        buildSystemPrompt: buildTestPrompt,
+        executeTool: async () => ({
+          success: false,
+          code: "MULTIPLE_MENU_ITEMS_FOUND",
+          message: "Please choose one Spaghetti option: Crave Special, Beef, Chicken."
+        })
+      }
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(
+      result.message,
+      "Please choose one Spaghetti option: Crave Special, Beef, Chicken."
+    );
+  } finally {
+    restoreEnv("OPENROUTER_MAX_TOOL_ROUNDS", originalMaxRounds);
   }
 });
 
