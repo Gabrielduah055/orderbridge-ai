@@ -223,7 +223,8 @@ export const runAgentOrchestrator = async (
       executeAgentTool(toolName, rawArgs, {
         restaurantId,
         restaurant: input.restaurant,
-        sender: input.sender
+        sender: input.sender,
+        originalMessage: normalizedInputMessage
       }));
 
   try {

@@ -1,7 +1,7 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 
 export const outboundMessageTypes = ["text", "document"] as const;
-export const outboundMessageStatuses = ["pending", "sending", "sent", "failed"] as const;
+export const outboundMessageStatuses = ["pending", "sending", "sent", "failed", "cancelled"] as const;
 
 export type OutboundMessageType = (typeof outboundMessageTypes)[number];
 export type OutboundMessageStatus = (typeof outboundMessageStatuses)[number];

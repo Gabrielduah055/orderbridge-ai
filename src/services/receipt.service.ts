@@ -265,7 +265,7 @@ const drawReceiptHeader = (
 const drawOrderMeta = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
   drawLabelValue(doc, "Order no.", order.orderNumber, { boldValue: true });
   drawLabelValue(doc, "Date", formatDateTime(order.restaurantConfirmedAt ?? order.createdAt));
-  drawLabelValue(doc, "Customer", order.customerName || "Guest");
+  drawLabelValue(doc, "Customer", order.customerName || "Customer");
   drawLabelValue(doc, "Phone", order.customerPhone);
   drawLabelValue(doc, "Type", titleCase(order.orderType), { boldValue: true });
 
@@ -311,8 +311,14 @@ const drawItems = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
 };
 
 const drawTotals = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
-  drawLabelValue(doc, "Subtotal", formatCurrency(order.subtotal));
-  drawLabelValue(doc, "Delivery", formatCurrency(order.deliveryFee));
+  const deliveryPending = order.orderType === "delivery" && order.deliveryFeePending;
+
+  drawLabelValue(doc, "Food subtotal", formatCurrency(order.subtotal));
+  drawLabelValue(
+    doc,
+    "Delivery fee",
+    deliveryPending ? "Pending confirmation" : formatCurrency(order.deliveryFee ?? 0)
+  );
 
   moveY(doc, 3);
   doc.roundedRect(receiptMargin, doc.y, contentWidth, 32, 6).fill("#F3F4F6");
@@ -320,7 +326,7 @@ const drawTotals = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
     .font("Helvetica-Bold")
     .fontSize(11)
     .fillColor(brandColor)
-    .text("TOTAL", receiptMargin + 10, doc.y + 9, {
+    .text(deliveryPending ? "FOOD TOTAL" : "TOTAL", receiptMargin + 10, doc.y + 9, {
       width: 70
     });
   doc

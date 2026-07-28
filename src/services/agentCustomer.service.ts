@@ -83,9 +83,14 @@ const getSessionExpiry = (): Date => {
 
 const resetSessionState = (session: ICustomerSessionDocument): void => {
   session.cartItems = [];
+  session.pendingMenuItemId = undefined;
+  session.pendingMenuItemName = undefined;
   session.currentStep = "idle";
   session.orderType = null;
   session.deliveryAddress = undefined;
+  session.deliveryFee = undefined;
+  session.deliveryFeeSource = undefined;
+  session.deliveryFeeResolved = false;
 };
 
 const getOrCreateSession = async (
@@ -106,6 +111,8 @@ const getOrCreateSession = async (
       cartItems: [],
       currentStep: "idle",
       orderType: null,
+      deliveryFeeResolved: false,
+      conversationVersion: 0,
       expiresAt: getSessionExpiry()
     });
   }
@@ -178,17 +185,25 @@ const buildCartSummary = (session: ICustomerSessionDocument): string => {
 const buildOrderSummary = (session: ICustomerSessionDocument): string => {
   const orderType = session.orderType ?? "pickup";
   const subtotal = getCartSubtotal(session);
+  const deliveryFeePending =
+    orderType === "delivery" && !session.deliveryFeeResolved && session.deliveryFeeSource === "manual_confirmation";
   const deliveryFee = orderType === "delivery" ? session.deliveryFee ?? 0 : 0;
-  const total = subtotal + deliveryFee;
+  const total = deliveryFeePending ? subtotal : subtotal + deliveryFee;
   const addressLine =
     orderType === "delivery" && session.deliveryAddress
       ? `\nDelivery address: ${session.deliveryAddress}`
       : "";
 
   const deliveryLine =
-    orderType === "delivery" ? `\nDelivery fee: ${formatCurrency(deliveryFee)}` : "";
+    orderType === "delivery"
+      ? deliveryFeePending
+        ? "\nDelivery fee: To be communicated"
+        : `\nDelivery fee: ${formatCurrency(deliveryFee)}`
+      : "";
 
-  return `${buildCartSummary(session)}\nOrder type: ${orderType}${addressLine}${deliveryLine}\nTotal: ${formatCurrency(total)}`;
+  return `${buildCartSummary(session)}\nOrder type: ${orderType}${addressLine}${deliveryLine}\n${
+    deliveryFeePending ? "Food total" : "Total"
+  }: ${formatCurrency(total)}`;
 };
 
 const isGreetingMessage = (message: string): boolean => {
@@ -416,7 +431,7 @@ export const handleCustomerMessage = async (
 
     if (!quantity) {
       return buildResponse(
-        `How many packs of ${session.pendingMenuItemName ?? "that item"} would you like?`,
+        `I still need the number of portions, please. Would you like 1, 2, or more?`,
         session
       );
     }
@@ -496,7 +511,7 @@ export const handleCustomerMessage = async (
     session.deliveryFeeSource = fee.source;
     session.deliveryFeeResolved = fee.resolved;
 
-    if (!fee.resolved) {
+    if (!fee.resolved && fee.source !== "manual_confirmation") {
       session.currentStep = "awaiting_delivery_fee";
       await session.save();
 
@@ -509,7 +524,7 @@ export const handleCustomerMessage = async (
     if (!session.customerName?.trim()) {
       session.currentStep = "collecting_name";
       await session.save();
-      return buildResponse("Thanks. May I have your name for the order?", session);
+      return buildResponse("Before I submit your order, may I have your name please?", session);
     }
 
     session.currentStep = "confirming_order";
@@ -586,7 +601,7 @@ export const handleCustomerMessage = async (
     if (!session.customerName?.trim()) {
       session.currentStep = "collecting_name";
       await session.save();
-      return buildResponse("Thanks. May I have your name for the order?", session);
+      return buildResponse("Before I submit your order, may I have your name please?", session);
     }
 
     await session.save();
@@ -647,7 +662,7 @@ export const handleCustomerMessage = async (
       session.currentStep = "collecting_quantity";
       await session.save();
 
-      return buildResponse(`Sure. How many packs of ${match.item.name} would you like?`, session);
+      return buildResponse(`Sure. How many portions of ${match.item.name} would you like?`, session);
     }
 
     addItemToCart(session, match.item, addItemRequest.quantity);
@@ -666,12 +681,12 @@ export const handleCustomerMessage = async (
       session.deliveryFee = fee.amount ?? undefined;
       session.deliveryFeeSource = fee.source;
       session.deliveryFeeResolved = fee.resolved;
-      session.currentStep = fee.resolved ? "choosing_items" : "awaiting_delivery_fee";
+      session.currentStep = fee.resolved || fee.source === "manual_confirmation" ? "choosing_items" : "awaiting_delivery_fee";
     }
 
     await session.save();
 
-    if (addItemRequest.orderType === "delivery" && !session.deliveryFeeResolved) {
+    if (addItemRequest.orderType === "delivery" && !session.deliveryFeeResolved && session.deliveryFeeSource !== "manual_confirmation") {
       return buildResponse(
         `Added ${addItemRequest.quantity} x ${match.item.name}. Let me confirm the delivery fee for ${session.deliveryAddress} before completing your order.`,
         session

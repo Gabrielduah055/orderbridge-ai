@@ -21,10 +21,12 @@ import {
   findActiveDraft,
   findMenuItemMatch,
   getMissingDraftFields,
+  getDraftMissingFieldCode,
   getOrCreateDraft,
   removeItemFromDraft,
   resetDraftState,
   parseExplicitQuantity,
+  resolveTrustedQuantity,
   submitOrderDraft
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
@@ -130,6 +132,10 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   orderNumber: order.orderNumber,
   status: order.status,
   orderType: order.orderType,
+  subtotal: order.subtotal,
+  deliveryFee: order.deliveryFee,
+  deliveryFeePending: order.deliveryFeePending,
+  deliveryFeeSource: order.deliveryFeeSource,
   total: order.total,
   createdAt: order.createdAt,
   customerConfirmedAt: order.customerConfirmedAt,
@@ -1015,14 +1021,17 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         "Add a menu item to the order draft by name. Resolves the name to a real menu item server-side.",
       parameters: {
         itemName: "Menu item name as the customer said it.",
-        quantity: "Optional quantity, defaults to 1."
+        quantity: "Optional quantity. The backend only accepts it when the customer message explicitly states the same quantity."
       }
     },
     roles: toolPermissions.add_order_item_by_name,
     schema: addOrderItemByNameSchema,
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
-      const explicitQuantity = args.quantity ?? parseExplicitQuantity(args.itemName);
+      const explicitQuantity = resolveTrustedQuantity(
+        args.quantity,
+        context.originalMessage ?? args.itemName
+      );
       const activeClarification = await findActiveOrderItemClarification({
         restaurantId: context.restaurantId,
         senderPhone: context.sender.normalizedPhone
@@ -1046,7 +1055,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             };
           }
 
-          const quantity = args.quantity ?? resolved.quantity;
+          const quantity = resolveTrustedQuantity(
+            args.quantity,
+            context.originalMessage ?? args.itemName,
+            resolved.quantity
+          );
 
           if (!quantity) {
             draft.pendingMenuItemId = item._id;
@@ -1057,7 +1070,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             return {
               success: false,
               code: "ORDER_ITEM_QUANTITY_REQUIRED",
-              message: `Sure. How many packs of ${item.name} would you like?`,
+              message: `Sure. How many portions of ${item.name} would you like?`,
               data: buildDraftView(draft, context.restaurant)
             };
           }
@@ -1124,7 +1137,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return {
           success: false,
           code: "ORDER_ITEM_QUANTITY_REQUIRED",
-          message: `Sure. How many packs of ${match.item.name} would you like?`,
+          message: `Sure. How many portions of ${match.item.name} would you like?`,
           data: buildDraftView(draft, context.restaurant)
         };
       }
@@ -1226,7 +1239,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         draft.deliveryFeeResolved = fee.resolved;
 
         if (!fee.resolved) {
-          draft.currentStep = "awaiting_delivery_fee";
+          draft.currentStep =
+            fee.source === "manual_confirmation"
+              ? draft.customerName?.trim()
+                ? "confirming_order"
+                : "collecting_name"
+              : "awaiting_delivery_fee";
         }
       }
 
@@ -1237,12 +1255,14 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         code:
           draft.orderType === "delivery" && !draft.deliveryFeeResolved
             ? draft.deliveryFeeSource === "manual_confirmation"
-              ? "DELIVERY_FEE_REQUIRES_OWNER_CONFIRMATION"
+              ? "DELIVERY_FEE_PENDING_CONFIRMATION"
               : "DELIVERY_FEE_NOT_CONFIGURED"
             : undefined,
         message:
           draft.orderType === "delivery" && !draft.deliveryFeeResolved
-            ? "I have your name and address. The restaurant still needs to confirm the delivery fee before I can submit the order."
+            ? draft.deliveryFeeSource === "manual_confirmation"
+              ? "The delivery fee will be communicated by the restaurant or delivery rider after reviewing the location."
+              : "The restaurant still needs to configure delivery pricing before I can submit the order."
             : "Order draft updated.",
         data: {
           ...buildDraftView(draft, context.restaurant),
@@ -1316,8 +1336,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       if (missingFields.length > 0) {
         return {
           success: false,
-          code: "ORDER_DRAFT_INCOMPLETE",
-          message: `The order draft is missing: ${missingFields.join(", ")}.`,
+          code: getDraftMissingFieldCode(missingFields),
+          message: missingFields.includes("customerName")
+            ? "Before I submit your order, may I have your name please?"
+            : `The order draft is missing: ${missingFields.join(", ")}.`,
           data: buildDraftView(draft, context.restaurant)
         };
       }
@@ -1330,7 +1352,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         if (error instanceof BadRequestError) {
           return {
             success: false,
-            code: "ORDER_DRAFT_INVALID",
+            code: error.code ?? "ORDER_DRAFT_INVALID",
             message: error.message,
             data: buildDraftView(draft, context.restaurant)
           };
