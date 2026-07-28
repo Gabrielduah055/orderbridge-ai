@@ -16,8 +16,36 @@ const normalizeComparableText = (value: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
+const confirmationPhrases = [
+  "yes",
+  "yeah",
+  "yep",
+  "that is what i mean",
+  "that is what i want",
+  "thats what i mean",
+  "that's what i mean",
+  "that one",
+  "the spaghetti one"
+];
+
+const getMeaningfulSelectionTokens = (text: string): string[] => {
+  const normalized = normalizeComparableText(text).replace(/\b(with|from|the|one|option)\b/g, " ");
+
+  return normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !["please", "want", "mean"].includes(token));
+};
+
+const isConfirmationText = (text: string): boolean => {
+  const normalized = normalizeComparableText(text);
+
+  return confirmationPhrases.some((phrase) => normalized === phrase || normalized.includes(phrase));
+};
+
 const tokenMatches = (candidate: IAgentClarificationCandidate, text: string): boolean => {
   const normalizedText = normalizeComparableText(text);
+  const selectionTokens = getMeaningfulSelectionTokens(text);
   const candidateParts = [
     candidate.name,
     candidate.categoryName,
@@ -28,7 +56,10 @@ const tokenMatches = (candidate: IAgentClarificationCandidate, text: string): bo
     .map(normalizeComparableText);
 
   return candidateParts.some(
-    (part) => part.includes(normalizedText) || normalizedText.includes(part)
+    (part) =>
+      part.includes(normalizedText) ||
+      normalizedText.includes(part) ||
+      selectionTokens.some((token) => part.split(/\s+/).includes(token))
   );
 };
 
@@ -86,7 +117,10 @@ export const resolveOrderItemClarification = async (
   clarification: IAgentClarificationDocument,
   text: string
 ) => {
-  const matches = clarification.candidates.filter((candidate) => tokenMatches(candidate, text));
+  const matches =
+    clarification.candidates.length === 1 && isConfirmationText(text)
+      ? [clarification.candidates[0]]
+      : clarification.candidates.filter((candidate) => tokenMatches(candidate, text));
 
   if (matches.length !== 1) {
     return {
@@ -110,6 +144,7 @@ export const resolveOrderItemClarification = async (
 export const buildClarificationCandidate = (input: {
   menuItemId: Types.ObjectId;
   name: string;
+  categoryId?: Types.ObjectId;
   price: number;
   categoryName?: string;
   available: boolean;

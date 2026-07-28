@@ -1,6 +1,7 @@
 import {
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
+import { findActiveOrderItemClarification } from "./agentClarification.service";
 import {
   cancelPendingToolAction,
   executeAgentTool,
@@ -12,6 +13,12 @@ import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
+import {
+  addPendingItemToDraft,
+  buildDraftView,
+  findActiveDraft,
+  parseExplicitQuantity
+} from "./orderDraft.service";
 import {
   handleSavedOwnerSelectionReply,
   handleUnquotedOwnerOrderDecision,
@@ -259,6 +266,86 @@ const handleLocalCustomerRequest = async (
   };
 };
 
+const handleDeterministicCustomerContinuation = async (
+  input: RestaurantAgentMessageInput,
+  sender: ReturnType<typeof resolveSenderIdentity>
+): Promise<RestaurantAgentResponse | null> => {
+  const restaurantId = String(input.restaurant._id);
+  const [activeClarification, activeDraft] = await Promise.all([
+    findActiveOrderItemClarification({
+      restaurantId,
+      senderPhone: sender.normalizedPhone
+    }),
+    findActiveDraft(restaurantId, sender.normalizedPhone)
+  ]);
+
+  if (activeDraft?.currentStep === "collecting_quantity" && activeDraft.pendingMenuItemId) {
+    const quantity = parseExplicitQuantity(input.message);
+
+    if (!quantity) {
+      return {
+        success: false,
+        message: "I still need the number of portions, please. Would you like 1, 2, or more?",
+        data: buildDraftView(activeDraft, input.restaurant),
+        source: "openrouter_agent",
+        sender
+      };
+    }
+
+    const message = await addPendingItemToDraft(activeDraft, restaurantId, quantity);
+    await activeDraft.save();
+
+    return {
+      success: true,
+      message,
+      data: buildDraftView(activeDraft, input.restaurant),
+      source: "openrouter_agent",
+      sender
+    };
+  }
+
+  if (!activeClarification && !activeDraft?.pendingCategoryId) {
+    return null;
+  }
+
+  const result = await executeAgentTool(
+    "add_order_item_by_name",
+    {
+      itemName: input.message
+    },
+    {
+      restaurantId,
+      restaurant: input.restaurant,
+      sender,
+      originalMessage: input.message
+    }
+  );
+
+  return {
+    success: result.success,
+    message: result.message,
+    data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+    source: "openrouter_agent",
+    sender
+  };
+};
+
+const saveAssistantResponse = async (
+  restaurantId: string,
+  sender: ReturnType<typeof resolveSenderIdentity>,
+  response: RestaurantAgentResponse,
+  metadata: Record<string, unknown>
+): Promise<void> => {
+  await saveAgentConversationMessage({
+    restaurantId,
+    senderPhone: sender.normalizedPhone,
+    senderRole: sender.role,
+    direction: "assistant",
+    content: response.message,
+    metadata
+  });
+};
+
 export const handleRestaurantAgentMessage = async (
   input: RestaurantAgentMessageInput
 ): Promise<RestaurantAgentResponse> => {
@@ -298,6 +385,18 @@ export const handleRestaurantAgentMessage = async (
 
   if (sender.role === "customer") {
     if (customerOpenRouterEnabled) {
+      const deterministicResponse = await handleDeterministicCustomerContinuation(input, sender);
+
+      if (deterministicResponse) {
+        await saveAssistantResponse(restaurantId, sender, deterministicResponse, {
+          source: "openrouter_agent",
+          deterministicAction: "customer_order_continuation",
+          success: deterministicResponse.success
+        });
+
+        return deterministicResponse;
+      }
+
       const agentResult = await runAgentOrchestrator({
         restaurant: input.restaurant,
         sender,
