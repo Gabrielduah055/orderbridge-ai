@@ -17,7 +17,10 @@ import {
   addPendingItemToDraft,
   buildDraftView,
   findActiveDraft,
-  parseExplicitQuantity
+  isOnlyThatCompletionMessage,
+  parseExplicitQuantity,
+  parseQuantityCorrection,
+  updateRecentCartItemQuantity
 } from "./orderDraft.service";
 import {
   handleSavedOwnerSelectionReply,
@@ -298,6 +301,53 @@ const handleDeterministicCustomerContinuation = async (
     return {
       success: true,
       message,
+      data: buildDraftView(activeDraft, input.restaurant),
+      source: "openrouter_agent",
+      sender
+    };
+  }
+
+  const correctedQuantity = parseQuantityCorrection(input.message);
+
+  if (correctedQuantity) {
+    if (!activeDraft) {
+      return {
+        success: false,
+        message: "Which item would you like me to change?",
+        source: "openrouter_agent",
+        sender
+      };
+    }
+
+    const correctionResult = updateRecentCartItemQuantity(activeDraft, correctedQuantity);
+    await activeDraft.save();
+
+    return {
+      success: correctionResult.status === "updated",
+      message: correctionResult.message,
+      data: buildDraftView(activeDraft, input.restaurant),
+      source: "openrouter_agent",
+      sender
+    };
+  }
+
+  if (isOnlyThatCompletionMessage(input.message)) {
+    if (!activeDraft || activeDraft.cartItems.length === 0) {
+      return {
+        success: false,
+        message: "What would you like to order?",
+        data: activeDraft ? buildDraftView(activeDraft, input.restaurant) : undefined,
+        source: "openrouter_agent",
+        sender
+      };
+    }
+
+    activeDraft.currentStep = "choosing_order_type";
+    await activeDraft.save();
+
+    return {
+      success: true,
+      message: "Sure. Is this order for pickup or delivery?",
       data: buildDraftView(activeDraft, input.restaurant),
       source: "openrouter_agent",
       sender

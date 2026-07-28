@@ -113,6 +113,25 @@ export const findActiveOrderItemClarification = async (input: {
   }).sort({ createdAt: -1 });
 };
 
+export const cancelPendingOrderItemClarifications = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+}): Promise<void> => {
+  await AgentClarification.updateMany(
+    {
+      restaurantId: input.restaurantId,
+      senderPhone: input.senderPhone,
+      intent: "order_item_selection",
+      status: "pending"
+    },
+    {
+      $set: {
+        status: "cancelled"
+      }
+    }
+  );
+};
+
 export const resolveOrderItemClarification = async (
   clarification: IAgentClarificationDocument,
   text: string

@@ -1,12 +1,18 @@
-import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
+import {
+  CustomerSession,
+  type ICustomerSessionCartItem,
+  type ICustomerSessionDocument
+} from "../models/customerSession.model";
 import { Order, type IOrderDocument } from "../models/order.model";
 import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
+import { cancelPendingOrderItemClarifications } from "./agentClarification.service";
 import { BadRequestError } from "../utils/httpErrors";
 
 const sessionTtlMs = 2 * 60 * 60 * 1000;
+const quantityCorrectionWindowMs = 5 * 60 * 1000;
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 const normalizeComparableText = (value: string): string => normalizeText(value).toLowerCase();
@@ -29,6 +35,28 @@ const ambiguousQuantityPhrases = [
   /\b(another one|one more)\b/,
   /\b(the|that|this)\s+(?:ghs\s*)?\d+(?:\.\d+)?\s+(package|pack|option|one)\b/,
   /^(ok|okay|yes|yeah|yh|sure|alright)$/
+];
+
+const quantityCorrectionPatterns = [
+  /\bmake\s+it\b/,
+  /\bchange\s+it\s+to\b/,
+  /\bactually\b/,
+  /\boh\s+no\b/,
+  /\bno,?\s+i\s+want\b/,
+  /\bincrease\s+it\s+to\b/,
+  /\breduce\s+it\s+to\b/,
+  /\bi\s+said\b/
+];
+
+const onlyThatCompletionPatterns = [
+  /\bonly\s+that\b/,
+  /\bi\s+want\s+only\s+that\b/,
+  /\bjust\s+that\b/,
+  /\bthat's\s+all\b/,
+  /\bthats\s+all\b/,
+  /\bthat\s+is\s+all\b/,
+  /\bproceed\s+with\s+that\b/,
+  /\bi\s+don'?t\s+want\s+anything\s+else\b/
 ];
 
 export type MenuItemMatchResult =
@@ -58,6 +86,13 @@ export const resetDraftState = (session: ICustomerSessionDocument): void => {
   session.pendingMenuItemName = undefined;
   session.pendingCategoryId = undefined;
   session.pendingCategoryName = undefined;
+  session.lastModifiedMenuItemId = undefined;
+  session.lastModifiedMenuItemName = undefined;
+  session.lastModifiedCategoryName = undefined;
+  session.lastModifiedDisplayName = undefined;
+  session.lastModifiedAt = undefined;
+  session.lastModifiedPreviousQuantity = undefined;
+  session.lastModifiedCurrentQuantity = undefined;
   session.currentStep = "idle";
   session.orderType = null;
   session.deliveryAddress = undefined;
@@ -81,6 +116,43 @@ export const clearPendingMenuItem = (session: ICustomerSessionDocument): void =>
 export const clearPendingCategory = (session: ICustomerSessionDocument): void => {
   session.pendingCategoryId = undefined;
   session.pendingCategoryName = undefined;
+};
+
+export const getMenuItemCategoryName = (item: IMenuItemDocument): string | undefined => {
+  return (item as IMenuItemDocument & { categoryName?: string }).categoryName;
+};
+
+export const getMenuItemDisplayName = (
+  item: Pick<IMenuItemDocument, "name">,
+  categoryName?: string
+): string => {
+  const itemName = normalizeText(item.name);
+  const normalizedItemName = normalizeComparableText(itemName);
+  const normalizedCategoryName = categoryName ? normalizeComparableText(categoryName) : "";
+
+  if (!normalizedCategoryName || normalizedItemName.includes(normalizedCategoryName)) {
+    return itemName;
+  }
+
+  return `${itemName} ${normalizeText(categoryName!)}`;
+};
+
+export const getCartItemDisplayName = (
+  item: Pick<ICustomerSessionCartItem, "name" | "categoryName" | "displayName">
+): string => item.displayName?.trim() || getMenuItemDisplayName({ name: item.name }, item.categoryName);
+
+const rememberLastModifiedCartItem = (
+  session: ICustomerSessionDocument,
+  item: ICustomerSessionCartItem,
+  previousQuantity: number
+): void => {
+  session.lastModifiedMenuItemId = item.menuItemId;
+  session.lastModifiedMenuItemName = item.name;
+  session.lastModifiedCategoryName = item.categoryName;
+  session.lastModifiedDisplayName = getCartItemDisplayName(item);
+  session.lastModifiedAt = new Date();
+  session.lastModifiedPreviousQuantity = previousQuantity;
+  session.lastModifiedCurrentQuantity = item.quantity;
 };
 
 export const parseExplicitQuantity = (message: string): number | null => {
@@ -117,6 +189,22 @@ export const parseExplicitQuantity = (message: string): number | null => {
   }
 
   return null;
+};
+
+export const parseQuantityCorrection = (message: string): number | null => {
+  const normalized = normalizeComparableText(message);
+
+  if (!quantityCorrectionPatterns.some((pattern) => pattern.test(normalized))) {
+    return null;
+  }
+
+  return parseExplicitQuantity(message);
+};
+
+export const isOnlyThatCompletionMessage = (message: string): boolean => {
+  const normalized = normalizeComparableText(message);
+
+  return onlyThatCompletionPatterns.some((pattern) => pattern.test(normalized));
 };
 
 export const resolveTrustedQuantity = (
@@ -303,23 +391,36 @@ export const addItemToDraft = (
 ): void => {
   clearConvertedDraftState(session);
 
+  const categoryName = getMenuItemCategoryName(item);
+  const displayName = getMenuItemDisplayName(item, categoryName);
   const existingItem = session.cartItems.find(
     (cartItem) => String(cartItem.menuItemId) === String(item._id)
   );
 
   if (existingItem) {
+    const previousQuantity = existingItem.quantity;
     existingItem.quantity += quantity;
     existingItem.totalPrice = existingItem.quantity * existingItem.unitPrice;
+    existingItem.categoryId = existingItem.categoryId ?? item.categoryId;
+    existingItem.categoryName = existingItem.categoryName ?? categoryName;
+    existingItem.displayName = existingItem.displayName ?? displayName;
+    rememberLastModifiedCartItem(session, existingItem, previousQuantity);
     return;
   }
 
-  session.cartItems.push({
+  const cartItem = {
     menuItemId: item._id,
     name: item.name,
+    categoryId: item.categoryId,
+    categoryName,
+    displayName,
     quantity,
     unitPrice: item.price,
     totalPrice: item.price * quantity
-  });
+  };
+
+  session.cartItems.push(cartItem);
+  rememberLastModifiedCartItem(session, cartItem, 0);
 };
 
 export const addPendingItemToDraft = async (
@@ -343,11 +444,88 @@ export const addPendingItemToDraft = async (
     return "That item is no longer available. Please choose another item.";
   }
 
+  if (item.categoryId && !getMenuItemCategoryName(item)) {
+    const category = await MenuCategory.findOne({
+      _id: item.categoryId,
+      restaurantId,
+      isActive: true
+    });
+
+    if (category) {
+      (item as IMenuItemDocument & { categoryName?: string }).categoryName = category.name;
+    }
+  }
+
+  const displayName = getMenuItemDisplayName(item, getMenuItemCategoryName(item));
   addItemToDraft(session, item, quantity);
   clearPendingMenuItem(session);
+  clearPendingCategory(session);
   session.currentStep = "choosing_items";
+  await cancelPendingOrderItemClarifications({
+    restaurantId,
+    senderPhone: session.customerPhone
+  });
 
-  return `Added ${quantity} x ${item.name} to the order draft.`;
+  return `Added ${quantity} x ${displayName} to the order draft.`;
+};
+
+export const updateRecentCartItemQuantity = (
+  session: ICustomerSessionDocument,
+  quantity: number,
+  now = new Date()
+):
+  | {
+      status: "updated";
+      message: string;
+      item: ICustomerSessionCartItem;
+    }
+  | {
+      status: "needs_item";
+      message: string;
+    } => {
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return {
+      status: "needs_item",
+      message: "Please provide a positive quantity to update."
+    };
+  }
+
+  const lastModifiedAt = session.lastModifiedAt?.getTime?.() ?? 0;
+  const withinCorrectionWindow =
+    Boolean(session.lastModifiedMenuItemId) &&
+    lastModifiedAt > 0 &&
+    now.getTime() - lastModifiedAt <= quantityCorrectionWindowMs;
+
+  if (!withinCorrectionWindow) {
+    return {
+      status: "needs_item",
+      message: "Which item would you like me to change?"
+    };
+  }
+
+  const item = session.cartItems.find(
+    (cartItem) => String(cartItem.menuItemId) === String(session.lastModifiedMenuItemId)
+  );
+
+  if (!item) {
+    return {
+      status: "needs_item",
+      message: "Which item would you like me to change?"
+    };
+  }
+
+  const previousQuantity = item.quantity;
+  item.quantity = quantity;
+  item.totalPrice = item.unitPrice * quantity;
+  rememberLastModifiedCartItem(session, item, previousQuantity);
+
+  const displayName = getCartItemDisplayName(item);
+
+  return {
+    status: "updated",
+    message: `Updated ${displayName} from ${previousQuantity} portions to ${quantity} portions.`,
+    item
+  };
 };
 
 export const removeItemFromDraft = (
@@ -357,11 +535,14 @@ export const removeItemFromDraft = (
 ): string => {
   const normalizedRequestedName = normalizeComparableText(requestedName);
   const matches = session.cartItems.filter((item) => {
-    const normalizedItemName = normalizeComparableText(item.name);
+    const normalizedItemName = normalizeComparableText(getCartItemDisplayName(item));
+    const normalizedRawName = normalizeComparableText(item.name);
 
     return (
       normalizedItemName.includes(normalizedRequestedName) ||
-      normalizedRequestedName.includes(normalizedItemName)
+      normalizedRequestedName.includes(normalizedItemName) ||
+      normalizedRawName.includes(normalizedRequestedName) ||
+      normalizedRequestedName.includes(normalizedRawName)
     );
   });
 
@@ -371,11 +552,12 @@ export const removeItemFromDraft = (
 
   if (matches.length > 1) {
     return `Multiple draft items matched "${requestedName}". Ask the customer to be more specific: ${matches
-      .map((item) => item.name)
+      .map(getCartItemDisplayName)
       .join(", ")}.`;
   }
 
   const matchedItem = matches[0];
+  const displayName = getCartItemDisplayName(matchedItem);
   const removeQuantity = quantity ?? matchedItem.quantity;
 
   if (!Number.isInteger(removeQuantity) || removeQuantity <= 0) {
@@ -386,13 +568,13 @@ export const removeItemFromDraft = (
     session.cartItems = session.cartItems.filter(
       (item) => String(item.menuItemId) !== String(matchedItem.menuItemId)
     );
-    return `${matchedItem.name} removed from the draft.`;
+    return `${displayName} removed from the draft.`;
   }
 
   matchedItem.quantity -= removeQuantity;
   matchedItem.totalPrice = matchedItem.quantity * matchedItem.unitPrice;
 
-  return `Removed ${removeQuantity} x ${matchedItem.name} from the draft.`;
+  return `Removed ${removeQuantity} x ${displayName} from the draft.`;
 };
 
 export const getDraftSubtotal = (session: ICustomerSessionDocument): number => {
@@ -546,7 +728,10 @@ export const buildDraftView = (
 
   return {
     items: session.cartItems.map((item) => ({
-      name: item.name,
+      name: getCartItemDisplayName(item),
+      rawName: item.name,
+      categoryId: item.categoryId ? String(item.categoryId) : undefined,
+      categoryName: item.categoryName,
       quantity: item.quantity,
       unitPrice: item.unitPrice,
       totalPrice: item.totalPrice

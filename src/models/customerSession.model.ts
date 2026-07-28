@@ -18,6 +18,9 @@ export type CustomerSessionStep = (typeof customerSessionSteps)[number];
 export interface ICustomerSessionCartItem {
   menuItemId: Types.ObjectId;
   name: string;
+  categoryId?: Types.ObjectId;
+  categoryName?: string;
+  displayName?: string;
   quantity: number;
   unitPrice: number;
   totalPrice: number;
@@ -32,6 +35,13 @@ export interface ICustomerSession {
   pendingMenuItemName?: string;
   pendingCategoryId?: Types.ObjectId;
   pendingCategoryName?: string;
+  lastModifiedMenuItemId?: Types.ObjectId;
+  lastModifiedMenuItemName?: string;
+  lastModifiedCategoryName?: string;
+  lastModifiedDisplayName?: string;
+  lastModifiedAt?: Date;
+  lastModifiedPreviousQuantity?: number;
+  lastModifiedCurrentQuantity?: number;
   currentStep: CustomerSessionStep;
   orderType: OrderType | null;
   deliveryAddress?: string;
@@ -63,6 +73,18 @@ const customerSessionCartItemSchema = new Schema<ICustomerSessionCartItem>(
     name: {
       type: String,
       required: true,
+      trim: true
+    },
+    categoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuCategory"
+    },
+    categoryName: {
+      type: String,
+      trim: true
+    },
+    displayName: {
+      type: String,
       trim: true
     },
     quantity: {
@@ -123,6 +145,33 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
     pendingCategoryName: {
       type: String,
       trim: true
+    },
+    lastModifiedMenuItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuItem"
+    },
+    lastModifiedMenuItemName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedCategoryName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedDisplayName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedAt: {
+      type: Date
+    },
+    lastModifiedPreviousQuantity: {
+      type: Number,
+      min: 0
+    },
+    lastModifiedCurrentQuantity: {
+      type: Number,
+      min: 1
     },
     currentStep: {
       type: String,

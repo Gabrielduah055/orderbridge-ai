@@ -39,11 +39,17 @@ const {
 } = require("../dist/services/wasenderQueue.service");
 const {
   parseExplicitQuantity,
+  parseQuantityCorrection,
   getMissingDraftFields,
   getDraftMissingFieldCode,
   buildDraftView,
   buildStateAwareFollowUpMessage,
-  resolveTrustedQuantity
+  resolveTrustedQuantity,
+  addItemToDraft,
+  getCartItemDisplayName,
+  getMenuItemDisplayName,
+  isOnlyThatCompletionMessage,
+  updateRecentCartItemQuantity
 } = require("../dist/services/orderDraft.service");
 const {
   normalizeIncomingWebhook,
@@ -57,6 +63,7 @@ const {
   addPendingItemToDraft
 } = require("../dist/services/orderDraft.service");
 const { MenuItem } = require("../dist/models/MenuItem");
+const { AgentClarification } = require("../dist/models/agentClarification.model");
 const {
   buildOwnerNewOrderNotification,
   buildCustomerOrderConfirmedMessage,
@@ -230,6 +237,7 @@ test("yes confirms a single clarified item but does not create quantity 1", asyn
 
 test("one explicit quantity adds the pending clarified item and clears it", async () => {
   const originalFindOne = MenuItem.findOne;
+  const originalUpdateMany = AgentClarification.updateMany;
   const session = {
     pendingMenuItemId: "64b000000000000000000303",
     pendingMenuItemName: "Chicken Spaghetti",
@@ -243,6 +251,7 @@ test("one explicit quantity adds the pending clarified item and clears it", asyn
     price: 45,
     isAvailable: true
   });
+  AgentClarification.updateMany = async () => ({ modifiedCount: 0 });
 
   try {
     const message = await addPendingItemToDraft(session, "64b000000000000000000001", 1);
@@ -254,7 +263,108 @@ test("one explicit quantity adds the pending clarified item and clears it", asyn
     assert.equal(session.currentStep, "choosing_items");
   } finally {
     MenuItem.findOne = originalFindOne;
+    AgentClarification.updateMany = originalUpdateMany;
   }
+});
+
+test("raw item names keep full category display identity in the draft", () => {
+  const item = {
+    _id: "64b000000000000000000303",
+    name: "Chicken",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    isAvailable: true
+  };
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+
+  addItemToDraft(session, item, 2);
+  const view = buildDraftView(session, {});
+
+  assert.equal(getMenuItemDisplayName(item, "Spaghetti"), "Chicken Spaghetti");
+  assert.equal(session.cartItems.length, 1);
+  assert.equal(session.cartItems[0].name, "Chicken");
+  assert.equal(session.cartItems[0].categoryName, "Spaghetti");
+  assert.equal(session.cartItems[0].displayName, "Chicken Spaghetti");
+  assert.equal(getCartItemDisplayName(session.cartItems[0]), "Chicken Spaghetti");
+  assert.equal(view.items[0].name, "Chicken Spaghetti");
+  assert.equal(view.items[0].rawName, "Chicken");
+});
+
+test("recent quantity correction updates one cart item instead of adding another", () => {
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+  const item = {
+    _id: "64b000000000000000000303",
+    name: "Chicken",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    isAvailable: true
+  };
+
+  addItemToDraft(session, item, 2);
+
+  assert.equal(parseQuantityCorrection("Oh no make it 5"), 5);
+
+  const result = updateRecentCartItemQuantity(session, 5);
+
+  assert.equal(result.status, "updated");
+  assert.equal(result.message, "Updated Chicken Spaghetti from 2 portions to 5 portions.");
+  assert.equal(session.cartItems.length, 1);
+  assert.equal(session.cartItems[0].quantity, 5);
+  assert.equal(session.cartItems[0].totalPrice, 225);
+  assert.equal(session.lastModifiedPreviousQuantity, 2);
+  assert.equal(session.lastModifiedCurrentQuantity, 5);
+});
+
+test("quantity correction without a safe recent item asks which item to change", () => {
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+
+  const result = updateRecentCartItemQuantity(session, 5);
+
+  assert.equal(result.status, "needs_item");
+  assert.equal(result.message, "Which item would you like me to change?");
+});
+
+test("stale recent item quantity correction is not applied", () => {
+  const session = {
+    cartItems: [
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken",
+        categoryName: "Spaghetti",
+        displayName: "Chicken Spaghetti",
+        quantity: 2,
+        unitPrice: 45,
+        totalPrice: 90
+      }
+    ],
+    lastModifiedMenuItemId: "64b000000000000000000303",
+    lastModifiedAt: new Date("2026-07-28T12:00:00.000Z"),
+    deliveryFeeResolved: false
+  };
+
+  const result = updateRecentCartItemQuantity(session, 5, new Date("2026-07-28T12:06:00.000Z"));
+
+  assert.equal(result.status, "needs_item");
+  assert.equal(result.message, "Which item would you like me to change?");
+  assert.equal(session.cartItems[0].quantity, 2);
+});
+
+test("only-that completion intents are not menu item requests", () => {
+  assert.equal(isOnlyThatCompletionMessage("I want only that"), true);
+  assert.equal(isOnlyThatCompletionMessage("that's all"), true);
+  assert.equal(isOnlyThatCompletionMessage("proceed with that"), true);
+  assert.equal(isOnlyThatCompletionMessage("I want Chicken"), false);
 });
 
 test("delivery fee resolver uses configured sources only", () => {
@@ -1306,6 +1416,78 @@ test("bulk accepted order side effects process each order exactly once", async (
     sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = originalNotifyConfirmed;
     delete require.cache[controllerPath];
   }
+});
+
+test("same customer webhook turns are processed sequentially", async () => {
+  const { runCustomerConversationSequentially } = require("../dist/controllers/wasender.controller");
+  const events = [];
+  let releaseFirst;
+  let resolveFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+  const first = runCustomerConversationSequentially(
+      "64b000000000000000000001",
+      "+233500000001",
+      async () => {
+        events.push("first-start");
+        resolveFirstStarted();
+        await new Promise((release) => {
+          releaseFirst = release;
+        });
+        events.push("first-end");
+      }
+  );
+
+  await firstStarted;
+
+  const second = runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000001",
+    async () => {
+      events.push("second-start");
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(events, ["first-start"]);
+
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.deepEqual(events, ["first-start", "first-end", "second-start"]);
+});
+
+test("different customer webhook turns can run concurrently", async () => {
+  const { runCustomerConversationSequentially } = require("../dist/controllers/wasender.controller");
+  const events = [];
+  let releaseFirst;
+  const first = runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000001",
+    async () => {
+      events.push("first-start");
+      await new Promise((release) => {
+        releaseFirst = release;
+      });
+      events.push("first-end");
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000002",
+    async () => {
+      events.push("second-start");
+    }
+  );
+
+  assert.deepEqual(events, ["first-start", "second-start"]);
+
+  releaseFirst();
+  await first;
 });
 
 test("OpenRouter max-round fallback returns recoverable clarification message", async () => {
