@@ -25,7 +25,7 @@ import type { IOrderDocument } from "../../models/order.model";
 const safeFallbackMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
 const maxRoundsFallbackMessage =
-  "I couldn't complete that request safely. Please try a simpler request or contact support.";
+  "I'm sorry, I had a little trouble with that one. Could you try again or rephrase what you'd like?";
 const recoverableToolCodes = new Set([
   "MULTIPLE_MENU_ITEMS_FOUND",
   "ORDER_ITEM_QUANTITY_REQUIRED",
