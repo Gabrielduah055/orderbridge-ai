@@ -23,6 +23,7 @@ import {
   findActiveDraft,
   findMenuItemMatch,
   findMenuItemMatchInCategory,
+  getCartItemDisplayName,
   getMenuItemDisplayName,
   getMissingDraftFields,
   getDraftMissingFieldCode,
@@ -78,6 +79,12 @@ const removeOrderItemByNameSchema = z
   .object({
     itemName: z.string().trim().min(1),
     quantity: z.number().int().positive().optional()
+  })
+  .strict();
+const updateOrderItemQuantitySchema = z
+  .object({
+    itemName: z.string().trim().min(1),
+    newQuantity: z.number().int().positive()
   })
   .strict();
 const updateOrderDraftSchema = z
@@ -1334,6 +1341,79 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message,
+        data: buildDraftView(draft, context.restaurant)
+      };
+    }
+  },
+  update_order_item_quantity: {
+    definition: {
+      name: "update_order_item_quantity",
+      description:
+        "Set an exact new quantity for an item already in the order draft. Use this when the customer wants to change how many of something they ordered (e.g. from 2 to 5). This REPLACES the quantity — it does not add to it.",
+      parameters: {
+        itemName: "Name of the item in the cart to update.",
+        newQuantity: "The exact new quantity the customer wants. Must be a positive integer."
+      }
+    },
+    roles: toolPermissions.update_order_item_quantity,
+    schema: updateOrderItemQuantitySchema,
+    handler: async (args, context) => {
+      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+
+      if (draft.cartItems.length === 0) {
+        return {
+          success: false,
+          code: "CART_EMPTY",
+          message: "The order draft is empty. There are no items to update."
+        };
+      }
+
+      const normalizedName = args.itemName.toLowerCase().trim();
+      const matches = draft.cartItems.filter((item) => {
+        const displayName = getCartItemDisplayName(item).toLowerCase();
+        const rawName = item.name.toLowerCase();
+
+        return (
+          displayName.includes(normalizedName) ||
+          normalizedName.includes(displayName) ||
+          rawName.includes(normalizedName) ||
+          normalizedName.includes(rawName)
+        );
+      });
+
+      if (matches.length === 0) {
+        return {
+          success: false,
+          code: "CART_ITEM_NOT_FOUND",
+          message: `I couldn't find "${args.itemName}" in your order draft. Here is your current order:`,
+          data: buildDraftView(draft, context.restaurant)
+        };
+      }
+
+      if (matches.length > 1) {
+        const names = matches.map(getCartItemDisplayName).join(", ");
+
+        return {
+          success: false,
+          code: "MULTIPLE_CART_ITEMS_FOUND",
+          message: `Multiple items matched "${args.itemName}". Please be more specific: ${names}.`,
+          data: buildDraftView(draft, context.restaurant)
+        };
+      }
+
+      const cartItem = matches[0];
+      const displayName = getCartItemDisplayName(cartItem);
+      const previousQuantity = cartItem.quantity;
+
+      cartItem.quantity = args.newQuantity;
+      cartItem.totalPrice = cartItem.unitPrice * args.newQuantity;
+
+      clearConvertedDraftState(draft);
+      await draft.save();
+
+      return {
+        success: true,
+        message: `Updated ${displayName}: changed from ${previousQuantity} to ${args.newQuantity} portion${args.newQuantity === 1 ? "" : "s"}.`,
         data: buildDraftView(draft, context.restaurant)
       };
     }
