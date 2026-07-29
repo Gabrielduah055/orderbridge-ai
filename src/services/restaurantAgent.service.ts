@@ -1,7 +1,7 @@
 import {
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
-import { findActiveOrderItemClarification } from "./agentClarification.service";
+import { cancelPendingOrderItemClarifications } from "./agentClarification.service";
 import {
   cancelPendingToolAction,
   executeAgentTool,
@@ -13,15 +13,6 @@ import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
-import {
-  addPendingItemToDraft,
-  buildDraftView,
-  findActiveDraft,
-  isOnlyThatCompletionMessage,
-  parseExplicitQuantity,
-  parseQuantityCorrection,
-  updateRecentCartItemQuantity
-} from "./orderDraft.service";
 import {
   handleSavedOwnerSelectionReply,
   handleUnquotedOwnerOrderDecision,
@@ -269,133 +260,6 @@ const handleLocalCustomerRequest = async (
   };
 };
 
-const handleDeterministicCustomerContinuation = async (
-  input: RestaurantAgentMessageInput,
-  sender: ReturnType<typeof resolveSenderIdentity>
-): Promise<RestaurantAgentResponse | null> => {
-  const restaurantId = String(input.restaurant._id);
-  const [activeClarification, activeDraft] = await Promise.all([
-    findActiveOrderItemClarification({
-      restaurantId,
-      senderPhone: sender.normalizedPhone
-    }),
-    findActiveDraft(restaurantId, sender.normalizedPhone)
-  ]);
-
-  if (activeDraft?.currentStep === "collecting_quantity" && activeDraft.pendingMenuItemId) {
-    const quantity = parseExplicitQuantity(input.message);
-
-    if (!quantity) {
-      return {
-        success: false,
-        message: "I still need the number of portions, please. Would you like 1, 2, or more?",
-        data: buildDraftView(activeDraft, input.restaurant),
-        source: "openrouter_agent",
-        sender
-      };
-    }
-
-    const message = await addPendingItemToDraft(activeDraft, restaurantId, quantity);
-    await activeDraft.save();
-
-    return {
-      success: true,
-      message,
-      data: buildDraftView(activeDraft, input.restaurant),
-      source: "openrouter_agent",
-      sender
-    };
-  }
-
-  const correctedQuantity = parseQuantityCorrection(input.message);
-
-  if (correctedQuantity) {
-    if (!activeDraft) {
-      return {
-        success: false,
-        message: "Which item would you like me to change?",
-        source: "openrouter_agent",
-        sender
-      };
-    }
-
-    const correctionResult = updateRecentCartItemQuantity(activeDraft, correctedQuantity);
-    await activeDraft.save();
-
-    return {
-      success: correctionResult.status === "updated",
-      message: correctionResult.message,
-      data: buildDraftView(activeDraft, input.restaurant),
-      source: "openrouter_agent",
-      sender
-    };
-  }
-
-  if (isOnlyThatCompletionMessage(input.message)) {
-    if (!activeDraft || activeDraft.cartItems.length === 0) {
-      return {
-        success: false,
-        message: "What would you like to order?",
-        data: activeDraft ? buildDraftView(activeDraft, input.restaurant) : undefined,
-        source: "openrouter_agent",
-        sender
-      };
-    }
-
-    activeDraft.currentStep = "choosing_order_type";
-    await activeDraft.save();
-
-    return {
-      success: true,
-      message: "Sure. Is this order for pickup or delivery?",
-      data: buildDraftView(activeDraft, input.restaurant),
-      source: "openrouter_agent",
-      sender
-    };
-  }
-
-  if (!activeClarification && !activeDraft?.pendingCategoryId) {
-    return null;
-  }
-
-  // When a clarification has multiple ambiguous candidates and the customer sends
-  // a general confirmation ("yes", "that one", "that is what I mean", etc.), we
-  // cannot determine WHICH candidate they mean by matching tokens alone.
-  // Return null so the AI orchestrator handles it: it has the full conversation
-  // history and can ask a targeted follow-up or resolve from context.
-  if (activeClarification && activeClarification.candidates.length > 1) {
-    const normalizedMsg = input.message.toLowerCase().trim();
-    const isGeneralConfirmation =
-      /^(yes|yeah|yep|yh|sure|ok|okay|alright|correct|right)\b/.test(normalizedMsg) ||
-      /\b(that is what i|thats what i|that's what i)\b/.test(normalizedMsg) ||
-      /^(that one|the one|it)\b/.test(normalizedMsg);
-
-    if (isGeneralConfirmation) {
-      return null;
-    }
-  }
-
-  const result = await executeAgentTool(
-    "add_order_item_by_name",
-    {
-      itemName: input.message
-    },
-    {
-      restaurantId,
-      restaurant: input.restaurant,
-      sender,
-      originalMessage: input.message
-    }
-  );
-
-  return {
-    success: result.success,
-    message: result.message,
-    data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-    source: "openrouter_agent",
-    sender
-  };
-};
 
 const saveAssistantResponse = async (
   restaurantId: string,
@@ -461,25 +325,20 @@ export const handleRestaurantAgentMessage = async (
 
   if (sender.role === "customer") {
     if (customerOpenRouterEnabled) {
-      const deterministicResponse = await handleDeterministicCustomerContinuation(input, sender);
+      // ── Stale-clarification guard ──────────────────────────────────────────
+      // If the customer sends a greeting or asks for the menu, they have clearly
+      // started a new conversation.  Cancel any pending clarification that was
+      // left over from the previous session so the AI starts with a clean slate
+      // and does not keep asking them to choose between items they no longer
+      // care about.  For all other messages the AI receives the active
+      // clarification in its system-prompt context and can reason about it.
+      const isGreeting = /^(hi|hello|hey|good\s+(morning|afternoon|evening)|start)\b/i.test(message);
 
-      if (deterministicResponse) {
-        // Save user message now that the orchestrator was bypassed
-        await saveAgentConversationMessage({
+      if (isGreeting || isMenuRequest(message)) {
+        await cancelPendingOrderItemClarifications({
           restaurantId,
-          senderPhone: sender.normalizedPhone,
-          senderRole: sender.role,
-          direction: "user",
-          content: message,
-          metadata: { source: "openrouter_agent" }
+          senderPhone: sender.normalizedPhone
         });
-        await saveAssistantResponse(restaurantId, sender, deterministicResponse, {
-          source: "openrouter_agent",
-          deterministicAction: "customer_order_continuation",
-          success: deterministicResponse.success
-        });
-
-        return deterministicResponse;
       }
 
       const agentResult = await runAgentOrchestrator({

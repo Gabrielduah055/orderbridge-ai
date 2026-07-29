@@ -63,6 +63,7 @@ const tokenMatches = (candidate: IAgentClarificationCandidate, text: string): bo
   );
 };
 
+
 export const createOrderItemClarification = async (input: {
   restaurantId: string;
   senderPhone: string;
@@ -136,6 +137,37 @@ export const resolveOrderItemClarification = async (
   clarification: IAgentClarificationDocument,
   text: string
 ) => {
+  const selectionTokens = getMeaningfulSelectionTokens(text);
+
+  // ── Exclusive multi-token pass ────────────────────────────────────────────
+  // When the customer types more than one meaningful word (e.g. "Chicken
+  // spaghetti"), ALL tokens must appear in one candidate's combined
+  // name+category text.  This stops "Chicken spaghetti" from matching
+  // "Chicken Noodles" just because both share the word "chicken".
+  if (selectionTokens.length > 1) {
+    const exclusiveMatches = clarification.candidates.filter((candidate) => {
+      const combinedTokens = normalizeComparableText(
+        [candidate.name, candidate.categoryName].filter(Boolean).join(" ")
+      ).split(/\s+/);
+
+      return selectionTokens.every((token) => combinedTokens.includes(token));
+    });
+
+    if (exclusiveMatches.length === 1) {
+      clarification.status = "resolved";
+      clarification.resolvedAt = new Date();
+      await clarification.save();
+
+      return {
+        status: "matched",
+        candidate: exclusiveMatches[0],
+        menuItemId: String(exclusiveMatches[0].menuItemId),
+        quantity: clarification.quantity
+      } as const;
+    }
+  }
+
+  // ── Standard single-token / confirmation pass ─────────────────────────────
   const matches =
     clarification.candidates.length === 1 && isConfirmationText(text)
       ? [clarification.candidates[0]]
