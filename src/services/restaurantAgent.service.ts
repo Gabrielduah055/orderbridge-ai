@@ -358,6 +358,23 @@ const handleDeterministicCustomerContinuation = async (
     return null;
   }
 
+  // When a clarification has multiple ambiguous candidates and the customer sends
+  // a general confirmation ("yes", "that one", "that is what I mean", etc.), we
+  // cannot determine WHICH candidate they mean by matching tokens alone.
+  // Return null so the AI orchestrator handles it: it has the full conversation
+  // history and can ask a targeted follow-up or resolve from context.
+  if (activeClarification && activeClarification.candidates.length > 1) {
+    const normalizedMsg = input.message.toLowerCase().trim();
+    const isGeneralConfirmation =
+      /^(yes|yeah|yep|yh|sure|ok|okay|alright|correct|right)\b/.test(normalizedMsg) ||
+      /\b(that is what i|thats what i|that's what i)\b/.test(normalizedMsg) ||
+      /^(that one|the one|it)\b/.test(normalizedMsg);
+
+    if (isGeneralConfirmation) {
+      return null;
+    }
+  }
+
   const result = await executeAgentTool(
     "add_order_item_by_name",
     {
@@ -415,16 +432,25 @@ export const handleRestaurantAgentMessage = async (
     verified: sender.verified
   });
 
-  await saveAgentConversationMessage({
-    restaurantId,
-    senderPhone: sender.normalizedPhone,
-    senderRole: sender.role,
-    direction: "user",
-    content: message,
-    metadata: {
-      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
-    }
-  });
+  // For the customer OpenRouter orchestrator path we defer the user-message save until
+  // AFTER the orchestrator returns.  If we save it now it appears at the end of the
+  // history window that the orchestrator fetches, which (a) wastes a context slot and
+  // (b) can cause the orchestrator to push the same message a second time, confusing
+  // the AI about what was already said.
+  const deferUserMessageSave = sender.role === "customer" && customerOpenRouterEnabled;
+
+  if (!deferUserMessageSave) {
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "user",
+      content: message,
+      metadata: {
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
+      }
+    });
+  }
 
   if (
     isMenuRequest(message) &&
@@ -438,6 +464,15 @@ export const handleRestaurantAgentMessage = async (
       const deterministicResponse = await handleDeterministicCustomerContinuation(input, sender);
 
       if (deterministicResponse) {
+        // Save user message now that the orchestrator was bypassed
+        await saveAgentConversationMessage({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          direction: "user",
+          content: message,
+          metadata: { source: "openrouter_agent" }
+        });
         await saveAssistantResponse(restaurantId, sender, deterministicResponse, {
           source: "openrouter_agent",
           deterministicAction: "customer_order_continuation",
@@ -451,6 +486,17 @@ export const handleRestaurantAgentMessage = async (
         restaurant: input.restaurant,
         sender,
         message
+      });
+
+      // Now that the orchestrator has run and built its context from the uncontaminated
+      // history window, persist the user message followed by the assistant response.
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: { source: "openrouter_agent" }
       });
 
       await saveAgentConversationMessage({
