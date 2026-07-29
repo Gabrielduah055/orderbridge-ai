@@ -1,3 +1,4 @@
+import { Types } from "mongoose";
 import {
   CustomerSession,
   type ICustomerSessionCartItem,
@@ -812,7 +813,7 @@ export const submitOrderDraft = async (
     deliveryFeeSource: draft.deliveryFeeSource,
     paymentMethod: "unknown",
     paymentStatus: "unpaid",
-    sourceDraftId: String(draft._id)
+    sourceDraftId: String(new Types.ObjectId())
   });
 
   resetDraftState(draft);
