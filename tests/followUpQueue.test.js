@@ -141,6 +141,28 @@ test("outdated follow-ups are cancelled after a reply or draft-step change", asy
   }
 });
 
+test("a follow-up is cancelled when its scoped customer session no longer exists", async () => {
+  const result = await processReminder({
+    metadata: {
+      kind: "customer_follow_up",
+      restaurantId,
+      customerPhone,
+      conversationVersion: 4,
+      expectedDraftStep: "collecting_quantity"
+    },
+    session: null
+  });
+
+  assert.equal(result.processed, true);
+  assert.equal(result.locked.status, "cancelled");
+  assert.equal(result.sendCount, 0);
+  assert.equal(result.savedCount, 1);
+  assert.deepEqual(result.sessionFilter, {
+    restaurantId,
+    customerPhone
+  });
+});
+
 test("a current follow-up is still sent", async () => {
   const result = await processReminder({
     metadata: {

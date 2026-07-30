@@ -62,7 +62,7 @@ export const isQueuedConversationalMessageStale = (
   }
 
   if (!session) {
-    return false;
+    return metadata.kind === "customer_follow_up";
   }
 
   const expectedVersion = Number(metadata.conversationVersion);
