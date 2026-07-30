@@ -2,11 +2,21 @@ export const restaurantPlans = ["starter", "growth", "premium"] as const;
 export const restaurantStatuses = ["trial", "active", "paused", "cancelled"] as const;
 export const assistantTones = ["friendly", "professional", "casual", "concise", "playful"] as const;
 export const billingStatuses = ["active", "inactive", "past_due", "cancelled"] as const;
+export const ownerSummaryWeekdays = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday"
+] as const;
 
 export type RestaurantPlan = (typeof restaurantPlans)[number];
 export type RestaurantStatus = (typeof restaurantStatuses)[number];
 export type AssistantTone = (typeof assistantTones)[number];
 export type BillingStatus = (typeof billingStatuses)[number];
+export type OwnerSummaryWeekday = (typeof ownerSummaryWeekdays)[number];
 export type DeliveryPricingType = "flat" | "zone_based" | "manual_confirmation";
 
 export interface RestaurantDeliveryPricingZoneInput {
@@ -64,6 +74,12 @@ export interface RestaurantInput {
   assistantPersonalitySummary?: string;
   followUpEnabled?: boolean;
   followUpDelayMinutes?: number;
+  timezone?: string;
+  ownerDailySummaryEnabled?: boolean;
+  ownerDailySummaryTime?: string;
+  ownerWeeklySummaryEnabled?: boolean;
+  ownerWeeklySummaryDay?: OwnerSummaryWeekday;
+  ownerWeeklySummaryTime?: string;
 }
 
 export interface RestaurantManagerContactInput {

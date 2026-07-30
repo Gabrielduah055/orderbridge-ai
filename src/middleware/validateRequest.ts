@@ -9,12 +9,30 @@ import {
 import {
   assistantTones,
   billingStatuses,
+  ownerSummaryWeekdays,
   restaurantPlans,
   restaurantStatuses
 } from "../types/restaurant.types";
 
 const phoneSchema = z.string().trim().min(7);
 const optionalTextSchema = z.string().trim().min(1).optional();
+const ownerSummaryTimeSchema = z
+  .string()
+  .trim()
+  .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, "Time must use 24-hour HH:mm format");
+const timezoneSchema = z.string().trim().min(1).refine(
+  (value) => {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  {
+    message: "Timezone must be a valid IANA timezone"
+  }
+);
 const managerContactSchema = z
   .object({
     name: optionalTextSchema,
@@ -70,7 +88,13 @@ export const createRestaurantSchema = z
     assistantTone: z.enum(assistantTones).default("friendly"),
     assistantPersonalitySummary: optionalTextSchema,
     followUpEnabled: z.boolean().default(true),
-    followUpDelayMinutes: z.number().int().min(0).default(5)
+    followUpDelayMinutes: z.number().int().min(0).default(5),
+    timezone: timezoneSchema.default("Africa/Accra"),
+    ownerDailySummaryEnabled: z.boolean().default(false),
+    ownerDailySummaryTime: ownerSummaryTimeSchema.default("08:00"),
+    ownerWeeklySummaryEnabled: z.boolean().default(false),
+    ownerWeeklySummaryDay: z.enum(ownerSummaryWeekdays).default("monday"),
+    ownerWeeklySummaryTime: ownerSummaryTimeSchema.default("08:00")
   })
   .strict();
 

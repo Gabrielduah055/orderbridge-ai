@@ -4,8 +4,10 @@ import {
   billingStatuses,
   restaurantPlans,
   restaurantStatuses,
+  ownerSummaryWeekdays,
   type AssistantTone,
   type BillingStatus,
+  type OwnerSummaryWeekday,
   type RestaurantPlan,
   type RestaurantStatus
 } from "../types/restaurant.types";
@@ -41,6 +43,12 @@ export interface IRestaurant {
   assistantPersonalitySummary?: string;
   followUpEnabled: boolean;
   followUpDelayMinutes: number;
+  timezone: string;
+  ownerDailySummaryEnabled: boolean;
+  ownerDailySummaryTime: string;
+  ownerWeeklySummaryEnabled: boolean;
+  ownerWeeklySummaryDay: OwnerSummaryWeekday;
+  ownerWeeklySummaryTime: string;
 }
 
 export interface RestaurantManagerContact {
@@ -248,11 +256,53 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
       type: Number,
       default: 3,
       min: 0
+    },
+    timezone: {
+      type: String,
+      default: "Africa/Accra",
+      trim: true,
+      validate: {
+        validator: (value: string) => {
+          try {
+            new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        message: "timezone must be a valid IANA timezone"
+      }
+    },
+    ownerDailySummaryEnabled: {
+      type: Boolean,
+      default: false
+    },
+    ownerDailySummaryTime: {
+      type: String,
+      default: "08:00",
+      match: /^(?:[01]\d|2[0-3]):[0-5]\d$/
+    },
+    ownerWeeklySummaryEnabled: {
+      type: Boolean,
+      default: false
+    },
+    ownerWeeklySummaryDay: {
+      type: String,
+      enum: ownerSummaryWeekdays,
+      default: "monday"
+    },
+    ownerWeeklySummaryTime: {
+      type: String,
+      default: "08:00",
+      match: /^(?:[01]\d|2[0-3]):[0-5]\d$/
     }
   },
   {
     timestamps: true
   }
 );
+
+restaurantSchema.index({ status: 1, ownerDailySummaryEnabled: 1 });
+restaurantSchema.index({ status: 1, ownerWeeklySummaryEnabled: 1 });
 
 export const Restaurant = model<IRestaurantDocument>("Restaurant", restaurantSchema);
