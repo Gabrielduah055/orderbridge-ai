@@ -280,7 +280,7 @@ const getNormalizedCustomerPhones = (
 export const buildOwnerSummaryMetrics = (
   input: GetOwnerSummaryMetricsInput,
   periodOrders: SummaryOrder[],
-  priorCustomerOrders: Array<Pick<SummaryOrder, "customerPhone">>
+  priorCustomerOrders: Array<Pick<SummaryOrder, "customerPhone" | "status">>
 ): OwnerSummaryMetrics => {
   const timezone = input.timezone ?? DEFAULT_TIMEZONE;
   const periodType = input.periodType ?? "custom";
@@ -325,8 +325,10 @@ export const buildOwnerSummaryMetrics = (
         first.name.localeCompare(second.name)
     )
     .slice(0, 5);
-  const periodCustomers = getNormalizedCustomerPhones(periodOrders);
-  const priorCustomers = getNormalizedCustomerPhones(priorCustomerOrders);
+  const periodCustomers = getNormalizedCustomerPhones(completedOrders);
+  const priorCustomers = getNormalizedCustomerPhones(
+    priorCustomerOrders.filter((order) => order.status === "completed")
+  );
   let returningCustomers = 0;
 
   for (const phone of periodCustomers) {
@@ -407,10 +409,11 @@ export const getOwnerSummaryMetrics = async (
     }).select("status total customerPhone items createdAt"),
     Order.find({
       restaurantId: input.restaurantId,
+      status: "completed",
       createdAt: {
         $lt: input.periodStart
       }
-    }).select("customerPhone")
+    }).select("status customerPhone")
   ]);
 
   return buildOwnerSummaryMetrics(input, periodOrders, priorCustomerOrders);
@@ -450,7 +453,7 @@ export const formatOwnerSummaryMessage = (
       : "None";
   const busiestDayLine =
     period.type === "weekly" && metrics.busiestDay
-      ? `\nBusiest day: ${metrics.busiestDay.date} (${metrics.busiestDay.totalOrders} orders)`
+      ? `\nBusiest day by orders received: ${metrics.busiestDay.date} (${metrics.busiestDay.totalOrders} orders)`
       : "";
 
   return [

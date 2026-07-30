@@ -8,6 +8,7 @@ const {
 } = require("../dist/middleware/validateRequest");
 const {
   buildOwnerSummaryMetrics,
+  formatOwnerSummaryMessage,
   getOwnerSummaryMetrics,
   getPreviousDailySummaryPeriod,
   getPreviousWeeklySummaryPeriod
@@ -182,9 +183,24 @@ test("owner summary revenue, average, status counts, and top items use completed
     day: "wednesday",
     totalOrders: 2
   });
+  assert.equal(metrics.uniqueCustomers, 2);
+  assert.match(
+    formatOwnerSummaryMessage(
+      "Tenant Restaurant",
+      {
+        type: "weekly",
+        timezone: "Africa/Accra",
+        periodStart,
+        periodEnd,
+        key: "2026-07-20_to_2026-07-26"
+      },
+      metrics
+    ),
+    /Busiest day by orders received: 2026-07-22 \(2 orders\)/
+  );
 });
 
-test("new and returning customer counts compare normalized restaurant phone history", () => {
+test("new and returning customer counts use completed orders and normalized phone history only", () => {
   const metrics = buildOwnerSummaryMetrics(
     metricInput({ periodType: "daily" }),
     [
@@ -194,30 +210,63 @@ test("new and returning customer counts compare normalized restaurant phone hist
         customerPhone: "0557038547"
       }),
       makeOrder({
-        status: "cancelled",
+        status: "completed",
         total: 20,
-        customerPhone: "+233557038547"
-      }),
-      makeOrder({
-        status: "rejected",
-        total: 30,
         customerPhone: "0241234567"
       }),
       makeOrder({
-        status: "pending",
+        status: "cancelled",
+        total: 30,
+        customerPhone: "+233501111111"
+      }),
+      makeOrder({
+        status: "rejected",
         total: 40,
-        customerPhone: "+233500000001"
+        customerPhone: "+233502222222"
+      }),
+      makeOrder({
+        status: "pending",
+        total: 50,
+        customerPhone: "+233503333333"
+      }),
+      makeOrder({
+        status: "accepted",
+        total: 60,
+        customerPhone: "+233504444444"
+      }),
+      makeOrder({
+        status: "preparing",
+        total: 70,
+        customerPhone: "+233505555555"
+      }),
+      makeOrder({
+        status: "ready",
+        total: 80,
+        customerPhone: "+233506666666"
       })
     ],
     [
-      { customerPhone: "233557038547" },
-      { customerPhone: "+233509999999" }
+      {
+        status: "completed",
+        customerPhone: "233557038547"
+      },
+      {
+        status: "cancelled",
+        customerPhone: "+233241234567"
+      }
     ]
   );
 
-  assert.equal(metrics.uniqueCustomers, 3);
+  assert.equal(metrics.totalOrders, 8);
+  assert.equal(metrics.countsByStatus.cancelled, 1);
+  assert.equal(metrics.countsByStatus.rejected, 1);
+  assert.equal(metrics.countsByStatus.pending, 1);
+  assert.equal(metrics.countsByStatus.accepted, 1);
+  assert.equal(metrics.countsByStatus.preparing, 1);
+  assert.equal(metrics.countsByStatus.ready, 1);
+  assert.equal(metrics.uniqueCustomers, 2);
   assert.equal(metrics.returningCustomers, 1);
-  assert.equal(metrics.newCustomers, 2);
+  assert.equal(metrics.newCustomers, 1);
 });
 
 test("owner summary order queries are all scoped by restaurantId", async () => {
@@ -254,6 +303,7 @@ test("owner summary order queries are all scoped by restaurantId", async () => {
   assert.deepEqual(filters[1].createdAt, {
     $lt: periodStart
   });
+  assert.equal(filters[1].status, "completed");
 });
 
 test("today orders and sales tools expose completed-only reporting metrics", async () => {
@@ -312,6 +362,8 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
     assert.equal(today.data.revenue, 75);
     assert.equal(today.data.statuses.cancelled, 1);
     assert.equal(today.data.statuses.rejected, 1);
+    assert.equal(today.data.uniqueCustomers, 1);
+    assert.equal(today.data.newCustomers, 1);
     assert.equal(sales.data.revenue, 75);
     assert.deepEqual(sales.data.bestSellingItem, {
       menuItemId: completedItemId,
