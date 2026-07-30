@@ -36,6 +36,12 @@ const toolNameByMcpName: Record<string, string> = {
   set_availability: "set_item_availability",
   get_orders: "get_today_orders",
   get_today_orders: "get_today_orders",
+  get_marketing_preference: "get_marketing_preference",
+  create_campaign_draft: "create_campaign_draft",
+  preview_campaign: "preview_campaign",
+  approve_campaign: "approve_campaign",
+  cancel_campaign: "cancel_campaign",
+  list_campaigns: "list_campaigns",
   start_order: "start_order",
   add_order_item_by_name: "add_order_item_by_name",
   remove_order_item_by_name: "remove_order_item_by_name",
@@ -173,6 +179,120 @@ export const mcpTools = [
     name: "get_orders",
     description: "Owner/manager. Read today's orders summary.",
     inputSchema: toolInputSchema({})
+  },
+  {
+    name: "get_marketing_preference",
+    description:
+      "Customer-only. Read the current restaurant-scoped promotional messaging preference.",
+    inputSchema: toolInputSchema({})
+  },
+  {
+    name: "create_campaign_draft",
+    description:
+      "Owner/manager only. Create an approval-gated customer campaign draft using bounded targeting.",
+    inputSchema: toolInputSchema(
+      {
+        name: { type: "string" },
+        message: { type: "string" },
+        campaignType: {
+          type: "string",
+          enum: [
+            "promotion",
+            "inactivity_reengagement",
+            "holiday",
+            "announcement"
+          ]
+        },
+        targeting: {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              enum: [
+                "all_eligible_customers",
+                "inactive_customers",
+                "returning_customers",
+                "ordered_menu_item",
+                "last_order_date_range"
+              ]
+            },
+            inactiveDays: { type: "integer", minimum: 1, maximum: 3650 },
+            menuItemId: { type: "string" },
+            startDate: { type: "string" },
+            endDate: { type: "string" }
+          },
+          required: ["type"],
+          additionalProperties: false
+        },
+        scheduledAt: { type: "string" },
+        referencedMenuItemId: { type: "string" }
+      },
+      ["name", "message", "campaignType", "targeting"]
+    )
+  },
+  {
+    name: "preview_campaign",
+    description:
+      "Owner/manager only. Preview a restaurant-scoped campaign.",
+    inputSchema: toolInputSchema(
+      {
+        campaignId: { type: "string" }
+      },
+      ["campaignId"]
+    )
+  },
+  {
+    name: "approve_campaign",
+    description:
+      "Owner/manager only. Prepare campaign approval through the existing confirmation flow.",
+    inputSchema: toolInputSchema(
+      {
+        campaignId: { type: "string" }
+      },
+      ["campaignId"]
+    )
+  },
+  {
+    name: "cancel_campaign",
+    description:
+      "Owner/manager only. Prepare campaign cancellation through the existing confirmation flow.",
+    inputSchema: toolInputSchema(
+      {
+        campaignId: { type: "string" }
+      },
+      ["campaignId"]
+    )
+  },
+  {
+    name: "list_campaigns",
+    description:
+      "Owner/manager only. List restaurant campaigns with bounded filters.",
+    inputSchema: toolInputSchema({
+      status: {
+        type: "string",
+        enum: [
+          "draft",
+          "pending_approval",
+          "approved",
+          "scheduled",
+          "sending",
+          "sent",
+          "partially_failed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      campaignType: {
+        type: "string",
+        enum: [
+          "promotion",
+          "inactivity_reengagement",
+          "holiday",
+          "announcement"
+        ]
+      },
+      limit: { type: "integer", minimum: 1, maximum: 25 }
+    })
   },
   {
     name: "start_order",

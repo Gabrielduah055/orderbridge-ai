@@ -367,18 +367,28 @@ export const updateConfirmedCustomerPreferences = async (
   }
 
   if (input.marketingConsent !== undefined) {
+    const marketingPreferenceUpdatedAt = new Date();
     preferenceFields.marketingConsent = input.marketingConsent;
+    preferenceFields.marketingPreferenceUpdatedAt =
+      marketingPreferenceUpdatedAt;
+    preferenceFields.marketingConsentSource = "admin_recorded";
 
     if (input.marketingConsent) {
       preferenceFields.isOptedOut = false;
+      preferenceFields.marketingConsentAt = marketingPreferenceUpdatedAt;
     }
   }
 
   if (input.isOptedOut !== undefined) {
+    const marketingPreferenceUpdatedAt = new Date();
     preferenceFields.isOptedOut = input.isOptedOut;
+    preferenceFields.marketingPreferenceUpdatedAt =
+      marketingPreferenceUpdatedAt;
 
     if (input.isOptedOut) {
       preferenceFields.marketingConsent = false;
+      preferenceFields.optedOutAt = marketingPreferenceUpdatedAt;
+      preferenceFields.optedOutSource = "admin_recorded";
     }
   }
 

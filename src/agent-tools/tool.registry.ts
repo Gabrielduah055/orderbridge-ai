@@ -8,6 +8,18 @@ import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
 import * as customerRecommendationService from "../services/customerRecommendation.service";
 import {
+  approveCustomerCampaign,
+  buildCustomerCampaignPreviewMessage,
+  campaignIdSchema,
+  cancelCustomerCampaign,
+  createCustomerCampaignDraft,
+  createCustomerCampaignDraftSchema,
+  listCustomerCampaigns,
+  listCustomerCampaignsSchema,
+  previewCustomerCampaign
+} from "../services/customerCampaign.service";
+import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
+import {
   getCurrentDailySummaryPeriod,
   getOwnerSummaryMetrics
 } from "../services/ownerSummary.service";
@@ -548,6 +560,24 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  get_marketing_preference: {
+    definition: {
+      name: "get_marketing_preference",
+      description:
+        "Read this customer's restaurant-scoped promotional messaging preference. Preference changes themselves are handled only by explicit deterministic customer commands such as STOP or START.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_marketing_preference,
+    schema: emptySchema,
+    handler: async (_args, context) => ({
+      success: true,
+      message: "Marketing preference retrieved.",
+      data: await getCustomerMarketingPreference(
+        context.restaurantId,
+        context.sender.normalizedPhone
+      )
+    })
+  },
   get_today_orders: {
     definition: {
       name: "get_today_orders",
@@ -744,6 +774,238 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           pendingOrders: metrics.countsByStatus.pending,
           unavailableItems
         }
+      };
+    }
+  },
+  create_campaign_draft: {
+    definition: {
+      name: "create_campaign_draft",
+      description:
+        "Owner/manager only. Store a campaign draft with bounded targeting and prepare an approval preview. This never sends customer messages before explicit confirmation.",
+      parameters: {
+        name: "Campaign name.",
+        message: "Final campaign wording.",
+        campaignType:
+          "promotion | inactivity_reengagement | holiday | announcement",
+        targeting:
+          "Strict targeting rule: all_eligible_customers, inactive_customers, returning_customers, ordered_menu_item, or last_order_date_range.",
+        scheduledAt:
+          "Optional ISO or restaurant-local date-time.",
+        referencedMenuItemId:
+          "Optional restaurant menu item explicitly referenced by the campaign message."
+      }
+    },
+    roles: toolPermissions.create_campaign_draft,
+    sensitive: true,
+    schema: createCustomerCampaignDraftSchema,
+    handler: async (args, context) => {
+      if (
+        context.sender.role !== "owner" &&
+        context.sender.role !== "manager"
+      ) {
+        return {
+          success: false,
+          code: "CAMPAIGN_FORBIDDEN",
+          message:
+            "Only a verified owner or manager can create a campaign."
+        };
+      }
+
+      const { campaign, preview } =
+        await createCustomerCampaignDraft({
+          ...args,
+          restaurantId: context.restaurantId,
+          createdByPhone: context.sender.normalizedPhone,
+          createdByRole: context.sender.role
+        });
+      const previewMessage = buildCustomerCampaignPreviewMessage(
+        campaign,
+        preview
+      );
+      const pending = await createPendingToolAction(
+        context,
+        "approve_campaign",
+        {
+          campaignId: String(campaign._id)
+        },
+        previewMessage
+      );
+
+      return {
+        ...pending,
+        data: {
+          campaignId: String(campaign._id),
+          status: campaign.status,
+          preview: {
+            targetingDescription: preview.targetingDescription,
+            estimatedEligibleRecipients:
+              preview.estimatedEligibleRecipients,
+            excludedNoConsent: preview.excludedNoConsent,
+            excludedOptOut: preview.excludedOptOut,
+            excludedInvalidPhone: preview.excludedInvalidPhone,
+            plannedSend:
+              campaign.scheduledAt?.toISOString() ?? null,
+            timezone: campaign.timezone
+          }
+        }
+      };
+    }
+  },
+  preview_campaign: {
+    definition: {
+      name: "preview_campaign",
+      description:
+        "Owner/manager only. Recalculate a campaign preview from bounded backend targeting without sending it.",
+      parameters: {
+        campaignId: "Campaign ID."
+      }
+    },
+    roles: toolPermissions.preview_campaign,
+    schema: campaignIdSchema,
+    handler: async (args, context) => {
+      const { campaign, preview } = await previewCustomerCampaign(
+        context.restaurantId,
+        args.campaignId
+      );
+
+      return {
+        success: true,
+        message: buildCustomerCampaignPreviewMessage(
+          campaign,
+          preview
+        ),
+        data: {
+          campaignId: String(campaign._id),
+          status: campaign.status,
+          preview
+        }
+      };
+    }
+  },
+  approve_campaign: {
+    definition: {
+      name: "approve_campaign",
+      description:
+        "Owner/manager only. Prepare or confirm campaign approval. Approval snapshots eligible recipients; delivery remains scheduled through the outbound queue.",
+      parameters: {
+        campaignId: "Campaign ID."
+      }
+    },
+    roles: toolPermissions.approve_campaign,
+    sensitive: true,
+    schema: campaignIdSchema,
+    handler: async (args, context) => {
+      if (!context.confirmed) {
+        const { campaign, preview } =
+          await previewCustomerCampaign(
+            context.restaurantId,
+            args.campaignId
+          );
+
+        return createPendingToolAction(
+          context,
+          "approve_campaign",
+          args,
+          buildCustomerCampaignPreviewMessage(campaign, preview)
+        );
+      }
+
+      const campaign = await approveCustomerCampaign(
+        context.restaurantId,
+        args.campaignId,
+        context.sender.normalizedPhone
+      );
+
+      return {
+        success: true,
+        message:
+          campaign.status === "scheduled"
+            ? "Campaign approved and scheduled."
+            : "Campaign approved for queue delivery.",
+        data: {
+          campaignId: String(campaign._id),
+          status: campaign.status,
+          totalRecipientCount: campaign.totalRecipientCount,
+          scheduledAt: campaign.scheduledAt
+        }
+      };
+    }
+  },
+  cancel_campaign: {
+    definition: {
+      name: "cancel_campaign",
+      description:
+        "Owner/manager only. Prepare or confirm cancelling a campaign and all unsent recipients.",
+      parameters: {
+        campaignId: "Campaign ID."
+      }
+    },
+    roles: toolPermissions.cancel_campaign,
+    sensitive: true,
+    schema: campaignIdSchema,
+    handler: async (args, context) => {
+      if (!context.confirmed) {
+        return createPendingToolAction(
+          context,
+          "cancel_campaign",
+          args,
+          "Should I cancel this campaign and all of its unsent promotional messages?"
+        );
+      }
+
+      const campaign = await cancelCustomerCampaign(
+        context.restaurantId,
+        args.campaignId,
+        context.sender.normalizedPhone
+      );
+
+      return {
+        success: true,
+        message: "Campaign cancelled.",
+        data: {
+          campaignId: String(campaign._id),
+          status: campaign.status
+        }
+      };
+    }
+  },
+  list_campaigns: {
+    definition: {
+      name: "list_campaigns",
+      description:
+        "Owner/manager only. List this restaurant's campaigns using bounded status/type filters.",
+      parameters: {
+        status: "Optional controlled campaign status.",
+        campaignType: "Optional controlled campaign type.",
+        limit: "Optional result limit, maximum 25."
+      }
+    },
+    roles: toolPermissions.list_campaigns,
+    schema: listCustomerCampaignsSchema,
+    handler: async (args, context) => {
+      const campaigns = await listCustomerCampaigns(
+        context.restaurantId,
+        args
+      );
+
+      return {
+        success: true,
+        message: "Campaigns retrieved.",
+        data: campaigns.map((campaign) => ({
+          id: String(campaign._id),
+          name: campaign.name,
+          campaignType: campaign.campaignType,
+          status: campaign.status,
+          scheduledAt: campaign.scheduledAt,
+          estimatedRecipientCount:
+            campaign.estimatedRecipientCount,
+          totalRecipientCount: campaign.totalRecipientCount,
+          sentRecipientCount: campaign.sentRecipientCount,
+          failedRecipientCount: campaign.failedRecipientCount,
+          cancelledRecipientCount:
+            campaign.cancelledRecipientCount,
+          createdAt: campaign.createdAt
+        }))
       };
     }
   },
