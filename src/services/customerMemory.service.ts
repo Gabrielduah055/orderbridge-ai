@@ -16,7 +16,6 @@ export const CUSTOMER_MEMORY_FOOD_PREFERENCE_LIMIT = 5;
 
 const MAX_MEMORY_NAME_LENGTH = 80;
 const MAX_MEMORY_ITEM_NAME_LENGTH = 80;
-const MAX_MEMORY_AREA_LENGTH = 120;
 const MAX_MEMORY_PREFERENCE_LENGTH = 80;
 
 export type CustomerMarketingConsent =
@@ -41,7 +40,6 @@ export interface CustomerMemorySummary {
   recentOrders?: CustomerMemoryRecentOrder[];
   frequentItems?: string[];
   preferredOrderType?: OrderType;
-  commonDeliveryArea?: string;
   confirmedFoodPreferences?: CustomerMemoryFoodPreferences;
   marketingConsent?: CustomerMarketingConsent;
 }
@@ -52,7 +50,6 @@ type CustomerMemoryProfileSource = Pick<
   | "orderCount"
   | "frequentlyOrderedItems"
   | "preferredOrderType"
-  | "commonDeliveryAddresses"
   | "dietaryPreferences"
   | "spicePreference"
   | "marketingConsent"
@@ -169,13 +166,6 @@ export const buildCustomerMemorySummary = (
         item.orderCount === 1 ? "" : "s"
       })`;
     });
-  const commonDeliveryArea =
-    profile.commonDeliveryAddresses?.[0]?.address?.trim()
-      ? compactText(
-          profile.commonDeliveryAddresses[0].address,
-          MAX_MEMORY_AREA_LENGTH
-        )
-      : undefined;
   const confirmedFoodPreferences =
     getConfirmedFoodPreferences(profile);
   const marketingConsent = getMarketingConsent(profile);
@@ -189,7 +179,6 @@ export const buildCustomerMemorySummary = (
     ...(profile.preferredOrderType
       ? { preferredOrderType: profile.preferredOrderType }
       : {}),
-    ...(commonDeliveryArea ? { commonDeliveryArea } : {}),
     ...(confirmedFoodPreferences
       ? { confirmedFoodPreferences }
       : {}),
@@ -214,7 +203,6 @@ export const loadCustomerMemorySummary = async (
       "frequentlyOrderedItems.name",
       "frequentlyOrderedItems.orderCount",
       "preferredOrderType",
-      "commonDeliveryAddresses.address",
       "dietaryPreferences",
       "spicePreference",
       "marketingConsent",

@@ -2105,7 +2105,7 @@ test("customer memory summary is compact and excludes internal profile data", ()
   );
   assert.equal(memory.recentOrders[0].items.length, 5);
   assert.equal(memory.recentOrders[0].items[4], "+3 more items");
-  assert.equal(memory.commonDeliveryArea, "Madina Estate");
+  assert.equal(memory.commonDeliveryArea, undefined);
   assert.deepEqual(memory.confirmedFoodPreferences, {
     dietary: ["No peanuts", "Vegetarian"],
     spice: "medium"
@@ -2114,6 +2114,8 @@ test("customer memory summary is compact and excludes internal profile data", ()
   assert.equal(serializedMemory.includes("customerPhone"), false);
   assert.equal(serializedMemory.includes("averageOrderValue"), false);
   assert.equal(serializedMemory.includes("menuItemId"), false);
+  assert.equal(serializedMemory.includes("commonDeliveryArea"), false);
+  assert.equal(serializedMemory.includes("Madina Estate"), false);
   assert.equal(
     serializedMemory.includes("Another full address"),
     false
@@ -2192,6 +2194,10 @@ test("customer memory loader scopes profile and recent orders to one restaurant"
     });
     assert.equal(profileProjection.includes("customerPhone"), false);
     assert.equal(profileProjection.includes("averageOrderValue"), false);
+    assert.equal(
+      profileProjection.includes("commonDeliveryAddresses"),
+      false
+    );
     assert.equal(orderFilter.restaurantId, "64b000000000000000000001");
     assert.equal(orderFilter.status, "completed");
     assert.deepEqual(orderFilter.customerPhone.$in.sort(), [
@@ -2277,8 +2283,7 @@ test("customer prompt receives memory for the exact restaurant and phone", async
         return {
           name: "Ama",
           frequentItems: ["Jollof Rice (3 completed orders)"],
-          preferredOrderType: "delivery",
-          commonDeliveryArea: "Madina"
+          preferredOrderType: "delivery"
         };
       }
     }
@@ -2292,6 +2297,11 @@ test("customer prompt receives memory for the exact restaurant and phone", async
   assert.match(prompt, /Jollof Rice \(3 completed orders\)/);
   assert.match(prompt, /personalization only/);
   assert.match(prompt, /Never auto-add frequent or recent items/);
+  assert.match(prompt, /Unsolicited marketing or promotional messages require/);
+  assert.match(
+    prompt,
+    /Customers may ask about current promotions regardless of marketing consent/
+  );
 });
 
 test("owner prompts never load or include customer memory", async () => {
