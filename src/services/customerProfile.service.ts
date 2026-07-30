@@ -212,7 +212,7 @@ const ensureCustomerPhone = (customerPhone: string): string => {
   return normalizedPhone;
 };
 
-const getEquivalentCustomerPhones = (customerPhone: string): string[] => {
+export const getEquivalentCustomerPhones = (customerPhone: string): string[] => {
   const normalizedPhone = ensureCustomerPhone(customerPhone);
   const equivalentPhones = new Set([
     normalizedPhone,
