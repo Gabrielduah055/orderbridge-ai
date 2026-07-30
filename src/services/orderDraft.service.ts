@@ -609,7 +609,10 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
     missing.push("deliveryFee");
   }
 
-  if (!session.customerName?.trim()) {
+  const genericNames = new Set(["customer", "user", "guest", "unknown", "n/a"]);
+  const name = session.customerName?.trim();
+
+  if (!name || genericNames.has(name.toLowerCase())) {
     missing.push("customerName");
   }
 

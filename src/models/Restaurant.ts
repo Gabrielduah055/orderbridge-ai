@@ -246,7 +246,7 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     },
     followUpDelayMinutes: {
       type: Number,
-      default: 5,
+      default: 3,
       min: 0
     }
   },
