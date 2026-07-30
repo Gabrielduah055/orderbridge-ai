@@ -8,6 +8,10 @@ import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
 import * as customerRecommendationService from "../services/customerRecommendation.service";
 import {
+  getCurrentDailySummaryPeriod,
+  getOwnerSummaryMetrics
+} from "../services/ownerSummary.service";
+import {
   buildClarificationCandidate,
   cancelPendingOrderItemClarifications,
   createOrderItemClarification,
@@ -547,29 +551,32 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
   get_today_orders: {
     definition: {
       name: "get_today_orders",
-      description: "Return today's order summary for the current restaurant.",
+      description:
+        "Return today's order counts and completed-order revenue for the current restaurant.",
       parameters: {}
     },
     roles: toolPermissions.get_today_orders,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const orders = await Order.find({
+      const period = getCurrentDailySummaryPeriod(
+        new Date(),
+        context.restaurant.timezone
+      );
+      const metrics = await getOwnerSummaryMetrics({
         restaurantId: context.restaurantId,
-        createdAt: { $gte: startOfToday() }
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+        timezone: period.timezone,
+        periodType: period.type
       });
-      const countByStatus = new Map(orderStatuses.map((status) => [status, 0]));
-
-      for (const order of orders) {
-        countByStatus.set(order.status, (countByStatus.get(order.status) ?? 0) + 1);
-      }
 
       return {
         success: true,
         message: "Today's orders retrieved successfully.",
         data: {
-          totalOrders: orders.length,
-          revenue: orders.reduce((sum, order) => sum + order.total, 0),
-          statuses: Object.fromEntries(countByStatus)
+          ...metrics,
+          revenue: metrics.completedRevenue,
+          statuses: metrics.countsByStatus
         }
       };
     }
@@ -607,40 +614,31 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_sales_summary",
       description:
-        "Owner/manager. Return today's revenue and best-selling menu item from real order data.",
+        "Owner/manager. Return today's completed-order revenue and best-selling completed-order menu item.",
       parameters: {}
     },
     roles: toolPermissions.get_sales_summary,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const orders = await Order.find({
+      const period = getCurrentDailySummaryPeriod(
+        new Date(),
+        context.restaurant.timezone
+      );
+      const metrics = await getOwnerSummaryMetrics({
         restaurantId: context.restaurantId,
-        createdAt: { $gte: startOfToday() }
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+        timezone: period.timezone,
+        periodType: period.type
       });
-      const itemTotals = new Map<string, { quantity: number; revenue: number }>();
-
-      for (const order of orders) {
-        for (const item of order.items) {
-          const current = itemTotals.get(item.name) ?? { quantity: 0, revenue: 0 };
-
-          itemTotals.set(item.name, {
-            quantity: current.quantity + item.quantity,
-            revenue: current.revenue + item.totalPrice
-          });
-        }
-      }
-
-      const bestSellingItem = Array.from(itemTotals.entries())
-        .map(([name, totals]) => ({ name, ...totals }))
-        .sort((first, second) => second.quantity - first.quantity)[0];
 
       return {
         success: true,
         message: "Sales summary retrieved successfully.",
         data: {
-          totalOrders: orders.length,
-          revenue: orders.reduce((sum, order) => sum + order.total, 0),
-          bestSellingItem
+          ...metrics,
+          revenue: metrics.completedRevenue,
+          bestSellingItem: metrics.topSellingItems[0]
         }
       };
     }
@@ -721,9 +719,16 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.get_business_summary,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const todayOrders = await Order.find({
+      const period = getCurrentDailySummaryPeriod(
+        new Date(),
+        context.restaurant.timezone
+      );
+      const metrics = await getOwnerSummaryMetrics({
         restaurantId: context.restaurantId,
-        createdAt: { $gte: startOfToday() }
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+        timezone: period.timezone,
+        periodType: period.type
       });
       const unavailableItems = await MenuItem.countDocuments({
         restaurantId: context.restaurantId,
@@ -734,9 +739,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Business summary retrieved successfully.",
         data: {
-          todayOrderCount: todayOrders.length,
-          todayRevenue: todayOrders.reduce((sum, order) => sum + order.total, 0),
-          pendingOrders: todayOrders.filter((order) => order.status === "pending").length,
+          todayOrderCount: metrics.totalOrders,
+          todayRevenue: metrics.completedRevenue,
+          pendingOrders: metrics.countsByStatus.pending,
           unavailableItems
         }
       };

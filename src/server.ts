@@ -2,6 +2,7 @@ import { app } from "./app";
 import { connectDb } from "./config/db";
 import { env } from "./config/env";
 import { startFollowUpScheduler } from "./services/followUp.service";
+import { startOwnerSummaryScheduler } from "./services/ownerSummaryScheduler.service";
 import { startWasenderQueueWorker } from "./services/wasenderQueue.service";
 
 const startServer = async (): Promise<void> => {
@@ -12,6 +13,7 @@ const startServer = async (): Promise<void> => {
   });
   startWasenderQueueWorker();
   startFollowUpScheduler();
+  startOwnerSummaryScheduler();
 };
 
 void startServer();

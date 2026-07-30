@@ -38,6 +38,7 @@ const getErrorMessage = (result: WasenderSendResult): string =>
 
 const transactionalKinds = new Set([
   "owner_order_notification",
+  "owner_summary",
   "customer_order_confirmed_notification",
   "customer_order_rejected_notification",
   "receipt_delivery"
@@ -234,10 +235,15 @@ const updateOrderSideEffectAfterSend = async (
 export const enqueueWasenderMessage = async (
   input: EnqueueWasenderMessageInput
 ): Promise<IOutboundMessageDocument> => {
-  if (input.idempotencyKey) {
-    const existing = await OutboundMessage.findOne({
-      idempotencyKey: input.idempotencyKey
-    }).select("+apiKey");
+  const idempotencyFilter = input.idempotencyKey
+    ? {
+        idempotencyKey: input.idempotencyKey,
+        ...(input.restaurantId ? { restaurantId: input.restaurantId } : {})
+      }
+    : undefined;
+
+  if (idempotencyFilter) {
+    const existing = await OutboundMessage.findOne(idempotencyFilter).select("+apiKey");
 
     if (existing) {
       return existing;
@@ -263,15 +269,13 @@ export const enqueueWasenderMessage = async (
     });
   } catch (error) {
     if (
-      input.idempotencyKey &&
+      idempotencyFilter &&
       error &&
       typeof error === "object" &&
       "code" in error &&
       (error as { code?: number }).code === 11000
     ) {
-      const existing = await OutboundMessage.findOne({
-        idempotencyKey: input.idempotencyKey
-      }).select("+apiKey");
+      const existing = await OutboundMessage.findOne(idempotencyFilter).select("+apiKey");
 
       if (existing) {
         return existing;
