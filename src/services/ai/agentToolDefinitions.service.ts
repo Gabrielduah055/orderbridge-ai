@@ -7,6 +7,10 @@ import type { AiToolDefinition } from "./ai.types";
 type JsonSchema = Record<string, unknown>;
 
 const zodToJsonSchema = (schema: z.ZodTypeAny): JsonSchema => {
+  if (schema instanceof z.ZodEffects) {
+    return zodToJsonSchema(schema.innerType());
+  }
+
   if (schema instanceof z.ZodOptional || schema instanceof z.ZodNullable) {
     return zodToJsonSchema(schema.unwrap());
   }

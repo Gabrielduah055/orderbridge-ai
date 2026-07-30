@@ -20,6 +20,7 @@ import {
   resolveQuotedOwnerOrderDecision
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
+import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
 import type {
   RestaurantAgentMessageInput,
   RestaurantAgentResponse
@@ -295,6 +296,50 @@ export const handleRestaurantAgentMessage = async (
     senderRole: sender.role,
     verified: sender.verified
   });
+
+  if (sender.role === "customer") {
+    const preferenceResult =
+      await handleCustomerMarketingPreferenceCommand(
+        restaurantId,
+        sender.normalizedPhone,
+        message
+      );
+
+    if (preferenceResult.handled && preferenceResult.message) {
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: {
+          source: "deterministic_marketing_preference",
+          command: preferenceResult.command
+        }
+      });
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: preferenceResult.message,
+        metadata: {
+          source: "deterministic_marketing_preference",
+          command: preferenceResult.command
+        }
+      });
+
+      return {
+        success: true,
+        message: preferenceResult.message,
+        data: {
+          marketingPreference: preferenceResult.command
+        },
+        source: "legacy_customer",
+        sender
+      };
+    }
+  }
 
   // For the customer OpenRouter orchestrator path we defer the user-message save until
   // AFTER the orchestrator returns.  If we save it now it appears at the end of the

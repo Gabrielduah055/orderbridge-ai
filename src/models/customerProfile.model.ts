@@ -9,6 +9,14 @@ export const customerProfileValueSources = [
 export type CustomerProfileValueSource =
   (typeof customerProfileValueSources)[number];
 
+export const marketingPreferenceSources = [
+  "customer_message",
+  "admin_recorded"
+] as const;
+
+export type MarketingPreferenceSource =
+  (typeof marketingPreferenceSources)[number];
+
 export interface IFrequentlyOrderedItem {
   menuItemId: Types.ObjectId;
   name: string;
@@ -38,7 +46,12 @@ export interface ICustomerProfile {
   dietaryPreferences: string[];
   spicePreference?: string | null;
   marketingConsent?: boolean | null;
-  isOptedOut?: boolean | null;
+  marketingConsentAt?: Date;
+  marketingConsentSource?: MarketingPreferenceSource;
+  isOptedOut: boolean;
+  optedOutAt?: Date;
+  optedOutSource?: MarketingPreferenceSource;
+  marketingPreferenceUpdatedAt?: Date;
   preferencesConfirmedAt?: Date;
 }
 
@@ -165,9 +178,26 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
       type: Boolean,
       default: null
     },
+    marketingConsentAt: {
+      type: Date
+    },
+    marketingConsentSource: {
+      type: String,
+      enum: marketingPreferenceSources
+    },
     isOptedOut: {
       type: Boolean,
-      default: null
+      default: false
+    },
+    optedOutAt: {
+      type: Date
+    },
+    optedOutSource: {
+      type: String,
+      enum: marketingPreferenceSources
+    },
+    marketingPreferenceUpdatedAt: {
+      type: Date
     },
     preferencesConfirmedAt: {
       type: Date

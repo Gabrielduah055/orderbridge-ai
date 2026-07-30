@@ -8,6 +8,7 @@ import * as orderService from "./order.service";
 import { parseExplicitQuantity } from "./orderDraft.service";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
 
 interface CustomerMessageInput {
   restaurantId: string;
@@ -410,6 +411,20 @@ export const handleCustomerMessage = async (
   const customerPhone = normalizeGhanaPhone(input.customerPhone);
   const message = normalizeText(input.message);
   const normalizedMessage = normalizeComparableText(message);
+  const preferenceResult =
+    await handleCustomerMarketingPreferenceCommand(
+      input.restaurantId,
+      customerPhone,
+      message
+    );
+
+  if (preferenceResult.handled && preferenceResult.message) {
+    return {
+      success: true,
+      message: preferenceResult.message
+    };
+  }
+
   const session = await getOrCreateSession(
     input.restaurantId,
     customerPhone,

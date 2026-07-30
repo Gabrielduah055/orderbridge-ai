@@ -325,6 +325,7 @@ export const updateConfirmedCustomerPreferences = async (
   }
 
   const preferenceFields: Record<string, unknown> = {};
+  const preferenceUnsetFields: Record<string, ""> = {};
 
   if (input.customerName !== undefined) {
     const customerName = normalizeDisplayText(input.customerName);
@@ -367,18 +368,33 @@ export const updateConfirmedCustomerPreferences = async (
   }
 
   if (input.marketingConsent !== undefined) {
+    const marketingPreferenceUpdatedAt = new Date();
     preferenceFields.marketingConsent = input.marketingConsent;
+    preferenceFields.marketingPreferenceUpdatedAt =
+      marketingPreferenceUpdatedAt;
+    preferenceFields.marketingConsentSource = "admin_recorded";
 
     if (input.marketingConsent) {
       preferenceFields.isOptedOut = false;
+      preferenceFields.marketingConsentAt = marketingPreferenceUpdatedAt;
+      preferenceUnsetFields.optedOutAt = "";
+      preferenceUnsetFields.optedOutSource = "";
     }
   }
 
   if (input.isOptedOut !== undefined) {
+    const marketingPreferenceUpdatedAt = new Date();
     preferenceFields.isOptedOut = input.isOptedOut;
+    preferenceFields.marketingPreferenceUpdatedAt =
+      marketingPreferenceUpdatedAt;
 
     if (input.isOptedOut) {
       preferenceFields.marketingConsent = false;
+      preferenceFields.optedOutAt = marketingPreferenceUpdatedAt;
+      preferenceFields.optedOutSource = "admin_recorded";
+    } else {
+      preferenceUnsetFields.optedOutAt = "";
+      preferenceUnsetFields.optedOutSource = "";
     }
   }
 
@@ -397,6 +413,11 @@ export const updateConfirmedCustomerPreferences = async (
     },
     {
       $set: preferenceFields,
+      ...(Object.keys(preferenceUnsetFields).length > 0
+        ? {
+            $unset: preferenceUnsetFields
+          }
+        : {}),
       $setOnInsert: {
         restaurantId,
         customerPhone: normalizedPhone

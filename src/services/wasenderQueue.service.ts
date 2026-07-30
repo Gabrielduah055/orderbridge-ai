@@ -2,6 +2,10 @@ import { Types } from "mongoose";
 import { Order } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import { Restaurant } from "../models/Restaurant";
+import { CustomerCampaign } from "../models/customerCampaign.model";
+import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
+import { CustomerProfile } from "../models/customerProfile.model";
+import { MenuItem } from "../models/MenuItem";
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import {
   OutboundMessage,
@@ -15,6 +19,7 @@ import {
   type WasenderSendResult
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
+import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export interface EnqueueWasenderMessageInput {
@@ -203,6 +208,162 @@ export const getQueuedOwnerActionReminderStaleReason = async (
   return newerPendingAction ? "pending_action_replaced" : null;
 };
 
+export const getQueuedCustomerCampaignStaleReason = async (
+  metadata: Record<string, unknown> | undefined,
+  now = new Date(),
+  queuedRecipientPhone?: string,
+  queuedSessionId?: string,
+  queuedApiKey?: string
+): Promise<string | null> => {
+  if (metadata?.kind !== "customer_campaign") {
+    return null;
+  }
+
+  const restaurantId =
+    typeof metadata.restaurantId === "string"
+      ? metadata.restaurantId
+      : "";
+  const campaignId =
+    typeof metadata.campaignId === "string" ? metadata.campaignId : "";
+  const campaignRecipientId =
+    typeof metadata.campaignRecipientId === "string"
+      ? metadata.campaignRecipientId
+      : "";
+  const campaignVersion = Number(metadata.campaignVersion);
+  const customerPhone =
+    typeof metadata.customerPhone === "string"
+      ? normalizeGhanaPhone(metadata.customerPhone)
+      : "";
+  const queuedPhone = queuedRecipientPhone
+    ? normalizeGhanaPhone(queuedRecipientPhone)
+    : "";
+
+  if (
+    !Types.ObjectId.isValid(restaurantId) ||
+    !Types.ObjectId.isValid(campaignId) ||
+    !Types.ObjectId.isValid(campaignRecipientId) ||
+    !Number.isInteger(campaignVersion) ||
+    campaignVersion < 1 ||
+    !/^\+[1-9]\d{7,14}$/.test(customerPhone)
+  ) {
+    return "invalid_metadata";
+  }
+
+  if (queuedPhone && queuedPhone !== customerPhone) {
+    return "queued_recipient_changed";
+  }
+
+  const campaign = await CustomerCampaign.findOne({
+    _id: campaignId,
+    restaurantId
+  }).select(
+    "status campaignVersion scheduledAt referencedMenuItemId"
+  );
+
+  if (!campaign) {
+    return "campaign_missing";
+  }
+
+  if (
+    !["approved", "scheduled", "sending"].includes(campaign.status)
+  ) {
+    return `campaign_${campaign.status}`;
+  }
+
+  if (campaign.campaignVersion !== campaignVersion) {
+    return "campaign_version_changed";
+  }
+
+  if (campaign.scheduledAt && campaign.scheduledAt > now) {
+    return "campaign_not_due";
+  }
+
+  if (campaign.referencedMenuItemId) {
+    const availableItem = await MenuItem.exists({
+      _id: campaign.referencedMenuItemId,
+      restaurantId,
+      isAvailable: true
+    });
+
+    if (!availableItem) {
+      return "campaign_referenced_item_unavailable";
+    }
+  }
+
+  const recipient = await CustomerCampaignRecipient.findOne({
+    _id: campaignRecipientId,
+    restaurantId,
+    campaignId,
+    campaignVersion,
+    status: "pending"
+  }).select("customerPhone campaignVersion");
+
+  if (!recipient) {
+    return "campaign_recipient_missing_or_not_pending";
+  }
+
+  if (recipient.campaignVersion !== campaignVersion) {
+    return "campaign_recipient_version_changed";
+  }
+
+  if (normalizeGhanaPhone(recipient.customerPhone) !== customerPhone) {
+    return "campaign_recipient_phone_changed";
+  }
+
+  const profile = await CustomerProfile.findOne({
+    restaurantId,
+    customerPhone
+  }).select("customerPhone marketingConsent isOptedOut");
+
+  if (!profile) {
+    return "customer_profile_missing";
+  }
+
+  if (normalizeGhanaPhone(profile.customerPhone) !== customerPhone) {
+    return "customer_profile_phone_changed";
+  }
+
+  if (profile.marketingConsent !== true) {
+    return "marketing_consent_revoked";
+  }
+
+  if (profile.isOptedOut === true) {
+    return "customer_opted_out";
+  }
+
+  const restaurant = await Restaurant.findOne({
+    _id: restaurantId,
+    status: { $in: ["trial", "active"] }
+  }).select("+wasenderApiToken");
+
+  if (!restaurant) {
+    return "restaurant_inactive_or_missing";
+  }
+
+  if (
+    !restaurant.wasenderSessionId?.trim() ||
+    !restaurant.wasenderApiToken?.trim()
+  ) {
+    return "restaurant_wasender_credentials_missing";
+  }
+
+  if (
+    queuedSessionId &&
+    restaurant.wasenderSessionId !== queuedSessionId
+  ) {
+    return "restaurant_wasender_session_changed";
+  }
+
+  if (
+    queuedApiKey &&
+    restaurant.wasenderApiToken !== queuedApiKey
+  ) {
+    return "restaurant_wasender_token_changed";
+  }
+
+  return null;
+};
+
 export const getWasenderRetryDelayMs = (result: WasenderSendResult): number => {
   const data = result.data;
 
@@ -344,6 +505,169 @@ const updateOrderSideEffectAfterSend = async (
           }
     );
   }
+};
+
+const updateCampaignRecipientAfterAttempt = async (
+  message: IOutboundMessageDocument,
+  result: WasenderSendResult,
+  finalFailure: boolean
+): Promise<void> => {
+  if (message.metadata?.kind !== "customer_campaign") {
+    return;
+  }
+
+  const restaurantId =
+    typeof message.metadata.restaurantId === "string"
+      ? message.metadata.restaurantId
+      : "";
+  const campaignId =
+    typeof message.metadata.campaignId === "string"
+      ? message.metadata.campaignId
+      : "";
+  const campaignRecipientId =
+    typeof message.metadata.campaignRecipientId === "string"
+      ? message.metadata.campaignRecipientId
+      : "";
+  const campaignVersion = Number(message.metadata.campaignVersion);
+
+  if (
+    !restaurantId ||
+    !campaignId ||
+    !campaignRecipientId ||
+    !Number.isInteger(campaignVersion) ||
+    campaignVersion < 1
+  ) {
+    return;
+  }
+
+  const attemptedAt = new Date();
+
+  if (result.success) {
+    await CustomerCampaignRecipient.updateOne(
+      {
+        _id: campaignRecipientId,
+        restaurantId,
+        campaignId,
+        campaignVersion,
+        status: "pending"
+      },
+      {
+        $set: {
+          status: "sent",
+          attemptedAt,
+          sentAt: attemptedAt,
+          ...(extractWasenderProviderMessageId(result.data)
+            ? {
+                providerMessageId:
+                  extractWasenderProviderMessageId(result.data)
+              }
+            : {})
+        },
+        $unset: {
+          failureReason: ""
+        }
+      }
+    );
+    await updateCustomerCampaignAggregate(
+      restaurantId,
+      campaignId,
+      campaignVersion,
+      attemptedAt
+    );
+    return;
+  }
+
+  if (finalFailure) {
+    await CustomerCampaignRecipient.updateOne(
+      {
+        _id: campaignRecipientId,
+        restaurantId,
+        campaignId,
+        campaignVersion,
+        status: "pending"
+      },
+      {
+        $set: {
+          status: "failed",
+          attemptedAt,
+          failureReason: getErrorMessage(result)
+        }
+      }
+    );
+    await updateCustomerCampaignAggregate(
+      restaurantId,
+      campaignId,
+      campaignVersion,
+      attemptedAt
+    );
+    return;
+  }
+
+  await CustomerCampaignRecipient.updateOne(
+    {
+      _id: campaignRecipientId,
+      restaurantId,
+      campaignId,
+      campaignVersion,
+      status: "pending"
+    },
+    {
+      $set: {
+        attemptedAt
+      }
+    }
+  );
+};
+
+const cancelStaleCampaignRecipient = async (
+  metadata: Record<string, unknown>,
+  staleReason: string,
+  now = new Date()
+): Promise<void> => {
+  const restaurantId =
+    typeof metadata.restaurantId === "string"
+      ? metadata.restaurantId
+      : "";
+  const campaignId =
+    typeof metadata.campaignId === "string" ? metadata.campaignId : "";
+  const campaignRecipientId =
+    typeof metadata.campaignRecipientId === "string"
+      ? metadata.campaignRecipientId
+      : "";
+  const campaignVersion = Number(metadata.campaignVersion);
+
+  if (
+    !restaurantId ||
+    !campaignId ||
+    !campaignRecipientId ||
+    !Number.isInteger(campaignVersion) ||
+    campaignVersion < 1
+  ) {
+    return;
+  }
+
+  await CustomerCampaignRecipient.updateOne(
+    {
+      _id: campaignRecipientId,
+      restaurantId,
+      campaignId,
+      campaignVersion,
+      status: "pending"
+    },
+    {
+      $set: {
+        status: "cancelled",
+        attemptedAt: now,
+        failureReason: `Stale customer campaign message: ${staleReason}`
+      }
+    }
+  );
+  await updateCustomerCampaignAggregate(
+    restaurantId,
+    campaignId,
+    campaignVersion,
+    now
+  );
 };
 
 export const enqueueWasenderMessage = async (
@@ -504,6 +828,33 @@ export const processNextQueuedWasenderMessage = async (
       });
       return true;
     }
+  } else if (locked.metadata?.kind === "customer_campaign") {
+    const staleReason = await getQueuedCustomerCampaignStaleReason(
+      locked.metadata,
+      new Date(),
+      locked.to,
+      locked.sessionId,
+      locked.apiKey
+    );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale customer campaign message: ${staleReason}`;
+      await locked.save();
+      await cancelStaleCampaignRecipient(
+        locked.metadata,
+        staleReason
+      );
+      console.info("Stale customer campaign message cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        campaignId: locked.metadata.campaignId,
+        campaignRecipientId:
+          locked.metadata.campaignRecipientId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
   } else if (!isTransactionalQueuedMessage(locked.metadata)) {
     const restaurantId =
       typeof locked.metadata?.restaurantId === "string"
@@ -546,6 +897,7 @@ export const processNextQueuedWasenderMessage = async (
     locked.providerData = result.data;
     locked.lastError = undefined;
     await locked.save();
+    await updateCampaignRecipientAfterAttempt(locked, result, false);
     return true;
   }
 
@@ -561,6 +913,11 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   await locked.save();
+  await updateCampaignRecipientAfterAttempt(
+    locked,
+    result,
+    locked.status === "failed"
+  );
   return true;
 };
 
