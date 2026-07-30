@@ -192,6 +192,41 @@ export const updateOrderStatusSchema = z
   })
   .strict();
 
+export const updateCustomerPreferencesSchema = z
+  .object({
+    confirmed: z.literal(true),
+    customerName: optionalTextSchema,
+    preferredOrderType: z.enum(orderTypes).optional(),
+    dietaryPreferences: z
+      .array(z.string().trim().min(1).max(100))
+      .max(25)
+      .optional(),
+    spicePreference: z.string().trim().min(1).max(100).nullable().optional(),
+    marketingConsent: z.boolean().optional(),
+    isOptedOut: z.boolean().optional()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const preferenceKeys = Object.keys(value).filter(
+      (key) => key !== "confirmed"
+    );
+
+    if (preferenceKeys.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "At least one confirmed customer preference is required"
+      });
+    }
+
+    if (value.marketingConsent === true && value.isOptedOut === true) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Marketing consent and opt-out status cannot both be true",
+        path: ["isOptedOut"]
+      });
+    }
+  });
+
 export const agentCustomerMessageSchema = z
   .object({
     restaurantId: z.string().trim().min(1),

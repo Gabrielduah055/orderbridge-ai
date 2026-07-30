@@ -70,6 +70,7 @@ export interface IOrder {
   rejectionNotificationSentAt?: Date;
   customerNotificationFailedAt?: Date;
   customerNotificationFailureReason?: string;
+  completedAt?: Date;
   orderNumber?: string;
 }
 
@@ -263,6 +264,9 @@ const orderSchema = new Schema<IOrderDocument>(
       type: String,
       trim: true
     },
+    completedAt: {
+      type: Date
+    },
     orderNumber: {
       type: String,
       trim: true,
@@ -277,6 +281,12 @@ const orderSchema = new Schema<IOrderDocument>(
 
 orderSchema.index({ restaurantId: 1, createdAt: -1 });
 orderSchema.index({ restaurantId: 1, status: 1 });
+orderSchema.index({
+  restaurantId: 1,
+  customerPhone: 1,
+  status: 1,
+  completedAt: -1
+});
 
 orderSchema.pre("validate", function setOrderNumber(next) {
   if (!this.orderNumber) {
