@@ -117,7 +117,7 @@ const estimateReceiptHeight = (
     0
   );
 
-  return Math.max(420, 302 + (hasLogo ? 46 : 0) + addressLines * 10 + itemLines * 22);
+  return Math.max(550, 430 + (hasLogo ? 46 : 0) + addressLines * 10 + itemLines * 22);
 };
 
 const moveY = (doc: PDFKit.PDFDocument, amount: number): void => {
@@ -344,7 +344,6 @@ const drawTotals = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
 const drawPaymentAndFooter = (doc: PDFKit.PDFDocument, order: IOrderDocument): void => {
   drawLabelValue(doc, "Payment", titleCase(order.paymentMethod));
   drawLabelValue(doc, "Paid", titleCase(order.paymentStatus));
-  drawLabelValue(doc, "Status", titleCase(order.status), { boldValue: true });
 
   if (order.notes) {
     drawLabelValue(doc, "Notes", order.notes);
