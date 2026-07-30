@@ -1,5 +1,8 @@
 import { Restaurant } from "../models/Restaurant";
-import { CustomerSession } from "../models/customerSession.model";
+import {
+  CustomerSession,
+  type ICustomerSessionDocument
+} from "../models/customerSession.model";
 import { buildFollowUpKey, buildStateAwareFollowUpMessage } from "./orderDraft.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
@@ -14,6 +17,22 @@ const activeSteps: string[] = [
   "collecting_name",
   "confirming_order"
 ];
+
+export const buildCustomerFollowUpQueueMetadata = (
+  session: Pick<
+    ICustomerSessionDocument,
+    "_id" | "restaurantId" | "customerPhone" | "conversationVersion" | "currentStep"
+  >,
+  followUpKey: string
+): Record<string, unknown> => ({
+  kind: "customer_follow_up",
+  sessionId: String(session._id),
+  restaurantId: String(session.restaurantId),
+  customerPhone: session.customerPhone,
+  conversationVersion: session.conversationVersion,
+  expectedDraftStep: session.currentStep,
+  followUpKey
+});
 
 const runFollowUpPass = async (): Promise<void> => {
   try {
@@ -81,11 +100,7 @@ const runFollowUpPass = async (): Promise<void> => {
           text: message,
           apiKey: restaurant.wasenderApiToken,
           idempotencyKey,
-          metadata: {
-            kind: "customer_follow_up",
-            sessionId: String(session._id),
-            followUpKey
-          }
+          metadata: buildCustomerFollowUpQueueMetadata(session, followUpKey)
         });
 
         session.lastFollowUpKey = followUpKey;

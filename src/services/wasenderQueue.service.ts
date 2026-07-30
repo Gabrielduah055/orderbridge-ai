@@ -62,7 +62,7 @@ export const isQueuedConversationalMessageStale = (
   }
 
   if (!session) {
-    return false;
+    return metadata.kind === "customer_follow_up";
   }
 
   const expectedVersion = Number(metadata.conversationVersion);
@@ -73,7 +73,12 @@ export const isQueuedConversationalMessageStale = (
   }
 
   if (expectedStep && session.currentStep !== expectedStep) {
+    const kind = typeof metadata.kind === "string" ? metadata.kind : "";
     const purpose = typeof metadata.responsePurpose === "string" ? metadata.responsePurpose : "";
+
+    if (kind === "customer_follow_up") {
+      return true;
+    }
 
     if (purpose === "greeting" && session.currentStep !== "idle") {
       return true;
@@ -302,7 +307,13 @@ const sendQueuedMessage = async (
   });
 };
 
-export const processNextQueuedWasenderMessage = async (): Promise<boolean> => {
+export interface ProcessQueuedWasenderMessageDependencies {
+  sendMessage?: (message: IOutboundMessageDocument) => Promise<WasenderSendResult>;
+}
+
+export const processNextQueuedWasenderMessage = async (
+  dependencies: ProcessQueuedWasenderMessageDependencies = {}
+): Promise<boolean> => {
   const now = new Date();
   const candidate = await OutboundMessage.findOne({
     status: "pending",
@@ -388,7 +399,7 @@ export const processNextQueuedWasenderMessage = async (): Promise<boolean> => {
     }
   }
 
-  const result = await sendQueuedMessage(locked);
+  const result = await (dependencies.sendMessage ?? sendQueuedMessage)(locked);
   await updateOrderSideEffectAfterSend(locked, result);
 
   if (result.success) {
