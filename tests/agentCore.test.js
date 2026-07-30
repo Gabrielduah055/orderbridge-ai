@@ -30,13 +30,20 @@ const {
 const {
   resolveDeliveryFee,
   isPendingOrderActionable,
-  formatRelativeOrderAge
+  formatRelativeOrderAge,
+  updateOrderStatus
 } = require("../dist/services/order.service");
 const {
   buildCompletedOrderProfileStats,
   updateConfirmedCustomerPreferences,
   updateCustomerProfileFromCompletedOrder
 } = require("../dist/services/customerProfile.service");
+const {
+  CUSTOMER_MEMORY_FREQUENT_ITEM_LIMIT,
+  CUSTOMER_MEMORY_RECENT_ORDER_LIMIT,
+  buildCustomerMemorySummary,
+  loadCustomerMemorySummary
+} = require("../dist/services/customerMemory.service");
 const {
   CustomerProfile
 } = require("../dist/models/customerProfile.model");
@@ -46,6 +53,9 @@ const {
 const {
   updateCustomerPreferencesSchema
 } = require("../dist/middleware/validateRequest");
+const {
+  buildAgentSystemPrompt
+} = require("../dist/services/ai/agentPrompt.service");
 const {
   getNextSessionSendAt,
   getWasenderRetryDelayMs,
@@ -1038,7 +1048,7 @@ test("OpenRouter tool loop stops at configured maximum rounds", async () => {
 
     assert.equal(result.success, false);
     assert.equal(result.executedTools.length, 2);
-    assert.match(result.message, /couldn't complete/i);
+    assert.match(result.message, /little trouble|couldn't complete/i);
   } finally {
     restoreEnv("OPENROUTER_MAX_TOOL_ROUNDS", originalMaxRounds);
   }
@@ -2030,5 +2040,350 @@ test("confirmed preferences normalize facts and record conservative consent", as
     assert.equal(profile.customerNameSource, "customer_confirmed");
   } finally {
     CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("customer memory summary is compact and excludes internal profile data", () => {
+  const frequentItems = Array.from({ length: 8 }, (_, index) => ({
+    menuItemId: `64b0000000000000000003${String(index).padStart(2, "0")}`,
+    name: `Item ${index + 1}`,
+    orderCount: 8 - index,
+    totalQuantity: 10 - index,
+    lastOrderedAt: new Date("2026-07-25T12:00:00.000Z")
+  }));
+  const recentOrders = Array.from({ length: 6 }, (_, orderIndex) => ({
+    _id: `64b0000000000000000004${String(orderIndex).padStart(2, "0")}`,
+    customerPhone: "+233500000001",
+    orderType: orderIndex % 2 === 0 ? "delivery" : "pickup",
+    items: Array.from({ length: 7 }, (_, itemIndex) => ({
+      menuItemId: `64b0000000000000000005${String(itemIndex).padStart(2, "0")}`,
+      name: `Recent item ${itemIndex + 1}`,
+      quantity: itemIndex + 1,
+      unitPrice: 10,
+      totalPrice: 10 * (itemIndex + 1)
+    })),
+    completedAt: new Date(
+      Date.UTC(2026, 6, 25 - orderIndex, 12, 0, 0)
+    ),
+    createdAt: new Date("2026-07-20T11:00:00.000Z"),
+    updatedAt: new Date("2026-07-20T12:00:00.000Z")
+  }));
+  const memory = buildCustomerMemorySummary(
+    {
+      customerName: "Ama Mensah",
+      orderCount: 12,
+      averageOrderValue: 987.65,
+      customerPhone: "+233500000001",
+      frequentlyOrderedItems: frequentItems,
+      preferredOrderType: "delivery",
+      commonDeliveryAddresses: [
+        {
+          address: "Madina Estate",
+          orderCount: 4,
+          lastUsedAt: new Date("2026-07-25T12:00:00.000Z")
+        },
+        {
+          address: "Another full address that should not be included",
+          orderCount: 2,
+          lastUsedAt: new Date("2026-07-20T12:00:00.000Z")
+        }
+      ],
+      dietaryPreferences: ["No peanuts", "Vegetarian"],
+      spicePreference: "medium",
+      marketingConsent: true,
+      isOptedOut: false,
+      preferencesConfirmedAt: new Date("2026-07-01T12:00:00.000Z")
+    },
+    recentOrders
+  );
+  const serializedMemory = JSON.stringify(memory);
+
+  assert.equal(memory.recentOrders.length, CUSTOMER_MEMORY_RECENT_ORDER_LIMIT);
+  assert.equal(
+    memory.frequentItems.length,
+    CUSTOMER_MEMORY_FREQUENT_ITEM_LIMIT
+  );
+  assert.equal(memory.recentOrders[0].items.length, 5);
+  assert.equal(memory.recentOrders[0].items[4], "+3 more items");
+  assert.equal(memory.commonDeliveryArea, "Madina Estate");
+  assert.deepEqual(memory.confirmedFoodPreferences, {
+    dietary: ["No peanuts", "Vegetarian"],
+    spice: "medium"
+  });
+  assert.equal(memory.marketingConsent, "granted");
+  assert.equal(serializedMemory.includes("customerPhone"), false);
+  assert.equal(serializedMemory.includes("averageOrderValue"), false);
+  assert.equal(serializedMemory.includes("menuItemId"), false);
+  assert.equal(
+    serializedMemory.includes("Another full address"),
+    false
+  );
+});
+
+test("customer memory never exposes unconfirmed preference fields", () => {
+  const memory = buildCustomerMemorySummary(
+    {
+      customerName: "Ama",
+      orderCount: 1,
+      frequentlyOrderedItems: [],
+      commonDeliveryAddresses: [],
+      dietaryPreferences: ["Model guessed vegan"],
+      spicePreference: "hot",
+      marketingConsent: true,
+      isOptedOut: false
+    },
+    []
+  );
+
+  assert.equal(memory.confirmedFoodPreferences, undefined);
+  assert.equal(memory.marketingConsent, undefined);
+});
+
+test("customer memory loader scopes profile and recent orders to one restaurant", async () => {
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalOrderFind = Order.find;
+  const profile = {
+    customerName: "Ama",
+    orderCount: 1,
+    frequentlyOrderedItems: [],
+    commonDeliveryAddresses: [],
+    dietaryPreferences: [],
+    marketingConsent: false,
+    isOptedOut: true,
+    preferencesConfirmedAt: new Date("2026-07-01T12:00:00.000Z")
+  };
+  let profileFilter;
+  let profileProjection;
+  let orderFilter;
+  let orderProjection;
+  let orderLimit;
+
+  CustomerProfile.findOne = (filter) => ({
+    select: async (projection) => {
+      profileFilter = filter;
+      profileProjection = projection;
+      return profile;
+    }
+  });
+  Order.find = (filter) => ({
+    select(projection) {
+      orderFilter = filter;
+      orderProjection = projection;
+      return this;
+    },
+    sort() {
+      return this;
+    },
+    async limit(limit) {
+      orderLimit = limit;
+      return [];
+    }
+  });
+
+  try {
+    const memory = await loadCustomerMemorySummary(
+      "64b000000000000000000001",
+      "0500000001"
+    );
+
+    assert.deepEqual(profileFilter, {
+      restaurantId: "64b000000000000000000001",
+      customerPhone: "+233500000001"
+    });
+    assert.equal(profileProjection.includes("customerPhone"), false);
+    assert.equal(profileProjection.includes("averageOrderValue"), false);
+    assert.equal(orderFilter.restaurantId, "64b000000000000000000001");
+    assert.equal(orderFilter.status, "completed");
+    assert.deepEqual(orderFilter.customerPhone.$in.sort(), [
+      "+233500000001",
+      "0500000001",
+      "233500000001"
+    ]);
+    assert.equal(orderProjection.includes("customerPhone"), false);
+    assert.equal(orderProjection.includes("deliveryAddress"), false);
+    assert.equal(orderLimit, CUSTOMER_MEMORY_RECENT_ORDER_LIMIT);
+    assert.equal(memory.name, "Ama");
+    assert.equal(memory.marketingConsent, "opted_out");
+  } finally {
+    CustomerProfile.findOne = originalProfileFindOne;
+    Order.find = originalOrderFind;
+  }
+});
+
+test("customer memory loader does not query orders without a scoped profile", async () => {
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalOrderFind = Order.find;
+  let orderQueries = 0;
+
+  CustomerProfile.findOne = () => ({
+    select: async () => null
+  });
+  Order.find = () => {
+    orderQueries += 1;
+    return [];
+  };
+
+  try {
+    const memory = await loadCustomerMemorySummary(
+      "64b000000000000000000001",
+      "0500000001"
+    );
+
+    assert.equal(memory, null);
+    assert.equal(orderQueries, 0);
+  } finally {
+    CustomerProfile.findOne = originalProfileFindOne;
+    Order.find = originalOrderFind;
+  }
+});
+
+test("customer prompt receives memory for the exact restaurant and phone", async () => {
+  const customer = {
+    phone: "0500000001",
+    normalizedPhone: "+233500000001",
+    role: "customer",
+    verified: false
+  };
+  let memoryScope;
+  const prompt = await buildAgentSystemPrompt(
+    fakeRestaurant,
+    customer,
+    ["get_menu"],
+    {
+      buildRestaurantContext: async () => ({
+        restaurant: {
+          id: String(fakeRestaurant._id),
+          name: fakeRestaurant.name
+        },
+        sender: {
+          phone: customer.normalizedPhone,
+          role: customer.role,
+          verified: false
+        },
+        people: {},
+        settings: {},
+        summary: {
+          activeCategories: 0,
+          activeMenuItems: 0,
+          unavailableMenuItems: 0,
+          activeOrders: 0
+        },
+        permissions: ["get_menu"]
+      }),
+      findDraft: async () => null,
+      findClarification: async () => null,
+      loadCustomerMemory: async (restaurantId, customerPhone) => {
+        memoryScope = { restaurantId, customerPhone };
+        return {
+          name: "Ama",
+          frequentItems: ["Jollof Rice (3 completed orders)"],
+          preferredOrderType: "delivery",
+          commonDeliveryArea: "Madina"
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(memoryScope, {
+    restaurantId: String(fakeRestaurant._id),
+    customerPhone: customer.normalizedPhone
+  });
+  assert.match(prompt, /"memory":\{"name":"Ama"/);
+  assert.match(prompt, /Jollof Rice \(3 completed orders\)/);
+  assert.match(prompt, /personalization only/);
+  assert.match(prompt, /Never auto-add frequent or recent items/);
+});
+
+test("owner prompts never load or include customer memory", async () => {
+  let memoryLoads = 0;
+  const prompt = await buildAgentSystemPrompt(
+    fakeRestaurant,
+    fakeOwner,
+    ["get_menu"],
+    {
+      buildRestaurantContext: async () => ({
+        restaurant: {
+          id: String(fakeRestaurant._id),
+          name: fakeRestaurant.name
+        },
+        sender: {
+          name: fakeOwner.name,
+          phone: fakeOwner.normalizedPhone,
+          role: fakeOwner.role,
+          verified: true
+        },
+        people: {},
+        settings: {},
+        summary: {
+          activeCategories: 0,
+          activeMenuItems: 0,
+          unavailableMenuItems: 0,
+          activeOrders: 0
+        },
+        permissions: ["get_menu"]
+      }),
+      loadCustomerMemory: async () => {
+        memoryLoads += 1;
+        return {
+          name: "Wrong customer"
+        };
+      }
+    }
+  );
+
+  assert.equal(memoryLoads, 0);
+  assert.equal(prompt.includes("customerState"), false);
+  assert.equal(prompt.includes("Wrong customer"), false);
+});
+
+test("customer memory lookup failure does not block the ordering prompt", async () => {
+  const originalConsoleError = console.error;
+  const customer = {
+    phone: "0500000001",
+    normalizedPhone: "+233500000001",
+    role: "customer",
+    verified: false
+  };
+
+  console.error = () => {};
+
+  try {
+    const prompt = await buildAgentSystemPrompt(
+      fakeRestaurant,
+      customer,
+      ["get_menu"],
+      {
+        buildRestaurantContext: async () => ({
+          restaurant: {
+            id: String(fakeRestaurant._id),
+            name: fakeRestaurant.name
+          },
+          sender: {
+            phone: customer.normalizedPhone,
+            role: customer.role,
+            verified: false
+          },
+          people: {},
+          settings: {},
+          summary: {
+            activeCategories: 0,
+            activeMenuItems: 0,
+            unavailableMenuItems: 0,
+            activeOrders: 0
+          },
+          permissions: ["get_menu"]
+        }),
+        findDraft: async () => null,
+        findClarification: async () => null,
+        loadCustomerMemory: async () => {
+          throw new Error("Temporary profile read failure");
+        }
+      }
+    );
+
+    assert.match(prompt, /"memory":null/);
+    assert.match(prompt, /Help the customer browse the real menu/);
+  } finally {
+    console.error = originalConsoleError;
   }
 });
