@@ -80,6 +80,8 @@ export interface RestaurantInput {
   ownerWeeklySummaryEnabled?: boolean;
   ownerWeeklySummaryDay?: OwnerSummaryWeekday;
   ownerWeeklySummaryTime?: string;
+  ownerPendingActionReminderEnabled?: boolean;
+  ownerPendingActionReminderDelayMinutes?: number;
 }
 
 export interface RestaurantManagerContactInput {

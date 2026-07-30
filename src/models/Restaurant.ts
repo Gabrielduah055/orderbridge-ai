@@ -49,6 +49,8 @@ export interface IRestaurant {
   ownerWeeklySummaryEnabled: boolean;
   ownerWeeklySummaryDay: OwnerSummaryWeekday;
   ownerWeeklySummaryTime: string;
+  ownerPendingActionReminderEnabled: boolean;
+  ownerPendingActionReminderDelayMinutes: number;
 }
 
 export interface RestaurantManagerContact {
@@ -295,6 +297,15 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
       type: String,
       default: "08:00",
       match: /^(?:[01]\d|2[0-3]):[0-5]\d$/
+    },
+    ownerPendingActionReminderEnabled: {
+      type: Boolean,
+      default: false
+    },
+    ownerPendingActionReminderDelayMinutes: {
+      type: Number,
+      default: 3,
+      min: 1
     }
   },
   {
@@ -304,5 +315,6 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
 
 restaurantSchema.index({ status: 1, ownerDailySummaryEnabled: 1 });
 restaurantSchema.index({ status: 1, ownerWeeklySummaryEnabled: 1 });
+restaurantSchema.index({ status: 1, ownerPendingActionReminderEnabled: 1 });
 
 export const Restaurant = model<IRestaurantDocument>("Restaurant", restaurantSchema);

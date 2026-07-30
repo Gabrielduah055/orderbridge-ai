@@ -94,7 +94,9 @@ export const createRestaurantSchema = z
     ownerDailySummaryTime: ownerSummaryTimeSchema.default("08:00"),
     ownerWeeklySummaryEnabled: z.boolean().default(false),
     ownerWeeklySummaryDay: z.enum(ownerSummaryWeekdays).default("monday"),
-    ownerWeeklySummaryTime: ownerSummaryTimeSchema.default("08:00")
+    ownerWeeklySummaryTime: ownerSummaryTimeSchema.default("08:00"),
+    ownerPendingActionReminderEnabled: z.boolean().default(false),
+    ownerPendingActionReminderDelayMinutes: z.number().int().min(1).default(3)
   })
   .strict();
 
