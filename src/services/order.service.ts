@@ -12,6 +12,8 @@ import {
 import { Restaurant } from "../models/Restaurant";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
+import { normalizeGhanaPhone } from "../utils/phone.util";
+import { updateCustomerProfileFromCompletedOrder } from "./customerProfile.service";
 
 interface CreateOrderItemInput {
   menuItemId: string;
@@ -270,7 +272,7 @@ export const createOrder = async (
     return await Order.create({
       restaurantId,
       customerName: input.customerName,
-      customerPhone: input.customerPhone,
+      customerPhone: normalizeGhanaPhone(input.customerPhone),
       items,
       subtotal,
       deliveryFee,
@@ -325,8 +327,18 @@ export const updateOrderStatus = async (
   status: OrderStatus
 ): Promise<UpdateOrderStatusResult> => {
   const order = await getOrderOrThrow(orderId);
+  order.customerPhone = normalizeGhanaPhone(order.customerPhone);
   order.status = status;
+
+  if (status === "completed") {
+    order.completedAt = order.completedAt ?? new Date();
+  }
+
   await order.save();
+
+  if (status === "completed") {
+    await updateCustomerProfileFromCompletedOrder(order);
+  }
 
   return {
     order

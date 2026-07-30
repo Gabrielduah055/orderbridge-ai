@@ -28,8 +28,23 @@ const {
   validateSelectedAiProviderConfig
 } = require("../dist/services/ai/ai.config");
 const {
-  resolveDeliveryFee
+  resolveDeliveryFee,
+  updateOrderStatus
 } = require("../dist/services/order.service");
+const {
+  buildCompletedOrderProfileStats,
+  updateConfirmedCustomerPreferences,
+  updateCustomerProfileFromCompletedOrder
+} = require("../dist/services/customerProfile.service");
+const {
+  CustomerProfile
+} = require("../dist/models/customerProfile.model");
+const {
+  Order
+} = require("../dist/models/order.model");
+const {
+  updateCustomerPreferencesSchema
+} = require("../dist/middleware/validateRequest");
 const {
   getNextSessionSendAt,
   getWasenderRetryDelayMs
@@ -1075,4 +1090,297 @@ test("pending action cancellation accepts natural owner replies", () => {
   ].forEach((message) => {
     assert.equal(isPendingActionCancellationMessage(message), true, message);
   });
+});
+
+test("customer profile model has restaurant-scoped lookup and marketing indexes", () => {
+  const indexes = CustomerProfile.schema.indexes();
+  const scopedIndex = indexes.find(
+    ([fields]) =>
+      fields.restaurantId === 1 &&
+      fields.customerPhone === 1 &&
+      Object.keys(fields).length === 2
+  );
+  const marketingIndex = indexes.find(
+    ([fields]) =>
+      fields.restaurantId === 1 &&
+      fields.marketingConsent === 1 &&
+      fields.isOptedOut === 1
+  );
+
+  assert.equal(scopedIndex[1].unique, true);
+  assert.ok(marketingIndex);
+});
+
+test("customer profile statistics use completed orders only", () => {
+  const jollofId = "64b000000000000000000301";
+  const chickenId = "64b000000000000000000302";
+  const stats = buildCompletedOrderProfileStats([
+    {
+      status: "completed",
+      customerName: "Ama",
+      items: [
+        {
+          menuItemId: jollofId,
+          name: "Jollof Rice",
+          quantity: 2,
+          unitPrice: 30,
+          totalPrice: 60
+        }
+      ],
+      total: 70,
+      orderType: "delivery",
+      deliveryAddress: "Madina  Estate",
+      completedAt: new Date("2026-07-20T12:00:00.000Z"),
+      createdAt: new Date("2026-07-20T11:00:00.000Z"),
+      updatedAt: new Date("2026-07-20T12:00:00.000Z")
+    },
+    {
+      status: "cancelled",
+      customerName: "Wrong name",
+      items: [
+        {
+          menuItemId: chickenId,
+          name: "Chicken",
+          quantity: 99,
+          unitPrice: 10,
+          totalPrice: 990
+        }
+      ],
+      total: 990,
+      orderType: "pickup",
+      createdAt: new Date("2026-07-21T11:00:00.000Z"),
+      updatedAt: new Date("2026-07-21T12:00:00.000Z")
+    },
+    {
+      status: "completed",
+      customerName: "Ama Mensah",
+      items: [
+        {
+          menuItemId: jollofId,
+          name: "Jollof Rice",
+          quantity: 1,
+          unitPrice: 30,
+          totalPrice: 30
+        },
+        {
+          menuItemId: chickenId,
+          name: "Grilled Chicken",
+          quantity: 1,
+          unitPrice: 20,
+          totalPrice: 20
+        }
+      ],
+      total: 50,
+      orderType: "delivery",
+      deliveryAddress: "madina estate",
+      completedAt: new Date("2026-07-22T12:00:00.000Z"),
+      createdAt: new Date("2026-07-22T11:00:00.000Z"),
+      updatedAt: new Date("2026-07-22T12:00:00.000Z")
+    }
+  ]);
+
+  assert.equal(stats.orderCount, 2);
+  assert.equal(stats.customerName, "Ama Mensah");
+  assert.equal(stats.averageOrderValue, 60);
+  assert.equal(stats.preferredOrderType, "delivery");
+  assert.equal(stats.lastOrderAt.toISOString(), "2026-07-22T12:00:00.000Z");
+  assert.deepEqual(
+    stats.frequentlyOrderedItems.map((item) => ({
+      name: item.name,
+      orderCount: item.orderCount,
+      totalQuantity: item.totalQuantity
+    })),
+    [
+      { name: "Jollof Rice", orderCount: 2, totalQuantity: 3 },
+      { name: "Grilled Chicken", orderCount: 1, totalQuantity: 1 }
+    ]
+  );
+  assert.deepEqual(
+    stats.commonDeliveryAddresses.map((entry) => ({
+      address: entry.address,
+      orderCount: entry.orderCount
+    })),
+    [{ address: "madina estate", orderCount: 2 }]
+  );
+});
+
+test("customer preference validation requires explicit confirmation", () => {
+  assert.equal(
+    updateCustomerPreferencesSchema.safeParse({
+      dietaryPreferences: ["vegetarian"]
+    }).success,
+    false
+  );
+  assert.equal(
+    updateCustomerPreferencesSchema.safeParse({
+      confirmed: true
+    }).success,
+    false
+  );
+  assert.equal(
+    updateCustomerPreferencesSchema.safeParse({
+      confirmed: true,
+      marketingConsent: true,
+      isOptedOut: true
+    }).success,
+    false
+  );
+  assert.equal(
+    updateCustomerPreferencesSchema.safeParse({
+      confirmed: true,
+      dietaryPreferences: ["vegetarian"],
+      spicePreference: "medium",
+      marketingConsent: true
+    }).success,
+    true
+  );
+});
+
+test("non-completed orders never update customer profiles", async () => {
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  let writes = 0;
+
+  CustomerProfile.findOneAndUpdate = async () => {
+    writes += 1;
+  };
+
+  try {
+    const result = await updateCustomerProfileFromCompletedOrder({
+      status: "accepted"
+    });
+
+    assert.equal(result, null);
+    assert.equal(writes, 0);
+  } finally {
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("completed status updates persist completion time and refresh the profile", async () => {
+  const originalFindById = Order.findById;
+  const originalFind = Order.find;
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  const order = {
+    _id: "64b000000000000000000101",
+    restaurantId: "64b000000000000000000001",
+    customerName: "Ama",
+    customerPhone: "0557038547",
+    status: "ready",
+    items: [
+      {
+        menuItemId: "64b000000000000000000301",
+        name: "Jollof Rice",
+        quantity: 1,
+        unitPrice: 30,
+        totalPrice: 30
+      }
+    ],
+    total: 30,
+    orderType: "pickup",
+    createdAt: new Date("2026-07-22T11:00:00.000Z"),
+    updatedAt: new Date("2026-07-22T11:30:00.000Z"),
+    save: async function () {
+      this.updatedAt = new Date("2026-07-22T12:00:00.000Z");
+      return this;
+    }
+  };
+  let profileUpdate;
+
+  Order.findById = async () => order;
+  Order.find = () => ({
+    sort: async () => [order]
+  });
+  CustomerProfile.findOne = () => ({
+    select: async () => null
+  });
+  CustomerProfile.findOneAndUpdate = async (_filter, update) => {
+    profileUpdate = update;
+    return update.$set;
+  };
+
+  try {
+    const result = await updateOrderStatus(String(order._id), "completed");
+
+    assert.equal(result.order.status, "completed");
+    assert.equal(result.order.customerPhone, "+233557038547");
+    assert.ok(result.order.completedAt instanceof Date);
+    assert.equal(profileUpdate.$set.orderCount, 1);
+    assert.equal(profileUpdate.$set.averageOrderValue, 30);
+    assert.equal(
+      profileUpdate.$set.preferredOrderTypeSource,
+      "completed_order"
+    );
+  } finally {
+    Order.findById = originalFindById;
+    Order.find = originalFind;
+    CustomerProfile.findOne = originalProfileFindOne;
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("unconfirmed preferences are rejected without a profile write", async () => {
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  let writes = 0;
+
+  CustomerProfile.findOneAndUpdate = async () => {
+    writes += 1;
+  };
+
+  try {
+    await assert.rejects(
+      updateConfirmedCustomerPreferences(
+        "64b000000000000000000001",
+        "0557038547",
+        {
+          confirmed: false,
+          dietaryPreferences: ["vegetarian"]
+        }
+      ),
+      /explicitly confirmed/
+    );
+    assert.equal(writes, 0);
+  } finally {
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("confirmed preferences normalize facts and record conservative consent", async () => {
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  let capturedFilter;
+  let capturedUpdate;
+
+  CustomerProfile.findOneAndUpdate = async (filter, update) => {
+    capturedFilter = filter;
+    capturedUpdate = update;
+    return { ...filter, ...update.$set };
+  };
+
+  try {
+    const profile = await updateConfirmedCustomerPreferences(
+      "64b000000000000000000001",
+      "0557038547",
+      {
+        confirmed: true,
+        customerName: "  Ama   Mensah ",
+        dietaryPreferences: [" Vegetarian ", "vegetarian", "No Peanuts"],
+        spicePreference: " medium ",
+        isOptedOut: true
+      }
+    );
+
+    assert.equal(capturedFilter.customerPhone, "+233557038547");
+    assert.equal(capturedUpdate.$set.customerName, "Ama Mensah");
+    assert.deepEqual(capturedUpdate.$set.dietaryPreferences, [
+      "Vegetarian",
+      "No Peanuts"
+    ]);
+    assert.equal(capturedUpdate.$set.spicePreference, "medium");
+    assert.equal(capturedUpdate.$set.isOptedOut, true);
+    assert.equal(capturedUpdate.$set.marketingConsent, false);
+    assert.ok(capturedUpdate.$set.preferencesConfirmedAt instanceof Date);
+    assert.equal(profile.customerNameSource, "customer_confirmed");
+  } finally {
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
 });
