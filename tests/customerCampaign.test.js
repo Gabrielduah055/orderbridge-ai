@@ -130,6 +130,226 @@ const makeRecipient = (overrides = {}) => ({
   ...overrides
 });
 
+const installCampaignApprovalHarness = ({
+  campaignVersion = 1,
+  existingRecipients = [],
+  failFinalApprovalCount = 0
+} = {}) => {
+  const originals = {
+    campaignFindOne: CustomerCampaign.findOne,
+    campaignFindOneAndUpdate: CustomerCampaign.findOneAndUpdate,
+    restaurantFindOne: Restaurant.findOne,
+    profileFind: CustomerProfile.find,
+    recipientUpdateMany: CustomerCampaignRecipient.updateMany,
+    recipientDeleteMany: CustomerCampaignRecipient.deleteMany,
+    recipientInsertMany: CustomerCampaignRecipient.insertMany,
+    recipientCountDocuments:
+      CustomerCampaignRecipient.countDocuments
+  };
+  let campaignState = makeCampaign({
+    status: "pending_approval",
+    campaignVersion,
+    approvedAt: undefined,
+    totalRecipientCount: 0
+  });
+  let recipientState = structuredClone(existingRecipients);
+  let remainingFinalFailures = failFinalApprovalCount;
+  const calls = {
+    claims: [],
+    finalUpdates: [],
+    inserts: [],
+    counts: [],
+    sessionsEnded: 0
+  };
+
+  CustomerCampaign.findOne = async (filter) => {
+    if (
+      String(filter._id) !== campaignId ||
+      String(filter.restaurantId) !== restaurantId
+    ) {
+      return null;
+    }
+
+    return structuredClone(campaignState);
+  };
+  Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+  CustomerProfile.find = () =>
+    resolvedQuery([
+      {
+        _id: profileId,
+        customerPhone,
+        orderCount: 2,
+        marketingConsent: true,
+        isOptedOut: false,
+        marketingPreferenceUpdatedAt: now,
+        updatedAt: now
+      }
+    ]);
+  CustomerCampaign.findOneAndUpdate = async (
+    filter,
+    update,
+    options
+  ) => {
+    assert.ok(options.session);
+
+    if (
+      String(filter._id) !== campaignId ||
+      String(filter.restaurantId) !== restaurantId ||
+      filter.status !== campaignState.status ||
+      filter.campaignVersion !== campaignState.campaignVersion
+    ) {
+      return null;
+    }
+
+    if (filter.status === "pending_approval") {
+      calls.claims.push(filter);
+    } else {
+      calls.finalUpdates.push(filter);
+
+      if (remainingFinalFailures > 0) {
+        remainingFinalFailures -= 1;
+        return null;
+      }
+    }
+
+    campaignState = {
+      ...campaignState,
+      ...update.$set
+    };
+    return structuredClone(campaignState);
+  };
+  CustomerCampaignRecipient.updateMany = async (
+    filter,
+    update,
+    options
+  ) => {
+    assert.ok(options.session);
+
+    for (const recipient of recipientState) {
+      if (
+        String(recipient.restaurantId) === restaurantId &&
+        String(recipient.campaignId) === campaignId &&
+        recipient.status !== filter.status.$ne &&
+        recipient.campaignVersion !== filter.campaignVersion.$ne
+      ) {
+        Object.assign(recipient, update.$set);
+      }
+    }
+
+    return { modifiedCount: 0 };
+  };
+  CustomerCampaignRecipient.deleteMany = async (
+    filter,
+    options
+  ) => {
+    assert.ok(options.session);
+    const before = recipientState.length;
+    recipientState = recipientState.filter(
+      (recipient) =>
+        !(
+          String(recipient.restaurantId) === restaurantId &&
+          String(recipient.campaignId) === campaignId &&
+          recipient.campaignVersion === filter.campaignVersion &&
+          recipient.status !== "sent"
+        )
+    );
+    return { deletedCount: before - recipientState.length };
+  };
+  CustomerCampaignRecipient.insertMany = async (
+    recipients,
+    options
+  ) => {
+    assert.ok(options.session);
+    assert.equal(options.ordered, true);
+
+    for (const recipient of recipients) {
+      const duplicate = recipientState.some(
+        (existing) =>
+          String(existing.campaignId) ===
+            String(recipient.campaignId) &&
+          existing.campaignVersion === recipient.campaignVersion &&
+          existing.customerPhone === recipient.customerPhone
+      );
+
+      if (duplicate) {
+        throw new Error("duplicate recipient snapshot");
+      }
+
+      const inserted = {
+        ...recipient,
+        _id:
+          recipient.campaignVersion === 1
+            ? recipientId
+            : "64b000000000000000000b22"
+      };
+      calls.inserts.push(inserted);
+      recipientState.push(inserted);
+    }
+
+    return recipients;
+  };
+  CustomerCampaignRecipient.countDocuments = async (
+    filter,
+    options
+  ) => {
+    assert.ok(options.session);
+    calls.counts.push(filter);
+    return recipientState.filter(
+      (recipient) =>
+        String(recipient.restaurantId) === restaurantId &&
+        String(recipient.campaignId) === campaignId &&
+        recipient.campaignVersion === filter.campaignVersion
+    ).length;
+  };
+
+  return {
+    calls,
+    get campaign() {
+      return campaignState;
+    },
+    get recipients() {
+      return recipientState;
+    },
+    options(expectedCampaignVersion = campaignVersion) {
+      return {
+        expectedCampaignVersion,
+        startSession: async () => ({
+          async withTransaction(callback) {
+            const campaignBefore = structuredClone(campaignState);
+            const recipientsBefore = structuredClone(recipientState);
+
+            try {
+              return await callback();
+            } catch (error) {
+              campaignState = campaignBefore;
+              recipientState = recipientsBefore;
+              throw error;
+            }
+          },
+          async endSession() {
+            calls.sessionsEnded += 1;
+          }
+        })
+      };
+    },
+    restore() {
+      CustomerCampaign.findOne = originals.campaignFindOne;
+      CustomerCampaign.findOneAndUpdate =
+        originals.campaignFindOneAndUpdate;
+      Restaurant.findOne = originals.restaurantFindOne;
+      CustomerProfile.find = originals.profileFind;
+      CustomerCampaignRecipient.updateMany =
+        originals.recipientUpdateMany;
+      CustomerCampaignRecipient.deleteMany =
+        originals.recipientDeleteMany;
+      CustomerCampaignRecipient.insertMany =
+        originals.recipientInsertMany;
+      CustomerCampaignRecipient.countDocuments =
+        originals.recipientCountDocuments;
+    }
+  };
+};
+
 test("marketing preference commands are explicit and bounded", () => {
   assert.equal(parseCustomerMarketingPreferenceCommand(" STOP! "), "opt_out");
   assert.equal(
@@ -260,7 +480,55 @@ test("explicit opt-in is normalized, audited, and restaurant-scoped", async () =
       capturedUpdate.$set.marketingConsentAt,
       now
     );
+    assert.deepEqual(capturedUpdate.$unset, {
+      optedOutAt: "",
+      optedOutSource: ""
+    });
     assert.equal(profile.marketingConsent, true);
+  } finally {
+    CustomerProfile.findOne = originalFindOne;
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("explicit opt-in clears prior opt-out audit fields", async () => {
+  const originalFindOne = CustomerProfile.findOne;
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  let capturedUpdate;
+
+  try {
+    CustomerProfile.findOne = async () => ({
+      restaurantId,
+      customerPhone,
+      marketingConsent: false,
+      isOptedOut: true,
+      optedOutAt: new Date("2026-07-01T10:00:00.000Z"),
+      optedOutSource: "customer_message"
+    });
+    CustomerProfile.findOneAndUpdate = async (_filter, update) => {
+      capturedUpdate = update;
+      return {
+        ...update.$set
+      };
+    };
+
+    await setCustomerMarketingPreference(
+      restaurantId,
+      customerPhone,
+      "opt_in",
+      "customer_message",
+      now
+    );
+
+    assert.equal(capturedUpdate.$set.marketingConsent, true);
+    assert.equal(
+      capturedUpdate.$set.marketingPreferenceUpdatedAt,
+      now
+    );
+    assert.deepEqual(capturedUpdate.$unset, {
+      optedOutAt: "",
+      optedOutSource: ""
+    });
   } finally {
     CustomerProfile.findOne = originalFindOne;
     CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
@@ -469,12 +737,27 @@ test("campaign approval revalidates staff and creates one immutable scoped snaps
     CustomerCampaign.findOneAndUpdate;
   const originalRestaurantFindOne = Restaurant.findOne;
   const originalProfileFind = CustomerProfile.find;
-  const originalRecipientBulkWrite =
-    CustomerCampaignRecipient.bulkWrite;
+  const originalRecipientUpdateMany =
+    CustomerCampaignRecipient.updateMany;
+  const originalRecipientDeleteMany =
+    CustomerCampaignRecipient.deleteMany;
+  const originalRecipientInsertMany =
+    CustomerCampaignRecipient.insertMany;
   const originalRecipientCount =
     CustomerCampaignRecipient.countDocuments;
-  const operations = [];
+  const insertedRecipients = [];
+  const recipientUpdates = [];
+  let claimFilter;
   let approvalFilter;
+  let sessionEnded = false;
+  const session = {
+    async withTransaction(callback) {
+      return callback();
+    },
+    async endSession() {
+      sessionEnded = true;
+    }
+  };
 
   try {
     CustomerCampaign.findOne = async (filter) => {
@@ -501,16 +784,49 @@ test("campaign approval revalidates staff and creates one immutable scoped snaps
         }
       ]);
     };
-    CustomerCampaignRecipient.bulkWrite = async (writes) => {
-      operations.push(...writes);
-      return { upsertedCount: writes.length };
+    CustomerCampaignRecipient.updateMany = async (
+      filter,
+      update,
+      options
+    ) => {
+      recipientUpdates.push({ filter, update, options });
+      return { modifiedCount: 0 };
     };
-    CustomerCampaignRecipient.countDocuments = async (filter) => {
+    CustomerCampaignRecipient.deleteMany = async () => ({
+      deletedCount: 0
+    });
+    CustomerCampaignRecipient.insertMany = async (
+      recipients,
+      options
+    ) => {
+      assert.equal(options.session, session);
+      insertedRecipients.push(...recipients);
+      return recipients;
+    };
+    CustomerCampaignRecipient.countDocuments = async (
+      filter,
+      options
+    ) => {
       assert.equal(filter.restaurantId, restaurantId);
       assert.equal(String(filter.campaignId), campaignId);
+      assert.equal(filter.campaignVersion, 1);
+      assert.equal(options.session, session);
       return 1;
     };
-    CustomerCampaign.findOneAndUpdate = async (filter, update) => {
+    CustomerCampaign.findOneAndUpdate = async (
+      filter,
+      update,
+      options
+    ) => {
+      assert.equal(options.session, session);
+
+      if (filter.status === "pending_approval") {
+        claimFilter = filter;
+        return makeCampaign({
+          status: update.$set.status
+        });
+      }
+
       approvalFilter = filter;
       return {
         ...makeCampaign(),
@@ -522,43 +838,206 @@ test("campaign approval revalidates staff and creates one immutable scoped snaps
       restaurantId,
       campaignId,
       "+233507879374",
-      now
+      now,
+      {
+        startSession: async () => session
+      }
     );
 
     assert.equal(approved.status, "approved");
     assert.equal(approved.approvedByRole, "owner");
     assert.equal(approved.totalRecipientCount, 1);
-    assert.equal(operations.length, 1);
+    assert.equal(insertedRecipients.length, 1);
     assert.equal(
-      String(
-        operations[0].updateOne.filter.restaurantId
-      ),
+      String(insertedRecipients[0].restaurantId),
       restaurantId
     );
     assert.equal(
-      String(operations[0].updateOne.filter.campaignId),
+      String(insertedRecipients[0].campaignId),
       campaignId
     );
     assert.equal(
-      operations[0].updateOne.filter.customerPhone,
+      insertedRecipients[0].customerPhone,
       customerPhone
     );
-    assert.equal(
-      operations[0].updateOne.update.$setOnInsert.status,
-      "pending"
-    );
+    assert.equal(insertedRecipients[0].campaignVersion, 1);
+    assert.equal(insertedRecipients[0].status, "pending");
+    assert.equal(claimFilter.restaurantId, restaurantId);
+    assert.equal(claimFilter.status, "pending_approval");
+    assert.equal(claimFilter.campaignVersion, 1);
     assert.equal(approvalFilter.restaurantId, restaurantId);
-    assert.equal(approvalFilter.status, "pending_approval");
+    assert.equal(approvalFilter.status, "snapshotting");
+    assert.equal(approvalFilter.campaignVersion, 1);
+    assert.equal(
+      recipientUpdates[0].filter.campaignVersion.$ne,
+      1
+    );
+    assert.equal(sessionEnded, true);
   } finally {
     CustomerCampaign.findOne = originalCampaignFindOne;
     CustomerCampaign.findOneAndUpdate =
       originalCampaignFindOneAndUpdate;
     Restaurant.findOne = originalRestaurantFindOne;
     CustomerProfile.find = originalProfileFind;
-    CustomerCampaignRecipient.bulkWrite =
-      originalRecipientBulkWrite;
+    CustomerCampaignRecipient.updateMany =
+      originalRecipientUpdateMany;
+    CustomerCampaignRecipient.deleteMany =
+      originalRecipientDeleteMany;
+    CustomerCampaignRecipient.insertMany =
+      originalRecipientInsertMany;
     CustomerCampaignRecipient.countDocuments =
       originalRecipientCount;
+  }
+});
+
+test("superseded campaign approval creates no recipient snapshot", async () => {
+  const harness = installCampaignApprovalHarness({
+    campaignVersion: 2,
+    existingRecipients: [
+      makeRecipient({
+        campaignVersion: 1
+      })
+    ]
+  });
+
+  try {
+    await assert.rejects(
+      approveCustomerCampaign(
+        restaurantId,
+        campaignId,
+        "+233507879374",
+        now,
+        harness.options(1)
+      ),
+      /superseded/
+    );
+
+    assert.equal(harness.calls.claims.length, 0);
+    assert.equal(harness.calls.inserts.length, 0);
+    assert.equal(harness.campaign.status, "pending_approval");
+    assert.equal(
+      harness.recipients.some(
+        (recipient) => recipient.campaignVersion === 2
+      ),
+      false
+    );
+  } finally {
+    harness.restore();
+  }
+});
+
+test("failed transactional approval rolls back and can be retried safely", async () => {
+  const harness = installCampaignApprovalHarness({
+    failFinalApprovalCount: 1
+  });
+
+  try {
+    await assert.rejects(
+      approveCustomerCampaign(
+        restaurantId,
+        campaignId,
+        "+233507879374",
+        now,
+        harness.options()
+      ),
+      /superseded/
+    );
+
+    assert.equal(harness.campaign.status, "pending_approval");
+    assert.equal(harness.recipients.length, 0);
+
+    const approved = await approveCustomerCampaign(
+      restaurantId,
+      campaignId,
+      "+233507879374",
+      now,
+      harness.options()
+    );
+
+    assert.equal(approved.status, "approved");
+    assert.equal(harness.recipients.length, 1);
+    assert.equal(harness.recipients[0].campaignVersion, 1);
+    assert.equal(harness.calls.sessionsEnded, 2);
+  } finally {
+    harness.restore();
+  }
+});
+
+test("version-2 approval cancels old unsent recipients and counts only version 2", async () => {
+  const harness = installCampaignApprovalHarness({
+    campaignVersion: 2,
+    existingRecipients: [
+      makeRecipient({
+        campaignVersion: 1,
+        status: "pending"
+      })
+    ]
+  });
+
+  try {
+    const approved = await approveCustomerCampaign(
+      restaurantId,
+      campaignId,
+      "+233507879374",
+      now,
+      harness.options(2)
+    );
+    const version1Recipient = harness.recipients.find(
+      (recipient) => recipient.campaignVersion === 1
+    );
+    const version2Recipients = harness.recipients.filter(
+      (recipient) => recipient.campaignVersion === 2
+    );
+
+    assert.equal(version1Recipient.status, "cancelled");
+    assert.match(version1Recipient.failureReason, /superseded/i);
+    assert.equal(version2Recipients.length, 1);
+    assert.equal(version2Recipients[0].status, "pending");
+    assert.equal(approved.totalRecipientCount, 1);
+    assert.equal(
+      harness.calls.counts.at(-1).campaignVersion,
+      2
+    );
+  } finally {
+    harness.restore();
+  }
+});
+
+test("duplicate concurrent approvals create one versioned recipient snapshot", async () => {
+  const harness = installCampaignApprovalHarness();
+
+  try {
+    const approvals = await Promise.allSettled([
+      approveCustomerCampaign(
+        restaurantId,
+        campaignId,
+        "+233507879374",
+        now,
+        harness.options()
+      ),
+      approveCustomerCampaign(
+        restaurantId,
+        campaignId,
+        "+233507879374",
+        now,
+        harness.options()
+      )
+    ]);
+
+    assert.equal(
+      approvals.filter((result) => result.status === "fulfilled")
+        .length,
+      1
+    );
+    assert.equal(
+      approvals.filter((result) => result.status === "rejected")
+        .length,
+      1
+    );
+    assert.equal(harness.recipients.length, 1);
+    assert.equal(harness.recipients[0].campaignVersion, 1);
+  } finally {
+    harness.restore();
   }
 });
 
@@ -761,6 +1240,9 @@ const makeSchedulerHarness = ({
   const enqueued = [];
   const calls = {
     recipientBatchSizes: [],
+    recipientCampaignVersions: [],
+    aggregateCampaignVersions: [],
+    sendingCampaignVersions: [],
     errors: []
   };
   const dependencies = {
@@ -774,9 +1256,12 @@ const makeSchedulerHarness = ({
     ) => {
       assert.equal(scopedRestaurantId, restaurantId);
       assert.equal(scopedCampaignId, campaignId);
-      assert.equal(campaignVersion, 1);
+      calls.recipientCampaignVersions.push(campaignVersion);
       calls.recipientBatchSizes.push(requestedBatchSize);
-      return recipients;
+      return recipients.filter(
+        (recipient) =>
+          recipient.campaignVersion === campaignVersion
+      );
     },
     messageExists: async (_scopedRestaurantId, key) =>
       messageKeys.has(key),
@@ -795,9 +1280,22 @@ const makeSchedulerHarness = ({
       };
     },
     attachOutboundMessage: async () => {},
-    markCampaignSending: async () => {},
+    markCampaignSending: async (
+      _restaurantId,
+      _campaignId,
+      campaignVersion
+    ) => {
+      calls.sendingCampaignVersions.push(campaignVersion);
+    },
     validateReferencedItem: async () => {},
-    updateAggregate: async () => null,
+    updateAggregate: async (
+      _restaurantId,
+      _campaignId,
+      campaignVersion
+    ) => {
+      calls.aggregateCampaignVersions.push(campaignVersion);
+      return null;
+    },
     batchSize,
     logError: (message, context) =>
       calls.errors.push({ message, context })
@@ -857,9 +1355,44 @@ test("approved campaigns queue once with privacy-safe marketing metadata", async
   assert.equal(recipient.status, "pending");
 });
 
+test("campaign scheduler loads and aggregates only the approved campaign version", async () => {
+  const harness = makeSchedulerHarness({
+    campaigns: [
+      makeCampaign({
+        status: "approved",
+        campaignVersion: 2,
+        totalRecipientCount: 1
+      })
+    ],
+    recipients: [
+      makeRecipient({
+        campaignVersion: 1
+      }),
+      makeRecipient({
+        _id: "64b000000000000000000b22",
+        campaignVersion: 2
+      })
+    ]
+  });
+
+  const result = await runCustomerCampaignSchedulerPass(
+    now,
+    harness.dependencies
+  );
+
+  assert.equal(result.messagesQueued, 1);
+  assert.deepEqual(harness.calls.recipientCampaignVersions, [2]);
+  assert.deepEqual(harness.calls.sendingCampaignVersions, [2]);
+  assert.deepEqual(harness.calls.aggregateCampaignVersions, [2]);
+  assert.equal(harness.enqueued[0].metadata.campaignVersion, 2);
+});
+
 test("campaign scheduler skips unapproved and inactive restaurant campaigns", async () => {
   const unapprovedHarness = makeSchedulerHarness({
     campaigns: [makeCampaign({ status: "pending_approval" })]
+  });
+  const partialSnapshotHarness = makeSchedulerHarness({
+    campaigns: [makeCampaign({ status: "snapshotting" })]
   });
   const inactiveHarness = makeSchedulerHarness({
     restaurant: null
@@ -871,10 +1404,15 @@ test("campaign scheduler skips unapproved and inactive restaurant campaigns", as
   );
   await runCustomerCampaignSchedulerPass(
     now,
+    partialSnapshotHarness.dependencies
+  );
+  await runCustomerCampaignSchedulerPass(
+    now,
     inactiveHarness.dependencies
   );
 
   assert.equal(unapprovedHarness.enqueued.length, 0);
+  assert.equal(partialSnapshotHarness.enqueued.length, 0);
   assert.equal(inactiveHarness.enqueued.length, 0);
 });
 
@@ -1331,11 +1869,13 @@ test("campaign aggregate counts and terminal status reflect recipient delivery a
       resolvedQuery({
         _id: campaignId,
         restaurantId,
-        status: "sending"
+        status: "sending",
+        campaignVersion: 1
       });
     CustomerCampaignRecipient.find = (filter) => {
       assert.equal(filter.restaurantId, restaurantId);
       assert.equal(filter.campaignId, campaignId);
+      assert.equal(filter.campaignVersion, 1);
       return resolvedQuery([
         { status: "sent", outboundMessageId: "queue-1" },
         { status: "failed", outboundMessageId: "queue-2" },
@@ -1351,6 +1891,7 @@ test("campaign aggregate counts and terminal status reflect recipient delivery a
     const aggregate = await updateCustomerCampaignAggregate(
       restaurantId,
       campaignId,
+      1,
       now
     );
 
@@ -1360,6 +1901,7 @@ test("campaign aggregate counts and terminal status reflect recipient delivery a
     assert.equal(aggregate.failed, 1);
     assert.equal(aggregate.cancelled, 1);
     assert.equal(capturedFilter.restaurantId, restaurantId);
+    assert.equal(capturedFilter.campaignVersion, 1);
     assert.equal(capturedUpdate.$set.status, "partially_failed");
     assert.equal(capturedUpdate.$set.sentRecipientCount, 1);
     assert.equal(capturedUpdate.$set.failedRecipientCount, 1);
@@ -1386,6 +1928,7 @@ test("campaign model indexes support scoped scheduling and unique recipient snap
     .find(
       ([fields, options]) =>
         fields.campaignId === 1 &&
+        fields.campaignVersion === 1 &&
         fields.customerPhone === 1 &&
         options.unique === true
     );

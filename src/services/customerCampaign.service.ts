@@ -1,4 +1,4 @@
-import { Types } from "mongoose";
+import { Types, type ClientSession } from "mongoose";
 import { z } from "zod";
 import {
   CustomerCampaign,
@@ -129,6 +129,12 @@ export const createCustomerCampaignDraftSchema = z
 export const campaignIdSchema = z
   .object({
     campaignId: z.string().trim().min(1)
+  })
+  .strict();
+
+export const approveCampaignSchema = campaignIdSchema
+  .extend({
+    expectedCampaignVersion: z.number().int().min(1).optional()
   })
   .strict();
 
@@ -710,7 +716,11 @@ export const approveCustomerCampaign = async (
   restaurantId: string,
   campaignId: string,
   approverPhone: string,
-  now = new Date()
+  now = new Date(),
+  options: {
+    expectedCampaignVersion?: number;
+    startSession?: () => Promise<ClientSession>;
+  } = {}
 ): Promise<ICustomerCampaignDocument> => {
   const campaign = await getCustomerCampaignForRestaurant(
     restaurantId,
@@ -720,6 +730,15 @@ export const approveCustomerCampaign = async (
   if (campaign.status !== "pending_approval") {
     throw new BadRequestError(
       "Campaign is no longer awaiting approval"
+    );
+  }
+
+  const expectedCampaignVersion =
+    options.expectedCampaignVersion ?? campaign.campaignVersion;
+
+  if (campaign.campaignVersion !== expectedCampaignVersion) {
+    throw new BadRequestError(
+      "Campaign approval was superseded by another update"
     );
   }
 
@@ -738,83 +757,162 @@ export const approveCustomerCampaign = async (
     campaign.targeting,
     now
   );
+  const restaurantObjectId = new Types.ObjectId(restaurantId);
+  const session = await (
+    options.startSession ?? (() => CustomerCampaign.db.startSession())
+  )();
+  let approvedCampaign: ICustomerCampaignDocument | null = null;
 
-  if (preview.recipients.length > 0) {
-    await CustomerCampaignRecipient.bulkWrite(
-      preview.recipients.map((recipient) => ({
-        updateOne: {
-          filter: {
-            restaurantId: new Types.ObjectId(restaurantId),
-            campaignId: campaign._id,
-            customerPhone: recipient.customerPhone
+  try {
+    await session.withTransaction(async () => {
+      const claimedCampaign =
+        await CustomerCampaign.findOneAndUpdate(
+          {
+            _id: campaignId,
+            restaurantId,
+            status: "pending_approval",
+            campaignVersion: expectedCampaignVersion
           },
-          update: {
-            $setOnInsert: {
-              restaurantId: new Types.ObjectId(restaurantId),
-              campaignId: campaign._id,
-              customerProfileId: new Types.ObjectId(
-                recipient.customerProfileId
-              ),
-              customerPhone: recipient.customerPhone,
-              campaignVersion: campaign.campaignVersion,
-              qualificationReason: recipient.qualificationReason,
-              consentSnapshotUpdatedAt:
-                recipient.consentSnapshotUpdatedAt,
-              status: "pending"
+          {
+            $set: {
+              status: "snapshotting"
             }
           },
-          upsert: true
+          {
+            new: true,
+            runValidators: true,
+            session
+          }
+        );
+
+      if (!claimedCampaign) {
+        throw new BadRequestError(
+          "Campaign approval was superseded by another update"
+        );
+      }
+
+      await CustomerCampaignRecipient.updateMany(
+        {
+          restaurantId,
+          campaignId: claimedCampaign._id,
+          campaignVersion: {
+            $ne: expectedCampaignVersion
+          },
+          status: {
+            $ne: "sent"
+          }
+        },
+        {
+          $set: {
+            status: "cancelled",
+            attemptedAt: now,
+            failureReason:
+              "Recipient snapshot superseded by a newer campaign version"
+          }
+        },
+        {
+          session
         }
-      })),
-      {
-        ordered: false
-      }
-    );
-  }
+      );
 
-  const totalRecipientCount =
-    await CustomerCampaignRecipient.countDocuments({
-      restaurantId,
-      campaignId: campaign._id
+      await CustomerCampaignRecipient.deleteMany(
+        {
+          restaurantId,
+          campaignId: claimedCampaign._id,
+          campaignVersion: expectedCampaignVersion,
+          status: {
+            $ne: "sent"
+          }
+        },
+        {
+          session
+        }
+      );
+
+      if (preview.recipients.length > 0) {
+        await CustomerCampaignRecipient.insertMany(
+          preview.recipients.map((recipient) => ({
+            restaurantId: restaurantObjectId,
+            campaignId: claimedCampaign._id,
+            customerProfileId: new Types.ObjectId(
+              recipient.customerProfileId
+            ),
+            customerPhone: recipient.customerPhone,
+            campaignVersion: expectedCampaignVersion,
+            qualificationReason: recipient.qualificationReason,
+            consentSnapshotUpdatedAt:
+              recipient.consentSnapshotUpdatedAt,
+            status: "pending"
+          })),
+          {
+            ordered: true,
+            session
+          }
+        );
+      }
+
+      const totalRecipientCount =
+        await CustomerCampaignRecipient.countDocuments(
+          {
+            restaurantId,
+            campaignId: claimedCampaign._id,
+            campaignVersion: expectedCampaignVersion
+          },
+          {
+            session
+          }
+        );
+      const nextStatus =
+        claimedCampaign.scheduledAt &&
+        claimedCampaign.scheduledAt > now
+          ? "scheduled"
+          : "approved";
+      const approved = await CustomerCampaign.findOneAndUpdate(
+        {
+          _id: campaignId,
+          restaurantId,
+          status: "snapshotting",
+          campaignVersion: expectedCampaignVersion
+        },
+        {
+          $set: {
+            status: nextStatus,
+            approvedByPhone: staff.phone,
+            approvedByRole: staff.role,
+            approvedAt: now,
+            estimatedRecipientCount:
+              preview.estimatedEligibleRecipients,
+            totalRecipientCount,
+            excludedNoConsentCount: preview.excludedNoConsent,
+            excludedOptOutCount: preview.excludedOptOut,
+            excludedInvalidPhoneCount:
+              preview.excludedInvalidPhone
+          }
+        },
+        {
+          new: true,
+          runValidators: true,
+          session
+        }
+      );
+
+      if (!approved) {
+        throw new BadRequestError(
+          "Campaign approval was superseded by another update"
+        );
+      }
+
+      approvedCampaign = approved;
     });
-  const nextStatus =
-    campaign.scheduledAt && campaign.scheduledAt > now
-      ? "scheduled"
-      : "approved";
-  const approved = await CustomerCampaign.findOneAndUpdate(
-    {
-      _id: campaignId,
-      restaurantId,
-      status: "pending_approval",
-      campaignVersion: campaign.campaignVersion
-    },
-    {
-      $set: {
-        status: nextStatus,
-        approvedByPhone: staff.phone,
-        approvedByRole: staff.role,
-        approvedAt: now,
-        estimatedRecipientCount:
-          preview.estimatedEligibleRecipients,
-        totalRecipientCount,
-        excludedNoConsentCount: preview.excludedNoConsent,
-        excludedOptOutCount: preview.excludedOptOut,
-        excludedInvalidPhoneCount: preview.excludedInvalidPhone
-      }
-    },
-    {
-      new: true,
-      runValidators: true
-    }
-  );
-
-  if (!approved) {
-    throw new BadRequestError(
-      "Campaign approval was superseded by another update"
-    );
+  } finally {
+    await session.endSession();
   }
 
-  return approved;
+  if (!approvedCampaign) {
+    throw new BadRequestError("Campaign approval did not complete");
+  }
+
+  return approvedCampaign;
 };
 
 export const cancelCustomerCampaign = async (
@@ -942,20 +1040,37 @@ export interface CustomerCampaignAggregate {
 export const updateCustomerCampaignAggregate = async (
   restaurantId: string,
   campaignId: string,
-  now = new Date()
+  campaignVersionOrNow?: number | Date,
+  aggregateNow?: Date
 ): Promise<CustomerCampaignAggregate | null> => {
+  const requestedCampaignVersion =
+    typeof campaignVersionOrNow === "number"
+      ? campaignVersionOrNow
+      : undefined;
+  const now =
+    campaignVersionOrNow instanceof Date
+      ? campaignVersionOrNow
+      : (aggregateNow ?? new Date());
   const campaign = await CustomerCampaign.findOne({
     _id: campaignId,
     restaurantId
-  }).select("status");
+  }).select("status campaignVersion");
 
   if (!campaign || campaign.status === "cancelled") {
     return null;
   }
 
+  const campaignVersion =
+    requestedCampaignVersion ?? campaign.campaignVersion;
+
+  if (campaign.campaignVersion !== campaignVersion) {
+    return null;
+  }
+
   const recipients = await CustomerCampaignRecipient.find({
     restaurantId,
-    campaignId
+    campaignId,
+    campaignVersion
   }).select("status outboundMessageId");
   const counts: Record<CustomerCampaignRecipientStatus, number> = {
     pending: 0,
@@ -996,6 +1111,7 @@ export const updateCustomerCampaignAggregate = async (
     {
       _id: campaignId,
       restaurantId,
+      campaignVersion,
       status: { $ne: "cancelled" }
     },
     {

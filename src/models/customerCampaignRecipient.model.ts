@@ -108,15 +108,18 @@ customerCampaignRecipientSchema.index({
 customerCampaignRecipientSchema.index({
   restaurantId: 1,
   campaignId: 1,
+  campaignVersion: 1,
   status: 1
 });
 customerCampaignRecipientSchema.index(
   {
     campaignId: 1,
+    campaignVersion: 1,
     customerPhone: 1
   },
   {
-    unique: true
+    unique: true,
+    name: "campaign_recipient_version_phone_unique"
   }
 );
 customerCampaignRecipientSchema.index({
@@ -129,3 +132,35 @@ export const CustomerCampaignRecipient =
     "CustomerCampaignRecipient",
     customerCampaignRecipientSchema
   );
+
+export const ensureCustomerCampaignRecipientIndexes =
+  async (): Promise<void> => {
+    await CustomerCampaignRecipient.collection.createIndex(
+      {
+        campaignId: 1,
+        campaignVersion: 1,
+        customerPhone: 1
+      },
+      {
+        unique: true,
+        name: "campaign_recipient_version_phone_unique"
+      }
+    );
+
+    const indexes =
+      await CustomerCampaignRecipient.collection.indexes();
+    const legacyIndex = indexes.find(
+      (index) =>
+        index.unique === true &&
+        index.name !== "campaign_recipient_version_phone_unique" &&
+        index.key.campaignId === 1 &&
+        index.key.customerPhone === 1 &&
+        !("campaignVersion" in index.key)
+    );
+
+    if (legacyIndex?.name) {
+      await CustomerCampaignRecipient.collection.dropIndex(
+        legacyIndex.name
+      );
+    }
+  };

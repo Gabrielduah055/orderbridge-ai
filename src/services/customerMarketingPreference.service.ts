@@ -143,7 +143,9 @@ export const setCustomerMarketingPreference = async (
   const alreadyApplied =
     command === "opt_in"
       ? existing?.marketingConsent === true &&
-        existing.isOptedOut !== true
+        existing.isOptedOut !== true &&
+        !existing.optedOutAt &&
+        !existing.optedOutSource
       : existing?.isOptedOut === true &&
         existing.marketingConsent === false;
 
@@ -182,6 +184,14 @@ export const setCustomerMarketingPreference = async (
     },
     {
       $set: preferenceFields,
+      ...(command === "opt_in"
+        ? {
+            $unset: {
+              optedOutAt: "",
+              optedOutSource: ""
+            }
+          }
+        : {}),
       $setOnInsert: {
         restaurantId,
         customerPhone: normalizedPhone

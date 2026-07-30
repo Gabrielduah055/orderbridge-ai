@@ -9,6 +9,7 @@ import * as orderService from "../services/order.service";
 import * as customerRecommendationService from "../services/customerRecommendation.service";
 import {
   approveCustomerCampaign,
+  approveCampaignSchema,
   buildCustomerCampaignPreviewMessage,
   campaignIdSchema,
   cancelCustomerCampaign,
@@ -893,7 +894,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     },
     roles: toolPermissions.approve_campaign,
     sensitive: true,
-    schema: campaignIdSchema,
+    schema: approveCampaignSchema,
     handler: async (args, context) => {
       if (!context.confirmed) {
         const { campaign, preview } =
@@ -905,7 +906,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return createPendingToolAction(
           context,
           "approve_campaign",
-          args,
+          {
+            campaignId: args.campaignId,
+            expectedCampaignVersion: campaign.campaignVersion
+          },
           buildCustomerCampaignPreviewMessage(campaign, preview)
         );
       }
@@ -913,7 +917,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const campaign = await approveCustomerCampaign(
         context.restaurantId,
         args.campaignId,
-        context.sender.normalizedPhone
+        context.sender.normalizedPhone,
+        new Date(),
+        {
+          expectedCampaignVersion: args.expectedCampaignVersion
+        }
       );
 
       return {

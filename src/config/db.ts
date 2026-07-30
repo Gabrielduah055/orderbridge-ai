@@ -1,5 +1,6 @@
 import dns from "dns";
 import mongoose from "mongoose";
+import { ensureCustomerCampaignRecipientIndexes } from "../models/customerCampaignRecipient.model";
 import { env } from "./env";
 
 const getMongoErrorMessage = (error: unknown): string => {
@@ -27,6 +28,7 @@ export const connectDb = async (): Promise<void> => {
     await mongoose.connect(env.mongodbUri, {
       serverSelectionTimeoutMS: 10000
     });
+    await ensureCustomerCampaignRecipientIndexes();
     console.log("MongoDB connected successfully");
   } catch (error) {
     console.error(`MongoDB connection failed: ${getMongoErrorMessage(error)}`);

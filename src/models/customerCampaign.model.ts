@@ -4,6 +4,7 @@ import type { SenderRole } from "../types/agent.types";
 export const customerCampaignStatuses = [
   "draft",
   "pending_approval",
+  "snapshotting",
   "approved",
   "scheduled",
   "sending",

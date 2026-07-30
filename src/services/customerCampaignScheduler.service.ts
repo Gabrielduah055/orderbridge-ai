@@ -64,6 +64,7 @@ export interface CustomerCampaignSchedulerDependencies {
   markCampaignSending?: (
     restaurantId: string,
     campaignId: string,
+    campaignVersion: number,
     now: Date
   ) => Promise<void>;
   validateReferencedItem?: (
@@ -188,12 +189,14 @@ const attachOutboundMessage = async (
 const markCampaignSending = async (
   restaurantId: string,
   campaignId: string,
+  campaignVersion: number,
   now: Date
 ): Promise<void> => {
   await CustomerCampaign.updateOne(
     {
       _id: campaignId,
       restaurantId,
+      campaignVersion,
       status: {
         $in: ["approved", "scheduled", "sending"]
       }
@@ -397,7 +400,12 @@ export const runCustomerCampaignSchedulerPass = async (
 
       for (const recipient of recipients) {
         if (result.messagesQueued >= maxMessagesPerPass) {
-          await updateAggregate(restaurantId, campaignId, now);
+          await updateAggregate(
+            restaurantId,
+            campaignId,
+            campaign.campaignVersion,
+            now
+          );
           return result;
         }
 
@@ -465,6 +473,7 @@ export const runCustomerCampaignSchedulerPass = async (
           await setCampaignSending(
             restaurantId,
             campaignId,
+            campaign.campaignVersion,
             now
           );
           result.messagesQueued += 1;
@@ -482,7 +491,12 @@ export const runCustomerCampaignSchedulerPass = async (
         }
       }
 
-      await updateAggregate(restaurantId, campaignId, now);
+      await updateAggregate(
+        restaurantId,
+        campaignId,
+        campaign.campaignVersion,
+        now
+      );
     } catch (error) {
       result.errors += 1;
       logError("Customer campaign processing failed", {

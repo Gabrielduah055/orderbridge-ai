@@ -294,6 +294,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     _id: campaignRecipientId,
     restaurantId,
     campaignId,
+    campaignVersion,
     status: "pending"
   }).select("customerPhone campaignVersion");
 
@@ -527,8 +528,15 @@ const updateCampaignRecipientAfterAttempt = async (
     typeof message.metadata.campaignRecipientId === "string"
       ? message.metadata.campaignRecipientId
       : "";
+  const campaignVersion = Number(message.metadata.campaignVersion);
 
-  if (!restaurantId || !campaignId || !campaignRecipientId) {
+  if (
+    !restaurantId ||
+    !campaignId ||
+    !campaignRecipientId ||
+    !Number.isInteger(campaignVersion) ||
+    campaignVersion < 1
+  ) {
     return;
   }
 
@@ -540,6 +548,7 @@ const updateCampaignRecipientAfterAttempt = async (
         _id: campaignRecipientId,
         restaurantId,
         campaignId,
+        campaignVersion,
         status: "pending"
       },
       {
@@ -562,6 +571,7 @@ const updateCampaignRecipientAfterAttempt = async (
     await updateCustomerCampaignAggregate(
       restaurantId,
       campaignId,
+      campaignVersion,
       attemptedAt
     );
     return;
@@ -573,6 +583,7 @@ const updateCampaignRecipientAfterAttempt = async (
         _id: campaignRecipientId,
         restaurantId,
         campaignId,
+        campaignVersion,
         status: "pending"
       },
       {
@@ -586,6 +597,7 @@ const updateCampaignRecipientAfterAttempt = async (
     await updateCustomerCampaignAggregate(
       restaurantId,
       campaignId,
+      campaignVersion,
       attemptedAt
     );
     return;
@@ -596,6 +608,7 @@ const updateCampaignRecipientAfterAttempt = async (
       _id: campaignRecipientId,
       restaurantId,
       campaignId,
+      campaignVersion,
       status: "pending"
     },
     {
@@ -621,8 +634,15 @@ const cancelStaleCampaignRecipient = async (
     typeof metadata.campaignRecipientId === "string"
       ? metadata.campaignRecipientId
       : "";
+  const campaignVersion = Number(metadata.campaignVersion);
 
-  if (!restaurantId || !campaignId || !campaignRecipientId) {
+  if (
+    !restaurantId ||
+    !campaignId ||
+    !campaignRecipientId ||
+    !Number.isInteger(campaignVersion) ||
+    campaignVersion < 1
+  ) {
     return;
   }
 
@@ -631,6 +651,7 @@ const cancelStaleCampaignRecipient = async (
       _id: campaignRecipientId,
       restaurantId,
       campaignId,
+      campaignVersion,
       status: "pending"
     },
     {
@@ -644,6 +665,7 @@ const cancelStaleCampaignRecipient = async (
   await updateCustomerCampaignAggregate(
     restaurantId,
     campaignId,
+    campaignVersion,
     now
   );
 };
