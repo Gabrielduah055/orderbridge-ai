@@ -8,6 +8,7 @@ export const toolPermissions = {
   list_orders: ["owner", "manager"],
   get_sales_summary: ["owner", "manager"],
   get_latest_customer_order: ["customer"],
+  get_customer_recommendations: ["customer"],
   get_order_details: ["owner", "manager", "customer"],
   get_business_summary: ["owner", "manager"],
   add_menu_items: ["owner"],

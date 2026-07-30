@@ -45,6 +45,10 @@ const {
   loadCustomerMemorySummary
 } = require("../dist/services/customerMemory.service");
 const {
+  buildGroundedCustomerRecommendations,
+  getCustomerRecommendations
+} = require("../dist/services/customerRecommendation.service");
+const {
   CustomerProfile
 } = require("../dist/models/customerProfile.model");
 const {
@@ -56,6 +60,9 @@ const {
 const {
   buildAgentSystemPrompt
 } = require("../dist/services/ai/agentPrompt.service");
+const {
+  toolRegistry
+} = require("../dist/agent-tools/tool.registry");
 const {
   getNextSessionSendAt,
   getWasenderRetryDelayMs,
@@ -164,6 +171,33 @@ test("customer ordering uses draft tools instead of raw create order", () => {
   assert.equal(isToolAllowedForRole("add_order_item_by_name", "customer"), true);
   assert.equal(isToolAllowedForRole("update_order_draft", "customer"), true);
   assert.equal(isToolAllowedForRole("confirm_order_draft", "customer"), true);
+  assert.equal(
+    isToolAllowedForRole("get_customer_recommendations", "customer"),
+    true
+  );
+  assert.equal(
+    isToolAllowedForRole("get_customer_recommendations", "owner"),
+    false
+  );
+  assert.equal(
+    isToolAllowedForRole("get_customer_recommendations", "manager"),
+    false
+  );
+});
+
+test("customer recommendation tool schema accepts only a safe bounded limit", () => {
+  const schema = toolRegistry.get_customer_recommendations.schema;
+
+  assert.equal(schema.safeParse({}).success, true);
+  assert.equal(schema.safeParse({ limit: 5 }).success, true);
+  assert.equal(schema.safeParse({ limit: 0 }).success, false);
+  assert.equal(schema.safeParse({ limit: 9 }).success, false);
+  assert.equal(schema.safeParse({ limit: 2.5 }).success, false);
+  assert.equal(
+    schema.safeParse({ limit: 3, restaurantId: "another-restaurant" })
+      .success,
+    false
+  );
 });
 
 test("explicit quantity parser does not infer quantity from item name alone", () => {
@@ -1678,6 +1712,7 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(customerTools.includes("confirm_order_draft"), true);
   assert.equal(customerTools.includes("cancel_order_draft"), true);
   assert.equal(customerTools.includes("get_latest_customer_order"), true);
+  assert.equal(customerTools.includes("get_customer_recommendations"), true);
   assert.equal(customerTools.includes("update_menu_price"), false);
   assert.equal(customerTools.includes("confirm_order"), false);
   assert.equal(customerTools.includes("reject_order"), false);
@@ -2297,6 +2332,8 @@ test("customer prompt receives memory for the exact restaurant and phone", async
   assert.match(prompt, /Jollof Rice \(3 completed orders\)/);
   assert.match(prompt, /personalization only/);
   assert.match(prompt, /Never auto-add frequent or recent items/);
+  assert.match(prompt, /call get_customer_recommendations/);
+  assert.match(prompt, /only phrase the returned items naturally/);
   assert.match(prompt, /Unsolicited marketing or promotional messages require/);
   assert.match(
     prompt,
@@ -2395,5 +2432,256 @@ test("customer memory lookup failure does not block the ordering prompt", async 
     assert.match(prompt, /Help the customer browse the real menu/);
   } finally {
     console.error = originalConsoleError;
+  }
+});
+
+test("grounded recommendations exclude unavailable, nonexistent, and cross-restaurant items", () => {
+  const restaurantId = "64b000000000000000000001";
+  const otherRestaurantId = "64b000000000000000000002";
+  const frequentId = "64b000000000000000000301";
+  const unavailableId = "64b000000000000000000302";
+  const recentId = "64b000000000000000000303";
+  const nonexistentId = "64b000000000000000000304";
+  const crossRestaurantId = "64b000000000000000000305";
+  const popularId = "64b000000000000000000306";
+  const promoId = "64b000000000000000000307";
+  const recommendations = buildGroundedCustomerRecommendations({
+    restaurantId,
+    profile: {
+      restaurantId,
+      frequentlyOrderedItems: [
+        { menuItemId: frequentId, orderCount: 5 },
+        { menuItemId: unavailableId, orderCount: 10 },
+        { menuItemId: nonexistentId, orderCount: 9 },
+        { menuItemId: crossRestaurantId, orderCount: 8 }
+      ]
+    },
+    recentOrders: [
+      {
+        restaurantId,
+        status: "completed",
+        items: [
+          { menuItemId: recentId },
+          { menuItemId: unavailableId },
+          { menuItemId: nonexistentId }
+        ]
+      },
+      {
+        restaurantId: otherRestaurantId,
+        status: "completed",
+        items: [{ menuItemId: crossRestaurantId }]
+      },
+      {
+        restaurantId,
+        status: "cancelled",
+        items: [{ menuItemId: popularId }]
+      }
+    ],
+    menuItems: [
+      {
+        _id: frequentId,
+        restaurantId,
+        name: "Jollof Rice",
+        price: 45,
+        isAvailable: true,
+        isPopular: false,
+        isPromoItem: false
+      },
+      {
+        _id: unavailableId,
+        restaurantId,
+        name: "Unavailable Chicken",
+        price: 50,
+        isAvailable: false,
+        isPopular: true,
+        isPromoItem: true
+      },
+      {
+        _id: recentId,
+        restaurantId,
+        name: "Waakye",
+        price: 40,
+        isAvailable: true,
+        isPopular: false,
+        isPromoItem: false
+      },
+      {
+        _id: popularId,
+        restaurantId,
+        name: "Popular Banku",
+        price: 55,
+        isAvailable: true,
+        isPopular: true,
+        isPromoItem: false
+      },
+      {
+        _id: promoId,
+        restaurantId,
+        name: "Promo Fried Rice",
+        price: 35,
+        isAvailable: true,
+        isPopular: false,
+        isPromoItem: true
+      },
+      {
+        _id: crossRestaurantId,
+        restaurantId: otherRestaurantId,
+        name: "Other Restaurant Special",
+        price: 25,
+        isAvailable: true,
+        isPopular: true,
+        isPromoItem: true
+      },
+      {
+        _id: "64b000000000000000000308",
+        restaurantId,
+        name: "Available but Ungrounded",
+        price: 30,
+        isAvailable: true,
+        isPopular: false,
+        isPromoItem: false
+      }
+    ],
+    limit: 8
+  });
+  const names = recommendations.map((item) => item.name);
+
+  assert.deepEqual(names, [
+    "Jollof Rice",
+    "Popular Banku",
+    "Waakye",
+    "Promo Fried Rice"
+  ]);
+  assert.equal(names.includes("Unavailable Chicken"), false);
+  assert.equal(names.includes("Other Restaurant Special"), false);
+  assert.equal(names.includes("Available but Ungrounded"), false);
+  assert.equal(names.includes("nonexistent"), false);
+  assert.deepEqual(recommendations[0].reasons, ["frequently_ordered"]);
+  assert.deepEqual(recommendations[1].reasons, ["popular"]);
+  assert.deepEqual(recommendations[2].reasons, ["recently_ordered"]);
+  assert.deepEqual(recommendations[3].reasons, ["active_promo"]);
+});
+
+test("customer recommendation loader keeps every query restaurant-scoped", async () => {
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalOrderFind = Order.find;
+  const originalMenuFind = MenuItem.find;
+  const restaurantId = "64b000000000000000000001";
+  const otherRestaurantId = "64b000000000000000000002";
+  const frequentId = "64b000000000000000000301";
+  const unavailableId = "64b000000000000000000302";
+  let profileFilter;
+  let orderFilter;
+  let menuFilter;
+
+  CustomerProfile.findOne = (filter) => ({
+    select: async () => {
+      profileFilter = filter;
+      return {
+        restaurantId,
+        frequentlyOrderedItems: [
+          {
+            menuItemId: frequentId,
+            orderCount: 4
+          },
+          {
+            menuItemId: unavailableId,
+            orderCount: 7
+          }
+        ]
+      };
+    }
+  });
+  Order.find = (filter) => ({
+    select() {
+      orderFilter = filter;
+      return this;
+    },
+    sort() {
+      return this;
+    },
+    async limit() {
+      return [
+        {
+          restaurantId,
+          status: "completed",
+          items: [{ menuItemId: frequentId }]
+        }
+      ];
+    }
+  });
+  MenuItem.find = (filter) => ({
+    select: async () => {
+      menuFilter = filter;
+      return [
+        {
+          _id: frequentId,
+          restaurantId,
+          name: "Grounded Jollof",
+          price: 45,
+          isAvailable: true,
+          isPopular: false,
+          isPromoItem: false
+        },
+        {
+          _id: unavailableId,
+          restaurantId,
+          name: "Unavailable Chicken",
+          price: 50,
+          isAvailable: false,
+          isPopular: true,
+          isPromoItem: true
+        },
+        {
+          _id: "64b000000000000000000399",
+          restaurantId: otherRestaurantId,
+          name: "Cross-tenant Promo",
+          price: 10,
+          isAvailable: true,
+          isPopular: true,
+          isPromoItem: true
+        }
+      ];
+    }
+  });
+
+  try {
+    const recommendations = await getCustomerRecommendations(
+      restaurantId,
+      "0500000001",
+      5
+    );
+
+    assert.deepEqual(profileFilter, {
+      restaurantId,
+      customerPhone: "+233500000001"
+    });
+    assert.equal(orderFilter.restaurantId, restaurantId);
+    assert.equal(orderFilter.status, "completed");
+    assert.deepEqual(orderFilter.customerPhone.$in.sort(), [
+      "+233500000001",
+      "0500000001",
+      "233500000001"
+    ]);
+    assert.equal(menuFilter.restaurantId, restaurantId);
+    assert.equal(menuFilter.isAvailable, true);
+    assert.ok(
+      menuFilter.$or.some(
+        (condition) => condition.isPopular === true
+      )
+    );
+    assert.ok(
+      menuFilter.$or.some(
+        (condition) => condition.isPromoItem === true
+      )
+    );
+    assert.deepEqual(
+      recommendations.map((item) => item.name),
+      ["Grounded Jollof"]
+    );
+  } finally {
+    CustomerProfile.findOne = originalProfileFindOne;
+    Order.find = originalOrderFind;
+    MenuItem.find = originalMenuFind;
   }
 });

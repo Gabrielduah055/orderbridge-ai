@@ -6,6 +6,7 @@ import { Order, orderStatuses, type IOrderDocument, type OrderStatus } from "../
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
+import * as customerRecommendationService from "../services/customerRecommendation.service";
 import {
   buildClarificationCandidate,
   cancelPendingOrderItemClarifications,
@@ -500,6 +501,46 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Menu search completed.",
         data: items.map((item) => menuItemView(item, categoryNameById, includeInternal))
+      };
+    }
+  },
+  get_customer_recommendations: {
+    definition: {
+      name: "get_customer_recommendations",
+      description:
+        "Return backend-ranked, currently available menu recommendations for this customer. Use only these candidates when phrasing recommendations; never add items that are not returned.",
+      parameters: {
+        limit: `Optional number of recommendations, from 1 to ${customerRecommendationService.MAX_CUSTOMER_RECOMMENDATIONS}.`
+      }
+    },
+    roles: toolPermissions.get_customer_recommendations,
+    schema: z
+      .object({
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(customerRecommendationService.MAX_CUSTOMER_RECOMMENDATIONS)
+          .optional()
+      })
+      .strict(),
+    handler: async (args, context) => {
+      const recommendations =
+        await customerRecommendationService.getCustomerRecommendations(
+          context.restaurantId,
+          context.sender.normalizedPhone,
+          args.limit
+        );
+
+      return {
+        success: true,
+        message:
+          recommendations.length > 0
+            ? "Grounded customer recommendations retrieved successfully."
+            : "No grounded recommendations are currently available.",
+        data: {
+          recommendations
+        }
       };
     }
   },
