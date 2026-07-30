@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
+import { findActiveDraft, recordInboundCustomerTurn } from "../services/orderDraft.service";
 import { handleRestaurantAgentMessage } from "../services/restaurantAgent.service";
 import {
   notifyCustomerOfConfirmedOrderAndSendReceipt,
@@ -15,6 +16,30 @@ import {
 import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
 import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import { resolveSenderIdentity } from "../services/senderIdentity.service";
+
+const customerConversationQueues = new Map<string, Promise<void>>();
+
+export const runCustomerConversationSequentially = async <T>(
+  restaurantId: string,
+  customerPhone: string,
+  task: () => Promise<T>
+): Promise<T> => {
+  const key = `${restaurantId}:${normalizeGhanaPhone(customerPhone)}`;
+  const previous = customerConversationQueues.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(task);
+  const cleanup = next
+    .then(() => undefined, () => undefined)
+    .finally(() => {
+      if (customerConversationQueues.get(key) === cleanup) {
+        customerConversationQueues.delete(key);
+      }
+    });
+
+  customerConversationQueues.set(key, cleanup);
+
+  return next;
+};
 
 const getWebhookSecret = (req: Request): string | undefined => {
   const headerSecret =
@@ -136,6 +161,30 @@ const getErrorDetails = (error: unknown): Record<string, unknown> => {
   return details;
 };
 
+const latestResponsePurpose = (message: string): string => {
+  if (/welcome|hello|hi\b/i.test(message)) {
+    return "greeting";
+  }
+
+  if (/how many|number of portions|1, 2, or more/i.test(message)) {
+    return "quantity_clarification";
+  }
+
+  if (/pickup or delivery/i.test(message)) {
+    return "order_type_question";
+  }
+
+  if (/delivery location|where should we deliver|address/i.test(message)) {
+    return "address_question";
+  }
+
+  if (/may I have your name|name please/i.test(message)) {
+    return "name_question";
+  }
+
+  return "conversation";
+};
+
 const enqueueTextMessageOrThrow = async (
   sessionId: string,
   to: string,
@@ -188,23 +237,26 @@ const findRestaurantForWebhook = async (
   }).select("+wasenderApiToken");
 };
 
-const sendCustomerOrderSideEffects = async (
+const getStructuredOrderId = (orderData: unknown): string => {
+  return typeof orderData === "object" && orderData !== null && "_id" in orderData
+    ? String((orderData as { _id?: unknown })._id)
+    : typeof orderData === "object" && orderData !== null && "id" in orderData
+      ? String((orderData as { id?: unknown }).id)
+      : "";
+};
+
+const sendSingleCustomerOrderSideEffect = async (
   restaurant: IRestaurantDocument,
-  customerResponse: RestaurantAgentResponse
+  customerResponse: RestaurantAgentResponse,
+  orderData: unknown
 ): Promise<void> => {
-  const orderData = customerResponse.data?.order;
   const orderEvent = customerResponse.data?.orderEvent;
 
   if (!orderData || !orderEvent) {
     return;
   }
 
-  const orderId =
-    typeof orderData === "object" && "_id" in orderData
-      ? String((orderData as { _id?: unknown })._id)
-      : typeof orderData === "object" && "id" in orderData
-        ? String((orderData as { id?: unknown }).id)
-        : "";
+  const orderId = getStructuredOrderId(orderData);
 
   if (!orderId) {
     console.error("Order side effect skipped because structured order ID is missing", {
@@ -241,6 +293,24 @@ const sendCustomerOrderSideEffects = async (
   if (orderEvent === "rejected" && customerResponse.data?.notifyCustomer) {
     await notifyCustomerOfRejectedOrder(restaurant, order);
   }
+};
+
+export const sendCustomerOrderSideEffects = async (
+  restaurant: IRestaurantDocument,
+  customerResponse: RestaurantAgentResponse
+): Promise<void> => {
+  const orderList = Array.isArray(customerResponse.data?.orders)
+    ? customerResponse.data.orders
+    : undefined;
+
+  if (orderList) {
+    for (const orderData of orderList) {
+      await sendSingleCustomerOrderSideEffect(restaurant, customerResponse, orderData);
+    }
+    return;
+  }
+
+  await sendSingleCustomerOrderSideEffect(restaurant, customerResponse, customerResponse.data?.order);
 };
 
 const processNormalizedWebhook = async (
@@ -280,48 +350,102 @@ const processNormalizedWebhook = async (
       throw new Error("Wasender webhook missing sender phone");
     }
 
-    if (webhook.messageType !== "text" || !webhook.message.trim()) {
+    const sender = resolveSenderIdentity(restaurant, webhook.from);
+    const processWebhookTurn = async (): Promise<void> => {
+      let conversationMetadata: Record<string, unknown> = {};
+
+      if (sender.role === "customer") {
+        const turnSession = await recordInboundCustomerTurn(
+          String(restaurant._id),
+          normalizeGhanaPhone(webhook.from),
+          eventId,
+          sender.name
+        );
+
+        conversationMetadata = {
+          customerPhone: turnSession.customerPhone,
+          inboundEventId: eventId,
+          draftId: String(turnSession._id),
+          conversationVersion: turnSession.conversationVersion,
+          expectedDraftStep: turnSession.currentStep
+        };
+      }
+
+      if (webhook.messageType !== "text" || !webhook.message.trim()) {
+        await enqueueTextMessageOrThrow(
+          restaurant.wasenderSessionId,
+          webhook.from,
+          "Please send a text message so I can help with your order.",
+          {
+            action: "send_unsupported_message_type_reply",
+            restaurantId: String(restaurant._id),
+            eventId,
+            ...conversationMetadata,
+            responsePurpose: "unsupported_message_type"
+          },
+          restaurant.wasenderApiToken
+        );
+        webhookEvent.status = "processed";
+        webhookEvent.processedAt = new Date();
+        await webhookEvent.save();
+        return;
+      }
+
+      const agentResponse = await handleRestaurantAgentMessage({
+        restaurant,
+        senderPhone: webhook.from,
+        message: webhook.message,
+        quotedMessageId: webhook.quotedMessageId
+      });
+
+      if (sender.role === "customer") {
+        const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
+
+        if (latestDraft) {
+          conversationMetadata = {
+            ...conversationMetadata,
+            draftId: String(latestDraft._id),
+            conversationVersion: latestDraft.conversationVersion,
+            expectedDraftStep: latestDraft.currentStep
+          };
+        }
+      }
+
       await enqueueTextMessageOrThrow(
         restaurant.wasenderSessionId,
         webhook.from,
-        "Please send a text message so I can help with your order.",
+        agentResponse.message,
         {
-          action: "send_unsupported_message_type_reply",
+          action: "send_restaurant_agent_reply",
           restaurantId: String(restaurant._id),
-          eventId
+          eventId,
+          source: agentResponse.source,
+          senderRole: agentResponse.sender?.role,
+          ...conversationMetadata,
+          responsePurpose:
+            agentResponse.sender?.role === "customer"
+              ? latestResponsePurpose(agentResponse.message)
+              : "owner_agent_reply"
         },
         restaurant.wasenderApiToken
       );
+      await sendCustomerOrderSideEffects(restaurant, agentResponse);
+
       webhookEvent.status = "processed";
       webhookEvent.processedAt = new Date();
       await webhookEvent.save();
+    };
+
+    if (sender.role === "customer") {
+      await runCustomerConversationSequentially(
+        String(restaurant._id),
+        sender.normalizedPhone,
+        processWebhookTurn
+      );
       return;
     }
 
-    const agentResponse = await handleRestaurantAgentMessage({
-      restaurant,
-      senderPhone: webhook.from,
-      message: webhook.message
-    });
-
-    await enqueueTextMessageOrThrow(
-      restaurant.wasenderSessionId,
-      webhook.from,
-      agentResponse.message,
-      {
-        action: "send_restaurant_agent_reply",
-        restaurantId: String(restaurant._id),
-        eventId,
-        source: agentResponse.source,
-        senderRole: agentResponse.sender?.role
-      },
-      restaurant.wasenderApiToken
-    );
-    await sendCustomerOrderSideEffects(restaurant, agentResponse);
-
-    webhookEvent.status = "processed";
-    webhookEvent.processedAt = new Date();
-    await webhookEvent.save();
+    await processWebhookTurn();
   } catch (error) {
     if (
       error &&

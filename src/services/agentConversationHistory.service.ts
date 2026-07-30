@@ -21,7 +21,8 @@ export const getRecentAgentConversationHistory = async (
 ): Promise<AgentHistoryMessage[]> => {
   const messages = await AgentConversationMessage.find({
     restaurantId,
-    senderPhone
+    senderPhone,
+    direction: { $in: ["user", "assistant"] }
   })
     .sort({ createdAt: -1 })
     .limit(limit);

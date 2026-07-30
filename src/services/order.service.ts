@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import {
   Order,
@@ -50,6 +51,12 @@ export interface DeliveryFeeResolution {
   resolved: boolean;
   zoneName?: string;
 }
+
+export const getPendingOrderExpiryMinutes = (): number => {
+  const configured = Number(process.env.PENDING_ORDER_EXPIRY_MINUTES);
+
+  return Number.isFinite(configured) && configured > 0 ? configured : 60;
+};
 
 const ensureValidObjectId = (id: string, fieldName: string): void => {
   if (!Types.ObjectId.isValid(id)) {
@@ -137,6 +144,19 @@ const getMenuItemsForOrder = async (
 };
 
 const normalizeComparableText = (value: string): string => value.trim().replace(/\s+/g, " ").toLowerCase();
+const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
+
+const getDisplayOrderItemName = (item: IMenuItemDocument, categoryName?: string): string => {
+  const itemName = normalizeText(item.name);
+  const normalizedItemName = normalizeComparableText(itemName);
+  const normalizedCategoryName = categoryName ? normalizeComparableText(categoryName) : "";
+
+  if (!normalizedCategoryName || normalizedItemName.includes(normalizedCategoryName)) {
+    return itemName;
+  }
+
+  return `${itemName} ${normalizeText(categoryName!)}`;
+};
 
 export const resolveDeliveryFee = (
   restaurant: Pick<IRestaurantDocument, "deliveryPricing">,
@@ -220,6 +240,20 @@ export const buildOrderItems = async (
 
   const normalizedItems = normalizeOrderItems(inputItems);
   const menuItemById = await getMenuItemsForOrder(restaurantId, normalizedItems);
+  const categoryIds = Array.from(
+    new Set(
+      Array.from(menuItemById.values())
+        .map((item) => String(item.categoryId))
+        .filter(Boolean)
+    )
+  );
+  const categories = await MenuCategory.find({
+    _id: {
+      $in: categoryIds
+    },
+    restaurantId
+  });
+  const categoryNameById = new Map(categories.map((category) => [String(category._id), category.name]));
 
   return normalizedItems.map((item) => {
     const menuItem = menuItemById.get(item.menuItemId);
@@ -230,7 +264,7 @@ export const buildOrderItems = async (
 
     return {
       menuItemId: menuItem._id,
-      name: menuItem.name,
+      name: getDisplayOrderItemName(menuItem, categoryNameById.get(String(menuItem.categoryId))),
       quantity: item.quantity,
       unitPrice: menuItem.price,
       totalPrice: menuItem.price * item.quantity
@@ -243,6 +277,11 @@ export const createOrder = async (
   input: CreateOrderInput
 ): Promise<IOrderDocument> => {
   const restaurant = await getRestaurantOrThrow(restaurantId);
+  const customerName = input.customerName?.trim();
+
+  if (!customerName) {
+    throw new BadRequestError("Customer name is required before submitting the order", "CUSTOMER_NAME_REQUIRED");
+  }
 
   if (input.orderType === "delivery") {
     if (!restaurant.deliveryEnabled) {
@@ -261,23 +300,33 @@ export const createOrder = async (
       ? resolveDeliveryFee(restaurant, input.orderType, input.deliveryAddress, subtotal)
       : resolveDeliveryFee(restaurant, input.orderType, undefined, subtotal);
 
-  if (!deliveryFeeResolution.resolved || deliveryFeeResolution.amount === null) {
+  const deliveryFeePending =
+    input.orderType === "delivery" &&
+    !deliveryFeeResolution.resolved &&
+    deliveryFeeResolution.source === "manual_confirmation";
+
+  if (
+    !deliveryFeePending &&
+    (!deliveryFeeResolution.resolved || deliveryFeeResolution.amount === null)
+  ) {
     throw new BadRequestError("Delivery fee is not resolved for this order");
   }
 
-  const deliveryFee = input.deliveryFee ?? deliveryFeeResolution.amount;
-  const total = subtotal + deliveryFee;
+  const resolvedDeliveryFee = input.deliveryFee ?? deliveryFeeResolution.amount ?? 0;
+  const deliveryFee = deliveryFeePending ? null : resolvedDeliveryFee;
+  const total = deliveryFeePending ? subtotal : subtotal + resolvedDeliveryFee;
 
   try {
     return await Order.create({
       restaurantId,
-      customerName: input.customerName,
-      customerPhone: normalizeGhanaPhone(input.customerPhone),
+      customerName,
+      customerPhone: input.customerPhone,
       items,
       subtotal,
       deliveryFee,
       deliveryFeeSource: input.deliveryFeeSource ?? deliveryFeeResolution.source,
-      deliveryFeeResolvedAt: new Date(),
+      deliveryFeePending,
+      deliveryFeeResolvedAt: deliveryFeePending ? undefined : new Date(),
       total,
       orderType: input.orderType,
       deliveryAddress: input.orderType === "delivery" ? input.deliveryAddress : undefined,
@@ -308,6 +357,79 @@ export const createOrder = async (
 
     throw error;
   }
+};
+
+export const getOrderAgeMs = (order: Pick<IOrderDocument, "customerConfirmedAt" | "createdAt">): number => {
+  return Date.now() - (order.customerConfirmedAt ?? order.createdAt).getTime();
+};
+
+export const isPendingOrderActionable = (
+  order: Pick<IOrderDocument, "status" | "customerConfirmedAt" | "createdAt">,
+  now = new Date(),
+  expiryMinutes = getPendingOrderExpiryMinutes()
+): boolean => {
+  if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
+    return false;
+  }
+
+  const ageMs = now.getTime() - (order.customerConfirmedAt ?? order.createdAt).getTime();
+
+  return ageMs <= expiryMinutes * 60 * 1000;
+};
+
+export const formatRelativeOrderAge = (
+  order: Pick<IOrderDocument, "customerConfirmedAt" | "createdAt">,
+  now = new Date()
+): string => {
+  const ageMs = Math.max(0, now.getTime() - (order.customerConfirmedAt ?? order.createdAt).getTime());
+  const minutes = Math.floor(ageMs / 60_000);
+
+  if (minutes < 1) {
+    return "just now";
+  }
+
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+
+  if (hours < 24) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  }
+
+  if (hours < 48) {
+    return "yesterday";
+  }
+
+  const days = Math.floor(hours / 24);
+
+  return `${days} days ago`;
+};
+
+export const expireOldPendingOrders = async (
+  restaurantId?: string,
+  now = new Date(),
+  expiryMinutes = getPendingOrderExpiryMinutes()
+): Promise<number> => {
+  const cutoff = new Date(now.getTime() - expiryMinutes * 60 * 1000);
+  const result = await Order.updateMany(
+    {
+      ...(restaurantId ? { restaurantId } : {}),
+      status: { $in: ["awaiting_restaurant_confirmation", "pending"] },
+      $or: [
+        { customerConfirmedAt: { $lte: cutoff } },
+        { customerConfirmedAt: { $exists: false }, createdAt: { $lte: cutoff } }
+      ]
+    },
+    {
+      $set: {
+        status: "expired"
+      }
+    }
+  );
+
+  return result.modifiedCount;
 };
 
 export const getOrdersByRestaurant = async (
@@ -361,6 +483,12 @@ export const confirmRestaurantOrder = async (
     throw new BadRequestError("Only pending orders can be confirmed by the restaurant");
   }
 
+  if (!isPendingOrderActionable(order)) {
+    order.status = "expired";
+    await order.save();
+    throw new BadRequestError("This order has expired and cannot be accepted.");
+  }
+
   order.status = "accepted";
   order.restaurantConfirmedAt = order.restaurantConfirmedAt ?? new Date();
   await order.save();
@@ -386,6 +514,12 @@ export const rejectRestaurantOrder = async (
 
   if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
     throw new BadRequestError("Only pending orders can be rejected by the restaurant");
+  }
+
+  if (!isPendingOrderActionable(order)) {
+    order.status = "expired";
+    await order.save();
+    throw new BadRequestError("This order has expired and cannot be rejected.");
   }
 
   order.status = "rejected";

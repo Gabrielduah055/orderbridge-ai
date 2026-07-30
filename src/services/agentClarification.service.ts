@@ -16,8 +16,36 @@ const normalizeComparableText = (value: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
+const confirmationPhrases = [
+  "yes",
+  "yeah",
+  "yep",
+  "that is what i mean",
+  "that is what i want",
+  "thats what i mean",
+  "that's what i mean",
+  "that one",
+  "the spaghetti one"
+];
+
+const getMeaningfulSelectionTokens = (text: string): string[] => {
+  const normalized = normalizeComparableText(text).replace(/\b(with|from|the|one|option)\b/g, " ");
+
+  return normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !["please", "want", "mean"].includes(token));
+};
+
+const isConfirmationText = (text: string): boolean => {
+  const normalized = normalizeComparableText(text);
+
+  return confirmationPhrases.some((phrase) => normalized === phrase || normalized.includes(phrase));
+};
+
 const tokenMatches = (candidate: IAgentClarificationCandidate, text: string): boolean => {
   const normalizedText = normalizeComparableText(text);
+  const selectionTokens = getMeaningfulSelectionTokens(text);
   const candidateParts = [
     candidate.name,
     candidate.categoryName,
@@ -28,9 +56,13 @@ const tokenMatches = (candidate: IAgentClarificationCandidate, text: string): bo
     .map(normalizeComparableText);
 
   return candidateParts.some(
-    (part) => part.includes(normalizedText) || normalizedText.includes(part)
+    (part) =>
+      part.includes(normalizedText) ||
+      normalizedText.includes(part) ||
+      selectionTokens.some((token) => part.split(/\s+/).includes(token))
   );
 };
+
 
 export const createOrderItemClarification = async (input: {
   restaurantId: string;
@@ -82,11 +114,64 @@ export const findActiveOrderItemClarification = async (input: {
   }).sort({ createdAt: -1 });
 };
 
+export const cancelPendingOrderItemClarifications = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+}): Promise<void> => {
+  await AgentClarification.updateMany(
+    {
+      restaurantId: input.restaurantId,
+      senderPhone: input.senderPhone,
+      intent: "order_item_selection",
+      status: "pending"
+    },
+    {
+      $set: {
+        status: "cancelled"
+      }
+    }
+  );
+};
+
 export const resolveOrderItemClarification = async (
   clarification: IAgentClarificationDocument,
   text: string
 ) => {
-  const matches = clarification.candidates.filter((candidate) => tokenMatches(candidate, text));
+  const selectionTokens = getMeaningfulSelectionTokens(text);
+
+  // ── Exclusive multi-token pass ────────────────────────────────────────────
+  // When the customer types more than one meaningful word (e.g. "Chicken
+  // spaghetti"), ALL tokens must appear in one candidate's combined
+  // name+category text.  This stops "Chicken spaghetti" from matching
+  // "Chicken Noodles" just because both share the word "chicken".
+  if (selectionTokens.length > 1) {
+    const exclusiveMatches = clarification.candidates.filter((candidate) => {
+      const combinedTokens = normalizeComparableText(
+        [candidate.name, candidate.categoryName].filter(Boolean).join(" ")
+      ).split(/\s+/);
+
+      return selectionTokens.every((token) => combinedTokens.includes(token));
+    });
+
+    if (exclusiveMatches.length === 1) {
+      clarification.status = "resolved";
+      clarification.resolvedAt = new Date();
+      await clarification.save();
+
+      return {
+        status: "matched",
+        candidate: exclusiveMatches[0],
+        menuItemId: String(exclusiveMatches[0].menuItemId),
+        quantity: clarification.quantity
+      } as const;
+    }
+  }
+
+  // ── Standard single-token / confirmation pass ─────────────────────────────
+  const matches =
+    clarification.candidates.length === 1 && isConfirmationText(text)
+      ? [clarification.candidates[0]]
+      : clarification.candidates.filter((candidate) => tokenMatches(candidate, text));
 
   if (matches.length !== 1) {
     return {
@@ -110,6 +195,7 @@ export const resolveOrderItemClarification = async (
 export const buildClarificationCandidate = (input: {
   menuItemId: Types.ObjectId;
   name: string;
+  categoryId?: Types.ObjectId;
   price: number;
   categoryName?: string;
   available: boolean;

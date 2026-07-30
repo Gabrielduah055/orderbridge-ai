@@ -22,6 +22,7 @@ export const toolPermissions = {
   start_order: ["customer"],
   add_order_item_by_name: ["customer"],
   remove_order_item_by_name: ["customer"],
+  update_order_item_quantity: ["customer"],
   update_order_draft: ["customer"],
   get_order_draft: ["customer"],
   confirm_order_draft: ["customer"],

@@ -4,6 +4,7 @@ import { orderTypes, type OrderType } from "./order.model";
 export const customerSessionSteps = [
   "idle",
   "choosing_items",
+  "selecting_item_from_category",
   "collecting_quantity",
   "choosing_order_type",
   "collecting_address",
@@ -17,6 +18,9 @@ export type CustomerSessionStep = (typeof customerSessionSteps)[number];
 export interface ICustomerSessionCartItem {
   menuItemId: Types.ObjectId;
   name: string;
+  categoryId?: Types.ObjectId;
+  categoryName?: string;
+  displayName?: string;
   quantity: number;
   unitPrice: number;
   totalPrice: number;
@@ -29,6 +33,15 @@ export interface ICustomerSession {
   cartItems: ICustomerSessionCartItem[];
   pendingMenuItemId?: Types.ObjectId;
   pendingMenuItemName?: string;
+  pendingCategoryId?: Types.ObjectId;
+  pendingCategoryName?: string;
+  lastModifiedMenuItemId?: Types.ObjectId;
+  lastModifiedMenuItemName?: string;
+  lastModifiedCategoryName?: string;
+  lastModifiedDisplayName?: string;
+  lastModifiedAt?: Date;
+  lastModifiedPreviousQuantity?: number;
+  lastModifiedCurrentQuantity?: number;
   currentStep: CustomerSessionStep;
   orderType: OrderType | null;
   deliveryAddress?: string;
@@ -38,6 +51,10 @@ export interface ICustomerSession {
   convertedOrderId?: Types.ObjectId;
   convertedAt?: Date;
   lastMessage?: string;
+  lastInboundEventId?: string;
+  conversationVersion: number;
+  lastFollowUpKey?: string;
+  lastFollowUpAt?: Date;
   expiresAt: Date;
 }
 
@@ -56,6 +73,18 @@ const customerSessionCartItemSchema = new Schema<ICustomerSessionCartItem>(
     name: {
       type: String,
       required: true,
+      trim: true
+    },
+    categoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuCategory"
+    },
+    categoryName: {
+      type: String,
+      trim: true
+    },
+    displayName: {
+      type: String,
       trim: true
     },
     quantity: {
@@ -109,6 +138,41 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
       type: String,
       trim: true
     },
+    pendingCategoryId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuCategory"
+    },
+    pendingCategoryName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedMenuItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuItem"
+    },
+    lastModifiedMenuItemName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedCategoryName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedDisplayName: {
+      type: String,
+      trim: true
+    },
+    lastModifiedAt: {
+      type: Date
+    },
+    lastModifiedPreviousQuantity: {
+      type: Number,
+      min: 0
+    },
+    lastModifiedCurrentQuantity: {
+      type: Number,
+      min: 1
+    },
     currentStep: {
       type: String,
       enum: customerSessionSteps,
@@ -145,6 +209,22 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
     lastMessage: {
       type: String,
       trim: true
+    },
+    lastInboundEventId: {
+      type: String,
+      trim: true
+    },
+    conversationVersion: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    lastFollowUpKey: {
+      type: String,
+      trim: true
+    },
+    lastFollowUpAt: {
+      type: Date
     },
     expiresAt: {
       type: Date,

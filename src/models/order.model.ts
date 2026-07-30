@@ -9,6 +9,7 @@ export const orderStatuses = [
   "pending",
   "confirmed",
   "accepted",
+  "expired",
   "rejected",
   "preparing",
   "ready",
@@ -38,8 +39,9 @@ export interface IOrder {
   customerPhone: string;
   items: IOrderItem[];
   subtotal: number;
-  deliveryFee: number;
+  deliveryFee?: number | null;
   deliveryFeeSource?: string;
+  deliveryFeePending?: boolean;
   deliveryFeeResolvedAt?: Date;
   total: number;
   orderType: OrderType;
@@ -58,6 +60,7 @@ export interface IOrder {
   receiptDeliveryFailureReason?: string;
   customerConfirmedAt?: Date;
   ownerNotifiedAt?: Date;
+  ownerNotificationProviderMessageId?: string;
   ownerNotificationFailedAt?: Date;
   ownerNotificationFailureReason?: string;
   restaurantConfirmedAt?: Date;
@@ -142,13 +145,17 @@ const orderSchema = new Schema<IOrderDocument>(
     },
     deliveryFee: {
       type: Number,
-      required: true,
       min: 0,
-      default: 0
+      default: undefined
     },
     deliveryFeeSource: {
       type: String,
       trim: true
+    },
+    deliveryFeePending: {
+      type: Boolean,
+      default: false,
+      index: true
     },
     deliveryFeeResolvedAt: {
       type: Date
@@ -221,6 +228,11 @@ const orderSchema = new Schema<IOrderDocument>(
     },
     ownerNotifiedAt: {
       type: Date
+    },
+    ownerNotificationProviderMessageId: {
+      type: String,
+      trim: true,
+      index: true
     },
     ownerNotificationFailedAt: {
       type: Date

@@ -29,7 +29,8 @@ const {
 } = require("../dist/services/ai/ai.config");
 const {
   resolveDeliveryFee,
-  updateOrderStatus
+  isPendingOrderActionable,
+  formatRelativeOrderAge
 } = require("../dist/services/order.service");
 const {
   buildCompletedOrderProfileStats,
@@ -47,11 +48,36 @@ const {
 } = require("../dist/middleware/validateRequest");
 const {
   getNextSessionSendAt,
-  getWasenderRetryDelayMs
+  getWasenderRetryDelayMs,
+  isQueuedConversationalMessageStale
 } = require("../dist/services/wasenderQueue.service");
 const {
-  parseExplicitQuantity
+  parseExplicitQuantity,
+  parseQuantityCorrection,
+  getMissingDraftFields,
+  getDraftMissingFieldCode,
+  buildDraftView,
+  buildStateAwareFollowUpMessage,
+  resolveTrustedQuantity,
+  addItemToDraft,
+  getCartItemDisplayName,
+  getMenuItemDisplayName,
+  isOnlyThatCompletionMessage,
+  updateRecentCartItemQuantity
 } = require("../dist/services/orderDraft.service");
+const {
+  normalizeIncomingWebhook,
+  extractWasenderProviderMessageId
+} = require("../dist/services/wasender.service");
+const {
+  buildClarificationCandidate,
+  resolveOrderItemClarification
+} = require("../dist/services/agentClarification.service");
+const {
+  addPendingItemToDraft
+} = require("../dist/services/orderDraft.service");
+const { MenuItem } = require("../dist/models/MenuItem");
+const { AgentClarification } = require("../dist/models/agentClarification.model");
 const {
   buildOwnerNewOrderNotification,
   buildCustomerOrderConfirmedMessage,
@@ -62,6 +88,11 @@ const {
   isPendingActionCancellationMessage,
   shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
+const {
+  parseSimpleOwnerDecision,
+  parseOwnerSelectionReply,
+  buildOwnerSelectionMessage
+} = require("../dist/services/ownerOrderResolution.service");
 
 const restaurant = {
   ownerName: "Gabriel",
@@ -130,7 +161,224 @@ test("explicit quantity parser does not infer quantity from item name alone", ()
   assert.equal(parseExplicitQuantity("I want two assorted fried rice"), 2);
   assert.equal(parseExplicitQuantity("I want a plate of jollof"), 1);
   assert.equal(parseExplicitQuantity("Make it 3"), 3);
-  assert.equal(parseExplicitQuantity("Add another one"), 1);
+  assert.equal(parseExplicitQuantity("Add another one"), null);
+  assert.equal(parseExplicitQuantity("that one"), null);
+  assert.equal(parseExplicitQuantity("I will go for the GHS 60 package"), null);
+  assert.equal(parseExplicitQuantity("2 portions"), 2);
+});
+
+test("clarification candidates preserve category context", () => {
+  const candidate = buildClarificationCandidate({
+    menuItemId: "64b000000000000000000301",
+    name: "Chicken Spaghetti",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    available: true
+  });
+
+  assert.equal(String(candidate.menuItemId), "64b000000000000000000301");
+  assert.equal(String(candidate.categoryId), "64b000000000000000000401");
+  assert.equal(candidate.categoryName, "Spaghetti");
+  assert.equal(candidate.available, true);
+});
+
+test("with chicken resolves active Spaghetti clarification without Chicken Noodles", async () => {
+  const clarification = {
+    candidates: [
+      {
+        menuItemId: "64b000000000000000000301",
+        name: "Crave Special Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 60,
+        available: true
+      },
+      {
+        menuItemId: "64b000000000000000000302",
+        name: "Beef Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 50,
+        available: true
+      },
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 45,
+        available: true
+      }
+    ],
+    save: async () => {}
+  };
+
+  const resolved = await resolveOrderItemClarification(clarification, "With chicken");
+
+  assert.equal(resolved.status, "matched");
+  assert.equal(resolved.candidate.name, "Chicken Spaghetti");
+  assert.notEqual(resolved.candidate.name, "Chicken Noodles");
+  assert.equal(resolved.quantity, undefined);
+  assert.equal(clarification.status, "resolved");
+});
+
+test("yes confirms a single clarified item but does not create quantity 1", async () => {
+  const clarification = {
+    candidates: [
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken Spaghetti",
+        categoryId: "64b000000000000000000401",
+        categoryName: "Spaghetti",
+        price: 45,
+        available: true
+      }
+    ],
+    save: async () => {}
+  };
+
+  const resolved = await resolveOrderItemClarification(
+    clarification,
+    "Yes, that is what I mean"
+  );
+
+  assert.equal(resolved.status, "matched");
+  assert.equal(resolved.candidate.name, "Chicken Spaghetti");
+  assert.equal(resolved.quantity, undefined);
+  assert.equal(parseExplicitQuantity("Yes, that is what I mean"), null);
+});
+
+test("one explicit quantity adds the pending clarified item and clears it", async () => {
+  const originalFindOne = MenuItem.findOne;
+  const originalUpdateMany = AgentClarification.updateMany;
+  const session = {
+    pendingMenuItemId: "64b000000000000000000303",
+    pendingMenuItemName: "Chicken Spaghetti",
+    cartItems: [],
+    currentStep: "collecting_quantity"
+  };
+
+  MenuItem.findOne = async () => ({
+    _id: "64b000000000000000000303",
+    name: "Chicken Spaghetti",
+    price: 45,
+    isAvailable: true
+  });
+  AgentClarification.updateMany = async () => ({ modifiedCount: 0 });
+
+  try {
+    const message = await addPendingItemToDraft(session, "64b000000000000000000001", 1);
+
+    assert.equal(message, "Added 1 x Chicken Spaghetti to the order draft.");
+    assert.equal(session.cartItems.length, 1);
+    assert.equal(session.cartItems[0].quantity, 1);
+    assert.equal(session.pendingMenuItemId, undefined);
+    assert.equal(session.currentStep, "choosing_items");
+  } finally {
+    MenuItem.findOne = originalFindOne;
+    AgentClarification.updateMany = originalUpdateMany;
+  }
+});
+
+test("raw item names keep full category display identity in the draft", () => {
+  const item = {
+    _id: "64b000000000000000000303",
+    name: "Chicken",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    isAvailable: true
+  };
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+
+  addItemToDraft(session, item, 2);
+  const view = buildDraftView(session, {});
+
+  assert.equal(getMenuItemDisplayName(item, "Spaghetti"), "Chicken Spaghetti");
+  assert.equal(session.cartItems.length, 1);
+  assert.equal(session.cartItems[0].name, "Chicken");
+  assert.equal(session.cartItems[0].categoryName, "Spaghetti");
+  assert.equal(session.cartItems[0].displayName, "Chicken Spaghetti");
+  assert.equal(getCartItemDisplayName(session.cartItems[0]), "Chicken Spaghetti");
+  assert.equal(view.items[0].name, "Chicken Spaghetti");
+  assert.equal(view.items[0].rawName, "Chicken");
+});
+
+test("recent quantity correction updates one cart item instead of adding another", () => {
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+  const item = {
+    _id: "64b000000000000000000303",
+    name: "Chicken",
+    categoryId: "64b000000000000000000401",
+    categoryName: "Spaghetti",
+    price: 45,
+    isAvailable: true
+  };
+
+  addItemToDraft(session, item, 2);
+
+  assert.equal(parseQuantityCorrection("Oh no make it 5"), 5);
+
+  const result = updateRecentCartItemQuantity(session, 5);
+
+  assert.equal(result.status, "updated");
+  assert.equal(result.message, "Updated Chicken Spaghetti from 2 portions to 5 portions.");
+  assert.equal(session.cartItems.length, 1);
+  assert.equal(session.cartItems[0].quantity, 5);
+  assert.equal(session.cartItems[0].totalPrice, 225);
+  assert.equal(session.lastModifiedPreviousQuantity, 2);
+  assert.equal(session.lastModifiedCurrentQuantity, 5);
+});
+
+test("quantity correction without a safe recent item asks which item to change", () => {
+  const session = {
+    cartItems: [],
+    deliveryFeeResolved: false
+  };
+
+  const result = updateRecentCartItemQuantity(session, 5);
+
+  assert.equal(result.status, "needs_item");
+  assert.equal(result.message, "Which item would you like me to change?");
+});
+
+test("stale recent item quantity correction is not applied", () => {
+  const session = {
+    cartItems: [
+      {
+        menuItemId: "64b000000000000000000303",
+        name: "Chicken",
+        categoryName: "Spaghetti",
+        displayName: "Chicken Spaghetti",
+        quantity: 2,
+        unitPrice: 45,
+        totalPrice: 90
+      }
+    ],
+    lastModifiedMenuItemId: "64b000000000000000000303",
+    lastModifiedAt: new Date("2026-07-28T12:00:00.000Z"),
+    deliveryFeeResolved: false
+  };
+
+  const result = updateRecentCartItemQuantity(session, 5, new Date("2026-07-28T12:06:00.000Z"));
+
+  assert.equal(result.status, "needs_item");
+  assert.equal(result.message, "Which item would you like me to change?");
+  assert.equal(session.cartItems[0].quantity, 2);
+});
+
+test("only-that completion intents are not menu item requests", () => {
+  assert.equal(isOnlyThatCompletionMessage("I want only that"), true);
+  assert.equal(isOnlyThatCompletionMessage("that's all"), true);
+  assert.equal(isOnlyThatCompletionMessage("proceed with that"), true);
+  assert.equal(isOnlyThatCompletionMessage("I want Chicken"), false);
 });
 
 test("delivery fee resolver uses configured sources only", () => {
@@ -189,6 +437,81 @@ test("delivery fee resolver reports manual confirmation separately", () => {
   );
 });
 
+test("manual delivery fee stays pending without becoming zero in draft view", () => {
+  const session = {
+    cartItems: [
+      {
+        name: "Jollof Rice",
+        quantity: 1,
+        unitPrice: 60,
+        totalPrice: 60
+      }
+    ],
+    orderType: "delivery",
+    deliveryAddress: "Madina",
+    deliveryFeeSource: "manual_confirmation",
+    deliveryFeeResolved: false,
+    customerName: "Rebecca"
+  };
+  const view = buildDraftView(session, {
+    deliveryPricing: { type: "manual_confirmation" }
+  });
+
+  assert.equal(view.deliveryFee, null);
+  assert.equal(view.deliveryFeePending, true);
+  assert.equal(view.deliveryFeeLabel, "To be communicated");
+  assert.equal(view.foodTotal, 60);
+  assert.equal(view.total, 60);
+  assert.deepEqual(view.missingFields, []);
+  assert.equal(view.readyToConfirm, true);
+});
+
+test("category context survives in the customer draft view", () => {
+  const view = buildDraftView(
+    {
+      cartItems: [],
+      orderType: null,
+      deliveryFeeResolved: false,
+      pendingCategoryId: "64b000000000000000000401",
+      pendingCategoryName: "Spaghetti"
+    },
+    {}
+  );
+
+  assert.deepEqual(view.pendingCategory, {
+    id: "64b000000000000000000401",
+    name: "Spaghetti"
+  });
+});
+
+test("model-supplied quantity is not trusted without explicit customer quantity", () => {
+  assert.equal(resolveTrustedQuantity(1, "With chicken"), null);
+  assert.equal(resolveTrustedQuantity(1, "one portion"), 1);
+});
+
+test("missing customer name gets structured draft error code", () => {
+  const missing = getMissingDraftFields({
+    cartItems: [{ totalPrice: 60 }],
+    orderType: "pickup",
+    deliveryFeeResolved: true
+  });
+
+  assert.equal(missing.includes("customerName"), true);
+  assert.equal(getDraftMissingFieldCode(missing), "CUSTOMER_NAME_REQUIRED");
+});
+
+test("state-aware follow-ups use active order step", () => {
+  assert.equal(
+    buildStateAwareFollowUpMessage("collecting_quantity"),
+    "Are you still there? I just need the number of portions you would like."
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage("collecting_name"),
+    "Are you still there? I just need the name for the order."
+  );
+  assert.equal(buildStateAwareFollowUpMessage("idle"), null);
+});
+
 test("Wasender queue respects retry_after from account protection", () => {
   assert.equal(
     getWasenderRetryDelayMs({
@@ -209,6 +532,74 @@ test("Wasender queue spaces sends per session", () => {
 
   assert.equal(nextSendAt.toISOString(), "2026-07-27T17:29:53.000Z");
   assert.equal(getNextSessionSendAt(lastSentAt, new Date("2026-07-27T17:29:54.000Z"), 5000), null);
+});
+
+test("stale conversational replies are cancelled while transactional messages continue", () => {
+  const session = {
+    conversationVersion: 3,
+    currentStep: "collecting_quantity"
+  };
+
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        conversationVersion: 1,
+        expectedDraftStep: "idle",
+        responsePurpose: "greeting"
+      },
+      session
+    ),
+    true
+  );
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        conversationVersion: 3,
+        expectedDraftStep: "collecting_quantity",
+        responsePurpose: "quantity_clarification"
+      },
+      session
+    ),
+    false
+  );
+  assert.equal(
+    isQueuedConversationalMessageStale(
+      {
+        kind: "receipt_delivery",
+        conversationVersion: 1
+      },
+      session
+    ),
+    false
+  );
+});
+
+test("Wasender normalizer extracts quoted reply and provider message IDs from known shapes", () => {
+  const webhook = normalizeIncomingWebhook({
+    event: "messages.received",
+    data: {
+      messages: {
+        key: {
+          id: "inbound-1",
+          remoteJid: "233557038547@s.whatsapp.net",
+          fromMe: false
+        },
+        message: {
+          extendedTextMessage: {
+            text: "Accept",
+            contextInfo: {
+              stanzaId: "owner-notification-1"
+            }
+          }
+        }
+      }
+    },
+    sessionId: "session-1"
+  });
+
+  assert.equal(webhook.message, "Accept");
+  assert.equal(webhook.quotedMessageId, "owner-notification-1");
+  assert.equal(extractWasenderProviderMessageId({ data: { key: { id: "sent-1" } } }), "sent-1");
 });
 
 test("restaurant acceptance and rejection are owner or manager only", () => {
@@ -896,6 +1287,9 @@ test("owner notification text uses real order data and pending status", () => {
       customerPhone: "+233557038547",
       orderType: "delivery",
       deliveryAddress: "Madina",
+      subtotal: 165,
+      deliveryFee: null,
+      deliveryFeePending: true,
       items: [
         {
           name: "Jollof Rice",
@@ -919,11 +1313,265 @@ test("owner notification text uses real order data and pending status", () => {
   assert.match(message, /New order awaiting your confirmation/);
   assert.match(message, /Golden Grill/);
   assert.match(message, /Order: ORD-123/);
+  assert.match(message, /Customer: Gabriel/);
   assert.match(message, /2 x Jollof Rice - GHS 120\.00/);
+  assert.match(message, /Delivery fee: Pending confirmation/);
+  assert.match(message, /Food total: GHS 165\.00/);
   assert.match(message, /Total: GHS 165\.00/);
   assert.match(message, /Status: Awaiting confirmation/);
-  assert.match(message, /ACCEPT ORD-123/);
-  assert.match(message, /REJECT ORD-123/);
+  assert.match(message, /Reply to this message with:/);
+  assert.match(message, /\bAccept\b/);
+  assert.match(message, /\bReject\b/);
+});
+
+test("owner simple decisions and saved selections parse safely", () => {
+  assert.equal(parseSimpleOwnerDecision("Accept"), "accept");
+  assert.equal(parseSimpleOwnerDecision("Reject"), "reject");
+  assert.equal(parseSimpleOwnerDecision("Accept ORD-123"), null);
+  assert.deepEqual(parseOwnerSelectionReply("1", 2), { type: "indexes", indexes: [1] });
+  assert.deepEqual(parseOwnerSelectionReply("both", 2), { type: "all" });
+  assert.deepEqual(parseOwnerSelectionReply("cancel", 2), { type: "cancel" });
+});
+
+test("owner selection message preserves numbered order list", () => {
+  const now = new Date("2026-07-28T12:00:00.000Z");
+  const orders = [
+    {
+      customerName: "Rebecca",
+      items: [{ name: "Jollof Rice" }],
+      subtotal: 60,
+      customerConfirmedAt: new Date("2026-07-28T11:58:00.000Z"),
+      createdAt: new Date("2026-07-28T11:58:00.000Z")
+    },
+    {
+      customerName: "Ama",
+      items: [{ name: "Fried Rice" }],
+      subtotal: 80,
+      customerConfirmedAt: new Date("2026-07-28T11:55:00.000Z"),
+      createdAt: new Date("2026-07-28T11:55:00.000Z")
+    }
+  ];
+  const message = buildOwnerSelectionMessage("accept", orders, now);
+
+  assert.match(message, /Which order should I accept/);
+  assert.match(message, /1\. Rebecca - Jollof Rice - GHS 60\.00 - 2 minutes ago/);
+  assert.match(message, /2\. Ama - Fried Rice - GHS 80\.00 - 5 minutes ago/);
+  assert.match(message, /Reply 1, 2, or both/);
+});
+
+test("bulk accepted order side effects process each order exactly once", async () => {
+  const sideEffects = require("../dist/services/orderSideEffects.service");
+  const { Order } = require("../dist/models/order.model");
+  const controllerPath = require.resolve("../dist/controllers/wasender.controller");
+  const originalFindOne = Order.findOne;
+  const originalNotifyConfirmed = sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt;
+  const acceptedOrders = [
+    {
+      _id: "64b000000000000000000201",
+      orderNumber: "ORD-201",
+      customerName: "Rebecca"
+    },
+    {
+      _id: "64b000000000000000000202",
+      orderNumber: "ORD-202",
+      customerName: "Ama"
+    }
+  ];
+  const notificationCounts = new Map();
+  const receiptCounts = new Map();
+
+  delete require.cache[controllerPath];
+
+  Order.findOne = async (query) => {
+    return acceptedOrders.find((order) => String(order._id) === String(query._id)) ?? null;
+  };
+  sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = async (_restaurant, order) => {
+    notificationCounts.set(String(order._id), (notificationCounts.get(String(order._id)) ?? 0) + 1);
+    receiptCounts.set(String(order._id), (receiptCounts.get(String(order._id)) ?? 0) + 1);
+
+    return {
+      customerNotification: "queued",
+      receiptDelivery: "queued"
+    };
+  };
+
+  try {
+    const { sendCustomerOrderSideEffects } = require("../dist/controllers/wasender.controller");
+    const restaurantRecord = {
+      _id: "64b000000000000000000001",
+      name: "Golden Grill"
+    };
+    const response = {
+      success: true,
+      message: "2 orders accepted.",
+      data: {
+        orders: acceptedOrders,
+        orderEvent: "confirmed",
+        notifyCustomer: true,
+        receiptRequired: true
+      }
+    };
+    const timeout = new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error("bulk side effects did not finish")), 250);
+    });
+
+    await Promise.race([sendCustomerOrderSideEffects(restaurantRecord, response), timeout]);
+
+    assert.deepEqual(
+      acceptedOrders.map((order) => notificationCounts.get(String(order._id))),
+      [1, 1]
+    );
+    assert.deepEqual(
+      acceptedOrders.map((order) => receiptCounts.get(String(order._id))),
+      [1, 1]
+    );
+  } finally {
+    Order.findOne = originalFindOne;
+    sideEffects.notifyCustomerOfConfirmedOrderAndSendReceipt = originalNotifyConfirmed;
+    delete require.cache[controllerPath];
+  }
+});
+
+test("same customer webhook turns are processed sequentially", async () => {
+  const { runCustomerConversationSequentially } = require("../dist/controllers/wasender.controller");
+  const events = [];
+  let releaseFirst;
+  let resolveFirstStarted;
+  const firstStarted = new Promise((resolve) => {
+    resolveFirstStarted = resolve;
+  });
+  const first = runCustomerConversationSequentially(
+      "64b000000000000000000001",
+      "+233500000001",
+      async () => {
+        events.push("first-start");
+        resolveFirstStarted();
+        await new Promise((release) => {
+          releaseFirst = release;
+        });
+        events.push("first-end");
+      }
+  );
+
+  await firstStarted;
+
+  const second = runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000001",
+    async () => {
+      events.push("second-start");
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(events, ["first-start"]);
+
+  releaseFirst();
+  await Promise.all([first, second]);
+
+  assert.deepEqual(events, ["first-start", "first-end", "second-start"]);
+});
+
+test("different customer webhook turns can run concurrently", async () => {
+  const { runCustomerConversationSequentially } = require("../dist/controllers/wasender.controller");
+  const events = [];
+  let releaseFirst;
+  const first = runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000001",
+    async () => {
+      events.push("first-start");
+      await new Promise((release) => {
+        releaseFirst = release;
+      });
+      events.push("first-end");
+    }
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await runCustomerConversationSequentially(
+    "64b000000000000000000001",
+    "+233500000002",
+    async () => {
+      events.push("second-start");
+    }
+  );
+
+  assert.deepEqual(events, ["first-start", "second-start"]);
+
+  releaseFirst();
+  await first;
+});
+
+test("OpenRouter max-round fallback returns recoverable clarification message", async () => {
+  const originalMaxRounds = process.env.OPENROUTER_MAX_TOOL_ROUNDS;
+  process.env.OPENROUTER_MAX_TOOL_ROUNDS = "2";
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    complete: async () => ({
+      toolCalls: [
+        {
+          id: `call_${Date.now()}`,
+          name: "add_order_item_by_name",
+          arguments: { itemName: "spaghetti" }
+        }
+      ]
+    })
+  };
+
+  try {
+    const result = await runAgentOrchestrator(
+      {
+        restaurant: fakeRestaurant,
+        sender: {
+          phone: "0557038547",
+          normalizedPhone: "+233557038547",
+          role: "customer",
+          verified: false
+        },
+        message: "I want spaghetti"
+      },
+      {
+        provider,
+        getHistory: getEmptyHistory,
+        saveMessage: saveNoop,
+        buildSystemPrompt: buildTestPrompt,
+        executeTool: async () => ({
+          success: false,
+          code: "MULTIPLE_MENU_ITEMS_FOUND",
+          message: "Please choose one Spaghetti option: Crave Special, Beef, Chicken."
+        })
+      }
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(
+      result.message,
+      "Please choose one Spaghetti option: Crave Special, Beef, Chicken."
+    );
+  } finally {
+    restoreEnv("OPENROUTER_MAX_TOOL_ROUNDS", originalMaxRounds);
+  }
+});
+
+test("pending order expiry helpers exclude old orders", () => {
+  const now = new Date("2026-07-28T12:00:00.000Z");
+  const fresh = {
+    status: "awaiting_restaurant_confirmation",
+    customerConfirmedAt: new Date("2026-07-28T11:30:00.000Z"),
+    createdAt: new Date("2026-07-28T11:30:00.000Z")
+  };
+  const old = {
+    status: "awaiting_restaurant_confirmation",
+    customerConfirmedAt: new Date("2026-07-28T10:00:00.000Z"),
+    createdAt: new Date("2026-07-28T10:00:00.000Z")
+  };
+
+  assert.equal(isPendingOrderActionable(fresh, now, 60), true);
+  assert.equal(isPendingOrderActionable(old, now, 60), false);
+  assert.equal(formatRelativeOrderAge(old, now), "2 hours ago");
 });
 
 test("customer decision messages do not invent receipt on rejection", () => {

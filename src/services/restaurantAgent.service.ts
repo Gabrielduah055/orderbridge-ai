@@ -1,6 +1,7 @@
 import {
   saveAgentConversationMessage
 } from "./agentConversationHistory.service";
+import { cancelPendingOrderItemClarifications } from "./agentClarification.service";
 import {
   cancelPendingToolAction,
   executeAgentTool,
@@ -12,6 +13,12 @@ import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
+import {
+  handleSavedOwnerSelectionReply,
+  handleUnquotedOwnerOrderDecision,
+  parseSimpleOwnerDecision,
+  resolveQuotedOwnerOrderDecision
+} from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import type {
   RestaurantAgentMessageInput,
@@ -189,7 +196,8 @@ const handleLocalMenuRequest = async (
     {
       restaurantId,
       restaurant: input.restaurant,
-      sender
+      sender,
+      originalMessage: input.message
     }
   );
   const message = result.success
@@ -252,6 +260,23 @@ const handleLocalCustomerRequest = async (
   };
 };
 
+
+const saveAssistantResponse = async (
+  restaurantId: string,
+  sender: ReturnType<typeof resolveSenderIdentity>,
+  response: RestaurantAgentResponse,
+  metadata: Record<string, unknown>
+): Promise<void> => {
+  await saveAgentConversationMessage({
+    restaurantId,
+    senderPhone: sender.normalizedPhone,
+    senderRole: sender.role,
+    direction: "assistant",
+    content: response.message,
+    metadata
+  });
+};
+
 export const handleRestaurantAgentMessage = async (
   input: RestaurantAgentMessageInput
 ): Promise<RestaurantAgentResponse> => {
@@ -271,16 +296,25 @@ export const handleRestaurantAgentMessage = async (
     verified: sender.verified
   });
 
-  await saveAgentConversationMessage({
-    restaurantId,
-    senderPhone: sender.normalizedPhone,
-    senderRole: sender.role,
-    direction: "user",
-    content: message,
-    metadata: {
-      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
-    }
-  });
+  // For the customer OpenRouter orchestrator path we defer the user-message save until
+  // AFTER the orchestrator returns.  If we save it now it appears at the end of the
+  // history window that the orchestrator fetches, which (a) wastes a context slot and
+  // (b) can cause the orchestrator to push the same message a second time, confusing
+  // the AI about what was already said.
+  const deferUserMessageSave = sender.role === "customer" && customerOpenRouterEnabled;
+
+  if (!deferUserMessageSave) {
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "user",
+      content: message,
+      metadata: {
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
+      }
+    });
+  }
 
   if (
     isMenuRequest(message) &&
@@ -291,10 +325,37 @@ export const handleRestaurantAgentMessage = async (
 
   if (sender.role === "customer") {
     if (customerOpenRouterEnabled) {
+      // ── Stale-clarification guard ──────────────────────────────────────────
+      // If the customer sends a greeting or asks for the menu, they have clearly
+      // started a new conversation.  Cancel any pending clarification that was
+      // left over from the previous session so the AI starts with a clean slate
+      // and does not keep asking them to choose between items they no longer
+      // care about.  For all other messages the AI receives the active
+      // clarification in its system-prompt context and can reason about it.
+      const isGreeting = /^(hi|hello|hey|good\s+(morning|afternoon|evening)|start)\b/i.test(message);
+
+      if (isGreeting || isMenuRequest(message)) {
+        await cancelPendingOrderItemClarifications({
+          restaurantId,
+          senderPhone: sender.normalizedPhone
+        });
+      }
+
       const agentResult = await runAgentOrchestrator({
         restaurant: input.restaurant,
         sender,
         message
+      });
+
+      // Now that the orchestrator has run and built its context from the uncontaminated
+      // history window, persist the user message followed by the assistant response.
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: { source: "openrouter_agent" }
       });
 
       await saveAgentConversationMessage({
@@ -352,12 +413,85 @@ export const handleRestaurantAgentMessage = async (
   const executionContext = {
     restaurantId,
     restaurant: input.restaurant,
-    sender
+    sender,
+    originalMessage: message,
+    quotedMessageId: input.quotedMessageId
   };
   const ownerOrderDecision =
     sender.role === "owner" || sender.role === "manager"
       ? parseOwnerOrderDecision(message)
       : null;
+  const simpleOwnerDecision =
+    sender.role === "owner" || sender.role === "manager"
+      ? parseSimpleOwnerDecision(message)
+      : null;
+
+  if (sender.role === "owner" || sender.role === "manager") {
+    const selectionResult = await handleSavedOwnerSelectionReply(
+      restaurantId,
+      sender.normalizedPhone,
+      message
+    );
+
+    if (selectionResult.handled) {
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: selectionResult.message,
+        metadata: {
+          source: "deterministic_owner_order_selection",
+          success: selectionResult.success
+        }
+      });
+
+      return {
+        success: selectionResult.success,
+        message: selectionResult.message,
+        data: selectionResult.data,
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        sender
+      };
+    }
+  }
+
+  if (simpleOwnerDecision) {
+    const quotedResult = await resolveQuotedOwnerOrderDecision(
+      restaurantId,
+      input.quotedMessageId,
+      simpleOwnerDecision
+    );
+    const result = quotedResult.handled
+      ? quotedResult
+      : await handleUnquotedOwnerOrderDecision(
+          restaurantId,
+          sender.normalizedPhone,
+          simpleOwnerDecision
+        );
+
+    await saveAgentConversationMessage({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      direction: "assistant",
+      content: result.message,
+      metadata: {
+        source: quotedResult.handled
+          ? "deterministic_quoted_owner_order_decision"
+          : "deterministic_simple_owner_order_decision",
+        success: result.success
+      }
+    });
+
+    return {
+      success: result.success,
+      message: result.message,
+      data: result.data,
+      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+      sender
+    };
+  }
 
   if (ownerOrderDecision) {
     const result = await executeAgentTool(

@@ -25,7 +25,14 @@ import type { IOrderDocument } from "../../models/order.model";
 const safeFallbackMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
 const maxRoundsFallbackMessage =
-  "I couldn't complete that request safely. Please try a simpler request or contact support.";
+  "I'm sorry, I had a little trouble with that one. Could you try again or rephrase what you'd like?";
+const recoverableToolCodes = new Set([
+  "MULTIPLE_MENU_ITEMS_FOUND",
+  "ORDER_ITEM_QUANTITY_REQUIRED",
+  "ORDER_ITEM_CLARIFICATION_NO_MATCH",
+  "ORDER_DRAFT_INCOMPLETE",
+  "CUSTOMER_NAME_REQUIRED"
+]);
 
 const classifyOrchestratorError = (error: unknown): string => {
   if (!(error instanceof Error)) {
@@ -163,6 +170,16 @@ const getFailedToolSuccessClaimMessage = (
   return failedTool.message || "I couldn't complete that request.";
 };
 
+const getRecoverableToolFallbackMessage = (
+  executedTools: ExecutedAgentTool[]
+): string | null => {
+  const latestRecoverable = [...executedTools]
+    .reverse()
+    .find((tool) => tool.code && recoverableToolCodes.has(tool.code));
+
+  return latestRecoverable?.message ?? null;
+};
+
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
   getHistory?: typeof getRecentAgentConversationHistory;
@@ -223,7 +240,8 @@ export const runAgentOrchestrator = async (
       executeAgentTool(toolName, rawArgs, {
         restaurantId,
         restaurant: input.restaurant,
-        sender: input.sender
+        sender: input.sender,
+        originalMessage: normalizedInputMessage
       }));
 
   try {
@@ -343,9 +361,11 @@ export const runAgentOrchestrator = async (
       }
     }
 
+    const recoverableMessage = getRecoverableToolFallbackMessage(executedTools);
+
     return {
       success: false,
-      message: maxRoundsFallbackMessage,
+      message: recoverableMessage ?? maxRoundsFallbackMessage,
       data: importantData,
       provider: provider.name,
       model: provider.model,

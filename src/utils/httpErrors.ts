@@ -9,10 +9,12 @@ export class NotFoundError extends Error {
 
 export class BadRequestError extends Error {
   statusCode = 400;
+  code?: string;
 
-  constructor(message: string) {
+  constructor(message: string, code?: string) {
     super(message);
     this.name = "BadRequestError";
+    this.code = code;
   }
 }
 

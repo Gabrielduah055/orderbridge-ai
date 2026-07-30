@@ -1,10 +1,16 @@
 import { Order } from "../models/order.model";
+import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import {
   OutboundMessage,
   type IOutboundMessageDocument,
   type OutboundMessageType
 } from "../models/outboundMessage.model";
-import { sendDocumentMessage, sendTextMessage, type WasenderSendResult } from "./wasender.service";
+import {
+  extractWasenderProviderMessageId,
+  sendDocumentMessage,
+  sendTextMessage,
+  type WasenderSendResult
+} from "./wasender.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -29,6 +35,53 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 const getErrorMessage = (result: WasenderSendResult): string =>
   result.error || (result.status ? `Wasender status ${result.status}` : "Wasender send failed");
+
+const transactionalKinds = new Set([
+  "owner_order_notification",
+  "customer_order_confirmed_notification",
+  "customer_order_rejected_notification",
+  "receipt_delivery"
+]);
+
+export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>): boolean => {
+  const kind = typeof metadata?.kind === "string" ? metadata.kind : undefined;
+
+  return Boolean(kind && transactionalKinds.has(kind));
+};
+
+export const isQueuedConversationalMessageStale = (
+  metadata: Record<string, unknown> | undefined,
+  session: Pick<ICustomerSessionDocument, "conversationVersion" | "currentStep"> | null
+): boolean => {
+  if (!metadata || isTransactionalQueuedMessage(metadata)) {
+    return false;
+  }
+
+  if (metadata.purpose === "transactional") {
+    return false;
+  }
+
+  if (!session) {
+    return false;
+  }
+
+  const expectedVersion = Number(metadata.conversationVersion);
+  const expectedStep = typeof metadata.expectedDraftStep === "string" ? metadata.expectedDraftStep : undefined;
+
+  if (Number.isFinite(expectedVersion) && session.conversationVersion > expectedVersion) {
+    return true;
+  }
+
+  if (expectedStep && session.currentStep !== expectedStep) {
+    const purpose = typeof metadata.responsePurpose === "string" ? metadata.responsePurpose : "";
+
+    if (purpose === "greeting" && session.currentStep !== "idle") {
+      return true;
+    }
+  }
+
+  return false;
+};
 
 export const getWasenderRetryDelayMs = (result: WasenderSendResult): number => {
   const data = result.data;
@@ -79,11 +132,15 @@ const updateOrderSideEffectAfterSend = async (
   const failureReason = result.success ? undefined : getErrorMessage(result);
 
   if (kind === "owner_order_notification") {
+    const providerMessageId = result.success ? extractWasenderProviderMessageId(result.data) : undefined;
     await Order.updateOne(
       { _id: orderId },
       result.success
         ? {
-            $set: { ownerNotifiedAt: now },
+            $set: {
+              ownerNotifiedAt: now,
+              ...(providerMessageId ? { ownerNotificationProviderMessageId: providerMessageId } : {})
+            },
             $unset: {
               ownerNotificationFailedAt: "",
               ownerNotificationFailureReason: ""
@@ -142,6 +199,13 @@ const updateOrderSideEffectAfterSend = async (
   }
 
   if (kind === "receipt_delivery") {
+    console.info(result.success ? "Receipt document sent" : "Receipt document failed", {
+      orderId,
+      orderNumber: message.metadata?.orderNumber,
+      queueMessageId: String(message._id),
+      status: result.status,
+      error: failureReason
+    });
     await Order.updateOne(
       { _id: orderId },
       result.success
@@ -290,6 +354,38 @@ export const processNextQueuedWasenderMessage = async (): Promise<boolean> => {
 
   if (!locked) {
     return true;
+  }
+
+  if (!isTransactionalQueuedMessage(locked.metadata)) {
+    const restaurantId =
+      typeof locked.metadata?.restaurantId === "string"
+        ? locked.metadata.restaurantId
+        : locked.restaurantId
+          ? String(locked.restaurantId)
+          : undefined;
+    const customerPhone =
+      typeof locked.metadata?.customerPhone === "string" ? locked.metadata.customerPhone : locked.to;
+    const session =
+      restaurantId && customerPhone
+        ? await CustomerSession.findOne({ restaurantId, customerPhone }).select(
+            "conversationVersion currentStep"
+          )
+        : null;
+
+    if (isQueuedConversationalMessageStale(locked.metadata, session)) {
+      locked.status = "cancelled";
+      locked.lastError = "Stale conversational reply superseded by a newer customer turn";
+      await locked.save();
+      console.info("Stale conversational reply cancelled", {
+        restaurantId,
+        customerPhone,
+        queueMessageId: String(locked._id),
+        conversationVersion: locked.metadata?.conversationVersion,
+        expectedDraftStep: locked.metadata?.expectedDraftStep,
+        currentDraftStep: session?.currentStep
+      });
+      return true;
+    }
   }
 
   const result = await sendQueuedMessage(locked);
