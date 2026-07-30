@@ -2,12 +2,17 @@ import type { IRestaurantDocument } from "../models/Restaurant";
 import type { ResolvedSender } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
+type RestaurantIdentitySource = Pick<
+  IRestaurantDocument,
+  "ownerName" | "ownerPhone" | "managerPhones" | "managerContacts"
+>;
+
 const normalizePhone = (phone?: string): string => {
   return phone ? normalizeGhanaPhone(phone) : "";
 };
 
 export const resolveSenderIdentity = (
-  restaurant: IRestaurantDocument,
+  restaurant: RestaurantIdentitySource,
   senderPhone: string
 ): ResolvedSender => {
   const normalizedPhone = normalizePhone(senderPhone);

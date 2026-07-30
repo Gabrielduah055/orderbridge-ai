@@ -33,6 +33,7 @@ export interface IPendingAgentAction {
   confirmationMessage: string;
   resultMessage?: string;
   errorMessage?: string;
+  actionVersion: number;
   expiresAt: Date;
 }
 
@@ -104,6 +105,11 @@ const pendingAgentActionSchema = new Schema<IPendingAgentActionDocument>(
       type: String,
       trim: true
     },
+    actionVersion: {
+      type: Number,
+      default: 1,
+      min: 1
+    },
     expiresAt: {
       type: Date,
       required: true,
@@ -121,6 +127,35 @@ pendingAgentActionSchema.index({
   senderPhone: 1,
   status: 1,
   createdAt: -1
+});
+pendingAgentActionSchema.index({
+  restaurantId: 1,
+  status: 1,
+  expiresAt: 1,
+  updatedAt: 1
+});
+
+const versionedActionFields = [
+  "senderPhone",
+  "senderRole",
+  "action",
+  "toolName",
+  "arguments",
+  "summary",
+  "data",
+  "confirmationMessage",
+  "expiresAt"
+];
+
+pendingAgentActionSchema.pre("save", function incrementActionVersion(next) {
+  if (
+    !this.isNew &&
+    versionedActionFields.some((field) => this.isModified(field))
+  ) {
+    this.actionVersion = (this.actionVersion ?? 1) + 1;
+  }
+
+  next();
 });
 
 export const PendingAgentAction = model<IPendingAgentActionDocument>(

@@ -1,4 +1,6 @@
+import { Types } from "mongoose";
 import { Order } from "../models/order.model";
+import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import {
   OutboundMessage,
@@ -11,6 +13,7 @@ import {
   sendTextMessage,
   type WasenderSendResult
 } from "./wasender.service";
+import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -38,6 +41,7 @@ const getErrorMessage = (result: WasenderSendResult): string =>
 
 const transactionalKinds = new Set([
   "owner_order_notification",
+  "owner_action_reminder",
   "owner_summary",
   "customer_order_confirmed_notification",
   "customer_order_rejected_notification",
@@ -87,6 +91,96 @@ export const isQueuedConversationalMessageStale = (
   }
 
   return false;
+};
+
+export const getQueuedOwnerActionReminderStaleReason = async (
+  metadata: Record<string, unknown> | undefined,
+  now = new Date(),
+  queuedRecipientPhone?: string
+): Promise<string | null> => {
+  if (metadata?.kind !== "owner_action_reminder") {
+    return null;
+  }
+
+  const restaurantId =
+    typeof metadata.restaurantId === "string" ? metadata.restaurantId : "";
+  const pendingActionId =
+    typeof metadata.pendingActionId === "string" ? metadata.pendingActionId : "";
+  const expectedVersion = Number(metadata.actionVersion);
+  const expectedPhone =
+    typeof metadata.pendingActionPhone === "string"
+      ? normalizeGhanaPhone(metadata.pendingActionPhone)
+      : "";
+
+  if (
+    !restaurantId ||
+    !Types.ObjectId.isValid(pendingActionId) ||
+    !Number.isInteger(expectedVersion) ||
+    expectedVersion < 1 ||
+    !expectedPhone
+  ) {
+    return "invalid_metadata";
+  }
+
+  if (
+    queuedRecipientPhone &&
+    normalizeGhanaPhone(queuedRecipientPhone) !== expectedPhone
+  ) {
+    return "queued_recipient_changed";
+  }
+
+  const action = await PendingAgentAction.findOne({
+    _id: pendingActionId,
+    restaurantId
+  }).select(
+    "senderPhone senderRole status actionVersion expiresAt createdAt"
+  );
+
+  if (!action) {
+    return "pending_action_missing";
+  }
+
+  if (action.status !== "pending") {
+    return `pending_action_${action.status}`;
+  }
+
+  if (action.expiresAt <= now) {
+    return "pending_action_expired";
+  }
+
+  const currentVersion =
+    Number.isInteger(action.actionVersion) && action.actionVersion > 0
+      ? action.actionVersion
+      : 1;
+
+  if (currentVersion !== expectedVersion) {
+    return "pending_action_version_changed";
+  }
+
+  if (
+    action.senderRole &&
+    action.senderRole !== "owner" &&
+    action.senderRole !== "manager"
+  ) {
+    return "pending_action_sender_not_staff";
+  }
+
+  if (
+    expectedPhone &&
+    normalizeGhanaPhone(action.senderPhone) !== expectedPhone
+  ) {
+    return "pending_action_recipient_changed";
+  }
+
+  const newerPendingAction = await PendingAgentAction.exists({
+    restaurantId,
+    senderPhone: action.senderPhone,
+    status: "pending",
+    expiresAt: { $gt: now },
+    createdAt: { $gt: action.createdAt }
+  });
+
+  return newerPendingAction ? "pending_action_replaced" : null;
 };
 
 export const getWasenderRetryDelayMs = (result: WasenderSendResult): number => {
@@ -371,7 +465,26 @@ export const processNextQueuedWasenderMessage = async (
     return true;
   }
 
-  if (!isTransactionalQueuedMessage(locked.metadata)) {
+  if (locked.metadata?.kind === "owner_action_reminder") {
+    const staleReason = await getQueuedOwnerActionReminderStaleReason(
+      locked.metadata,
+      new Date(),
+      locked.to
+    );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale owner pending-action reminder: ${staleReason}`;
+      await locked.save();
+      console.info("Stale owner pending-action reminder cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        pendingActionId: locked.metadata.pendingActionId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (!isTransactionalQueuedMessage(locked.metadata)) {
     const restaurantId =
       typeof locked.metadata?.restaurantId === "string"
         ? locked.metadata.restaurantId
