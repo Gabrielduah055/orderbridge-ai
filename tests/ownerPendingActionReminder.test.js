@@ -401,13 +401,22 @@ const resolvedQuery = (value) => ({
   }
 });
 
-const processQueuedReminder = async ({ action, newerAction = false }) => {
+const processQueuedReminder = async ({
+  action,
+  newerAction = false,
+  restaurant = makeRestaurant(),
+  queuedRecipientPhone = action?.senderPhone ?? "+233557038547"
+}) => {
   const originalOutboundFindOne = OutboundMessage.findOne;
   const originalOutboundFindOneAndUpdate = OutboundMessage.findOneAndUpdate;
   const originalActionFindOne = PendingAgentAction.findOne;
   const originalActionExists = PendingAgentAction.exists;
+  const originalRestaurantFindOne = Restaurant.findOne;
   let sendCount = 0;
   let saveCount = 0;
+  let actionLookupFilter;
+  let newerActionLookupFilter;
+  let restaurantLookupFilter;
   const candidate = {
     _id: "64b000000000000000000a51",
     sessionId: "wasender-session-1",
@@ -416,7 +425,7 @@ const processQueuedReminder = async ({ action, newerAction = false }) => {
   const locked = {
     ...candidate,
     restaurantId,
-    to: "+233557038547",
+    to: queuedRecipientPhone,
     type: "text",
     text: "Reminder",
     status: "sending",
@@ -427,7 +436,7 @@ const processQueuedReminder = async ({ action, newerAction = false }) => {
       restaurantId,
       pendingActionId: ownerActionId,
       actionVersion: 1,
-      pendingActionPhone: "+233557038547"
+      pendingActionPhone: queuedRecipientPhone
     },
     async save() {
       saveCount += 1;
@@ -439,9 +448,18 @@ const processQueuedReminder = async ({ action, newerAction = false }) => {
     OutboundMessage.findOne = (filter) =>
       resolvedQuery(filter.status === "pending" ? candidate : null);
     OutboundMessage.findOneAndUpdate = () => resolvedQuery(locked);
-    PendingAgentAction.findOne = () => resolvedQuery(action);
-    PendingAgentAction.exists = async () =>
-      newerAction ? { _id: "64b000000000000000000a52" } : null;
+    PendingAgentAction.findOne = (filter) => {
+      actionLookupFilter = filter;
+      return resolvedQuery(action);
+    };
+    PendingAgentAction.exists = async (filter) => {
+      newerActionLookupFilter = filter;
+      return newerAction ? { _id: "64b000000000000000000a52" } : null;
+    };
+    Restaurant.findOne = (filter) => {
+      restaurantLookupFilter = filter;
+      return resolvedQuery(restaurant);
+    };
 
     const processed = await processNextQueuedWasenderMessage({
       sendMessage: async () => {
@@ -458,13 +476,17 @@ const processQueuedReminder = async ({ action, newerAction = false }) => {
       locked,
       processed,
       saveCount,
-      sendCount
+      sendCount,
+      actionLookupFilter,
+      newerActionLookupFilter,
+      restaurantLookupFilter
     };
   } finally {
     OutboundMessage.findOne = originalOutboundFindOne;
     OutboundMessage.findOneAndUpdate = originalOutboundFindOneAndUpdate;
     PendingAgentAction.findOne = originalActionFindOne;
     PendingAgentAction.exists = originalActionExists;
+    Restaurant.findOne = originalRestaurantFindOne;
   }
 };
 
@@ -514,7 +536,7 @@ test("cancelled and expired actions cancel queued reminders before send", async 
   assert.match(expired.locked.lastError, /pending_action_expired/);
 });
 
-test("a valid unchanged pending action reminder is sent", async () => {
+test("a currently authorized owner reminder is still sent", async () => {
   const result = await processQueuedReminder({
     action: makeAction({
       expiresAt: new Date("2099-01-01T00:00:00.000Z")
@@ -527,10 +549,78 @@ test("a valid unchanged pending action reminder is sent", async () => {
   assert.equal(result.saveCount, 1);
 });
 
+test("a manager removed after queueing has its reminder cancelled before send", async () => {
+  const managerPhone = "+233241234567";
+  const result = await processQueuedReminder({
+    action: makeAction({
+      senderPhone: managerPhone,
+      senderRole: "manager",
+      expiresAt: new Date("2099-01-01T00:00:00.000Z")
+    }),
+    restaurant: makeRestaurant({
+      managerPhones: [],
+      managerContacts: []
+    }),
+    queuedRecipientPhone: managerPhone
+  });
+
+  assert.equal(result.locked.status, "cancelled");
+  assert.equal(result.sendCount, 0);
+  assert.equal(result.saveCount, 1);
+  assert.match(result.locked.lastError, /pending_action_recipient_not_verified/);
+});
+
+test("a currently authorized manager reminder is still sent", async () => {
+  const managerPhone = "+233241234567";
+  const result = await processQueuedReminder({
+    action: makeAction({
+      senderPhone: managerPhone,
+      senderRole: "manager",
+      expiresAt: new Date("2099-01-01T00:00:00.000Z")
+    }),
+    queuedRecipientPhone: managerPhone
+  });
+
+  assert.equal(result.locked.status, "sent");
+  assert.equal(result.sendCount, 1);
+  assert.equal(result.locked.sentAt instanceof Date, true);
+});
+
+test("a missing restaurant cancels its queued reminder before send", async () => {
+  const result = await processQueuedReminder({
+    action: makeAction({
+      expiresAt: new Date("2099-01-01T00:00:00.000Z")
+    }),
+    restaurant: null
+  });
+
+  assert.equal(result.locked.status, "cancelled");
+  assert.equal(result.sendCount, 0);
+  assert.match(result.locked.lastError, /restaurant_missing/);
+});
+
+test("queued reminder authorization lookups stay restaurant-scoped", async () => {
+  const result = await processQueuedReminder({
+    action: makeAction({
+      expiresAt: new Date("2099-01-01T00:00:00.000Z")
+    })
+  });
+
+  assert.deepEqual(result.actionLookupFilter, {
+    _id: ownerActionId,
+    restaurantId
+  });
+  assert.deepEqual(result.restaurantLookupFilter, {
+    _id: restaurantId
+  });
+  assert.equal(result.newerActionLookupFilter.restaurantId, restaurantId);
+});
+
 test("a newer pending action makes an older queued reminder stale", async () => {
   const staleReason = await (async () => {
     const originalFindOne = PendingAgentAction.findOne;
     const originalExists = PendingAgentAction.exists;
+    const originalRestaurantFindOne = Restaurant.findOne;
 
     try {
       PendingAgentAction.findOne = () =>
@@ -542,6 +632,7 @@ test("a newer pending action makes an older queued reminder stale", async () => 
       PendingAgentAction.exists = async () => ({
         _id: "64b000000000000000000a61"
       });
+      Restaurant.findOne = () => resolvedQuery(makeRestaurant());
 
       return await getQueuedOwnerActionReminderStaleReason(
         {
@@ -556,6 +647,7 @@ test("a newer pending action makes an older queued reminder stale", async () => 
     } finally {
       PendingAgentAction.findOne = originalFindOne;
       PendingAgentAction.exists = originalExists;
+      Restaurant.findOne = originalRestaurantFindOne;
     }
   })();
 

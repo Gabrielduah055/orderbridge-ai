@@ -1,6 +1,7 @@
 import { Types } from "mongoose";
 import { Order } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
+import { Restaurant } from "../models/Restaurant";
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import {
   OutboundMessage,
@@ -13,6 +14,7 @@ import {
   sendTextMessage,
   type WasenderSendResult
 } from "./wasender.service";
+import { resolveSenderIdentity } from "./senderIdentity.service";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export interface EnqueueWasenderMessageInput {
@@ -111,6 +113,9 @@ export const getQueuedOwnerActionReminderStaleReason = async (
     typeof metadata.pendingActionPhone === "string"
       ? normalizeGhanaPhone(metadata.pendingActionPhone)
       : "";
+  const normalizedQueuedRecipient = queuedRecipientPhone
+    ? normalizeGhanaPhone(queuedRecipientPhone)
+    : "";
 
   if (
     !restaurantId ||
@@ -123,8 +128,8 @@ export const getQueuedOwnerActionReminderStaleReason = async (
   }
 
   if (
-    queuedRecipientPhone &&
-    normalizeGhanaPhone(queuedRecipientPhone) !== expectedPhone
+    normalizedQueuedRecipient &&
+    normalizedQueuedRecipient !== expectedPhone
   ) {
     return "queued_recipient_changed";
   }
@@ -133,7 +138,7 @@ export const getQueuedOwnerActionReminderStaleReason = async (
     _id: pendingActionId,
     restaurantId
   }).select(
-    "senderPhone senderRole status actionVersion expiresAt createdAt"
+    "senderPhone status actionVersion expiresAt createdAt"
   );
 
   if (!action) {
@@ -157,17 +162,32 @@ export const getQueuedOwnerActionReminderStaleReason = async (
     return "pending_action_version_changed";
   }
 
-  if (
-    action.senderRole &&
-    action.senderRole !== "owner" &&
-    action.senderRole !== "manager"
-  ) {
-    return "pending_action_sender_not_staff";
+  const restaurant = await Restaurant.findOne({
+    _id: restaurantId
+  }).select("ownerName ownerPhone managerPhones managerContacts");
+
+  if (!restaurant) {
+    return "restaurant_missing";
+  }
+
+  const currentIdentity = resolveSenderIdentity(restaurant, action.senderPhone);
+
+  if (!currentIdentity.verified) {
+    return "pending_action_recipient_not_verified";
   }
 
   if (
-    expectedPhone &&
-    normalizeGhanaPhone(action.senderPhone) !== expectedPhone
+    currentIdentity.role !== "owner" &&
+    currentIdentity.role !== "manager"
+  ) {
+    return "pending_action_recipient_not_staff";
+  }
+
+  const resolvedPhone = normalizeGhanaPhone(currentIdentity.normalizedPhone);
+
+  if (
+    resolvedPhone !== expectedPhone ||
+    (normalizedQueuedRecipient && resolvedPhone !== normalizedQueuedRecipient)
   ) {
     return "pending_action_recipient_changed";
   }
