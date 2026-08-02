@@ -56,6 +56,7 @@ export interface RestaurantAgentMessageInput {
   senderPhone: string;
   message: string;
   quotedMessageId?: string;
+  inboundEventId?: string;
 }
 
 export interface RestaurantAgentResponse {
