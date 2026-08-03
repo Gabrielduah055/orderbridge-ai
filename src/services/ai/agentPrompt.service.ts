@@ -129,6 +129,8 @@ export const buildAgentSystemPrompt = async (
           "Respect owner and manager permissions.",
           "Confirming an order means the restaurant accepts and can prepare it; rejecting an order means the restaurant cannot fulfil it.",
           "Use backend tools for all order decisions, including confirm_order and reject_order.",
+          "Use list_customer_feedback to read restaurant-scoped reviews or problems. Use resolve_customer_feedback only after the owner or manager explicitly confirms resolution.",
+          "Do not offer a general send-any-message feature. The normal workflow is accept, reject, or respond when a customer reports a problem.",
           "Owners and managers can accept or reject by replying to an order notification, saying Accept or Reject when there is one fresh pending order, or choosing from a numbered list.",
           "Never execute an ambiguous confirm, yes, okay, or do it when multiple pending actions exist.",
           "Menu updates and order confirmations are separate action types. Never use one pending action type to execute another.",

@@ -36,6 +36,8 @@ const toolNameByMcpName: Record<string, string> = {
   set_availability: "set_item_availability",
   get_orders: "get_today_orders",
   get_today_orders: "get_today_orders",
+  list_customer_feedback: "list_customer_feedback",
+  resolve_customer_feedback: "resolve_customer_feedback",
   get_marketing_preference: "get_marketing_preference",
   create_campaign_draft: "create_campaign_draft",
   preview_campaign: "preview_campaign",
@@ -179,6 +181,37 @@ export const mcpTools = [
     name: "get_orders",
     description: "Owner/manager. Read today's orders summary.",
     inputSchema: toolInputSchema({})
+  },
+  {
+    name: "list_customer_feedback",
+    description:
+      "Owner/manager only. List bounded restaurant-scoped customer feedback.",
+    inputSchema: toolInputSchema({
+      type: {
+        type: "string",
+        enum: [
+          "review",
+          "complaint",
+          "suggestion",
+          "system_feedback",
+          "delivery_not_received",
+          "mixed"
+        ]
+      },
+      requiresAttention: { type: "boolean" },
+      limit: { type: "integer", minimum: 1, maximum: 20 }
+    })
+  },
+  {
+    name: "resolve_customer_feedback",
+    description:
+      "Owner/manager only. Prepare resolution of one restaurant-scoped feedback record through the confirmation flow.",
+    inputSchema: toolInputSchema(
+      {
+        feedbackId: { type: "string" }
+      },
+      ["feedbackId"]
+    )
   },
   {
     name: "get_marketing_preference",

@@ -19,11 +19,28 @@ export const orderStatuses = [
 ] as const;
 export const paymentMethods = ["cash", "momo", "card", "unknown"] as const;
 export const paymentStatuses = ["unpaid", "paid", "pending"] as const;
+export const orderCompletionSources = [
+  "customer_confirmed",
+  "customer_feedback",
+  "automatic_timeout",
+  "owner_manual"
+] as const;
+export const feedbackFollowUpStatuses = [
+  "not_scheduled",
+  "scheduled",
+  "requested",
+  "answered",
+  "issue_reported",
+  "cancelled",
+  "automatically_closed"
+] as const;
 
 export type OrderType = (typeof orderTypes)[number];
 export type OrderStatus = (typeof orderStatuses)[number];
 export type PaymentMethod = (typeof paymentMethods)[number];
 export type PaymentStatus = (typeof paymentStatuses)[number];
+export type OrderCompletionSource = (typeof orderCompletionSources)[number];
+export type FeedbackFollowUpStatus = (typeof feedbackFollowUpStatuses)[number];
 
 export interface IOrderItem {
   menuItemId: Types.ObjectId;
@@ -71,6 +88,19 @@ export interface IOrder {
   customerNotificationFailedAt?: Date;
   customerNotificationFailureReason?: string;
   completedAt?: Date;
+  completionSource?: OrderCompletionSource;
+  completionConfirmedByCustomer?: boolean;
+  customerConfirmedReceiptAt?: Date;
+  completionProfileUpdatedAt?: Date;
+  feedbackFollowUpScheduledAt?: Date;
+  feedbackRequestedAt?: Date;
+  feedbackRequestSentAt?: Date;
+  feedbackReminderSentAt?: Date;
+  feedbackReceivedAt?: Date;
+  feedbackFollowUpStatus: FeedbackFollowUpStatus;
+  feedbackFollowUpVersion: number;
+  feedbackAwaitingComplaint?: boolean;
+  feedbackReceiptClarificationPending?: boolean;
   orderNumber?: string;
 }
 
@@ -267,6 +297,56 @@ const orderSchema = new Schema<IOrderDocument>(
     completedAt: {
       type: Date
     },
+    completionSource: {
+      type: String,
+      enum: orderCompletionSources
+    },
+    completionConfirmedByCustomer: {
+      type: Boolean
+    },
+    customerConfirmedReceiptAt: {
+      type: Date
+    },
+    completionProfileUpdatedAt: {
+      type: Date
+    },
+    feedbackFollowUpScheduledAt: {
+      type: Date,
+      index: true
+    },
+    feedbackRequestedAt: {
+      type: Date
+    },
+    feedbackRequestSentAt: {
+      type: Date,
+      index: true
+    },
+    feedbackReminderSentAt: {
+      type: Date
+    },
+    feedbackReceivedAt: {
+      type: Date
+    },
+    feedbackFollowUpStatus: {
+      type: String,
+      enum: feedbackFollowUpStatuses,
+      default: "not_scheduled",
+      required: true
+    },
+    feedbackFollowUpVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      required: true
+    },
+    feedbackAwaitingComplaint: {
+      type: Boolean,
+      default: false
+    },
+    feedbackReceiptClarificationPending: {
+      type: Boolean,
+      default: false
+    },
     orderNumber: {
       type: String,
       trim: true,
@@ -281,6 +361,16 @@ const orderSchema = new Schema<IOrderDocument>(
 
 orderSchema.index({ restaurantId: 1, createdAt: -1 });
 orderSchema.index({ restaurantId: 1, status: 1 });
+orderSchema.index({
+  restaurantId: 1,
+  feedbackFollowUpStatus: 1,
+  feedbackFollowUpScheduledAt: 1
+});
+orderSchema.index({
+  restaurantId: 1,
+  feedbackFollowUpStatus: 1,
+  feedbackRequestSentAt: 1
+});
 orderSchema.index({
   restaurantId: 1,
   customerPhone: 1,
