@@ -14,6 +14,9 @@ import { Restaurant } from "../models/Restaurant";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  cancelQueuedOrderFeedbackMessages
+} from "./orderCompletion.service";
 import { updateCustomerProfileFromCompletedOrder } from "./customerProfile.service";
 
 interface CreateOrderItemInput {
@@ -449,17 +452,40 @@ export const updateOrderStatus = async (
   status: OrderStatus
 ): Promise<UpdateOrderStatusResult> => {
   const order = await getOrderOrThrow(orderId);
+  const hadActiveFeedbackFollowUp = Boolean(
+    order.feedbackFollowUpStatus &&
+      order.feedbackFollowUpStatus !== "not_scheduled"
+  );
   order.customerPhone = normalizeGhanaPhone(order.customerPhone);
   order.status = status;
 
   if (status === "completed") {
     order.completedAt = order.completedAt ?? new Date();
+    order.completionSource = order.completionSource ?? "owner_manual";
+    order.completionConfirmedByCustomer =
+      order.completionConfirmedByCustomer ?? false;
+    order.feedbackFollowUpStatus = "cancelled";
+  } else if (["rejected", "cancelled", "expired"].includes(status)) {
+    order.feedbackFollowUpStatus = "cancelled";
   }
 
   await order.save();
 
-  if (status === "completed") {
+  if (status === "completed" && !order.completionProfileUpdatedAt) {
     await updateCustomerProfileFromCompletedOrder(order);
+    order.completionProfileUpdatedAt = new Date();
+    await order.save();
+  }
+
+  if (
+    ["completed", "rejected", "cancelled", "expired"].includes(status) &&
+    hadActiveFeedbackFollowUp
+  ) {
+    await cancelQueuedOrderFeedbackMessages(
+      String(order.restaurantId),
+      String(order._id),
+      `Order changed to ${status}`
+    );
   }
 
   return {
@@ -523,9 +549,15 @@ export const rejectRestaurantOrder = async (
   }
 
   order.status = "rejected";
+  order.feedbackFollowUpStatus = "cancelled";
   order.restaurantRejectedAt = order.restaurantRejectedAt ?? new Date();
   order.restaurantRejectionReason = reason?.trim() || order.restaurantRejectionReason;
   await order.save();
+  await cancelQueuedOrderFeedbackMessages(
+    String(order.restaurantId),
+    String(order._id),
+    "Order rejected"
+  );
 
   return {
     order,

@@ -55,6 +55,15 @@ import {
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  OrderFeedback,
+  orderFeedbackTypes,
+  type IOrderFeedbackDocument
+} from "../models/orderFeedback.model";
+import {
+  listCustomerFeedback,
+  resolveCustomerFeedback
+} from "../services/orderFeedback.service";
 import { toolPermissions, type ToolName } from "./tool.permissions";
 
 const emptySchema = z.object({}).strict();
@@ -74,6 +83,18 @@ const listOrdersSchema = z
     status: z.enum(orderStatuses).optional(),
     date: z.enum(["today", "yesterday"]).optional(),
     limit: z.number().int().positive().max(25).optional()
+  })
+  .strict();
+const listCustomerFeedbackSchema = z
+  .object({
+    type: z.enum(orderFeedbackTypes).optional(),
+    requiresAttention: z.boolean().optional(),
+    limit: z.number().int().positive().max(20).optional()
+  })
+  .strict();
+const resolveCustomerFeedbackSchema = z
+  .object({
+    feedbackId: z.string().trim().min(1)
   })
   .strict();
 const menuItemLookupSchema = z
@@ -175,6 +196,13 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   receiptUrl: includeCustomer ? order.receiptUrl : undefined,
   receiptGeneratedAt: order.receiptGeneratedAt,
   receiptSentAt: order.receiptSentAt,
+  completedAt: order.completedAt,
+  completionSource: order.completionSource,
+  completionConfirmedByCustomer: order.completionConfirmedByCustomer,
+  customerConfirmedReceiptAt: order.customerConfirmedReceiptAt,
+  feedbackFollowUpStatus: order.feedbackFollowUpStatus,
+  feedbackRequestSentAt: order.feedbackRequestSentAt,
+  feedbackReceivedAt: order.feedbackReceivedAt,
   items: order.items.map((item) => ({
     name: item.name,
     quantity: item.quantity,
@@ -190,6 +218,25 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
         paymentStatus: order.paymentStatus
       }
     : {})
+});
+
+const safeFeedbackView = (feedback: IOrderFeedbackDocument) => ({
+  id: String(feedback._id),
+  orderId: String(feedback.orderId),
+  orderNumber: feedback.orderNumber,
+  customerName: feedback.customerName,
+  customerPhone: feedback.customerPhone,
+  type: feedback.type,
+  message: feedback.message,
+  summary: feedback.summary,
+  sentiment: feedback.sentiment,
+  rating: feedback.rating,
+  requiresOwnerAttention: feedback.requiresOwnerAttention,
+  ownerNotifiedAt: feedback.ownerNotifiedAt,
+  ownerNotificationFailedAt: feedback.ownerNotificationFailedAt,
+  resolvedAt: feedback.resolvedAt,
+  resolvedByPhone: feedback.resolvedByPhone,
+  createdAt: feedback.createdAt
 });
 
 const normalizeComparableText = (value: string): string => {
@@ -692,6 +739,98 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Orders retrieved successfully.",
         data: orders.map((order) => safeOrderView(order, true))
+      };
+    }
+  },
+  list_customer_feedback: {
+    definition: {
+      name: "list_customer_feedback",
+      description:
+        "Owner/manager only. List recent restaurant-scoped customer reviews, complaints, suggestions, system feedback, and non-delivery reports.",
+      parameters: {
+        type: orderFeedbackTypes.join(" | "),
+        requiresAttention: "Optional boolean attention filter.",
+        limit: "Optional maximum number of records, up to 20."
+      }
+    },
+    roles: toolPermissions.list_customer_feedback,
+    schema: listCustomerFeedbackSchema,
+    handler: async (args, context) => {
+      const feedback = await listCustomerFeedback(context.restaurantId, args);
+
+      return {
+        success: true,
+        message:
+          feedback.length === 0
+            ? "No customer feedback matched those filters."
+            : `${feedback.length} customer feedback record${feedback.length === 1 ? "" : "s"} retrieved.`,
+        data: feedback.map(safeFeedbackView)
+      };
+    }
+  },
+  resolve_customer_feedback: {
+    definition: {
+      name: "resolve_customer_feedback",
+      description:
+        "Owner/manager only. Resolve a restaurant-scoped customer feedback record after explicit confirmation. Feedback is retained.",
+      parameters: {
+        feedbackId: "Feedback record ID."
+      }
+    },
+    roles: toolPermissions.resolve_customer_feedback,
+    sensitive: true,
+    schema: resolveCustomerFeedbackSchema,
+    handler: async (args, context) => {
+      if (!Types.ObjectId.isValid(args.feedbackId)) {
+        return {
+          success: false,
+          code: "FEEDBACK_NOT_FOUND",
+          message: "The requested customer feedback was not found."
+        };
+      }
+
+      const feedback = await OrderFeedback.findOne({
+        _id: args.feedbackId,
+        restaurantId: context.restaurantId
+      });
+
+      if (!feedback) {
+        return {
+          success: false,
+          code: "FEEDBACK_NOT_FOUND",
+          message: "The requested customer feedback was not found."
+        };
+      }
+
+      if (feedback.resolvedAt) {
+        return {
+          success: true,
+          message: "That feedback was already resolved.",
+          data: safeFeedbackView(feedback)
+        };
+      }
+
+      if (!context.confirmed) {
+        return createPendingToolAction(
+          context,
+          "resolve_customer_feedback",
+          { feedbackId: String(feedback._id) },
+          `Resolve the ${feedback.type.replace(/_/g, " ")} for order ${feedback.orderNumber}? The feedback will be kept in the record.`
+        );
+      }
+
+      const resolved = await resolveCustomerFeedback(
+        context.restaurantId,
+        String(feedback._id),
+        context.sender.normalizedPhone
+      );
+
+      return {
+        success: true,
+        message: resolved.idempotent
+          ? "That feedback was already resolved."
+          : "Customer feedback marked as resolved.",
+        data: safeFeedbackView(resolved.feedback)
       };
     }
   },

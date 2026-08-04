@@ -21,6 +21,11 @@ import {
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  applyOrderFeedbackProviderResult,
+  getQueuedOrderFeedbackStaleReason,
+  scheduleOrderFeedbackFollowUp
+} from "./orderFeedbackQueue.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -32,12 +37,14 @@ export interface EnqueueWasenderMessageInput {
   caption?: string;
   apiKey?: string;
   idempotencyKey?: string;
+  nextAttemptAt?: Date;
   metadata?: Record<string, unknown>;
 }
 
 const defaultSpacingMs = 5_000;
 const workerIntervalMs = 1_000;
 const defaultMaxAttempts = 5;
+const staleSendingRecoveryMs = 5 * 60_000;
 let workerStarted = false;
 let workerBusy = false;
 
@@ -52,7 +59,10 @@ const transactionalKinds = new Set([
   "owner_summary",
   "customer_order_confirmed_notification",
   "customer_order_rejected_notification",
-  "receipt_delivery"
+  "receipt_delivery",
+  "order_feedback_request",
+  "order_feedback_reminder",
+  "order_feedback_owner_notification"
 ]);
 
 export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>): boolean => {
@@ -398,14 +408,24 @@ export const getNextSessionSendAt = (
   return nextSendAt > now ? nextSendAt : null;
 };
 
-const updateOrderSideEffectAfterSend = async (
+export const updateOrderSideEffectAfterSend = async (
   message: IOutboundMessageDocument,
   result: WasenderSendResult
 ): Promise<void> => {
   const orderId = message.metadata?.orderId;
   const kind = message.metadata?.kind;
+  const restaurantId =
+    typeof message.metadata?.restaurantId === "string"
+      ? message.metadata.restaurantId
+      : message.restaurantId
+        ? String(message.restaurantId)
+        : "";
 
-  if (typeof orderId !== "string" || typeof kind !== "string") {
+  if (
+    typeof orderId !== "string" ||
+    typeof kind !== "string" ||
+    !restaurantId
+  ) {
     return;
   }
 
@@ -415,7 +435,7 @@ const updateOrderSideEffectAfterSend = async (
   if (kind === "owner_order_notification") {
     const providerMessageId = result.success ? extractWasenderProviderMessageId(result.data) : undefined;
     await Order.updateOne(
-      { _id: orderId },
+      { _id: orderId, restaurantId },
       result.success
         ? {
             $set: {
@@ -439,7 +459,7 @@ const updateOrderSideEffectAfterSend = async (
 
   if (kind === "customer_order_confirmed_notification") {
     await Order.updateOne(
-      { _id: orderId },
+      { _id: orderId, restaurantId },
       result.success
         ? {
             $set: { customerConfirmedNotificationSentAt: now },
@@ -455,12 +475,32 @@ const updateOrderSideEffectAfterSend = async (
             }
           }
     );
+
+    if (result.success) {
+      try {
+        await scheduleOrderFeedbackFollowUp(
+          restaurantId,
+          orderId,
+          { enqueueMessage: enqueueWasenderMessage },
+          now
+        );
+      } catch (error) {
+        console.error("Order feedback scheduling after acceptance send failed", {
+          restaurantId,
+          orderId,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unknown order feedback scheduling error"
+        });
+      }
+    }
     return;
   }
 
   if (kind === "customer_order_rejected_notification") {
     await Order.updateOne(
-      { _id: orderId },
+      { _id: orderId, restaurantId },
       result.success
         ? {
             $set: { rejectionNotificationSentAt: now },
@@ -488,7 +528,7 @@ const updateOrderSideEffectAfterSend = async (
       error: failureReason
     });
     await Order.updateOne(
-      { _id: orderId },
+      { _id: orderId, restaurantId },
       result.success
         ? {
             $set: { receiptSentAt: now },
@@ -504,6 +544,26 @@ const updateOrderSideEffectAfterSend = async (
             }
           }
     );
+
+    if (result.success) {
+      try {
+        await scheduleOrderFeedbackFollowUp(
+          restaurantId,
+          orderId,
+          { enqueueMessage: enqueueWasenderMessage },
+          now
+        );
+      } catch (error) {
+        console.error("Order feedback scheduling after receipt send failed", {
+          restaurantId,
+          orderId,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unknown order feedback scheduling error"
+        });
+      }
+    }
   }
 };
 
@@ -701,7 +761,7 @@ export const enqueueWasenderMessage = async (
       status: "pending",
       attempts: 0,
       maxAttempts: defaultMaxAttempts,
-      nextAttemptAt: new Date(),
+      nextAttemptAt: input.nextAttemptAt ?? new Date(),
       idempotencyKey: input.idempotencyKey,
       metadata: input.metadata
     });
@@ -809,7 +869,25 @@ export const processNextQueuedWasenderMessage = async (
     return true;
   }
 
-  if (locked.metadata?.kind === "owner_action_reminder") {
+  if (
+    locked.metadata?.kind === "order_feedback_request" ||
+    locked.metadata?.kind === "order_feedback_reminder"
+  ) {
+    const staleReason = await getQueuedOrderFeedbackStaleReason(locked);
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale order feedback message: ${staleReason}`;
+      await locked.save();
+      console.info("Stale order feedback message cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        orderId: locked.metadata.orderId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (locked.metadata?.kind === "owner_action_reminder") {
     const staleReason = await getQueuedOwnerActionReminderStaleReason(
       locked.metadata,
       new Date(),
@@ -889,6 +967,7 @@ export const processNextQueuedWasenderMessage = async (
 
   const result = await (dependencies.sendMessage ?? sendQueuedMessage)(locked);
   await updateOrderSideEffectAfterSend(locked, result);
+  await applyOrderFeedbackProviderResult(locked, result);
 
   if (result.success) {
     locked.status = "sent";
@@ -943,12 +1022,42 @@ export const drainQueuedWasenderMessages = async (
   return processed;
 };
 
+export const recoverStaleSendingWasenderMessages = async (
+  now = new Date()
+): Promise<number> => {
+  const cutoff = new Date(now.getTime() - staleSendingRecoveryMs);
+  const result = await OutboundMessage.updateMany(
+    {
+      status: "sending",
+      lastAttemptAt: { $lte: cutoff }
+    },
+    {
+      $set: {
+        status: "pending",
+        nextAttemptAt: now,
+        lastError: "Recovered after an interrupted queue worker attempt"
+      }
+    }
+  );
+
+  return result.modifiedCount;
+};
+
 export const startWasenderQueueWorker = (): void => {
   if (workerStarted) {
     return;
   }
 
   workerStarted = true;
+
+  void recoverStaleSendingWasenderMessages().catch((error) => {
+    console.error("Wasender queue recovery failed", {
+      error:
+        error instanceof Error
+          ? error.message
+          : "Unknown queue recovery error"
+    });
+  });
 
   const timer = setInterval(() => {
     if (workerBusy) {

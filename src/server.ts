@@ -5,6 +5,7 @@ import { startFollowUpScheduler } from "./services/followUp.service";
 import { startOwnerPendingActionReminderScheduler } from "./services/ownerPendingActionReminder.service";
 import { startOwnerSummaryScheduler } from "./services/ownerSummaryScheduler.service";
 import { startCustomerCampaignScheduler } from "./services/customerCampaignScheduler.service";
+import { startOrderFeedbackScheduler } from "./services/orderFeedbackScheduler.service";
 import { startWasenderQueueWorker } from "./services/wasenderQueue.service";
 import { startPostDeliveryFollowUpScheduler } from "./services/postDeliveryFollowUp.service";
 
@@ -20,6 +21,7 @@ const startServer = async (): Promise<void> => {
   startOwnerPendingActionReminderScheduler();
   startCustomerCampaignScheduler();
   startPostDeliveryFollowUpScheduler();
+  startOrderFeedbackScheduler();
 };
 
 void startServer();

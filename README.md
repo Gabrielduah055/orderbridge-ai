@@ -45,6 +45,11 @@ OPENROUTER_CUSTOMER_AGENT_ENABLED=false
 OPENROUTER_CUSTOMER_LEGACY_FALLBACK=false
 OPENROUTER_SITE_URL=
 OPENROUTER_APP_NAME=OrderBridgeAI
+
+# Transactional post-order feedback timing (optional; safe defaults shown)
+ORDER_FEEDBACK_DELAY_MINUTES=120
+ORDER_FEEDBACK_REMINDER_HOURS=12
+ORDER_AUTO_COMPLETE_HOURS=24
 ```
 
 The backend reads Firebase service account values from environment variables. `FIREBASE_PRIVATE_KEY` supports escaped newlines and is converted internally with `.replace(/\\n/g, "\n")`.
@@ -75,6 +80,8 @@ Important timestamps on orders include `customerConfirmedAt`, `ownerNotifiedAt`,
 Delivery fees are resolved only from restaurant configuration. Supported configuration is `deliveryPricing.type` of `flat`, `zone_based`, or `manual_confirmation`; unresolved delivery fees block final submission.
 
 Receipt PDFs are generated only after restaurant acceptance. If receipt generation or document delivery fails, the order remains accepted and the failure is recorded on the order for follow-up.
+
+After the accepted-order text or receipt is successfully sent by Wasender, the backend schedules one transactional post-order feedback request. A customer confirmation or delivery-confirming feedback completes the order; a non-delivery report keeps it open and alerts the owner. If the request receives no response, the order is automatically completed after the configured timeout unless a non-delivery issue is unresolved. Receipt generation, receipt delivery, payment state, and completion remain independent.
 
 ## Firebase Setup
 

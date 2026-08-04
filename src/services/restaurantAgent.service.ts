@@ -21,6 +21,7 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
+import { handleOrderFeedbackCustomerResponse } from "./orderFeedback.service";
 import type {
   RestaurantAgentMessageInput,
   RestaurantAgentResponse
@@ -339,6 +340,58 @@ export const handleRestaurantAgentMessage = async (
         sender
       };
     }
+
+    const feedbackResult = await handleOrderFeedbackCustomerResponse({
+      restaurantId,
+      customerPhone: sender.normalizedPhone,
+      customerName: sender.name,
+      message,
+      inboundEventId: input.inboundEventId
+    });
+
+    if (feedbackResult.handled && feedbackResult.message) {
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: {
+          source: "deterministic_order_feedback",
+          inboundEventId: input.inboundEventId
+        }
+      });
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: feedbackResult.message,
+        metadata: {
+          source: "deterministic_order_feedback",
+          success: feedbackResult.success,
+          orderId: feedbackResult.order
+            ? String(feedbackResult.order._id)
+            : undefined,
+          feedbackId: feedbackResult.feedback
+            ? String(feedbackResult.feedback._id)
+            : undefined
+        }
+      });
+
+      return {
+        success: feedbackResult.success,
+        message: feedbackResult.message,
+        data: {
+          order: feedbackResult.order,
+          feedback: feedbackResult.feedback,
+          ambiguousOrderNumbers: feedbackResult.ambiguousOrderNumbers
+        },
+        source: "legacy_customer",
+        sender
+      };
+    }
+
   }
 
   // For the customer OpenRouter orchestrator path we defer the user-message save until

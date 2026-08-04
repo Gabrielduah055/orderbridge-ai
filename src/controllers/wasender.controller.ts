@@ -395,7 +395,8 @@ const processNormalizedWebhook = async (
         restaurant,
         senderPhone: webhook.from,
         message: webhook.message,
-        quotedMessageId: webhook.quotedMessageId
+        quotedMessageId: webhook.quotedMessageId,
+        inboundEventId: eventId
       });
 
       if (sender.role === "customer") {
