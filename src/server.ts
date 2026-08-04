@@ -6,6 +6,7 @@ import { startOwnerPendingActionReminderScheduler } from "./services/ownerPendin
 import { startOwnerSummaryScheduler } from "./services/ownerSummaryScheduler.service";
 import { startCustomerCampaignScheduler } from "./services/customerCampaignScheduler.service";
 import { startWasenderQueueWorker } from "./services/wasenderQueue.service";
+import { startPostDeliveryFollowUpScheduler } from "./services/postDeliveryFollowUp.service";
 
 const startServer = async (): Promise<void> => {
   await connectDb();
@@ -18,6 +19,7 @@ const startServer = async (): Promise<void> => {
   startOwnerSummaryScheduler();
   startOwnerPendingActionReminderScheduler();
   startCustomerCampaignScheduler();
+  startPostDeliveryFollowUpScheduler();
 };
 
 void startServer();

@@ -51,6 +51,8 @@ export interface IRestaurant {
   ownerWeeklySummaryTime: string;
   ownerPendingActionReminderEnabled: boolean;
   ownerPendingActionReminderDelayMinutes: number;
+  postDeliveryFollowUpEnabled: boolean;
+  postDeliveryFollowUpDelayMinutes: number;
 }
 
 export interface RestaurantManagerContact {
@@ -277,7 +279,7 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     },
     ownerDailySummaryEnabled: {
       type: Boolean,
-      default: false
+      default: true
     },
     ownerDailySummaryTime: {
       type: String,
@@ -286,7 +288,7 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     },
     ownerWeeklySummaryEnabled: {
       type: Boolean,
-      default: false
+      default: true
     },
     ownerWeeklySummaryDay: {
       type: String,
@@ -305,6 +307,15 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
     ownerPendingActionReminderDelayMinutes: {
       type: Number,
       default: 3,
+      min: 1
+    },
+    postDeliveryFollowUpEnabled: {
+      type: Boolean,
+      default: true
+    },
+    postDeliveryFollowUpDelayMinutes: {
+      type: Number,
+      default: 45,
       min: 1
     }
   },

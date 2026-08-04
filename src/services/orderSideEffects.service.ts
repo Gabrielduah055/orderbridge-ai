@@ -198,6 +198,69 @@ export const notifyCustomerOfRejectedOrder = async (
   };
 };
 
+export const buildOwnerOrderCompletedNotification = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): string => {
+  const ref = getOrderReference(order);
+  const customerName = order.customerName || "Customer";
+  const orderTypeLine =
+    order.orderType === "delivery"
+      ? `Type: Delivery${order.deliveryAddress ? ` — ${order.deliveryAddress}` : ""}`
+      : "Type: Pickup";
+
+  return [
+    `✅ Order ${ref} has been completed.`,
+    "",
+    `Customer: ${customerName}`,
+    `Phone: ${order.customerPhone}`,
+    orderTypeLine,
+    `Total: ${formatGhanaCedi(order.total)}`,
+    "",
+    "The customer has been sent a follow-up to confirm receipt and leave feedback."
+  ].join("\n");
+};
+
+export const notifyOwnerOfCompletedOrder = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  if (order.ownerCompletionNotifiedAt) {
+    console.info("Owner completion notification skipped", {
+      restaurantId: String(restaurant._id),
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      reason: "already_sent"
+    });
+
+    return { ownerNotification: "skipped" };
+  }
+
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: restaurant.ownerPhone,
+    type: "text",
+    text: buildOwnerOrderCompletedNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `owner-order-completed:${String(order._id)}`,
+    metadata: {
+      kind: "owner_order_completed_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      recipientType: "owner"
+    }
+  });
+
+  console.info("Owner completion notification queued", {
+    restaurantId: String(restaurant._id),
+    orderId: String(order._id),
+    orderNumber: order.orderNumber
+  });
+
+  return { ownerNotification: "queued" };
+};
+
 export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   restaurant: IRestaurantDocument,
   order: IOrderDocument

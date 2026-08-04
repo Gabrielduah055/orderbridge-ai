@@ -72,7 +72,7 @@ const rejectOrderSchema = orderLookupSchema
 const listOrdersSchema = z
   .object({
     status: z.enum(orderStatuses).optional(),
-    date: z.enum(["today"]).optional(),
+    date: z.enum(["today", "yesterday"]).optional(),
     limit: z.number().int().positive().max(25).optional()
   })
   .strict();
@@ -429,6 +429,19 @@ const startOfToday = (): Date => {
   return date;
 };
 
+const startOfYesterday = (): Date => {
+  const date = new Date();
+  date.setDate(date.getDate() - 1);
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
+
+const endOfYesterday = (): Date => {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  return date;
+};
+
 export const toolRegistry: Record<ToolName, RegisteredTool> = {
   get_restaurant_profile: {
     definition: {
@@ -612,24 +625,65 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  get_yesterday_orders: {
+    definition: {
+      name: "get_yesterday_orders",
+      description:
+        "Return yesterday's order counts and completed-order revenue for the current restaurant.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_today_orders,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      const period = getCurrentDailySummaryPeriod(
+        new Date(Date.now() - 24 * 60 * 60 * 1000),
+        context.restaurant.timezone
+      );
+      const metrics = await getOwnerSummaryMetrics({
+        restaurantId: context.restaurantId,
+        periodStart: period.periodStart,
+        periodEnd: period.periodEnd,
+        timezone: period.timezone,
+        periodType: period.type
+      });
+
+      return {
+        success: true,
+        message: "Yesterday's orders retrieved successfully.",
+        data: {
+          ...metrics,
+          revenue: metrics.completedRevenue,
+          statuses: metrics.countsByStatus
+        }
+      };
+    }
+  },
   list_orders: {
     definition: {
       name: "list_orders",
       description:
-        "Owner/manager. List recent orders for this restaurant, optionally filtered by status and today's date.",
+        "Owner/manager. List recent orders for this restaurant, optionally filtered by status and today's/yesterday's date.",
       parameters: {
         status: orderStatuses.join(" | "),
-        date: "Optional. Use today to limit the list to today's orders.",
+        date: "Optional. Use today or yesterday to limit the list.",
         limit: "Optional max number of orders, up to 25."
       }
     },
     roles: toolPermissions.list_orders,
     schema: listOrdersSchema,
     handler: async (args, context) => {
+      const dateFilter: Record<string, unknown> = {};
+
+      if (args.date === "today") {
+        dateFilter.createdAt = { $gte: startOfToday() };
+      } else if (args.date === "yesterday") {
+        dateFilter.createdAt = { $gte: startOfYesterday(), $lt: endOfYesterday() };
+      }
+
       const orders = await Order.find({
         restaurantId: context.restaurantId,
         ...(args.status ? { status: args.status } : {}),
-        ...(args.date === "today" ? { createdAt: { $gte: startOfToday() } } : {})
+        ...dateFilter
       })
         .sort({ createdAt: -1 })
         .limit(args.limit ?? 10);

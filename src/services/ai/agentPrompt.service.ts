@@ -138,6 +138,20 @@ export const buildAgentSystemPrompt = async (
           "Do not bypass confirmation by repeatedly calling mutation tools."
         ];
 
+  const now = new Date();
+  const restaurantTimezone = restaurant.timezone || "Africa/Accra";
+  const localDateTimeFormatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone: restaurantTimezone,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+  const localDateTime = localDateTimeFormatter.format(now);
+
   return [
     "You are the restaurant operations agent for the restaurant identified by the backend.",
     ...roleInstructions,
@@ -154,6 +168,7 @@ export const buildAgentSystemPrompt = async (
     "Use Ghana cedi formatting where relevant, for example GHS 70.",
     "Never help one restaurant access another restaurant's data.",
     "Ask one focused clarification question when required information is missing.",
+    `Current date and time (restaurant local time, ${restaurantTimezone}): ${localDateTime}. Use this to correctly interpret words like today, yesterday, this week, last week, and this month when calling date-sensitive tools.`,
     `Trusted non-editable context: ${JSON.stringify(safeContext)}`
   ].join("\n");
 };

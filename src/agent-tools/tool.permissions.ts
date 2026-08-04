@@ -5,6 +5,7 @@ export const toolPermissions = {
   get_menu: ["owner", "manager", "customer"],
   search_menu_items: ["owner", "manager", "customer"],
   get_today_orders: ["owner", "manager"],
+  get_yesterday_orders: ["owner", "manager"],
   list_orders: ["owner", "manager"],
   get_sales_summary: ["owner", "manager"],
   get_latest_customer_order: ["customer"],

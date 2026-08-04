@@ -72,6 +72,8 @@ export interface IOrder {
   customerNotificationFailureReason?: string;
   completedAt?: Date;
   orderNumber?: string;
+  deliveryFollowUpSentAt?: Date;
+  ownerCompletionNotifiedAt?: Date;
 }
 
 export interface IOrderDocument extends IOrder, Document {
@@ -272,6 +274,12 @@ const orderSchema = new Schema<IOrderDocument>(
       trim: true,
       unique: true,
       sparse: true
+    },
+    deliveryFollowUpSentAt: {
+      type: Date
+    },
+    ownerCompletionNotifiedAt: {
+      type: Date
     }
   },
   {
