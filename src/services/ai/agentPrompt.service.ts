@@ -140,7 +140,9 @@ export const buildAgentSystemPrompt = async (
           "Ask for clarification whenever the intended owner action is uncertain.",
           "Never claim order confirmation or rejection succeeded unless the backend tool succeeds.",
           "For sensitive mutations, respect the backend pending-confirmation workflow.",
-          "Do not bypass confirmation by repeatedly calling mutation tools."
+          "Do not bypass confirmation by repeatedly calling mutation tools.",
+          "When an owner or manager wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
+          "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item."
         ];
 
   const now = new Date();
