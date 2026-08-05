@@ -43,7 +43,7 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
       wasenderSessionId: { $exists: true, $ne: "" },
       wasenderApiToken: { $exists: true, $ne: "" }
     }).select(
-      "_id name ownerPhone postDeliveryFollowUpDelayMinutes wasenderSessionId wasenderApiToken"
+      "_id name ownerPhone postDeliveryFollowUpDelayMinutes wasenderSessionId +wasenderApiToken"
     );
 
     if (restaurants.length === 0) {
