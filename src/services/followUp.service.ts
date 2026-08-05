@@ -40,7 +40,7 @@ const runFollowUpPass = async (): Promise<void> => {
       followUpEnabled: { $ne: false },
       wasenderSessionId: { $exists: true, $ne: "" },
       wasenderApiToken: { $exists: true, $ne: "" }
-    }).select("_id followUpDelayMinutes wasenderSessionId wasenderApiToken");
+    }).select("_id followUpDelayMinutes wasenderSessionId +wasenderApiToken");
 
     if (restaurants.length === 0) {
       return;
