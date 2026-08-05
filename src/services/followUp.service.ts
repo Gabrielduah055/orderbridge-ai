@@ -37,7 +37,7 @@ export const buildCustomerFollowUpQueueMetadata = (
 const runFollowUpPass = async (): Promise<void> => {
   try {
     const restaurants = await Restaurant.find({
-      followUpEnabled: true,
+      followUpEnabled: { $ne: false },
       wasenderSessionId: { $exists: true, $ne: "" },
       wasenderApiToken: { $exists: true, $ne: "" }
     }).select("_id followUpDelayMinutes wasenderSessionId wasenderApiToken");
