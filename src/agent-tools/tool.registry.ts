@@ -416,6 +416,24 @@ const createPendingToolAction = async (
   args: Record<string, unknown>,
   summary: string
 ): Promise<ToolResult> => {
+  // Cancel any stale TOOL_CALL pending actions for this sender before creating a new one.
+  // Without this, every AI proposal creates a new pending action and they accumulate,
+  // causing the "more than one action awaiting confirmation" loop.
+  await PendingAgentAction.updateMany(
+    {
+      restaurantId: context.restaurantId,
+      senderPhone: context.sender.normalizedPhone,
+      action: "TOOL_CALL",
+      status: "pending"
+    },
+    {
+      $set: {
+        status: "cancelled",
+        resultMessage: "Superseded by a newer pending action."
+      }
+    }
+  );
+
   const pendingAction = await PendingAgentAction.create({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
@@ -1214,7 +1232,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "add_menu_items",
       description:
-        "Prepare or confirm adding one or more menu items. Creates menu categories by name when needed. Requires owner confirmation.",
+        "Prepare or confirm adding one or more menu items. ONLY call this tool when the owner has explicitly provided the exact item name, price in GHS, and category for every item being added. Never guess, infer, or suggest specific item names, prices, or categories — if any detail is missing, ask the owner for it first before calling this tool. Creates menu categories by name when needed. Requires owner confirmation.",
       parameters: {
         items:
           "Array of { name, price, categoryName, description, isAvailable }. categoryName is optional and defaults to Main Meals."

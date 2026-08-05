@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { sendTextMessage } from "../services/wasender.service";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
@@ -212,6 +213,60 @@ const enqueueTextMessageOrThrow = async (
   });
 };
 
+// Option A: Send the AI reply directly — no queue, no wait, instant delivery.
+// If Wasender rejects it (e.g. rate limit), we silently fall back to the queue
+// so the customer still gets the message, just slightly delayed.
+const sendAgentReplyDirectly = async (
+  sessionId: string,
+  to: string,
+  message: string,
+  context: Record<string, unknown>,
+  apiKey?: string
+): Promise<void> => {
+  const recipient = normalizePhone(to) || to;
+
+  try {
+    const result = await sendTextMessage(sessionId, recipient, message, { apiKey });
+
+    if (result.success) {
+      return; // delivered instantly ✅
+    }
+
+    console.warn("[agentReply] Direct send failed, falling back to queue", {
+      sessionId,
+      recipient,
+      status: result.status,
+      error: result.error
+    });
+  } catch (directSendError) {
+    console.warn("[agentReply] Direct send threw error, falling back to queue", {
+      sessionId,
+      recipient,
+      error: directSendError instanceof Error ? directSendError.message : "Unknown"
+    });
+  }
+
+  // Fallback to queue on any failure
+  await enqueueWasenderMessage({
+    restaurantId: typeof context.restaurantId === "string" ? context.restaurantId : undefined,
+    sessionId,
+    to: recipient,
+    type: "text",
+    text: message,
+    apiKey,
+    idempotencyKey:
+      typeof context.eventId === "string" && typeof context.action === "string"
+        ? `${context.action}:${context.eventId}:${recipient}`
+        : undefined,
+    metadata: {
+      ...context,
+      recipientType: "webhook_sender",
+      usesRestaurantApiToken: Boolean(apiKey?.trim()),
+      directSendFailed: true
+    }
+  });
+};
+
 const findRestaurantForWebhook = async (
   webhook: NormalizedWasenderWebhook
 ): Promise<IRestaurantDocument | null> => {
@@ -412,7 +467,7 @@ const processNormalizedWebhook = async (
         }
       }
 
-      await enqueueTextMessageOrThrow(
+      await sendAgentReplyDirectly(
         restaurant.wasenderSessionId,
         webhook.from,
         agentResponse.message,

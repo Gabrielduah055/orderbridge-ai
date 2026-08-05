@@ -13,6 +13,7 @@ import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
+import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import {
   handleSavedOwnerSelectionReply,
   handleUnquotedOwnerOrderDecision,
@@ -69,6 +70,8 @@ export const isPendingActionConfirmationMessage = (message: string): boolean => 
 
   return (
     /^(yes|yeah|yep|yup|yh|sure|correct|confirm|confirmed)\b/.test(normalized) ||
+    /^\d+$/.test(normalized) ||
+    /^(yes|yeah|ok|okay)\s+\d+$/.test(normalized) ||
     /^(ok|okay|alright)\s+(go ahead|proceed|save|confirm|update|change|do it)\b/.test(normalized) ||
     /^(go ahead|proceed|save it|do it)\b/.test(normalized) ||
     /^(update|change)\s+(it|that|the item|the price|this)\b/.test(normalized)
@@ -636,6 +639,62 @@ export const handleRestaurantAgentMessage = async (
     const pendingActions = await findPendingToolActions(executionContext);
 
     if (pendingActions.length > 1) {
+      // Handle numbered replies: "1", "2", "Yes 1", "Yes 2", etc.
+      // The owner is picking a specific action from the numbered list we showed them.
+      const numberMatch = message.trim().match(/(\d+)$/);
+
+      if (numberMatch) {
+        const selectedIndex = parseInt(numberMatch[1], 10) - 1;
+        const selectedAction = pendingActions[selectedIndex];
+
+        if (selectedAction) {
+          // Cancel all other pending actions so they don't accumulate
+          const otherIds = pendingActions
+            .filter((_, i) => i !== selectedIndex)
+            .map((a) => a._id);
+
+          if (otherIds.length > 0) {
+            await PendingAgentAction.updateMany(
+              { _id: { $in: otherIds } },
+              {
+                $set: {
+                  status: "cancelled",
+                  resultMessage: "Superseded by owner selection."
+                }
+              }
+            );
+          }
+
+          const result = await executeConfirmedPendingToolAction(
+            String(selectedAction._id),
+            executionContext
+          );
+
+          await saveAgentConversationMessage({
+            restaurantId,
+            senderPhone: sender.normalizedPhone,
+            senderRole: sender.role,
+            direction: "assistant",
+            content: result.message,
+            metadata: {
+              source: "openrouter_agent",
+              deterministicAction: "confirm_pending_action_by_number",
+              selectedIndex,
+              success: result.success,
+              code: result.code
+            }
+          });
+
+          return {
+            success: result.success,
+            message: result.message,
+            data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+            source: "openrouter_agent",
+            sender
+          };
+        }
+      }
+
       const clarificationMessage = buildAmbiguousPendingActionMessage(pendingActions);
 
       await saveAgentConversationMessage({
