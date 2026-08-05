@@ -1,16 +1,23 @@
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { normalizeGhanaPhone } from "../utils/phone.util";
-import {
-  notifyOwnerOfCompletedOrder
-} from "./orderSideEffects.service";
+import { updateOrderStatus } from "./order.service";
+import { notifyOwnerOfCompletedOrder } from "./orderSideEffects.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
 const SCHEDULER_INTERVAL_MS = 60_000;
 const DEFAULT_DELAY_MINUTES = 45;
 
-// Statuses that mean the order has been handed off to the customer
-const completedStatuses = ["completed", "out_for_delivery", "ready"] as const;
+// Statuses that are terminal — no point sending a follow-up
+const skipStatuses = [
+  "cancelled",
+  "rejected",
+  "expired",
+  "collecting_details",
+  "awaiting_delivery_fee",
+  "awaiting_customer_confirmation",
+  "awaiting_restaurant_confirmation"
+] as const;
 
 const buildCustomerDeliveryFollowUpMessage = (
   restaurantName: string,
@@ -30,8 +37,9 @@ const buildCustomerDeliveryFollowUpMessage = (
 
 const runPostDeliveryFollowUpPass = async (): Promise<void> => {
   try {
+    // Fix A: use $ne: false so existing restaurants (field = undefined) are included
     const restaurants = await Restaurant.find({
-      postDeliveryFollowUpEnabled: true,
+      postDeliveryFollowUpEnabled: { $ne: false },
       wasenderSessionId: { $exists: true, $ne: "" },
       wasenderApiToken: { $exists: true, $ne: "" }
     }).select(
@@ -48,14 +56,17 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
 
     const now = new Date();
 
-    // Find completed orders that haven't had a follow-up sent yet
+    // Fix B: trigger on receiptSentAt (not order status)
+    // Once the receipt reaches the customer, the follow-up clock starts
     const orders = await Order.find({
       restaurantId: { $in: Array.from(restaurantMap.keys()) },
-      status: { $in: [...completedStatuses] },
-      deliveryFollowUpSentAt: { $exists: false }
+      receiptSentAt: { $exists: true, $ne: null },
+      deliveryFollowUpSentAt: { $exists: false },
+      status: { $nin: [...skipStatuses] }
     }).select(
       "_id restaurantId customerPhone customerName orderNumber orderType " +
-        "deliveryAddress total completedAt updatedAt deliveryFollowUpSentAt ownerCompletionNotifiedAt"
+        "deliveryAddress total status completedAt receiptSentAt " +
+        "deliveryFollowUpSentAt ownerCompletionNotifiedAt"
     );
 
     for (const order of orders) {
@@ -70,17 +81,34 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
           restaurant.postDeliveryFollowUpDelayMinutes ?? DEFAULT_DELAY_MINUTES;
         const delayMs = delayMinutes * 60 * 1000;
 
-        // Use completedAt if set, otherwise fall back to updatedAt
-        const completionTime = order.completedAt ?? order.updatedAt;
-        const elapsedMs = now.getTime() - completionTime.getTime();
+        // Use receiptSentAt as the start of the delay window
+        const elapsed = now.getTime() - order.receiptSentAt!.getTime();
 
-        if (elapsedMs < delayMs) {
+        if (elapsed < delayMs) {
           continue;
         }
 
         const orderId = String(order._id);
 
-        // ── Bug 3: Notify owner that order is done (if not already done) ──
+        // Option C — Auto-complete: mark order as completed if not already done
+        if (order.status !== "completed") {
+          try {
+            await updateOrderStatus(orderId, "completed");
+            console.info("[postDeliveryFollowUp] Order auto-completed", {
+              restaurantId: String(restaurant._id),
+              orderId,
+              orderNumber: order.orderNumber
+            });
+          } catch (completionError) {
+            console.error(
+              `[postDeliveryFollowUp] Could not auto-complete order ${orderId}:`,
+              completionError
+            );
+            // Still proceed to send follow-up even if auto-complete failed
+          }
+        }
+
+        // Bug 3 — Notify owner that order is done
         if (!order.ownerCompletionNotifiedAt) {
           try {
             await notifyOwnerOfCompletedOrder(restaurant, order);
@@ -93,9 +121,7 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
           }
         }
 
-        // ── Bug 2: Send follow-up to customer asking for receipt confirmation ──
-        const idempotencyKey = `delivery-follow-up:${orderId}`;
-
+        // Bug 2 — Send follow-up to customer
         await enqueueWasenderMessage({
           restaurantId: String(restaurant._id),
           sessionId: restaurant.wasenderSessionId,
@@ -106,7 +132,7 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
             order.customerName
           ),
           apiKey: restaurant.wasenderApiToken,
-          idempotencyKey,
+          idempotencyKey: `delivery-follow-up:${orderId}`,
           metadata: {
             kind: "delivery_follow_up",
             orderId,
