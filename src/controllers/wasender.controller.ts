@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import { sendTextMessage } from "../services/wasender.service";
+import { sendTextMessage, sendImageMessage } from "../services/wasender.service";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
@@ -15,6 +15,11 @@ import {
   type NormalizedWasenderWebhook,
 } from "../services/wasender.service";
 import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
+import {
+  isCloudinaryConfigured,
+  uploadImageFromUrl
+} from "../services/cloudinary.service";
+import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
@@ -426,6 +431,86 @@ const processNormalizedWebhook = async (
         };
       }
 
+      // ── Inbound image from owner/manager ──────────────────────────────────
+      // When an owner or manager sends a photo, upload it to Cloudinary and
+      // create a pending action so the AI can ask which menu item it belongs to.
+      if (webhook.messageType === "image" && sender.role !== "customer") {
+        const mediaUrl = webhook.mediaUrl;
+
+        if (!mediaUrl || !isCloudinaryConfigured()) {
+          await enqueueTextMessageOrThrow(
+            restaurant.wasenderSessionId,
+            webhook.from,
+            isCloudinaryConfigured()
+              ? "I received your image but couldn't retrieve the media URL. Please try again."
+              : "Image uploads are not configured yet. Please contact support.",
+            { action: "image_upload_error", restaurantId: String(restaurant._id), eventId },
+            restaurant.wasenderApiToken
+          );
+          webhookEvent.status = "processed";
+          webhookEvent.processedAt = new Date();
+          await webhookEvent.save();
+          return;
+        }
+
+        try {
+          // Upload image to Cloudinary first to get a permanent URL
+          const cloudinaryUrl = await uploadImageFromUrl(mediaUrl);
+
+          // Store the Cloudinary URL in a pending action so the AI can
+          // link it to a menu item once the owner names the item
+          await PendingAgentAction.updateMany(
+            {
+              restaurantId: restaurant._id,
+              senderPhone: normalizeGhanaPhone(webhook.from),
+              action: "TOOL_CALL",
+              status: "pending"
+            },
+            { $set: { status: "cancelled", resultMessage: "Superseded by new image upload." } }
+          );
+
+          await PendingAgentAction.create({
+            restaurantId: restaurant._id,
+            senderPhone: normalizeGhanaPhone(webhook.from),
+            senderRole: sender.role,
+            action: "TOOL_CALL",
+            toolName: "set_menu_item_image",
+            arguments: { imageUrl: cloudinaryUrl },
+            data: { imageUrl: cloudinaryUrl },
+            status: "pending",
+            summary: "Set menu item image",
+            confirmationMessage: "Set menu item image",
+            expiresAt: new Date(Date.now() + 10 * 60 * 1000)
+          });
+
+          await enqueueTextMessageOrThrow(
+            restaurant.wasenderSessionId,
+            webhook.from,
+            "Got your image! 📸 Which menu item is this for? Reply with the item name.",
+            { action: "image_received", restaurantId: String(restaurant._id), eventId },
+            restaurant.wasenderApiToken
+          );
+        } catch (uploadError) {
+          console.error("Image upload to Cloudinary failed", {
+            restaurantId: String(restaurant._id),
+            error: uploadError instanceof Error ? uploadError.message : "Unknown error"
+          });
+          await enqueueTextMessageOrThrow(
+            restaurant.wasenderSessionId,
+            webhook.from,
+            "Sorry, I had trouble uploading your image. Please try again.",
+            { action: "image_upload_failed", restaurantId: String(restaurant._id), eventId },
+            restaurant.wasenderApiToken
+          );
+        }
+
+        webhookEvent.status = "processed";
+        webhookEvent.processedAt = new Date();
+        await webhookEvent.save();
+        return;
+      }
+
+      // ── Non-text, non-image message (documents, audio, etc.) ──────────────
       if (webhook.messageType !== "text" || !webhook.message.trim()) {
         await enqueueTextMessageOrThrow(
           restaurant.wasenderSessionId,
@@ -453,6 +538,25 @@ const processNormalizedWebhook = async (
         quotedMessageId: webhook.quotedMessageId,
         inboundEventId: eventId
       });
+
+      // ── Send image to customer if the response includes one ───────────────
+      // Only send when a specific item image is available; never on full menu.
+      const responseImageUrl = typeof agentResponse.data === "object" &&
+        agentResponse.data !== null &&
+        "imageUrl" in agentResponse.data &&
+        typeof (agentResponse.data as Record<string, unknown>).imageUrl === "string"
+          ? (agentResponse.data as Record<string, unknown>).imageUrl as string
+          : undefined;
+
+      if (responseImageUrl && sender.role === "customer") {
+        await sendImageMessage(
+          restaurant.wasenderSessionId,
+          webhook.from,
+          responseImageUrl,
+          undefined,
+          { apiKey: restaurant.wasenderApiToken }
+        );
+      }
 
       if (sender.role === "customer") {
         const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);

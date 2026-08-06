@@ -1386,10 +1386,115 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  set_menu_item_image: {
+    definition: {
+      name: "set_menu_item_image",
+      description:
+        "Set or replace the image for a menu item. The image URL is already stored from the photo the owner sent — you only need the item name or ID to link them. Requires owner/manager confirmation.",
+      parameters: {
+        itemName: "Menu item name (optional if itemId provided).",
+        itemId: "Optional menu item ID.",
+        imageUrl: "The Cloudinary URL of the uploaded image. Injected from the pending action — do not ask the owner for this."
+      }
+    },
+    roles: toolPermissions.set_menu_item_image,
+    sensitive: true,
+    schema: menuItemLookupSchema
+      .extend({
+        imageUrl: z.string().url().trim().min(1)
+      })
+      .strict(),
+    handler: async (args, context) => {
+      const item = await findMenuItemForRestaurant(context, args);
+
+      if ("success" in item) {
+        return item;
+      }
+
+      if (!context.confirmed) {
+        return createPendingToolAction(
+          context,
+          "set_menu_item_image",
+          { itemId: String(item._id), imageUrl: args.imageUrl },
+          `Should I set this as the image for ${item.name}?`
+        );
+      }
+
+      const { deleteImageByUrl } = await import("../services/cloudinary.service");
+
+      // Delete old image from Cloudinary if it exists
+      if (item.imageUrl) {
+        await deleteImageByUrl(item.imageUrl);
+      }
+
+      const updated = await menuItemService.updateMenuItemImage(String(item._id), args.imageUrl);
+
+      return {
+        success: true,
+        message: `✅ Image updated for ${updated.name}.`,
+        data: {
+          itemName: updated.name,
+          imageUrl: updated.imageUrl
+        }
+      };
+    }
+  },
+  remove_menu_item_image: {
+    definition: {
+      name: "remove_menu_item_image",
+      description:
+        "Remove the image from a menu item. Requires owner/manager confirmation.",
+      parameters: {
+        itemName: "Menu item name (optional if itemId provided).",
+        itemId: "Optional menu item ID."
+      }
+    },
+    roles: toolPermissions.remove_menu_item_image,
+    sensitive: true,
+    schema: menuItemLookupSchema,
+    handler: async (args, context) => {
+      const item = await findMenuItemForRestaurant(context, args);
+
+      if ("success" in item) {
+        return item;
+      }
+
+      if (!item.imageUrl) {
+        return {
+          success: false,
+          code: "NO_IMAGE_TO_REMOVE",
+          message: `${item.name} doesn't have an image set.`
+        };
+      }
+
+      if (!context.confirmed) {
+        return createPendingToolAction(
+          context,
+          "remove_menu_item_image",
+          { itemId: String(item._id) },
+          `Should I remove the image for ${item.name}?`
+        );
+      }
+
+      const { deleteImageByUrl } = await import("../services/cloudinary.service");
+      await deleteImageByUrl(item.imageUrl);
+
+      const updated = await menuItemService.updateMenuItemImage(String(item._id), "");
+
+      return {
+        success: true,
+        message: `✅ Image removed for ${updated.name}.`,
+        data: {
+          itemName: updated.name
+        }
+      };
+    }
+  },
   confirm_order: {
     definition: {
       name: "confirm_order",
       description:
+
         "Owner/manager only. Confirm that the restaurant accepts a pending customer-submitted order.",
       parameters: { orderReference: "Order number or order ID." }
     },
