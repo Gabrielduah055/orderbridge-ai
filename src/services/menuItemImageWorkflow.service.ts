@@ -1,6 +1,6 @@
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
-import type { SenderRole } from "../types/agent.types";
+import type { SenderRole, ToolResult } from "../types/agent.types";
 
 const imageContextTtlMs = 10 * 60 * 1000;
 
@@ -60,12 +60,14 @@ const findMenuItem = async (
 const cancelPendingImageContexts = async (
   restaurantId: string,
   senderPhone: string,
+  senderRole: SenderRole,
   resultMessage: string
 ): Promise<void> => {
   await PendingAgentAction.updateMany(
     {
       restaurantId,
       senderPhone,
+      senderRole,
       action: "MENU_ITEM_IMAGE_CONTEXT",
       status: "pending"
     },
@@ -89,13 +91,16 @@ const createImageConfirmation = async (
     cancelPendingImageContexts(
       input.restaurantId,
       input.senderPhone,
+      input.senderRole,
       "Image context was converted to a confirmation."
     ),
     PendingAgentAction.updateMany(
       {
         restaurantId: input.restaurantId,
         senderPhone: input.senderPhone,
+        senderRole: input.senderRole,
         action: "TOOL_CALL",
+        toolName: "set_menu_item_image",
         status: "pending"
       },
       {
@@ -159,6 +164,7 @@ export const rememberMenuItemImageRequest = async (
   await cancelPendingImageContexts(
     input.restaurantId,
     input.senderPhone,
+    input.senderRole,
     "Superseded by a newer menu item image request."
   );
   await PendingAgentAction.create({
@@ -191,6 +197,7 @@ export const prepareUploadedMenuItemImage = async (
   const context = await PendingAgentAction.findOne({
     restaurantId: input.restaurantId,
     senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
     action: "MENU_ITEM_IMAGE_CONTEXT",
     status: "pending",
     expiresAt: { $gt: new Date() },
@@ -215,6 +222,7 @@ export const prepareUploadedMenuItemImage = async (
   await cancelPendingImageContexts(
     input.restaurantId,
     input.senderPhone,
+    input.senderRole,
     "Superseded by a newly uploaded image."
   );
   await PendingAgentAction.create({
@@ -239,12 +247,45 @@ export const prepareUploadedMenuItemImage = async (
   };
 };
 
+export const cancelPendingMenuItemImageConfirmation = async (
+  input: MenuItemImageWorkflowInput & { pendingActionId: string }
+): Promise<ToolResult> => {
+  const pendingAction = await PendingAgentAction.findOne({
+    _id: input.pendingActionId,
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    action: "TOOL_CALL",
+    toolName: "set_menu_item_image",
+    status: "pending",
+    expiresAt: { $gt: new Date() }
+  });
+
+  if (!pendingAction) {
+    return {
+      success: false,
+      code: "PENDING_ACTION_NOT_FOUND",
+      message: "There is no pending image action to cancel."
+    };
+  }
+
+  pendingAction.status = "cancelled";
+  pendingAction.resultMessage = "Pending image action cancelled.";
+  await pendingAction.save();
+
+  return {
+    success: true,
+    message: "Okay, I cancelled that pending image action."
+  };
+};
+
 export const attachPendingImageToNamedMenuItem = async (
   input: MenuItemImageWorkflowInput & { message: string }
 ): Promise<ImageWorkflowResult> => {
   const context = await PendingAgentAction.findOne({
     restaurantId: input.restaurantId,
     senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
     action: "MENU_ITEM_IMAGE_CONTEXT",
     status: "pending",
     expiresAt: { $gt: new Date() },

@@ -23,6 +23,7 @@ import {
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
   attachPendingImageToNamedMenuItem,
+  cancelPendingMenuItemImageConfirmation,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -620,6 +621,7 @@ export const handleRestaurantAgentMessage = async (
     const pendingImageConfirmation = await PendingAgentAction.findOne({
       restaurantId,
       senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
       action: "TOOL_CALL",
       toolName: "set_menu_item_image",
       status: "pending",
@@ -629,7 +631,8 @@ export const handleRestaurantAgentMessage = async (
     if (pendingImageConfirmation && isPendingActionConfirmationMessage(message)) {
       const result = await executeConfirmedPendingToolAction(
         String(pendingImageConfirmation._id),
-        executionContext
+        executionContext,
+        "set_menu_item_image"
       );
 
       await saveAssistantResponse(
@@ -659,7 +662,12 @@ export const handleRestaurantAgentMessage = async (
     }
 
     if (pendingImageConfirmation && isPendingActionCancellationMessage(message)) {
-      const result = await cancelPendingToolAction(executionContext);
+      const result = await cancelPendingMenuItemImageConfirmation({
+        pendingActionId: String(pendingImageConfirmation._id),
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role
+      });
 
       await saveAssistantResponse(
         restaurantId,

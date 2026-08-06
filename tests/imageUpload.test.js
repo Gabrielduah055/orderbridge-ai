@@ -12,6 +12,7 @@ const {
 } = require("../dist/services/cloudinary.service");
 const {
   attachPendingImageToNamedMenuItem,
+  cancelPendingMenuItemImageConfirmation,
   parseMenuItemImageIntent,
   prepareUploadedMenuItemImage,
   rememberMenuItemImageRequest
@@ -178,9 +179,13 @@ test("menu item image request preserves Chicken Salad context until the image ar
   const originalUpdateMany = PendingAgentAction.updateMany;
   const originalCreate = PendingAgentAction.create;
   const created = [];
+  let cancelledContextFilter;
 
   MenuItem.findOne = async () => ({ _id: menuItemId, name: "Chicken Salad" });
-  PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
+  PendingAgentAction.updateMany = async (filter) => {
+    cancelledContextFilter = filter;
+    return { modifiedCount: 0 };
+  };
   PendingAgentAction.create = async (input) => {
     created.push(input);
     return { _id: "context-1", ...input };
@@ -198,6 +203,13 @@ test("menu item image request preserves Chicken Salad context until the image ar
     assert.equal(result.handled, true);
     assert.equal(result.itemName, "Chicken Salad");
     assert.equal(created[0].action, "MENU_ITEM_IMAGE_CONTEXT");
+    assert.deepEqual(cancelledContextFilter, {
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      action: "MENU_ITEM_IMAGE_CONTEXT",
+      status: "pending"
+    });
     assert.deepEqual(created[0].data, {
       stage: "awaiting_image",
       itemId: menuItemId,
@@ -252,6 +264,254 @@ test("uploaded image uses preserved item context and creates an exact confirmati
     PendingAgentAction.findOne = originalFindOne;
     PendingAgentAction.updateMany = originalUpdateMany;
     PendingAgentAction.create = originalCreate;
+  }
+});
+
+test("creating an image confirmation does not cancel another pending tool action", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalUpdateMany = PendingAgentAction.updateMany;
+  const originalCreate = PendingAgentAction.create;
+  const pendingActions = [
+    {
+      senderRole: "manager",
+      action: "TOOL_CALL",
+      toolName: "set_item_availability",
+      status: "pending"
+    },
+    {
+      senderRole: "manager",
+      action: "TOOL_CALL",
+      toolName: "set_menu_item_image",
+      status: "pending"
+    }
+  ];
+
+  PendingAgentAction.findOne = () => ({
+    sort: async () => ({
+      data: {
+        stage: "awaiting_image",
+        itemId: menuItemId,
+        itemName: "Chicken Salad"
+      }
+    })
+  });
+  PendingAgentAction.updateMany = async (filter, update) => {
+    for (const action of pendingActions) {
+      if (
+        action.senderRole === filter.senderRole &&
+        action.action === filter.action &&
+        (!filter.toolName || action.toolName === filter.toolName) &&
+        action.status === filter.status
+      ) {
+        action.status = update.$set.status;
+      }
+    }
+
+    return { modifiedCount: 1 };
+  };
+  PendingAgentAction.create = async (input) => ({ _id: "confirmation-1", ...input });
+
+  try {
+    await prepareUploadedMenuItemImage({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      imageUrl: cloudinaryUrl
+    });
+
+    assert.equal(pendingActions[0].status, "pending");
+    assert.equal(pendingActions[1].status, "cancelled");
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
+    PendingAgentAction.updateMany = originalUpdateMany;
+    PendingAgentAction.create = originalCreate;
+  }
+});
+
+test("an owner cannot reuse a manager pending image context", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalUpdateMany = PendingAgentAction.updateMany;
+  const originalCreate = PendingAgentAction.create;
+  const findFilters = [];
+  const created = [];
+
+  PendingAgentAction.findOne = (filter) => {
+    findFilters.push(filter);
+    return {
+      sort: async () =>
+        filter.senderRole === "manager"
+          ? {
+              senderRole: "manager",
+              data: {
+                stage: "awaiting_image",
+                itemId: menuItemId,
+                itemName: "Chicken Salad"
+              }
+            }
+          : null
+    };
+  };
+  PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
+  PendingAgentAction.create = async (input) => {
+    created.push(input);
+    return { _id: "owner-context", ...input };
+  };
+
+  try {
+    const result = await prepareUploadedMenuItemImage({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      imageUrl: cloudinaryUrl
+    });
+
+    assert.equal(findFilters[0].senderRole, "owner");
+    assert.equal(result.message, "I received the image. Which menu item does it belong to?");
+    assert.equal(created.length, 1);
+    assert.equal(created[0].action, "MENU_ITEM_IMAGE_CONTEXT");
+    assert.equal(created[0].senderRole, "owner");
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
+    PendingAgentAction.updateMany = originalUpdateMany;
+    PendingAgentAction.create = originalCreate;
+  }
+});
+
+test("a manager cannot reuse an owner pending image context", async () => {
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalMenuFindOne = MenuItem.findOne;
+  let menuLookups = 0;
+  let capturedFilter;
+
+  PendingAgentAction.findOne = (filter) => {
+    capturedFilter = filter;
+    return {
+      sort: async () =>
+        filter.senderRole === "owner"
+          ? {
+              senderRole: "owner",
+              data: { stage: "awaiting_item", imageUrl: cloudinaryUrl }
+            }
+          : null
+    };
+  };
+  MenuItem.findOne = async () => {
+    menuLookups += 1;
+    return { _id: menuItemId, name: "Chicken Salad" };
+  };
+
+  try {
+    const result = await attachPendingImageToNamedMenuItem({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      message: "Chicken Salad"
+    });
+
+    assert.equal(capturedFilter.senderRole, "manager");
+    assert.equal(result.handled, false);
+    assert.equal(menuLookups, 0);
+  } finally {
+    PendingAgentAction.findOne = originalPendingFindOne;
+    MenuItem.findOne = originalMenuFindOne;
+  }
+});
+
+test("only older image confirmations in the same restaurant sender and role are cancelled", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalUpdateMany = PendingAgentAction.updateMany;
+  const originalCreate = PendingAgentAction.create;
+  const updateFilters = [];
+
+  PendingAgentAction.findOne = () => ({
+    sort: async () => ({
+      data: {
+        stage: "awaiting_image",
+        itemId: menuItemId,
+        itemName: "Chicken Salad"
+      }
+    })
+  });
+  PendingAgentAction.updateMany = async (filter) => {
+    updateFilters.push(filter);
+    return { modifiedCount: 1 };
+  };
+  PendingAgentAction.create = async (input) => ({ _id: "new-image-action", ...input });
+
+  try {
+    await prepareUploadedMenuItemImage({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      imageUrl: cloudinaryUrl
+    });
+
+    const confirmationCancellation = updateFilters.find(
+      (filter) => filter.action === "TOOL_CALL"
+    );
+    assert.deepEqual(confirmationCancellation, {
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      action: "TOOL_CALL",
+      toolName: "set_menu_item_image",
+      status: "pending"
+    });
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
+    PendingAgentAction.updateMany = originalUpdateMany;
+    PendingAgentAction.create = originalCreate;
+  }
+});
+
+test("image cancellation is scoped to the selected restaurant sender role and tool", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  let capturedFilter;
+  let saved = false;
+
+  PendingAgentAction.findOne = async (filter) => {
+    capturedFilter = filter;
+    return {
+      status: "pending",
+      resultMessage: undefined,
+      save: async () => {
+        saved = true;
+      }
+    };
+  };
+
+  try {
+    const result = await cancelPendingMenuItemImageConfirmation({
+      pendingActionId: "image-action-1",
+      restaurantId,
+      senderPhone,
+      senderRole: "manager"
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(saved, true);
+    assert.deepEqual(
+      {
+        _id: capturedFilter._id,
+        restaurantId: capturedFilter.restaurantId,
+        senderPhone: capturedFilter.senderPhone,
+        senderRole: capturedFilter.senderRole,
+        action: capturedFilter.action,
+        toolName: capturedFilter.toolName,
+        status: capturedFilter.status
+      },
+      {
+        _id: "image-action-1",
+        restaurantId,
+        senderPhone,
+        senderRole: "manager",
+        action: "TOOL_CALL",
+        toolName: "set_menu_item_image",
+        status: "pending"
+      }
+    );
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
   }
 });
 

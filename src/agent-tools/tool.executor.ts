@@ -91,12 +91,20 @@ export const executeAgentTool = async (
 
 export const executeConfirmedPendingToolAction = async (
   pendingActionId: string,
-  context: ToolExecutionContext
+  context: ToolExecutionContext,
+  expectedToolName?: ToolName
 ): Promise<ToolResult> => {
   const pendingAction = await PendingAgentAction.findOne({
     _id: pendingActionId,
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    ...(expectedToolName
+      ? {
+          senderRole: context.sender.role,
+          action: "TOOL_CALL",
+          toolName: expectedToolName
+        }
+      : {}),
     status: "pending",
     expiresAt: {
       $gt: new Date()
