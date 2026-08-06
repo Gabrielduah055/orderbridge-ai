@@ -1,5 +1,10 @@
 import type { NextFunction, Request, Response } from "express";
-import { sendTextMessage, sendImageMessage } from "../services/wasender.service";
+import {
+  decryptWasenderMedia,
+  sendTextMessage,
+  sendImageMessage,
+  type WasenderSendResult
+} from "../services/wasender.service";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
@@ -17,12 +22,13 @@ import {
 import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
 import {
   isCloudinaryConfigured,
-  uploadImageFromUrl
+  uploadDecryptedImageFromUrl
 } from "../services/cloudinary.service";
-import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import type { RestaurantAgentResponse } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
+import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
+import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
 
 const customerConversationQueues = new Map<string, Promise<void>>();
 
@@ -129,15 +135,7 @@ const normalizePhone = (phone?: string): string => {
 };
 
 const getErrorMessage = (error: unknown): string => {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  if (typeof error === "string") {
-    return error;
-  }
-
-  return "Unknown webhook processing error";
+  return getSafeErrorMessage(error, "Webhook processing failed without an error message");
 };
 
 const getErrorDetails = (error: unknown): Record<string, unknown> => {
@@ -147,24 +145,65 @@ const getErrorDetails = (error: unknown): Record<string, unknown> => {
 
   const details: Record<string, unknown> = {};
   const maybeDetailedError = error as {
-    context?: unknown;
-    wasenderSendResult?: unknown;
+    code?: unknown;
+    http_code?: unknown;
+    status?: unknown;
     stack?: unknown;
   };
 
-  if (maybeDetailedError.context) {
-    details.context = maybeDetailedError.context;
+  const code = maybeDetailedError.code ?? maybeDetailedError.http_code ?? maybeDetailedError.status;
+
+  if (typeof code === "string" || typeof code === "number") {
+    details.code = code;
   }
 
-  if (maybeDetailedError.wasenderSendResult) {
-    details.wasenderSendResult = maybeDetailedError.wasenderSendResult;
-  }
-
-  if (process.env.NODE_ENV !== "production" && maybeDetailedError.stack) {
-    details.stack = maybeDetailedError.stack;
+  if (process.env.NODE_ENV !== "production" && typeof maybeDetailedError.stack === "string") {
+    details.stack = redactUrls(maybeDetailedError.stack);
   }
 
   return details;
+};
+
+type ImageMessageSender = (
+  sessionId: string,
+  to: string,
+  imageUrl: string,
+  caption?: string,
+  options?: { apiKey?: string }
+) => Promise<WasenderSendResult>;
+
+export const sendCustomerMenuItemImage = async (
+  sessionId: string,
+  to: string,
+  imageUrl: string,
+  apiKey?: string,
+  imageSender: ImageMessageSender = sendImageMessage
+): Promise<boolean> => {
+  try {
+    const result = await imageSender(sessionId, to, imageUrl, undefined, { apiKey });
+
+    if (result.success) {
+      return true;
+    }
+
+    console.warn("Customer menu item image send failed", {
+      status: result.status,
+      error: getSafeErrorMessage(result.error, "WaSender rejected the image message")
+    });
+  } catch (error) {
+    console.warn("Customer menu item image send failed", {
+      error: getSafeErrorMessage(error, "WaSender image request failed")
+    });
+  }
+
+  return false;
+};
+
+export const buildCustomerImageFallbackMessage = (
+  agentMessage: string,
+  imageUrl: string
+): string => {
+  return `${agentMessage}\n\nI couldn't send the image directly. You can view it here: ${imageUrl}`;
 };
 
 const latestResponsePurpose = (message: string): string => {
@@ -247,7 +286,7 @@ const sendAgentReplyDirectly = async (
     console.warn("[agentReply] Direct send threw error, falling back to queue", {
       sessionId,
       recipient,
-      error: directSendError instanceof Error ? directSendError.message : "Unknown"
+      error: getSafeErrorMessage(directSendError, "Direct WaSender text delivery failed")
     });
   }
 
@@ -432,95 +471,60 @@ const processNormalizedWebhook = async (
       }
 
       // ── Inbound image from owner/manager ──────────────────────────────────
-      // When an owner or manager sends a photo, upload it to Cloudinary and
-      // create a pending action so the AI can ask which menu item it belongs to.
+      // Decrypt the complete raw message through WaSender, then upload only its
+      // temporary public URL and prepare the menu-item confirmation workflow.
       if (webhook.messageType === "image" && sender.role !== "customer") {
-        const mediaUrl = webhook.mediaUrl;
-
-        // Log full image message fields so we can inspect the encryption keys
-        const rawImageMessage = (webhook.rawPayload as Record<string, unknown>);
-        console.info("[image-upload] raw image webhook keys", {
-          mediaUrl: mediaUrl?.slice(0, 100),
-          messageId: webhook.messageId,
-          rawTopLevelKeys: Object.keys(rawImageMessage),
-          imageMessage: JSON.stringify(
-            (rawImageMessage?.data as Record<string, unknown>)?.messages ?? rawImageMessage?.message ?? rawImageMessage
-          ).slice(0, 600)
-        });
-
-        if (!mediaUrl || !isCloudinaryConfigured()) {
+        if (!isCloudinaryConfigured()) {
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
             webhook.from,
-            isCloudinaryConfigured()
-              ? "I received your image but couldn't retrieve the media URL. Please try again."
-              : "Image uploads are not configured yet. Please contact support.",
+            "Image uploads are not configured yet. Please contact support.",
             { action: "image_upload_error", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
           );
-          webhookEvent.status = "processed";
-          webhookEvent.processedAt = new Date();
-          await webhookEvent.save();
-          return;
+
+          throw new Error("Cloudinary image upload is not configured.");
         }
 
         try {
-          // Download from WaSender (auth required) then upload to Cloudinary
-          const cloudinaryUrl = await uploadImageFromUrl(mediaUrl, restaurant.wasenderApiToken ?? undefined);
-
-          // Store the Cloudinary URL in a pending action so the AI can
-          // link it to a menu item once the owner names the item
-          await PendingAgentAction.updateMany(
-            {
-              restaurantId: restaurant._id,
-              senderPhone: normalizeGhanaPhone(webhook.from),
-              action: "TOOL_CALL",
-              status: "pending"
-            },
-            { $set: { status: "cancelled", resultMessage: "Superseded by new image upload." } }
-          );
-
-          await PendingAgentAction.create({
-            restaurantId: restaurant._id,
+          const decryptedPublicUrl = await decryptWasenderMedia(webhook.rawMessage, {
+            apiKey: restaurant.wasenderApiToken
+          });
+          const cloudinaryUrl = await uploadDecryptedImageFromUrl(decryptedPublicUrl);
+          const workflowResult = await prepareUploadedMenuItemImage({
+            restaurantId: String(restaurant._id),
             senderPhone: normalizeGhanaPhone(webhook.from),
             senderRole: sender.role,
-            action: "TOOL_CALL",
-            toolName: "set_menu_item_image",
-            arguments: { imageUrl: cloudinaryUrl },
-            data: { imageUrl: cloudinaryUrl },
-            status: "pending",
-            summary: "Set menu item image",
-            confirmationMessage: "Set menu item image",
-            expiresAt: new Date(Date.now() + 10 * 60 * 1000)
+            imageUrl: cloudinaryUrl
           });
 
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
             webhook.from,
-            "Got your image! 📸 Which menu item is this for? Reply with the item name.",
+            workflowResult.message,
             { action: "image_received", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
           );
-        } catch (uploadError) {
-          // Cloudinary SDK throws plain objects, not Error instances — serialize properly
-          const errMessage = uploadError instanceof Error
-            ? uploadError.message
-            : typeof uploadError === "object" && uploadError !== null
-              ? JSON.stringify(uploadError)
-              : String(uploadError);
+        } catch (imageProcessingError) {
+          const errorMessage = getSafeErrorMessage(
+            imageProcessingError,
+            "Image decryption or Cloudinary upload failed"
+          );
 
-          console.error("Image upload to Cloudinary failed", {
+          console.error("Owner image processing failed", {
             restaurantId: String(restaurant._id),
-            error: errMessage,
-            mediaUrl: webhook.mediaUrl?.slice(0, 120)
+            messageId: webhook.messageId,
+            error: errorMessage
           });
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
             webhook.from,
-            "Sorry, I had trouble uploading your image. Please try again.",
+            "Sorry, I couldn't process that image. Please send it again.",
             { action: "image_upload_failed", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
           );
+
+          throw new Error(`Owner image processing failed: ${errorMessage}`);
         }
 
         webhookEvent.status = "processed";
@@ -566,15 +570,19 @@ const processNormalizedWebhook = async (
         typeof (agentResponse.data as Record<string, unknown>).imageUrl === "string"
           ? (agentResponse.data as Record<string, unknown>).imageUrl as string
           : undefined;
+      let replyMessage = agentResponse.message;
 
       if (responseImageUrl && sender.role === "customer") {
-        await sendImageMessage(
+        const imageSent = await sendCustomerMenuItemImage(
           restaurant.wasenderSessionId,
           webhook.from,
           responseImageUrl,
-          undefined,
-          { apiKey: restaurant.wasenderApiToken }
+          restaurant.wasenderApiToken
         );
+
+        if (!imageSent) {
+          replyMessage = buildCustomerImageFallbackMessage(agentResponse.message, responseImageUrl);
+        }
       }
 
       if (sender.role === "customer") {
@@ -593,7 +601,7 @@ const processNormalizedWebhook = async (
       await sendAgentReplyDirectly(
         restaurant.wasenderSessionId,
         webhook.from,
-        agentResponse.message,
+        replyMessage,
         {
           action: "send_restaurant_agent_reply",
           restaurantId: String(restaurant._id),
@@ -603,7 +611,7 @@ const processNormalizedWebhook = async (
           ...conversationMetadata,
           responsePurpose:
             agentResponse.sender?.role === "customer"
-              ? latestResponsePurpose(agentResponse.message)
+              ? latestResponsePurpose(replyMessage)
               : "owner_agent_reply"
         },
         restaurant.wasenderApiToken
@@ -635,10 +643,13 @@ const processNormalizedWebhook = async (
       return;
     }
 
-    console.error("Wasender webhook processing failed", error);
-
     const failureReason = getErrorMessage(error);
     const failureDetails = getErrorDetails(error);
+
+    console.error("Wasender webhook processing failed", {
+      eventId,
+      failureReason
+    });
 
     await WebhookEvent.updateOne(
       {

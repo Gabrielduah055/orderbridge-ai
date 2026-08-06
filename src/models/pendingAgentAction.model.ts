@@ -14,6 +14,7 @@ export const ownerAgentActions = [
   "MARK_ITEM_UNAVAILABLE",
   "MARK_ITEM_AVAILABLE",
   "OWNER_ORDER_SELECTION",
+  "MENU_ITEM_IMAGE_CONTEXT",
   "TOOL_CALL"
 ] as const;
 

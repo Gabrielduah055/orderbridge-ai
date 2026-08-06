@@ -111,7 +111,21 @@ const getImportantData = (
 ): AgentOrchestratorResult["data"] => {
   const nextData = { ...(currentData ?? {}) };
 
-  if (result.data && typeof result.data === "object") {
+  if (Array.isArray(result.data) && result.data.length === 1) {
+    const onlyItem = result.data[0];
+
+    if (onlyItem && typeof onlyItem === "object") {
+      const item = onlyItem as Record<string, unknown>;
+
+      if (typeof item.imageUrl === "string" && item.imageUrl.trim()) {
+        nextData.imageUrl = item.imageUrl;
+      }
+
+      if (typeof item.name === "string" && item.name.trim()) {
+        nextData.imageItemName = item.name;
+      }
+    }
+  } else if (result.data && typeof result.data === "object") {
     const data = result.data as Record<string, unknown>;
 
     if (data.order) {
@@ -124,7 +138,9 @@ const getImportantData = (
       "notifyCustomer",
       "receiptRequired",
       "orderSubmitted",
-      "idempotent"
+      "idempotent",
+      "imageUrl",
+      "imageItemName"
     ]) {
       if (key in data) {
         nextData[key] = data[key];

@@ -21,6 +21,10 @@ import {
   resolveQuotedOwnerOrderDecision
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
+import {
+  attachPendingImageToNamedMenuItem,
+  rememberMenuItemImageRequest
+} from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
 import { handleOrderFeedbackCustomerResponse } from "./orderFeedback.service";
 import type {
@@ -39,6 +43,7 @@ interface AgentMenuItemView {
   name?: unknown;
   price?: unknown;
   available?: unknown;
+  imageUrl?: unknown;
 }
 
 interface AgentMenuCategoryView {
@@ -55,6 +60,26 @@ const isMenuRequest = (message: string): boolean => {
       /\b(show|list|see|view|display|send|what|today|available|have)\b/.test(normalized)) ||
     /\b(serve|serving|food|foods|dish|dishes)\b/.test(normalized)
   );
+};
+
+export const parseSpecificMenuItemViewRequest = (message: string): string | null => {
+  const normalized = normalizeText(message);
+  const patterns = [
+    /^(?:please\s+)?(?:show|send)(?:\s+me)?(?:\s+(?:a|the))?(?:\s+(?:photo|image|picture))?(?:\s+of)?\s+(.+)$/i,
+    /^(?:please\s+)?(?:view|see)(?:\s+(?:a|the))?(?:\s+(?:photo|image|picture))?(?:\s+of)?\s+(.+)$/i,
+    /^(?:photo|image|picture)\s+(?:of|for)\s+(.+)$/i,
+    /^what\s+does\s+(.+?)\s+look\s+like\??$/i
+  ];
+
+  for (const pattern of patterns) {
+    const candidate = normalized.match(pattern)?.[1]?.trim().replace(/[.?!]+$/, "");
+
+    if (candidate && !/^(?:the\s+)?menus?$/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 };
 
 const normalizeDecisionText = (message: string): string => {
@@ -230,6 +255,59 @@ const handleLocalMenuRequest = async (
     source: "hermes_tools",
     sender
   };
+};
+
+const handleSpecificMenuItemViewRequest = async (
+  input: RestaurantAgentMessageInput,
+  sender: ReturnType<typeof resolveSenderIdentity>,
+  itemName: string
+): Promise<RestaurantAgentResponse> => {
+  const restaurantId = String(input.restaurant._id);
+  const result = await executeAgentTool(
+    "search_menu_items",
+    {
+      query: itemName,
+      availableOnly: true
+    },
+    {
+      restaurantId,
+      restaurant: input.restaurant,
+      sender,
+      originalMessage: input.message
+    }
+  );
+  const matches = Array.isArray(result.data) ? (result.data as AgentMenuItemView[]) : [];
+  const onlyItem = matches.length === 1 ? matches[0] : undefined;
+  const resolvedName = typeof onlyItem?.name === "string" ? onlyItem.name : itemName;
+  const imageUrl = typeof onlyItem?.imageUrl === "string" ? onlyItem.imageUrl : undefined;
+  const message = !result.success
+    ? result.message
+    : matches.length === 0
+      ? `I couldn't find ${itemName} on the current menu.`
+      : matches.length > 1
+        ? `I found several matching meals: ${matches
+            .map((item) => item.name)
+            .filter((name): name is string => typeof name === "string")
+            .join(", ")}. Which one would you like to view?`
+        : imageUrl
+          ? `Here is ${resolvedName}.`
+          : `I found ${resolvedName}, but it doesn't have a saved image yet.`;
+  const response: RestaurantAgentResponse = {
+    success: result.success,
+    message,
+    data: imageUrl ? { imageUrl, imageItemName: resolvedName } : undefined,
+    source: "hermes_tools",
+    sender
+  };
+
+  await saveAssistantResponse(restaurantId, sender, response, {
+    source: "deterministic_menu_item_image_view",
+    toolName: "search_menu_items",
+    success: result.success,
+    matchCount: matches.length
+  });
+
+  return response;
 };
 
 const handleLocalCustomerRequest = async (
@@ -417,6 +495,25 @@ export const handleRestaurantAgentMessage = async (
     });
   }
 
+  if (sender.role === "customer") {
+    const specificItemName = parseSpecificMenuItemViewRequest(message);
+
+    if (specificItemName) {
+      if (deferUserMessageSave) {
+        await saveAgentConversationMessage({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          direction: "user",
+          content: message,
+          metadata: { source: "deterministic_menu_item_image_view" }
+        });
+      }
+
+      return handleSpecificMenuItemViewRequest(input, sender, specificItemName);
+    }
+  }
+
   if (
     isMenuRequest(message) &&
     ((sender.role === "customer" && !customerOpenRouterEnabled) || aiProviderName !== "openrouter")
@@ -518,6 +615,141 @@ export const handleRestaurantAgentMessage = async (
     originalMessage: message,
     quotedMessageId: input.quotedMessageId
   };
+
+  if (sender.role === "owner" || sender.role === "manager") {
+    const pendingImageConfirmation = await PendingAgentAction.findOne({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      action: "TOOL_CALL",
+      toolName: "set_menu_item_image",
+      status: "pending",
+      expiresAt: { $gt: new Date() }
+    }).sort({ createdAt: -1 });
+
+    if (pendingImageConfirmation && isPendingActionConfirmationMessage(message)) {
+      const result = await executeConfirmedPendingToolAction(
+        String(pendingImageConfirmation._id),
+        executionContext
+      );
+
+      await saveAssistantResponse(
+        restaurantId,
+        sender,
+        {
+          success: result.success,
+          message: result.message,
+          data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          sender
+        },
+        {
+          source: "deterministic_menu_item_image_confirmation",
+          success: result.success,
+          code: result.code
+        }
+      );
+
+      return {
+        success: result.success,
+        message: result.message,
+        data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        sender
+      };
+    }
+
+    if (pendingImageConfirmation && isPendingActionCancellationMessage(message)) {
+      const result = await cancelPendingToolAction(executionContext);
+
+      await saveAssistantResponse(
+        restaurantId,
+        sender,
+        {
+          success: result.success,
+          message: result.message,
+          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          sender
+        },
+        {
+          source: "deterministic_menu_item_image_cancellation",
+          success: result.success,
+          code: result.code
+        }
+      );
+
+      return {
+        success: result.success,
+        message: result.message,
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        sender
+      };
+    }
+
+    const pendingImageItemResult = await attachPendingImageToNamedMenuItem({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      message
+    });
+
+    if (pendingImageItemResult.handled) {
+      await saveAssistantResponse(
+        restaurantId,
+        sender,
+        {
+          success: pendingImageItemResult.success,
+          message: pendingImageItemResult.message,
+          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          sender
+        },
+        {
+          source: "deterministic_menu_item_image_item_selection",
+          success: pendingImageItemResult.success,
+          itemName: pendingImageItemResult.itemName
+        }
+      );
+
+      return {
+        success: pendingImageItemResult.success,
+        message: pendingImageItemResult.message,
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        sender
+      };
+    }
+
+    const imageRequestResult = await rememberMenuItemImageRequest({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      message
+    });
+
+    if (imageRequestResult.handled) {
+      await saveAssistantResponse(
+        restaurantId,
+        sender,
+        {
+          success: imageRequestResult.success,
+          message: imageRequestResult.message,
+          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          sender
+        },
+        {
+          source: "deterministic_menu_item_image_context",
+          success: imageRequestResult.success,
+          itemName: imageRequestResult.itemName
+        }
+      );
+
+      return {
+        success: imageRequestResult.success,
+        message: imageRequestResult.message,
+        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        sender
+      };
+    }
+  }
+
   const ownerOrderDecision =
     sender.role === "owner" || sender.role === "manager"
       ? parseOwnerOrderDecision(message)

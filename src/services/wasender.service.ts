@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { getSafeErrorMessage } from "../utils/error.util";
 
 export type WasenderMessageType = "text" | "image" | "document" | "unknown";
 
@@ -13,6 +14,7 @@ export interface NormalizedWasenderWebhook {
   quotedMessageId?: string;
   receiver?: string;
   fromMe?: boolean;
+  rawMessage: Record<string, unknown>;
   rawPayload: Record<string, unknown>;
 }
 
@@ -37,7 +39,7 @@ const getWasenderConfig = (
     configuredApiUrl && !configuredApiUrl.includes("/api/webhooks/wasender")
       ? configuredApiUrl
       : defaultWasenderApiUrl;
-  const apiKey = options.apiKey?.trim() || process.env.WASENDER_API_KEY;
+  const apiKey = options.apiKey?.trim() || process.env.WASENDER_API_KEY?.trim();
 
   if (configuredApiUrl?.includes("/api/webhooks/wasender")) {
     console.warn("Ignoring invalid WASENDER_API_URL because it points to the inbound webhook", {
@@ -256,9 +258,16 @@ const postToWasender = async (
       (data as { success?: unknown }).success === false;
 
     if (!response.ok || explicitFailure) {
+      const providerError = getSafeErrorMessage(
+        data,
+        explicitFailure
+          ? "Wasender API returned success=false"
+          : `Wasender API request failed with status ${response.status}`
+      );
+
       console.error("Wasender API send failed", {
         status: response.status,
-        data,
+        error: providerError,
         to: body.to
       });
 
@@ -266,9 +275,7 @@ const postToWasender = async (
         success: false,
         status: response.status,
         data,
-        error: explicitFailure
-          ? "Wasender API returned success=false"
-          : `Wasender API request failed with status ${response.status}`
+        error: providerError
       };
     }
 
@@ -287,9 +294,105 @@ const postToWasender = async (
 
     return {
       success: false,
-      error: error instanceof Error ? error.message : "Unknown Wasender API error"
+      error: getSafeErrorMessage(error, "Wasender API request failed")
     };
   }
+};
+
+const normalizeWasenderPath = (apiUrl: string, path: string): string => {
+  return apiUrl.endsWith("/api") && path.startsWith("/api/")
+    ? path.replace(/^\/api/, "")
+    : path;
+};
+
+const isHttpUrl = (value: string): boolean => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Sends the complete raw WhatsApp message object to WaSender so its media key,
+ * encrypted URL, hashes, and message ID stay together for server-side decryption.
+ */
+export const decryptWasenderMedia = async (
+  rawMessage: Record<string, unknown>,
+  options: WasenderSendOptions = {}
+): Promise<string> => {
+  const config = getWasenderConfig(options);
+
+  if (!config) {
+    throw new Error(
+      "WaSender media decryption is not configured. Set a restaurant WaSender API token or WASENDER_API_KEY."
+    );
+  }
+
+  const path = normalizeWasenderPath(config.apiUrl, "/api/decrypt-media");
+  const messageId = firstString(rawMessage, ["key.id", "id", "messageId"]);
+
+  console.info("Wasender media decryption attempt", {
+    messageId,
+    usesRestaurantApiToken: Boolean(options.apiKey?.trim())
+  });
+
+  let response: Response;
+
+  try {
+    response = await fetch(`${config.apiUrl}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        data: {
+          messages: rawMessage
+        }
+      })
+    });
+  } catch (error) {
+    throw new Error(
+      `WaSender media decryption request failed: ${getSafeErrorMessage(
+        error,
+        "network request failed"
+      )}`
+    );
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  const data = contentType.includes("application/json")
+    ? ((await response.json()) as unknown)
+    : await response.text();
+  const explicitFailure =
+    data &&
+    typeof data === "object" &&
+    "success" in data &&
+    (data as { success?: unknown }).success === false;
+
+  if (!response.ok || explicitFailure) {
+    throw new Error(
+      `WaSender media decryption failed with status ${response.status}: ${getSafeErrorMessage(
+        data,
+        "provider rejected the decryption request"
+      )}`
+    );
+  }
+
+  const publicUrl = firstString(data, ["publicUrl", "data.publicUrl"]);
+
+  if (!publicUrl || !isHttpUrl(publicUrl)) {
+    throw new Error("WaSender media decryption succeeded but returned no valid publicUrl.");
+  }
+
+  console.info("Wasender media decryption completed", {
+    messageId,
+    status: response.status
+  });
+
+  return publicUrl;
 };
 
 export const sendTextMessage = async (
@@ -448,6 +551,10 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     "data.messages.message.extendedTextMessage.contextInfo.stanzaId"
   ]);
   const fromMe = firstBoolean(messagePayload, ["key.fromMe", "fromMe"]);
+  const rawMessage =
+    messagePayload && typeof messagePayload === "object"
+      ? (messagePayload as Record<string, unknown>)
+      : rawPayload;
 
   return {
     event,
@@ -460,6 +567,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     quotedMessageId,
     receiver: receiver || undefined,
     fromMe,
+    rawMessage,
     rawPayload
   };
 };
