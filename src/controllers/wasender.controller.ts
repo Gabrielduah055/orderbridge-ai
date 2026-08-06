@@ -437,6 +437,17 @@ const processNormalizedWebhook = async (
       if (webhook.messageType === "image" && sender.role !== "customer") {
         const mediaUrl = webhook.mediaUrl;
 
+        // Log full image message fields so we can inspect the encryption keys
+        const rawImageMessage = (webhook.rawPayload as Record<string, unknown>);
+        console.info("[image-upload] raw image webhook keys", {
+          mediaUrl: mediaUrl?.slice(0, 100),
+          messageId: webhook.messageId,
+          rawTopLevelKeys: Object.keys(rawImageMessage),
+          imageMessage: JSON.stringify(
+            (rawImageMessage?.data as Record<string, unknown>)?.messages ?? rawImageMessage?.message ?? rawImageMessage
+          ).slice(0, 600)
+        });
+
         if (!mediaUrl || !isCloudinaryConfigured()) {
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
