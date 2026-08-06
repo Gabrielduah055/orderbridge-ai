@@ -3,6 +3,7 @@ import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import type { ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { isToolAllowedForRole, type ToolName } from "./tool.permissions";
 import { toolRegistry } from "./tool.registry";
+import { getSafeErrorMessage } from "../utils/error.util";
 
 const isToolName = (toolName: string): toolName is ToolName => {
   return toolName in toolRegistry;
@@ -77,7 +78,7 @@ export const executeAgentTool = async (
       restaurantId: context.restaurantId,
       senderRole: context.sender.role,
       toolName,
-      error: error instanceof Error ? error.message : "Unknown error"
+      error: getSafeErrorMessage(error, "Agent tool execution failed without an error message")
     });
 
     return {

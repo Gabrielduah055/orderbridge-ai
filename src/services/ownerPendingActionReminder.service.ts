@@ -101,6 +101,7 @@ export const findEligibleOwnerPendingActions = async (
   return PendingAgentAction.find({
     restaurantId,
     status: "pending",
+    action: { $ne: "MENU_ITEM_IMAGE_CONTEXT" },
     expiresAt: { $gt: now },
     updatedAt: { $lte: cutoff }
   }).sort({ updatedAt: 1, createdAt: 1 });
@@ -220,6 +221,7 @@ const isActionStillEligible = (
 
   return (
     action.status === "pending" &&
+    action.action !== "MENU_ITEM_IMAGE_CONTEXT" &&
     action.expiresAt > now &&
     getActionVersion(action) === expectedVersion &&
     getActionLastChangedAt(action) <= cutoff
