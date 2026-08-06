@@ -54,28 +54,53 @@ export const uploadImageFromUrl = async (
 ): Promise<string> => {
   ensureConfigured();
 
-  // Step 1 — download the image ourselves with auth if needed
-  const headers: Record<string, string> = {};
+  // Step 1 — download the image ourselves.
+  // Try with auth first (WaSender API key), then fall back to no-auth
+  // in case the URL is a pre-signed CDN link that doesn't need a Bearer token.
+  let imageBuffer: Buffer | null = null;
+  let contentType = "image/jpeg";
 
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
+  const attemptFetch = async (withAuth: boolean): Promise<Response> => {
+    const headers: Record<string, string> = {};
+    if (withAuth && apiKey) {
+      headers.Authorization = `Bearer ${apiKey}`;
+    }
+    return fetch(remoteUrl, { headers });
+  };
+
+  for (const withAuth of [true, false]) {
+    const fetchResponse = await attemptFetch(withAuth);
+
+    console.info("[cloudinary] media fetch attempt", {
+      withAuth,
+      status: fetchResponse.status,
+      contentType: fetchResponse.headers.get("content-type"),
+      url: remoteUrl.slice(0, 80)
+    });
+
+    if (fetchResponse.ok) {
+      contentType = fetchResponse.headers.get("content-type") ?? "image/jpeg";
+      const arrayBuffer = await fetchResponse.arrayBuffer();
+      imageBuffer = Buffer.from(arrayBuffer);
+      break;
+    }
+
+    // If auth attempt failed with 401/403, the retry without auth may succeed
+    if (fetchResponse.status !== 401 && fetchResponse.status !== 403) {
+      throw new Error(
+        `Failed to download media from WaSender: ${fetchResponse.status} ${fetchResponse.statusText}`
+      );
+    }
   }
 
-  const fetchResponse = await fetch(remoteUrl, { headers });
-
-  if (!fetchResponse.ok) {
-    throw new Error(
-      `Failed to download media from WaSender (${fetchResponse.status} ${fetchResponse.statusText}). ` +
-      `URL: ${remoteUrl}`
-    );
+  if (!imageBuffer) {
+    throw new Error(`Could not download media from WaSender — both auth and no-auth attempts failed. URL: ${remoteUrl.slice(0, 120)}`);
   }
 
-  const contentType = fetchResponse.headers.get("content-type") ?? "image/jpeg";
-  const arrayBuffer = await fetchResponse.arrayBuffer();
-  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  const base64 = imageBuffer.toString("base64");
   const dataUri = `data:${contentType};base64,${base64}`;
 
-  // Step 2 — upload the buffer to Cloudinary (no outbound URL fetch needed)
+  // Step 2 — upload the buffer to Cloudinary
   const result = await cloudinary.uploader.upload(dataUri, {
     folder,
     resource_type: "image",
