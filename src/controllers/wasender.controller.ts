@@ -24,7 +24,10 @@ import {
   isCloudinaryConfigured,
   uploadDecryptedImageFromUrl
 } from "../services/cloudinary.service";
-import type { RestaurantAgentResponse } from "../types/agent.types";
+import type {
+  MenuItemImageDelivery,
+  RestaurantAgentResponse
+} from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
@@ -172,26 +175,27 @@ type ImageMessageSender = (
   options?: { apiKey?: string }
 ) => Promise<WasenderSendResult>;
 
-export const sendCustomerMenuItemImage = async (
+export const sendMenuItemImage = async (
   sessionId: string,
   to: string,
   imageUrl: string,
+  caption: string,
   apiKey?: string,
   imageSender: ImageMessageSender = sendImageMessage
 ): Promise<boolean> => {
   try {
-    const result = await imageSender(sessionId, to, imageUrl, undefined, { apiKey });
+    const result = await imageSender(sessionId, to, imageUrl, caption, { apiKey });
 
     if (result.success) {
       return true;
     }
 
-    console.warn("Customer menu item image send failed", {
+    console.warn("Menu item image send failed", {
       status: result.status,
       error: getSafeErrorMessage(result.error, "WaSender rejected the image message")
     });
   } catch (error) {
-    console.warn("Customer menu item image send failed", {
+    console.warn("Menu item image send failed", {
       error: getSafeErrorMessage(error, "WaSender image request failed")
     });
   }
@@ -199,11 +203,73 @@ export const sendCustomerMenuItemImage = async (
   return false;
 };
 
+export const sendCustomerMenuItemImage = async (
+  sessionId: string,
+  to: string,
+  imageUrl: string,
+  apiKey?: string,
+  imageSender: ImageMessageSender = sendImageMessage
+): Promise<boolean> => {
+  return sendMenuItemImage(sessionId, to, imageUrl, "", apiKey, imageSender);
+};
+
+export const getTrustedMenuItemImageDelivery = (
+  data: RestaurantAgentResponse["data"]
+): MenuItemImageDelivery | undefined => {
+  const candidate = data?.menuItemImage;
+
+  if (!candidate || typeof candidate !== "object") {
+    return undefined;
+  }
+
+  const delivery = candidate;
+  const source = delivery.source;
+
+  if (
+    typeof delivery.imageUrl !== "string" ||
+    !delivery.imageUrl.trim() ||
+    typeof delivery.caption !== "string" ||
+    !delivery.caption.trim() ||
+    (source !== "menu_item_record" && source !== "search_menu_items_tool")
+  ) {
+    return undefined;
+  }
+
+  return {
+    imageUrl: delivery.imageUrl,
+    caption: delivery.caption,
+    source
+  };
+};
+
+export const buildMenuItemImageReplyMessage = (
+  agentMessage: string,
+  caption: string
+): string => {
+  if (/https?:\/\/\S+/i.test(agentMessage)) {
+    return `Here is ${caption}.`;
+  }
+
+  const withoutUrls = agentMessage
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/ {2,}/g, " ")
+    .trim();
+
+  return withoutUrls || `Here is ${caption}.`;
+};
+
+export const buildMenuItemImageFallbackMessage = (
+  agentMessage: string
+): string => {
+  return `${agentMessage}\n\nI couldn't send the image right now. Please try again.`;
+};
+
 export const buildCustomerImageFallbackMessage = (
   agentMessage: string,
-  imageUrl: string
+  _imageUrl: string
 ): string => {
-  return `${agentMessage}\n\nI couldn't send the image directly. You can view it here: ${imageUrl}`;
+  return buildMenuItemImageFallbackMessage(agentMessage);
 };
 
 const latestResponsePurpose = (message: string): string => {
@@ -562,26 +628,26 @@ const processNormalizedWebhook = async (
         inboundEventId: eventId
       });
 
-      // ── Send image to customer if the response includes one ───────────────
-      // Only send when a specific item image is available; never on full menu.
-      const responseImageUrl = typeof agentResponse.data === "object" &&
-        agentResponse.data !== null &&
-        "imageUrl" in agentResponse.data &&
-        typeof (agentResponse.data as Record<string, unknown>).imageUrl === "string"
-          ? (agentResponse.data as Record<string, unknown>).imageUrl as string
-          : undefined;
+      // ── Send a trusted menu-item image when the response includes one ─────
+      // Send only explicitly trusted menu-item image payloads, for every authorized role.
+      const menuItemImage = getTrustedMenuItemImageDelivery(agentResponse.data);
       let replyMessage = agentResponse.message;
 
-      if (responseImageUrl && sender.role === "customer") {
-        const imageSent = await sendCustomerMenuItemImage(
+      if (menuItemImage) {
+        replyMessage = buildMenuItemImageReplyMessage(
+          agentResponse.message,
+          menuItemImage.caption
+        );
+        const imageSent = await sendMenuItemImage(
           restaurant.wasenderSessionId,
           webhook.from,
-          responseImageUrl,
+          menuItemImage.imageUrl,
+          menuItemImage.caption,
           restaurant.wasenderApiToken
         );
 
         if (!imageSent) {
-          replyMessage = buildCustomerImageFallbackMessage(agentResponse.message, responseImageUrl);
+          replyMessage = buildMenuItemImageFallbackMessage(replyMessage);
         }
       }
 

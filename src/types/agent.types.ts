@@ -59,6 +59,12 @@ export interface RestaurantAgentMessageInput {
   inboundEventId?: string;
 }
 
+export interface MenuItemImageDelivery {
+  imageUrl: string;
+  caption: string;
+  source: "menu_item_record" | "search_menu_items_tool";
+}
+
 export interface RestaurantAgentResponse {
   success: boolean;
   message: string;
@@ -69,6 +75,7 @@ export interface RestaurantAgentResponse {
     notifyCustomer?: boolean;
     receiptRequired?: boolean;
     pendingActionId?: string;
+    menuItemImage?: MenuItemImageDelivery;
     [key: string]: unknown;
   };
   source?: "openrouter_agent" | "hermes_agent" | "hermes_tools" | "legacy_owner" | "legacy_customer";

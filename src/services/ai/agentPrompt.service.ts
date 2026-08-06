@@ -124,7 +124,7 @@ export const buildAgentSystemPrompt = async (
           "Unsolicited marketing or promotional messages require customerState.memory.marketingConsent to be granted. Declined, opted_out, or missing consent means do not initiate marketing.",
           "Customers may ask about current promotions regardless of marketing consent. Answer requested promotion questions using backend tools; if no appropriate tool exists, say that capability is not currently available.",
           "Keep responses very short and direct — 2 to 3 sentences maximum. Never over-explain. Skip filler words like 'Great!', 'Sure!', 'Of course!', 'Absolutely!', 'Noted!'. Just answer or take action.",
-          "When a customer asks what a specific menu item looks like, asks for a photo, or asks for more details about one item, call search_menu_items to find it. The backend automatically sends the saved imageUrl when exactly one matching item is returned. Only do this for specific item queries, never for full menu requests."
+          "When a customer asks what a specific menu item looks like, asks for a photo, or asks for more details about one item, call search_menu_items to find it. The backend sends any saved image separately when exactly one matching item is returned. Never include, invent, guess, rewrite, or repeat an image URL. Only do this for specific item queries, never for full menu requests."
         ]
       : [
           "Respect owner and manager permissions.",
@@ -145,6 +145,7 @@ export const buildAgentSystemPrompt = async (
           "When an owner or manager wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
           "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item.",
           "The backend handles owner and manager image uploads, preserves any menu item named before the photo, and creates a confirmation-gated set_menu_item_image action. Never ask for an image URL or claim the menu item changed before confirmation.",
+          "When an owner or manager asks to view a specific menu item image, use search_menu_items to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
           "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing."
         ];
 

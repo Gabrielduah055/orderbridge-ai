@@ -83,6 +83,10 @@ export const parseSpecificMenuItemViewRequest = (message: string): string | null
   return null;
 };
 
+const hasExplicitImageViewCue = (message: string): boolean => {
+  return /\b(photo|image|picture)\b|\bwhat\s+does\b.+\blook\s+like\b/i.test(message);
+};
+
 const normalizeDecisionText = (message: string): string => {
   return message
     .toLowerCase()
@@ -268,7 +272,7 @@ const handleSpecificMenuItemViewRequest = async (
     "search_menu_items",
     {
       query: itemName,
-      availableOnly: true
+      availableOnly: sender.role === "customer"
     },
     {
       restaurantId,
@@ -296,7 +300,15 @@ const handleSpecificMenuItemViewRequest = async (
   const response: RestaurantAgentResponse = {
     success: result.success,
     message,
-    data: imageUrl ? { imageUrl, imageItemName: resolvedName } : undefined,
+    data: imageUrl
+      ? {
+          menuItemImage: {
+            imageUrl,
+            caption: resolvedName,
+            source: "menu_item_record"
+          }
+        }
+      : undefined,
     source: "hermes_tools",
     sender
   };
@@ -496,23 +508,25 @@ export const handleRestaurantAgentMessage = async (
     });
   }
 
-  if (sender.role === "customer") {
-    const specificItemName = parseSpecificMenuItemViewRequest(message);
+  const parsedSpecificItemName = parseSpecificMenuItemViewRequest(message);
+  const specificItemName =
+    sender.role === "customer" || hasExplicitImageViewCue(message)
+      ? parsedSpecificItemName
+      : null;
 
-    if (specificItemName) {
-      if (deferUserMessageSave) {
-        await saveAgentConversationMessage({
-          restaurantId,
-          senderPhone: sender.normalizedPhone,
-          senderRole: sender.role,
-          direction: "user",
-          content: message,
-          metadata: { source: "deterministic_menu_item_image_view" }
-        });
-      }
-
-      return handleSpecificMenuItemViewRequest(input, sender, specificItemName);
+  if (specificItemName) {
+    if (deferUserMessageSave) {
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: { source: "deterministic_menu_item_image_view" }
+      });
     }
+
+    return handleSpecificMenuItemViewRequest(input, sender, specificItemName);
   }
 
   if (

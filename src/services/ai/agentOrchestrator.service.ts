@@ -100,14 +100,44 @@ const buildToolResultForModel = (toolName: string, result: ToolResult) => ({
   tool: toolName,
   message: result.message,
   code: result.code,
-  data: result.data,
+  data: removeImageUrlsForModel(result.data),
   requiresConfirmation: result.requiresConfirmation,
   pendingActionId: result.pendingActionId
 });
 
+const removeImageUrlsForModel = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map(removeImageUrlsForModel);
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const source = value as Record<string, unknown>;
+  const sanitized: Record<string, unknown> = {};
+  let hasImage = false;
+
+  for (const [key, entryValue] of Object.entries(source)) {
+    if (key === "imageUrl") {
+      hasImage = typeof entryValue === "string" && Boolean(entryValue.trim());
+      continue;
+    }
+
+    sanitized[key] = removeImageUrlsForModel(entryValue);
+  }
+
+  if (hasImage) {
+    sanitized.hasImage = true;
+  }
+
+  return sanitized;
+};
+
 const getImportantData = (
   currentData: AgentOrchestratorResult["data"],
-  result: ToolResult
+  result: ToolResult,
+  toolName: string
 ): AgentOrchestratorResult["data"] => {
   const nextData = { ...(currentData ?? {}) };
 
@@ -117,12 +147,18 @@ const getImportantData = (
     if (onlyItem && typeof onlyItem === "object") {
       const item = onlyItem as Record<string, unknown>;
 
-      if (typeof item.imageUrl === "string" && item.imageUrl.trim()) {
-        nextData.imageUrl = item.imageUrl;
-      }
-
-      if (typeof item.name === "string" && item.name.trim()) {
-        nextData.imageItemName = item.name;
+      if (
+        toolName === "search_menu_items" &&
+        typeof item.imageUrl === "string" &&
+        item.imageUrl.trim() &&
+        typeof item.name === "string" &&
+        item.name.trim()
+      ) {
+        nextData.menuItemImage = {
+          imageUrl: item.imageUrl,
+          caption: item.name,
+          source: "search_menu_items_tool"
+        };
       }
     }
   } else if (result.data && typeof result.data === "object") {
@@ -138,9 +174,7 @@ const getImportantData = (
       "notifyCustomer",
       "receiptRequired",
       "orderSubmitted",
-      "idempotent",
-      "imageUrl",
-      "imageItemName"
+      "idempotent"
     ]) {
       if (key in data) {
         nextData[key] = data[key];
@@ -153,6 +187,39 @@ const getImportantData = (
   }
 
   return Object.keys(nextData).length > 0 ? nextData : undefined;
+};
+
+const sanitizeMenuItemImageResponse = (
+  message: string,
+  data: AgentOrchestratorResult["data"]
+): string => {
+  const candidate = data?.menuItemImage;
+
+  if (!candidate || typeof candidate !== "object") {
+    return message;
+  }
+
+  const caption = (candidate as Record<string, unknown>).caption;
+
+  if (/https?:\/\/\S+/i.test(message)) {
+    return typeof caption === "string" && caption.trim()
+      ? `Here is ${caption}.`
+      : "Here is the saved menu-item image.";
+  }
+
+  const withoutUrls = message
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/ {2,}/g, " ")
+    .trim();
+
+  if (withoutUrls) {
+    return withoutUrls;
+  }
+
+  return typeof caption === "string" && caption.trim()
+    ? `Here is ${caption}.`
+    : "Here is the saved menu-item image.";
 };
 
 const mergeUsage = (current: AiUsage | undefined, next: AiUsage | undefined): AiUsage | undefined => {
@@ -271,11 +338,13 @@ export const runAgentOrchestrator = async (
       usage = mergeUsage(usage, response.usage);
 
       if (response.toolCalls.length === 0) {
-        const finalMessage = response.text?.trim();
+        const rawFinalMessage = response.text?.trim();
 
-        if (!finalMessage) {
+        if (!rawFinalMessage) {
           throw new Error("Agent provider returned an empty final response.");
         }
+
+        const finalMessage = sanitizeMenuItemImageResponse(rawFinalMessage, importantData);
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
 
@@ -348,7 +417,7 @@ export const runAgentOrchestrator = async (
           requiresConfirmation: result.requiresConfirmation,
           pendingActionId: result.pendingActionId
         });
-        importantData = getImportantData(importantData, result);
+        importantData = getImportantData(importantData, result, toolName);
 
         await saveMessage({
           restaurantId,
