@@ -491,9 +491,17 @@ const processNormalizedWebhook = async (
             restaurant.wasenderApiToken
           );
         } catch (uploadError) {
+          // Cloudinary SDK throws plain objects, not Error instances — serialize properly
+          const errMessage = uploadError instanceof Error
+            ? uploadError.message
+            : typeof uploadError === "object" && uploadError !== null
+              ? JSON.stringify(uploadError)
+              : String(uploadError);
+
           console.error("Image upload to Cloudinary failed", {
             restaurantId: String(restaurant._id),
-            error: uploadError instanceof Error ? uploadError.message : "Unknown error"
+            error: errMessage,
+            mediaUrl: webhook.mediaUrl?.slice(0, 120)
           });
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
