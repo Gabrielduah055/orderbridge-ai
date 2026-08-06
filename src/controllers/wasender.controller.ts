@@ -454,8 +454,8 @@ const processNormalizedWebhook = async (
         }
 
         try {
-          // Upload image to Cloudinary first to get a permanent URL
-          const cloudinaryUrl = await uploadImageFromUrl(mediaUrl);
+          // Download from WaSender (auth required) then upload to Cloudinary
+          const cloudinaryUrl = await uploadImageFromUrl(mediaUrl, restaurant.wasenderApiToken ?? undefined);
 
           // Store the Cloudinary URL in a pending action so the AI can
           // link it to a menu item once the owner names the item

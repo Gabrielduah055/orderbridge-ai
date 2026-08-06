@@ -36,25 +36,55 @@ export const isCloudinaryConfigured = (): boolean => {
 };
 
 /**
- * Uploads an image from a remote URL (e.g. WaSender media URL) to Cloudinary.
- * Returns the permanent Cloudinary CDN URL.
+ * Uploads an image from a remote URL (e.g. a WaSender media URL) to Cloudinary.
+ *
+ * WaSender media URLs are auth-protected — Cloudinary cannot fetch them directly.
+ * We download the image ourselves first (with an optional Bearer token), then
+ * upload the raw buffer to Cloudinary as a base64 data URI so no external fetch
+ * by Cloudinary is needed.
+ *
+ * @param remoteUrl  The protected media URL to download from
+ * @param apiKey     Optional Bearer token to include when fetching the media
+ * @param folder     Cloudinary folder to upload into (default: "menu-items")
  */
 export const uploadImageFromUrl = async (
   remoteUrl: string,
+  apiKey?: string,
   folder = "menu-items"
 ): Promise<string> => {
   ensureConfigured();
 
-  const result = await cloudinary.uploader.upload(remoteUrl, {
+  // Step 1 — download the image ourselves with auth if needed
+  const headers: Record<string, string> = {};
+
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const fetchResponse = await fetch(remoteUrl, { headers });
+
+  if (!fetchResponse.ok) {
+    throw new Error(
+      `Failed to download media from WaSender (${fetchResponse.status} ${fetchResponse.statusText}). ` +
+      `URL: ${remoteUrl}`
+    );
+  }
+
+  const contentType = fetchResponse.headers.get("content-type") ?? "image/jpeg";
+  const arrayBuffer = await fetchResponse.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString("base64");
+  const dataUri = `data:${contentType};base64,${base64}`;
+
+  // Step 2 — upload the buffer to Cloudinary (no outbound URL fetch needed)
+  const result = await cloudinary.uploader.upload(dataUri, {
     folder,
     resource_type: "image",
-    // Use the URL hash as a stable public_id so the same image isn't uploaded twice
-    use_filename: false,
     unique_filename: true
   });
 
   return result.secure_url;
 };
+
 
 /**
  * Deletes an image from Cloudinary using its CDN URL.
