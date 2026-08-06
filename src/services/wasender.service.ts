@@ -322,6 +322,23 @@ export const sendDocumentMessage = async (
   }, options);
 };
 
+export const sendImageMessage = async (
+  sessionId: string,
+  to: string,
+  imageUrl: string,
+  caption?: string,
+  options: WasenderSendOptions = {}
+): Promise<WasenderSendResult> => {
+  void sessionId;
+
+  return postToWasender("/api/send-message", {
+    to,
+    imageUrl,
+    text: caption
+  }, options);
+};
+
+
 export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWebhook => {
   const rawPayload =
     payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};

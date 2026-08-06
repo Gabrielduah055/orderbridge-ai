@@ -23,6 +23,8 @@ export const toolPermissions = {
   add_menu_items: ["owner"],
   update_menu_price: ["owner"],
   set_item_availability: ["owner", "manager"],
+  set_menu_item_image: ["owner", "manager"],
+  remove_menu_item_image: ["owner", "manager"],
   confirm_order: ["owner", "manager"],
   reject_order: ["owner", "manager"],
   update_order_status: ["owner", "manager"],
