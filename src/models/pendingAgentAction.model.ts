@@ -2,6 +2,7 @@ import { Schema, model, type Document, type Types } from "mongoose";
 
 export const pendingAgentActionStatuses = [
   "pending",
+  "processing",
   "completed",
   "cancelled",
   "expired",
@@ -15,6 +16,7 @@ export const ownerAgentActions = [
   "MARK_ITEM_AVAILABLE",
   "OWNER_ORDER_SELECTION",
   "MENU_ITEM_IMAGE_CONTEXT",
+  "IMAGE_ASSIGNMENT",
   "TOOL_CALL"
 ] as const;
 
@@ -34,6 +36,11 @@ export interface IPendingAgentAction {
   confirmationMessage: string;
   resultMessage?: string;
   errorMessage?: string;
+  imageSecureUrl?: string;
+  imagePublicId?: string;
+  uploadedAt?: Date;
+  selectedMenuItemId?: Types.ObjectId;
+  completedAt?: Date;
   actionVersion: number;
   expiresAt: Date;
 }
@@ -106,6 +113,24 @@ const pendingAgentActionSchema = new Schema<IPendingAgentActionDocument>(
       type: String,
       trim: true
     },
+    imageSecureUrl: {
+      type: String,
+      trim: true
+    },
+    imagePublicId: {
+      type: String,
+      trim: true
+    },
+    uploadedAt: {
+      type: Date
+    },
+    selectedMenuItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuItem"
+    },
+    completedAt: {
+      type: Date
+    },
     actionVersion: {
       type: Number,
       default: 1,
@@ -135,6 +160,14 @@ pendingAgentActionSchema.index({
   expiresAt: 1,
   updatedAt: 1
 });
+pendingAgentActionSchema.index({
+  restaurantId: 1,
+  senderPhone: 1,
+  senderRole: 1,
+  action: 1,
+  status: 1,
+  expiresAt: 1
+});
 
 const versionedActionFields = [
   "senderPhone",
@@ -144,6 +177,10 @@ const versionedActionFields = [
   "arguments",
   "summary",
   "data",
+  "imageSecureUrl",
+  "imagePublicId",
+  "uploadedAt",
+  "selectedMenuItemId",
   "confirmationMessage",
   "expiresAt"
 ];

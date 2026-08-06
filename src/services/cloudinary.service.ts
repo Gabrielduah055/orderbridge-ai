@@ -3,6 +3,101 @@ import { getSafeErrorMessage } from "../utils/error.util";
 
 let configured = false;
 
+export interface TrustedCloudinaryImage {
+  secureUrl: string;
+  publicId: string;
+  uploadedAt: Date;
+}
+
+const getCloudinaryCloudName = (): string => {
+  return process.env.CLOUDINARY_CLOUD_NAME?.trim() ?? "";
+};
+
+const getCloudinaryDeliveryHostname = (): string => {
+  const configuredHostname =
+    process.env.CLOUDINARY_DELIVERY_HOST?.trim() ??
+    process.env.CLOUDINARY_DELIVERY_DOMAIN?.trim();
+
+  if (!configuredHostname) {
+    return "res.cloudinary.com";
+  }
+
+  try {
+    return new URL(
+      configuredHostname.includes("://") ? configuredHostname : `https://${configuredHostname}`
+    ).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+};
+
+const decodeUrlPath = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+export const extractCloudinaryPublicId = (secureUrl: string): string | null => {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(secureUrl);
+  } catch {
+    return null;
+  }
+
+  const uploadMarker = "/upload/";
+  const uploadIndex = parsedUrl.pathname.indexOf(uploadMarker);
+
+  if (uploadIndex === -1) {
+    return null;
+  }
+
+  const pathAfterUpload = parsedUrl.pathname.slice(uploadIndex + uploadMarker.length);
+  const withoutVersion = pathAfterUpload.replace(/^v\d+\//, "");
+  const withoutExtension = withoutVersion.replace(/\.[^/.]+$/, "");
+
+  return decodeUrlPath(withoutExtension);
+};
+
+export const validateTrustedCloudinaryImage = (
+  image: Pick<TrustedCloudinaryImage, "secureUrl" | "publicId">
+): boolean => {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(image.secureUrl);
+  } catch {
+    return false;
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase();
+  const deliveryHostname = getCloudinaryDeliveryHostname();
+  const cloudName = getCloudinaryCloudName();
+
+  if (
+    parsedUrl.protocol !== "https:" ||
+    !deliveryHostname ||
+    hostname === "example.com" ||
+    hostname.endsWith(".example.com") ||
+    hostname !== deliveryHostname ||
+    !image.publicId.trim()
+  ) {
+    return false;
+  }
+
+  if (
+    deliveryHostname === "res.cloudinary.com" &&
+    (!cloudName || !parsedUrl.pathname.startsWith(`/${encodeURIComponent(cloudName)}/`))
+  ) {
+    return false;
+  }
+
+  return extractCloudinaryPublicId(image.secureUrl) === image.publicId;
+};
+
 const ensureConfigured = (): void => {
   if (configured) {
     return;
@@ -53,6 +148,14 @@ export const uploadDecryptedImageFromUrl = async (
   publicUrl: string,
   folder = "menu-items"
 ): Promise<string> => {
+  const result = await uploadTrustedDecryptedImageFromUrl(publicUrl, folder);
+  return result.secureUrl;
+};
+
+export const uploadTrustedDecryptedImageFromUrl = async (
+  publicUrl: string,
+  folder = "menu-items"
+): Promise<TrustedCloudinaryImage> => {
   if (isEncryptedWhatsappMediaUrl(publicUrl)) {
     throw new Error("Refusing to upload an encrypted WhatsApp media URL to Cloudinary.");
   }
@@ -77,11 +180,21 @@ export const uploadDecryptedImageFromUrl = async (
     unique_filename: true
   });
 
-  if (!result.secure_url) {
-    throw new Error("Cloudinary accepted the image but returned no secure URL.");
+  if (!result.secure_url || !result.public_id) {
+    throw new Error("Cloudinary accepted the image but returned incomplete asset metadata.");
   }
 
-  return result.secure_url;
+  const trustedImage: TrustedCloudinaryImage = {
+    secureUrl: result.secure_url,
+    publicId: result.public_id,
+    uploadedAt: new Date()
+  };
+
+  if (!validateTrustedCloudinaryImage(trustedImage)) {
+    throw new Error("Cloudinary returned asset metadata that failed trusted URL validation.");
+  }
+
+  return trustedImage;
 };
 
 // Keep the previous export name for any callers outside this repository. The
@@ -99,16 +212,12 @@ export const deleteImageByUrl = async (imageUrl: string): Promise<void> => {
 
   try {
     ensureConfigured();
+    const publicId = extractCloudinaryPublicId(imageUrl);
 
-    const uploadIndex = imageUrl.indexOf("/upload/");
-
-    if (uploadIndex === -1) {
+    if (!publicId || !validateTrustedCloudinaryImage({ secureUrl: imageUrl, publicId })) {
+      console.warn("Cloudinary delete skipped for an untrusted image URL");
       return;
     }
-
-    const afterUpload = imageUrl.slice(uploadIndex + "/upload/".length);
-    const withoutVersion = afterUpload.replace(/^v\d+\//, "");
-    const publicId = withoutVersion.replace(/\.[^/.]+$/, "");
 
     await cloudinary.uploader.destroy(publicId, { resource_type: "image" });
   } catch (error) {

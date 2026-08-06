@@ -22,7 +22,7 @@ import {
 import { enqueueWasenderMessage } from "../services/wasenderQueue.service";
 import {
   isCloudinaryConfigured,
-  uploadDecryptedImageFromUrl
+  uploadTrustedDecryptedImageFromUrl
 } from "../services/cloudinary.service";
 import type {
   MenuItemImageDelivery,
@@ -554,12 +554,12 @@ const processNormalizedWebhook = async (
           const decryptedPublicUrl = await decryptWasenderMedia(webhook.rawMessage, {
             apiKey: restaurant.wasenderApiToken
           });
-          const cloudinaryUrl = await uploadDecryptedImageFromUrl(decryptedPublicUrl);
+          const trustedImage = await uploadTrustedDecryptedImageFromUrl(decryptedPublicUrl);
           const workflowResult = await prepareUploadedMenuItemImage({
             restaurantId: String(restaurant._id),
             senderPhone: normalizeGhanaPhone(webhook.from),
             senderRole: sender.role,
-            imageUrl: cloudinaryUrl
+            image: trustedImage
           });
 
           await enqueueTextMessageOrThrow(

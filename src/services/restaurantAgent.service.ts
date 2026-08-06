@@ -22,8 +22,7 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
-  attachPendingImageToNamedMenuItem,
-  cancelPendingMenuItemImageConfirmation,
+  handlePendingMenuItemImageReply,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -99,11 +98,13 @@ export const isPendingActionConfirmationMessage = (message: string): boolean => 
   const normalized = normalizeDecisionText(message);
 
   return (
-    /^(yes|yeah|yep|yup|yh|sure|correct|confirm|confirmed)\b/.test(normalized) ||
+    /^(yes|yea|yeah|yep|yup|yh|sure|correct|confirm|confirmed|okay|ok)\b/.test(
+      normalized
+    ) ||
     /^\d+$/.test(normalized) ||
     /^(yes|yeah|ok|okay)\s+\d+$/.test(normalized) ||
     /^(ok|okay|alright)\s+(go ahead|proceed|save|confirm|update|change|do it)\b/.test(normalized) ||
-    /^(go ahead|proceed|save it|do it)\b/.test(normalized) ||
+    /^(go ahead|proceed|save it|do it|add it|use it)\b/.test(normalized) ||
     /^(update|change)\s+(it|that|the item|the price|this)\b/.test(normalized)
   );
 };
@@ -632,108 +633,34 @@ export const handleRestaurantAgentMessage = async (
   };
 
   if (sender.role === "owner" || sender.role === "manager") {
-    const pendingImageConfirmation = await PendingAgentAction.findOne({
-      restaurantId,
-      senderPhone: sender.normalizedPhone,
-      senderRole: sender.role,
-      action: "TOOL_CALL",
-      toolName: "set_menu_item_image",
-      status: "pending",
-      expiresAt: { $gt: new Date() }
-    }).sort({ createdAt: -1 });
-
-    if (pendingImageConfirmation && isPendingActionConfirmationMessage(message)) {
-      const result = await executeConfirmedPendingToolAction(
-        String(pendingImageConfirmation._id),
-        executionContext,
-        "set_menu_item_image"
-      );
-
-      await saveAssistantResponse(
-        restaurantId,
-        sender,
-        {
-          success: result.success,
-          message: result.message,
-          data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
-          sender
-        },
-        {
-          source: "deterministic_menu_item_image_confirmation",
-          success: result.success,
-          code: result.code
-        }
-      );
-
-      return {
-        success: result.success,
-        message: result.message,
-        data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
-        sender
-      };
-    }
-
-    if (pendingImageConfirmation && isPendingActionCancellationMessage(message)) {
-      const result = await cancelPendingMenuItemImageConfirmation({
-        pendingActionId: String(pendingImageConfirmation._id),
-        restaurantId,
-        senderPhone: sender.normalizedPhone,
-        senderRole: sender.role
-      });
-
-      await saveAssistantResponse(
-        restaurantId,
-        sender,
-        {
-          success: result.success,
-          message: result.message,
-          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
-          sender
-        },
-        {
-          source: "deterministic_menu_item_image_cancellation",
-          success: result.success,
-          code: result.code
-        }
-      );
-
-      return {
-        success: result.success,
-        message: result.message,
-        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
-        sender
-      };
-    }
-
-    const pendingImageItemResult = await attachPendingImageToNamedMenuItem({
+    const pendingImageResult = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone: sender.normalizedPhone,
       senderRole: sender.role,
       message
     });
 
-    if (pendingImageItemResult.handled) {
+    if (pendingImageResult.handled) {
       await saveAssistantResponse(
         restaurantId,
         sender,
         {
-          success: pendingImageItemResult.success,
-          message: pendingImageItemResult.message,
+          success: pendingImageResult.success,
+          message: pendingImageResult.message,
           source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
           sender
         },
         {
-          source: "deterministic_menu_item_image_item_selection",
-          success: pendingImageItemResult.success,
-          itemName: pendingImageItemResult.itemName
+          source: "deterministic_menu_item_image_reply",
+          success: pendingImageResult.success,
+          itemName: pendingImageResult.itemName,
+          pendingActionId: pendingImageResult.pendingActionId
         }
       );
 
       return {
-        success: pendingImageItemResult.success,
-        message: pendingImageItemResult.message,
+        success: pendingImageResult.success,
+        message: pendingImageResult.message,
         source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
         sender
       };

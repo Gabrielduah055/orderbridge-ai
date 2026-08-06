@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
+    "audit:menu-images": "node dist/scripts/auditMenuItemImages.js",
     "start": "node dist/server.js",
     "test": "tsc && node --test tests/*.test.js"
   },
