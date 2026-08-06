@@ -421,7 +421,7 @@ export const sendDocumentMessage = async (
   return postToWasender("/api/send-message", {
     to,
     documentUrl: fileUrl,
-    text: caption
+    ...(caption?.trim() ? { text: caption } : {})
   }, options);
 };
 
@@ -434,13 +434,13 @@ export const sendImageMessage = async (
 ): Promise<WasenderSendResult> => {
   void sessionId;
 
+  // Fix: omit `text` entirely when caption is blank — sending text: "" causes WaSender to reject the image message
   return postToWasender("/api/send-message", {
     to,
     imageUrl,
-    text: caption
+    ...(caption?.trim() ? { text: caption } : {})
   }, options);
 };
-
 
 export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWebhook => {
   const rawPayload =

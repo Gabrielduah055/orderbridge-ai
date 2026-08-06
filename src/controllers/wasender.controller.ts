@@ -228,8 +228,6 @@ export const getTrustedMenuItemImageDelivery = (
   if (
     typeof delivery.imageUrl !== "string" ||
     !delivery.imageUrl.trim() ||
-    typeof delivery.caption !== "string" ||
-    !delivery.caption.trim() ||
     (source !== "menu_item_record" && source !== "search_menu_items_tool")
   ) {
     return undefined;
