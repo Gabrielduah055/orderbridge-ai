@@ -18,17 +18,24 @@ const {
   rememberMenuItemImageRequest
 } = require("../dist/services/menuItemImageWorkflow.service");
 const {
-  buildCustomerImageFallbackMessage,
-  sendCustomerMenuItemImage
+  buildMenuItemImageFallbackMessage,
+  buildMenuItemImageReplyMessage,
+  getTrustedMenuItemImageDelivery,
+  sendMenuItemImage
 } = require("../dist/controllers/wasender.controller");
 const {
   runAgentOrchestrator
 } = require("../dist/services/ai/agentOrchestrator.service");
 const { executeAgentTool } = require("../dist/agent-tools/tool.executor");
 const { MenuItem } = require("../dist/models/MenuItem");
+const { MenuCategory } = require("../dist/models/MenuCategory");
+const {
+  AgentConversationMessage
+} = require("../dist/models/agentConversation.model");
 const { PendingAgentAction } = require("../dist/models/pendingAgentAction.model");
 const menuItemService = require("../dist/services/menuItem.service");
 const {
+  handleRestaurantAgentMessage,
   parseSpecificMenuItemViewRequest
 } = require("../dist/services/restaurantAgent.service");
 
@@ -617,7 +624,75 @@ test("menu item image is not updated until the confirmation-gated tool is confir
   }
 });
 
-test("specific customer meal lookup carries its saved image into WaSender delivery data", async () => {
+test("owners and managers resolve image-view requests from the matching MenuItem record", async () => {
+  const originalCategoryFind = MenuCategory.find;
+  const originalMenuItemFind = MenuItem.find;
+  const originalConversationCreate = AgentConversationMessage.create;
+  const menuQueries = [];
+  const categoryId = "64b000000000000000000201";
+  const restaurant = {
+    _id: restaurantId,
+    name: "Test Restaurant",
+    ownerName: "Owner",
+    ownerPhone: "+233500000001",
+    managerPhones: ["+233500000002"],
+    managerContacts: []
+  };
+
+  MenuCategory.find = async () => [{ _id: categoryId, name: "Salads" }];
+  MenuItem.find = (query) => {
+    menuQueries.push(query);
+    return {
+      sort: async () => [
+        {
+          _id: menuItemId,
+          restaurantId,
+          categoryId,
+          name: "Chicken Salad",
+          price: 45,
+          imageUrl: cloudinaryUrl,
+          isAvailable: false,
+          tags: [],
+          allergens: [],
+          isPopular: false,
+          isPromoItem: false
+        }
+      ]
+    };
+  };
+  AgentConversationMessage.create = async (input) => input;
+
+  try {
+    for (const [role, phone] of [
+      ["owner", restaurant.ownerPhone],
+      ["manager", restaurant.managerPhones[0]]
+    ]) {
+      const response = await handleRestaurantAgentMessage({
+        restaurant,
+        senderPhone: phone,
+        message: "Show me the image of Chicken Salad"
+      });
+
+      assert.equal(response.sender.role, role);
+      assert.equal(response.message, "Here is Chicken Salad.");
+      assert.deepEqual(response.data.menuItemImage, {
+        imageUrl: cloudinaryUrl,
+        caption: "Chicken Salad",
+        source: "menu_item_record"
+      });
+    }
+
+    assert.equal(menuQueries.length, 2);
+    assert.ok(menuQueries.every((query) => query.restaurantId === restaurantId));
+    assert.ok(menuQueries.every((query) => !("isAvailable" in query)));
+  } finally {
+    MenuCategory.find = originalCategoryFind;
+    MenuItem.find = originalMenuItemFind;
+    AgentConversationMessage.create = originalConversationCreate;
+  }
+});
+
+test("specific meal lookup keeps the database image out of model-visible tool data", async () => {
   assert.equal(
     parseSpecificMenuItemViewRequest("Show me Chicken Salad"),
     "Chicken Salad"
@@ -625,10 +700,11 @@ test("specific customer meal lookup carries its saved image into WaSender delive
   assert.equal(parseSpecificMenuItemViewRequest("show menu"), null);
 
   let providerCalls = 0;
+  let secondRequest;
   const provider = {
     name: "openrouter",
     model: "test-model",
-    complete: async () => {
+    complete: async (request) => {
       providerCalls += 1;
 
       if (providerCalls === 1) {
@@ -644,7 +720,11 @@ test("specific customer meal lookup carries its saved image into WaSender delive
         };
       }
 
-      return { text: "Here is Chicken Salad.", toolCalls: [] };
+      secondRequest = request;
+      return {
+        text: "Here is Chicken Salad: https://restaurant-assets.example.com/images/chicken_salad.jpg",
+        toolCalls: []
+      };
     }
   };
   const result = await runAgentOrchestrator(
@@ -671,35 +751,97 @@ test("specific customer meal lookup carries its saved image into WaSender delive
     }
   );
 
-  assert.equal(result.data.imageUrl, cloudinaryUrl);
-  assert.equal(result.data.imageItemName, "Chicken Salad");
+  assert.deepEqual(result.data.menuItemImage, {
+    imageUrl: cloudinaryUrl,
+    caption: "Chicken Salad",
+    source: "search_menu_items_tool"
+  });
+  assert.doesNotMatch(result.message, /restaurant-assets\.example\.com/);
+  const modelVisibleMessages = JSON.stringify(secondRequest.messages);
+  assert.doesNotMatch(modelVisibleMessages, /res\.cloudinary\.com/);
+  const modelVisibleToolResult = JSON.parse(
+    secondRequest.messages.find((message) => message.role === "tool").content
+  );
+  assert.equal(modelVisibleToolResult.data[0].hasImage, true);
 });
 
-test("customer image sending checks WaSender success and provides a text fallback", async () => {
-  let capturedOptions;
-  const sent = await sendCustomerMenuItemImage(
-    "session-1",
-    senderPhone,
-    cloudinaryUrl,
-    "restaurant-token",
-    async (_sessionId, _to, _imageUrl, _caption, options) => {
-      capturedOptions = options;
-      return { success: true, status: 200 };
+test("trusted menu-item images are sent for customers owners and managers with the item caption", async () => {
+  const delivery = getTrustedMenuItemImageDelivery({
+    menuItemImage: {
+      imageUrl: cloudinaryUrl,
+      caption: "Chicken Salad",
+      source: "menu_item_record"
     }
-  );
-  assert.equal(sent, true);
-  assert.deepEqual(capturedOptions, { apiKey: "restaurant-token" });
+  });
+  const sends = [];
 
-  const failed = await sendCustomerMenuItemImage(
+  for (const role of ["customer", "owner", "manager"]) {
+    const sent = await sendMenuItemImage(
+      "session-1",
+      `${senderPhone}-${role}`,
+      delivery.imageUrl,
+      delivery.caption,
+      "restaurant-token",
+      async (sessionId, to, imageUrl, caption, options) => {
+        sends.push({ sessionId, to, imageUrl, caption, options });
+        return { success: true, status: 200 };
+      }
+    );
+
+    assert.equal(sent, true);
+  }
+
+  assert.equal(sends.length, 3);
+  assert.deepEqual(
+    sends.map(({ caption }) => caption),
+    ["Chicken Salad", "Chicken Salad", "Chicken Salad"]
+  );
+  assert.ok(sends.every(({ imageUrl }) => imageUrl === cloudinaryUrl));
+  assert.ok(sends.every(({ options }) => options.apiKey === "restaurant-token"));
+});
+
+test("untrusted or model-shaped image URLs are never treated as image delivery data", () => {
+  const fabricatedUrl =
+    "https://restaurant-assets.example.com/images/chicken_salad.jpg";
+
+  assert.equal(
+    getTrustedMenuItemImageDelivery({ imageUrl: fabricatedUrl }),
+    undefined
+  );
+  assert.equal(
+    getTrustedMenuItemImageDelivery({
+      menuItemImage: {
+        imageUrl: fabricatedUrl,
+        caption: "Chicken Salad",
+        source: "model"
+      }
+    }),
+    undefined
+  );
+  assert.equal(
+    buildMenuItemImageReplyMessage(
+      `Here it is: ${fabricatedUrl}`,
+      "Chicken Salad"
+    ),
+    "Here is Chicken Salad."
+  );
+});
+
+test("menu-item image sending checks WaSender success and uses a URL-free fallback", async () => {
+  const failed = await sendMenuItemImage(
     "session-1",
     senderPhone,
     cloudinaryUrl,
+    "Chicken Salad",
     "restaurant-token",
     async () => ({ success: false, status: 500, error: "provider rejected image" })
   );
+
   assert.equal(failed, false);
+  const fallback = buildMenuItemImageFallbackMessage("Here is Chicken Salad.");
   assert.equal(
-    buildCustomerImageFallbackMessage("Here is Chicken Salad.", cloudinaryUrl),
-    `Here is Chicken Salad.\n\nI couldn't send the image directly. You can view it here: ${cloudinaryUrl}`
+    fallback,
+    "Here is Chicken Salad.\n\nI couldn't send the image right now. Please try again."
   );
+  assert.doesNotMatch(fallback, /https?:\/\//);
 });
