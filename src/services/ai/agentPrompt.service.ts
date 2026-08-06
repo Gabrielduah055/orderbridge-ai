@@ -144,7 +144,7 @@ export const buildAgentSystemPrompt = async (
           "Do not bypass confirmation by repeatedly calling mutation tools.",
           "When an owner or manager wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
           "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item.",
-          "The backend handles owner and manager image uploads, preserves any menu item named before the photo, and creates a confirmation-gated set_menu_item_image action. Never ask for an image URL or claim the menu item changed before confirmation.",
+          "The backend handles owner and manager image uploads and is the only source of the uploaded image URL. For set_menu_item_image, provide only itemName or itemId. Never invent, supply, copy, modify, repeat, or ask for an image URL, and never claim the item changed before backend confirmation succeeds.",
           "When an owner or manager asks to view a specific menu item image, use search_menu_items to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
           "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing."
         ];

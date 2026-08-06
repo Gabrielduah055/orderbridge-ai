@@ -7,6 +7,7 @@ import {
   ensureRestaurantExists,
   findCategoryOrThrow
 } from "./menuCategory.service";
+import { validateTrustedCloudinaryImage } from "./cloudinary.service";
 
 const ensureValidObjectId = (id: string, fieldName: string): void => {
   if (!Types.ObjectId.isValid(id)) {
@@ -104,5 +105,36 @@ export const updateMenuItemImage = async (
 ): Promise<IMenuItemDocument> => {
   const item = await findItemOrThrow(itemId);
   item.imageUrl = imageUrl;
+  return item.save();
+};
+
+export const updateTrustedMenuItemImage = async (input: {
+  restaurantId: string;
+  itemId: string;
+  secureUrl: string;
+  publicId: string;
+}): Promise<IMenuItemDocument> => {
+  ensureValidObjectId(input.restaurantId, "restaurantId");
+  ensureValidObjectId(input.itemId, "itemId");
+
+  if (
+    !validateTrustedCloudinaryImage({
+      secureUrl: input.secureUrl,
+      publicId: input.publicId
+    })
+  ) {
+    throw new BadRequestError("Invalid trusted Cloudinary image metadata");
+  }
+
+  const item = await MenuItem.findOne({
+    _id: input.itemId,
+    restaurantId: input.restaurantId
+  });
+
+  if (!item) {
+    throw new NotFoundError("Menu item not found for this restaurant");
+  }
+
+  item.imageUrl = input.secureUrl;
   return item.save();
 };

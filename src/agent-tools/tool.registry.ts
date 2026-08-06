@@ -65,6 +65,7 @@ import {
   resolveCustomerFeedback
 } from "../services/orderFeedback.service";
 import { toolPermissions, type ToolName } from "./tool.permissions";
+import { selectPendingMenuItemImage } from "../services/menuItemImageWorkflow.service";
 
 const emptySchema = z.object({}).strict();
 const orderLookupSchema = z
@@ -1390,20 +1391,15 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "set_menu_item_image",
       description:
-        "Set or replace the image for a menu item. The image URL is already stored from the photo the owner sent — you only need the item name or ID to link them. Requires owner/manager confirmation.",
+        "Select which menu item should receive the owner's pending uploaded image. Provide only the menu item name or ID. The backend owns the uploaded asset and requires owner/manager confirmation.",
       parameters: {
         itemName: "Menu item name (optional if itemId provided).",
-        itemId: "Optional menu item ID.",
-        imageUrl: "The Cloudinary URL of the uploaded image. Injected from the pending action — do not ask the owner for this."
+        itemId: "Optional menu item ID."
       }
     },
     roles: toolPermissions.set_menu_item_image,
     sensitive: true,
-    schema: menuItemLookupSchema
-      .extend({
-        imageUrl: z.string().url().trim().min(1)
-      })
-      .strict(),
+    schema: menuItemLookupSchema,
     handler: async (args, context) => {
       const item = await findMenuItemForRestaurant(context, args);
 
@@ -1411,32 +1407,14 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return item;
       }
 
-      if (!context.confirmed) {
-        return createPendingToolAction(
-          context,
-          "set_menu_item_image",
-          { itemId: String(item._id), imageUrl: args.imageUrl },
-          `Should I set this as the image for ${item.name}?`
-        );
-      }
-
-      const { deleteImageByUrl } = await import("../services/cloudinary.service");
-
-      // Delete old image from Cloudinary if it exists
-      if (item.imageUrl) {
-        await deleteImageByUrl(item.imageUrl);
-      }
-
-      const updated = await menuItemService.updateMenuItemImage(String(item._id), args.imageUrl);
-
-      return {
-        success: true,
-        message: `✅ Image updated for ${updated.name}.`,
-        data: {
-          itemName: updated.name,
-          imageUrl: updated.imageUrl
-        }
-      };
+      return selectPendingMenuItemImage({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        senderRole: context.sender.role,
+        itemId: String(item._id),
+        itemName: item.name,
+        confirmImmediately: context.confirmed
+      });
     }
   },
   remove_menu_item_image: {
