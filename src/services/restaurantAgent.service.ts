@@ -23,6 +23,9 @@ import {
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
   handlePendingMenuItemImageReply,
+  isMenuItemImageCancellationMessage,
+  isMenuItemImageConfirmationMessage,
+  shouldHandlePendingMenuItemImageReply,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -213,6 +216,49 @@ export const hasMeaningfulAgentToolActivity = (
   executedTools: AgentOrchestratorResult["executedTools"]
 ): boolean =>
   executedTools.some((tool) => tool.success || Boolean(tool.pendingActionId));
+
+type RequiredImageWorkflowTool =
+  | "assign_pending_image_to_menu_item"
+  | "confirm_pending_image_assignment"
+  | "cancel_pending_image_assignment";
+
+const getRequiredImageWorkflowTool = (
+  imageWorkflow: Awaited<ReturnType<typeof buildStaffOperationalState>>["imageWorkflow"],
+  message: string
+): RequiredImageWorkflowTool | null => {
+  if (
+    !imageWorkflow ||
+    imageWorkflow.stage === "awaiting_image" ||
+    !shouldHandlePendingMenuItemImageReply(imageWorkflow.stage, message)
+  ) {
+    return null;
+  }
+
+  if (isMenuItemImageCancellationMessage(message)) {
+    return "cancel_pending_image_assignment";
+  }
+
+  if (
+    imageWorkflow.stage === "awaiting_confirmation" &&
+    isMenuItemImageConfirmationMessage(message)
+  ) {
+    return "confirm_pending_image_assignment";
+  }
+
+  return imageWorkflow.stage === "awaiting_item"
+    ? "assign_pending_image_to_menu_item"
+    : null;
+};
+
+const hasMeaningfulNamedToolActivity = (
+  executedTools: AgentOrchestratorResult["executedTools"],
+  toolName: string
+): boolean =>
+  executedTools.some(
+    (tool) =>
+      tool.name === toolName &&
+      (tool.success || Boolean(tool.pendingActionId))
+  );
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -599,6 +645,17 @@ export const handleRestaurantAgentMessage = async (
       const hasMeaningfulToolActivity = hasMeaningfulAgentToolActivity(
         agentResult.executedTools
       );
+      const requiredImageWorkflowTool = getRequiredImageWorkflowTool(
+        staffState.imageWorkflow,
+        message
+      );
+      const imageWorkflowNeedsFallback = Boolean(
+        requiredImageWorkflowTool &&
+          !hasMeaningfulNamedToolActivity(
+            agentResult.executedTools,
+            requiredImageWorkflowTool
+          )
+      );
       const hasUsableMessage = Boolean(agentResult.message?.trim());
       const looksLikePendingDecision =
         !hasMeaningfulToolActivity &&
@@ -617,9 +674,10 @@ export const handleRestaurantAgentMessage = async (
         : null;
       const pendingDecisionNeedsFallback = Boolean(pendingAction);
       const handledByAi =
-        hasMeaningfulToolActivity ||
+        (!imageWorkflowNeedsFallback && hasMeaningfulToolActivity) ||
         (agentResult.success &&
           hasUsableMessage &&
+          !imageWorkflowNeedsFallback &&
           !pendingDecisionNeedsFallback);
 
       if (handledByAi) {
@@ -657,7 +715,9 @@ export const handleRestaurantAgentMessage = async (
       }
 
       staffAgentFallbackResult = agentResult;
-      staffAgentFallbackReason = pendingDecisionNeedsFallback
+      staffAgentFallbackReason = imageWorkflowNeedsFallback
+        ? "agent_did_not_complete_image_workflow"
+        : pendingDecisionNeedsFallback
           ? "pending_action_requires_backend_confirmation"
           : agentResult.errorCode || "unusable_response";
     }
