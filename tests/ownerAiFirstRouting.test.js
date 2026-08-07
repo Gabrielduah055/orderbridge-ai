@@ -36,11 +36,23 @@ const makeAgentResult = (overrides = {}) => ({
   ...overrides
 });
 
+const makeStaffState = (overrides = {}) => ({
+  pendingActions: [],
+  imageWorkflow: null,
+  orders: { freshPending: [], recentActive: [] },
+  recentReferences: {},
+  permissions: ["confirm_order", "reject_order"],
+  ...overrides
+});
+
+const buildEmptyStaffState = async () => makeStaffState();
+
 const runWithRoutingHarness = async (callback) => {
   const originalProvider = process.env.AI_PROVIDER;
   const originalCreate = AgentConversationMessage.create;
   const originalInfo = console.info;
   const originalWarn = console.warn;
+  const originalError = console.error;
   const savedMessages = [];
   const logs = [];
 
@@ -51,6 +63,7 @@ const runWithRoutingHarness = async (callback) => {
   };
   console.info = (...args) => logs.push({ level: "info", args });
   console.warn = (...args) => logs.push({ level: "warn", args });
+  console.error = (...args) => logs.push({ level: "error", args });
 
   try {
     return await callback({ savedMessages, logs });
@@ -64,6 +77,7 @@ const runWithRoutingHarness = async (callback) => {
     AgentConversationMessage.create = originalCreate;
     console.info = originalInfo;
     console.warn = originalWarn;
+    console.error = originalError;
   }
 };
 
@@ -89,6 +103,7 @@ test("owner text reaches the orchestrator before owner order parsing", async () 
         message: "Accept ORD-123"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({
@@ -128,6 +143,7 @@ test("manager text reaches the orchestrator before deterministic image reply han
         message: "yeah, use it for Chicken Salad"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({ success: false, errorCode: "PROVIDER_TIMEOUT" });
@@ -162,6 +178,7 @@ test("a successful staff AI response prevents every legacy handler and saves one
         message: "I want to change the chicken salad price"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () => {
           orchestratorCalls += 1;
           return makeAgentResult();
@@ -188,6 +205,49 @@ test("a successful staff AI response prevents every legacy handler and saves one
   });
 });
 
+test("quoted provider message ID is passed to the staff state builder", async () => {
+  await runWithRoutingHarness(async () => {
+    const quotedMessageId = "provider-order-message-102";
+    let stateBuilderInput;
+    let orchestratorInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "reject this",
+        quotedMessageId
+      },
+      {
+        buildStaffState: async (input) => {
+          stateBuilderInput = input;
+          return makeStaffState({
+            recentReferences: {
+              quotedOrder: {
+                id: "order-102",
+                orderNumber: "ORD-102",
+                status: "pending"
+              }
+            }
+          });
+        },
+        runOrchestrator: async (input) => {
+          orchestratorInput = input;
+          return makeAgentResult({
+            executedTools: [{ name: "reject_order", success: true }]
+          });
+        }
+      }
+    );
+
+    assert.equal(stateBuilderInput.quotedMessageId, quotedMessageId);
+    assert.equal(
+      orchestratorInput.staffState.recentReferences.quotedOrder.orderNumber,
+      "ORD-102"
+    );
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
 test("OpenRouter failure preserves the deterministic image-intent text fallback", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];
@@ -198,6 +258,7 @@ test("OpenRouter failure preserves the deterministic image-intent text fallback"
         message: "Add an image to Check Check Fried Rice"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({ success: false, errorCode: "OPENROUTER_HTTP_ERROR" });
@@ -223,6 +284,16 @@ test("OpenRouter failure preserves the deterministic image-intent text fallback"
 test("an awaiting-item image does not hijack an ordinary conversational message", async () => {
   await runWithRoutingHarness(async () => {
     let legacyCalls = 0;
+    let receivedStaffState;
+    const staffState = makeStaffState({
+      imageWorkflow: {
+        active: true,
+        type: "menu_item_image",
+        stage: "awaiting_item",
+        imageUploaded: true,
+        pendingActionId: "image-awaiting-item"
+      }
+    });
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
@@ -230,7 +301,11 @@ test("an awaiting-item image does not hijack an ordinary conversational message"
         message: "you there?"
       },
       {
-        runOrchestrator: async () => makeAgentResult({ message: "Yes, I'm here." }),
+        buildStaffState: async () => staffState,
+        runOrchestrator: async (input) => {
+          receivedStaffState = input.staffState;
+          return makeAgentResult({ message: "Yes, I'm here." });
+        },
         getPendingImageStage: async () => "awaiting_item",
         handlePendingImageReply: async () => {
           legacyCalls += 1;
@@ -246,6 +321,43 @@ test("an awaiting-item image does not hijack an ordinary conversational message"
     assert.equal(response.message, "Yes, I'm here.");
     assert.equal(response.source, "openrouter_agent");
     assert.equal(legacyCalls, 0);
+    assert.equal(receivedStaffState.imageWorkflow.stage, "awaiting_item");
+  });
+});
+
+test("staff state loading failure falls back to safe empty state without blocking AI", async () => {
+  await runWithRoutingHarness(async ({ logs }) => {
+    let receivedStaffState;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "hello"
+      },
+      {
+        buildStaffState: async () => {
+          throw new Error("database unavailable");
+        },
+        runOrchestrator: async (input) => {
+          receivedStaffState = input.staffState;
+          return makeAgentResult({ message: "Hello. How can I help?" });
+        },
+        getPendingImageStage: async () => null
+      }
+    );
+
+    assert.equal(response.source, "openrouter_agent");
+    assert.deepEqual(receivedStaffState.pendingActions, []);
+    assert.equal(receivedStaffState.imageWorkflow, null);
+    assert.equal(receivedStaffState.permissions.includes("confirm_order"), true);
+    assert.equal(
+      logs.some(
+        ({ level, args }) =>
+          level === "error" && args[0] === "[staffState] build failed"
+      ),
+      true
+    );
+    assert.equal(JSON.stringify(logs).includes("database unavailable"), false);
   });
 });
 
@@ -253,6 +365,19 @@ test("pending mutation confirmation falls back safely after a no-tool AI answer"
   await runWithRoutingHarness(async () => {
     const events = [];
     const pendingAction = { _id: "64b000000000000000000d11" };
+    let receivedStaffState;
+    const staffState = makeStaffState({
+      pendingActions: [
+        {
+          actionId: String(pendingAction._id),
+          type: "TOOL_CALL",
+          toolName: "update_menu_price",
+          summary: "Change Chicken Salad to GHS 65",
+          status: "pending",
+          requiresConfirmation: true
+        }
+      ]
+    });
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
@@ -260,8 +385,10 @@ test("pending mutation confirmation falls back safely after a no-tool AI answer"
         message: "yes, go ahead"
       },
       {
-        runOrchestrator: async () => {
+        buildStaffState: async () => staffState,
+        runOrchestrator: async (input) => {
           events.push("ai");
+          receivedStaffState = input.staffState;
           return makeAgentResult({ message: "Done." });
         },
         getPendingImageStage: async () => null,
@@ -282,6 +409,10 @@ test("pending mutation confirmation falls back safely after a no-tool AI answer"
     assert.deepEqual(events, ["ai", "executeConfirmedPendingAction"]);
     assert.equal(response.message, "Price updated.");
     assert.equal(response.source, "legacy_owner");
+    assert.equal(
+      receivedStaffState.pendingActions[0].toolName,
+      "update_menu_price"
+    );
   });
 });
 
@@ -295,6 +426,7 @@ test("tool activity consumes a staff turn even if the provider fails afterward",
         message: "Change Chicken Salad to 65 cedis"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () =>
           makeAgentResult({
             success: false,
@@ -335,6 +467,7 @@ test("a failed tool attempt does not prevent deterministic fallback", async () =
         message: "Accept ORD-456"
       },
       {
+        buildStaffState: buildEmptyStaffState,
         runOrchestrator: async () =>
           makeAgentResult({
             success: false,
@@ -370,15 +503,27 @@ test("a failed tool attempt does not prevent deterministic fallback", async () =
 test("an awaiting-item image progresses for a genuine menu item answer", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];
+    let receivedStaffState;
+    const staffState = makeStaffState({
+      imageWorkflow: {
+        active: true,
+        type: "menu_item_image",
+        stage: "awaiting_item",
+        imageUploaded: true,
+        pendingActionId: "image-awaiting-item"
+      }
+    });
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
         senderPhone: ownerPhone,
-        message: "Chicken Salad"
+        message: "it belongs to Chicken Salad"
       },
       {
-        runOrchestrator: async () => {
+        buildStaffState: async () => staffState,
+        runOrchestrator: async (input) => {
           events.push("ai");
+          receivedStaffState = input.staffState;
           return makeAgentResult({ message: "Chicken Salad is on your menu." });
         },
         getPendingImageStage: async () => "awaiting_item",
@@ -396,6 +541,7 @@ test("an awaiting-item image progresses for a genuine menu item answer", async (
     assert.deepEqual(events, ["ai", "pendingImageReply"]);
     assert.equal(response.message, "Use this image for Chicken Salad?");
     assert.equal(response.source, "legacy_owner");
+    assert.equal(receivedStaffState.imageWorkflow.stage, "awaiting_item");
   });
 });
 
@@ -409,6 +555,17 @@ test("awaiting image confirmation executes the backend despite an AI Done respon
         message: "yes"
       },
       {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: {
+              active: true,
+              type: "menu_item_image",
+              stage: "awaiting_confirmation",
+              imageUploaded: true,
+              itemName: "Chicken Salad",
+              pendingActionId: "image-confirmation"
+            }
+          }),
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({ message: "Done." });
@@ -442,6 +599,17 @@ test("awaiting image confirmation preserves explicit backend cancellation", asyn
         message: "no, cancel it"
       },
       {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: {
+              active: true,
+              type: "menu_item_image",
+              stage: "awaiting_confirmation",
+              imageUploaded: true,
+              itemName: "Chicken Salad",
+              pendingActionId: "image-confirmation"
+            }
+          }),
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({ message: "Okay." });
