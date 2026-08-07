@@ -149,7 +149,10 @@ export const buildAgentSystemPrompt = async (
           "Do not bypass confirmation by repeatedly calling mutation tools.",
           "When an owner or manager wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
           "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item.",
-          "The backend handles owner and manager image uploads and is the only source of the uploaded image URL. For set_menu_item_image, provide only itemName or itemId. Never invent, supply, copy, modify, repeat, or ask for an image URL, and never claim the item changed before backend confirmation succeeds.",
+          "Treat staffState.imageWorkflow as trusted backend workflow context. Never invent, supply, copy, modify, repeat, or ask for an image URL.",
+          "For a new add/change image request, call start_menu_item_image_upload. At awaiting_image, the backend is waiting for the actual WhatsApp image; use cancel_pending_image_assignment only for an explicit cancellation and otherwise do not call another image tool just because ordinary conversation continues.",
+          "At awaiting_item, call assign_pending_image_to_menu_item with the exact pendingActionId after the user identifies the item. At awaiting_confirmation, use the exact-ID confirm, cancel, or assignment tool according to whether the user confirms, cancels, or retargets the image.",
+          "Ordinary conversation must not mutate imageWorkflow. Never claim an image changed until confirm_pending_image_assignment returns backend success.",
           "When an owner or manager asks to view a specific menu item image, use search_menu_items to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
           "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing."
         ];

@@ -65,7 +65,12 @@ import {
   resolveCustomerFeedback
 } from "../services/orderFeedback.service";
 import { toolPermissions, type ToolName } from "./tool.permissions";
-import { selectPendingMenuItemImage } from "../services/menuItemImageWorkflow.service";
+import {
+  assignPendingImageToMenuItem,
+  cancelPendingMenuItemImageConfirmation,
+  confirmPendingMenuItemImage,
+  startMenuItemImageUpload
+} from "../services/menuItemImageWorkflow.service";
 
 const emptySchema = z.object({}).strict();
 const orderLookupSchema = z
@@ -104,6 +109,51 @@ const menuItemLookupSchema = z
     itemId: z.string().trim().min(1).optional()
   })
   .strict();
+const objectIdSchema = z
+  .string()
+  .trim()
+  .refine((value) => Types.ObjectId.isValid(value), "A valid ID is required.");
+const startMenuItemImageUploadSchema = z
+  .object({
+    itemName: z.string().trim().min(1).optional(),
+    itemId: objectIdSchema.optional()
+  })
+  .strict();
+const pendingImageActionSchema = z
+  .object({
+    pendingActionId: objectIdSchema
+  })
+  .strict();
+const pendingImageAssignmentSchema = z
+  .object({
+    pendingActionId: objectIdSchema,
+    itemName: z.string().trim().min(1).optional(),
+    itemId: objectIdSchema.optional()
+  })
+  .strict()
+  .refine((args) => Boolean(args.itemName || args.itemId), {
+    message: "Provide either itemName or itemId."
+  });
+
+const logImageWorkflowToolResult = (
+  tool: ToolName,
+  context: ToolExecutionContext,
+  result: ToolResult,
+  stage: string,
+  pendingActionId?: string
+): ToolResult => {
+  console.info("[imageWorkflow] tool handled", {
+    tool,
+    restaurantId: context.restaurantId,
+    senderRole: context.sender.role,
+    pendingActionId: result.pendingActionId ?? pendingActionId,
+    stage: result.success ? stage : "unchanged",
+    success: result.success,
+    code: result.code
+  });
+
+  return result;
+};
 const startOrderSchema = z
   .object({
     customerName: z.string().trim().min(1).optional()
@@ -1387,19 +1437,66 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
-  set_menu_item_image: {
+  start_menu_item_image_upload: {
     definition: {
-      name: "set_menu_item_image",
+      name: "start_menu_item_image_upload",
       description:
-        "Select which menu item should receive the owner's pending uploaded image. Provide only the menu item name or ID. The backend owns the uploaded asset and requires owner/manager confirmation.",
+        "Start a trusted menu-item image upload workflow. Provide a menu item when known, or omit it when the owner wants to upload first and identify the item afterward.",
       parameters: {
         itemName: "Menu item name (optional if itemId provided).",
         itemId: "Optional menu item ID."
       }
     },
-    roles: toolPermissions.set_menu_item_image,
+    roles: toolPermissions.start_menu_item_image_upload,
+    schema: startMenuItemImageUploadSchema,
+    handler: async (args, context) => {
+      if (!args.itemName && !args.itemId) {
+        return logImageWorkflowToolResult(
+          "start_menu_item_image_upload",
+          context,
+          await startMenuItemImageUpload({
+            restaurantId: context.restaurantId,
+            senderPhone: context.sender.normalizedPhone,
+            senderRole: context.sender.role
+          }),
+          "awaiting_image"
+        );
+      }
+
+      const item = await findMenuItemForRestaurant(context, args);
+
+      if ("success" in item) {
+        return item;
+      }
+
+      return logImageWorkflowToolResult(
+        "start_menu_item_image_upload",
+        context,
+        await startMenuItemImageUpload({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          senderRole: context.sender.role,
+          itemId: String(item._id),
+          itemName: item.name
+        }),
+        "awaiting_image"
+      );
+    }
+  },
+  assign_pending_image_to_menu_item: {
+    definition: {
+      name: "assign_pending_image_to_menu_item",
+      description:
+        "Select or retarget the menu item for one exact trusted pending image. Requires the pendingActionId from staff operational state and a menu item name or ID.",
+      parameters: {
+        pendingActionId: "Exact pending image action ID from staff operational state.",
+        itemName: "Menu item name (optional if itemId provided).",
+        itemId: "Optional menu item ID."
+      }
+    },
+    roles: toolPermissions.assign_pending_image_to_menu_item,
     sensitive: true,
-    schema: menuItemLookupSchema,
+    schema: pendingImageAssignmentSchema,
     handler: async (args, context) => {
       const item = await findMenuItemForRestaurant(context, args);
 
@@ -1407,15 +1504,73 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return item;
       }
 
-      return selectPendingMenuItemImage({
-        restaurantId: context.restaurantId,
-        senderPhone: context.sender.normalizedPhone,
-        senderRole: context.sender.role,
-        itemId: String(item._id),
-        itemName: item.name,
-        confirmImmediately: context.confirmed
-      });
+      return logImageWorkflowToolResult(
+        "assign_pending_image_to_menu_item",
+        context,
+        await assignPendingImageToMenuItem({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          senderRole: context.sender.role,
+          pendingActionId: args.pendingActionId,
+          itemId: String(item._id),
+          itemName: item.name
+        }),
+        "awaiting_confirmation",
+        args.pendingActionId
+      );
     }
+  },
+  confirm_pending_image_assignment: {
+    definition: {
+      name: "confirm_pending_image_assignment",
+      description:
+        "Confirm one exact pending image assignment using its pendingActionId from staff operational state. The backend reads and applies the trusted uploaded media.",
+      parameters: {
+        pendingActionId: "Exact pending image action ID from staff operational state."
+      }
+    },
+    roles: toolPermissions.confirm_pending_image_assignment,
+    sensitive: true,
+    schema: pendingImageActionSchema,
+    handler: async (args, context) =>
+      logImageWorkflowToolResult(
+        "confirm_pending_image_assignment",
+        context,
+        await confirmPendingMenuItemImage({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          senderRole: context.sender.role,
+          pendingActionId: args.pendingActionId
+        }),
+        "completed",
+        args.pendingActionId
+      )
+  },
+  cancel_pending_image_assignment: {
+    definition: {
+      name: "cancel_pending_image_assignment",
+      description:
+        "Cancel one exact pending menu-item image workflow using its pendingActionId from staff operational state, including a workflow still waiting for the WhatsApp image.",
+      parameters: {
+        pendingActionId: "Exact pending image action ID from staff operational state."
+      }
+    },
+    roles: toolPermissions.cancel_pending_image_assignment,
+    sensitive: true,
+    schema: pendingImageActionSchema,
+    handler: async (args, context) =>
+      logImageWorkflowToolResult(
+        "cancel_pending_image_assignment",
+        context,
+        await cancelPendingMenuItemImageConfirmation({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          senderRole: context.sender.role,
+          pendingActionId: args.pendingActionId
+        }),
+        "cancelled",
+        args.pendingActionId
+      )
   },
   remove_menu_item_image: {
     definition: {

@@ -570,6 +570,10 @@ test("staff operational state reaches a delimited data-only prompt section", asy
   assert.match(prompt, /does not mean it succeeded/i);
   assert.match(prompt, /recentReferences\.quotedOrder/);
   assert.match(prompt, /appropriate trusted backend order tool/i);
+  assert.match(prompt, /start_menu_item_image_upload/);
+  assert.match(prompt, /assign_pending_image_to_menu_item/);
+  assert.match(prompt, /confirm_pending_image_assignment/);
+  assert.match(prompt, /Ordinary conversation must not mutate imageWorkflow/);
   assert.equal(prompt.includes("imageSecureUrl"), false);
   assert.equal(prompt.includes("imagePublicId"), false);
   assert.equal(prompt.includes("res.cloudinary.com"), false);

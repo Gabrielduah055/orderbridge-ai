@@ -22,10 +22,11 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
-  getActivePendingMenuItemImageStage,
+  extractMenuItemNameFromImageRetargetReply,
   handlePendingMenuItemImageReply,
+  isMenuItemImageCancellationMessage,
+  isMenuItemImageConfirmationMessage,
   shouldHandlePendingMenuItemImageReply,
-  type MenuItemImageStage,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -210,17 +211,62 @@ export interface RestaurantAgentRoutingDependencies {
   findPendingActions?: typeof findPendingToolActions;
   executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
   cancelPendingAction?: typeof cancelPendingToolAction;
-  getPendingImageStage?: (input: {
-    restaurantId: string;
-    senderPhone: string;
-    senderRole: "owner" | "manager";
-  }) => Promise<MenuItemImageStage | null>;
 }
 
 export const hasMeaningfulAgentToolActivity = (
   executedTools: AgentOrchestratorResult["executedTools"]
 ): boolean =>
   executedTools.some((tool) => tool.success || Boolean(tool.pendingActionId));
+
+type RequiredImageWorkflowTool =
+  | "assign_pending_image_to_menu_item"
+  | "confirm_pending_image_assignment"
+  | "cancel_pending_image_assignment";
+
+const getRequiredImageWorkflowTool = (
+  imageWorkflow: Awaited<ReturnType<typeof buildStaffOperationalState>>["imageWorkflow"],
+  message: string
+): RequiredImageWorkflowTool | null => {
+  if (
+    !imageWorkflow ||
+    !shouldHandlePendingMenuItemImageReply(imageWorkflow.stage, message)
+  ) {
+    return null;
+  }
+
+  if (
+    imageWorkflow.stage === "awaiting_confirmation" &&
+    extractMenuItemNameFromImageRetargetReply(message)
+  ) {
+    return "assign_pending_image_to_menu_item";
+  }
+
+  if (isMenuItemImageCancellationMessage(message)) {
+    return "cancel_pending_image_assignment";
+  }
+
+  if (
+    imageWorkflow.stage === "awaiting_confirmation" &&
+    isMenuItemImageConfirmationMessage(message)
+  ) {
+    return "confirm_pending_image_assignment";
+  }
+
+  return imageWorkflow.stage === "awaiting_item" ||
+    imageWorkflow.stage === "awaiting_confirmation"
+    ? "assign_pending_image_to_menu_item"
+    : null;
+};
+
+const hasMeaningfulNamedToolActivity = (
+  executedTools: AgentOrchestratorResult["executedTools"],
+  toolName: string
+): boolean =>
+  executedTools.some(
+    (tool) =>
+      tool.name === toolName &&
+      (tool.success || Boolean(tool.pendingActionId))
+  );
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -448,8 +494,6 @@ export const handleRestaurantAgentMessage = async (
     dependencies.executeConfirmedAction ?? executeConfirmedPendingToolAction;
   const cancelPendingAction =
     dependencies.cancelPendingAction ?? cancelPendingToolAction;
-  const getPendingImageStage =
-    dependencies.getPendingImageStage ?? getActivePendingMenuItemImageStage;
 
   console.info("Restaurant agent sender resolved", {
     restaurantId,
@@ -575,9 +619,9 @@ export const handleRestaurantAgentMessage = async (
 
   let staffAgentFallbackResult: AgentOrchestratorResult | undefined;
   let staffAgentFallbackReason: string | undefined;
-  let prefetchedPendingImageResult:
-    | Awaited<ReturnType<typeof handlePendingMenuItemImageReply>>
-    | undefined;
+  let staffImageWorkflow: Awaited<
+    ReturnType<typeof buildStaffOperationalState>
+  >["imageWorkflow"] = null;
 
   if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
     let agentResult: AgentOrchestratorResult | undefined;
@@ -597,6 +641,8 @@ export const handleRestaurantAgentMessage = async (
       });
     }
 
+    staffImageWorkflow = staffState.imageWorkflow;
+
     try {
       agentResult = await runOrchestrator({
         restaurant: input.restaurant,
@@ -612,32 +658,18 @@ export const handleRestaurantAgentMessage = async (
       const hasMeaningfulToolActivity = hasMeaningfulAgentToolActivity(
         agentResult.executedTools
       );
+      const requiredImageWorkflowTool = getRequiredImageWorkflowTool(
+        staffState.imageWorkflow,
+        message
+      );
+      const imageWorkflowNeedsFallback = Boolean(
+        requiredImageWorkflowTool &&
+          !hasMeaningfulNamedToolActivity(
+            agentResult.executedTools,
+            requiredImageWorkflowTool
+          )
+      );
       const hasUsableMessage = Boolean(agentResult.message?.trim());
-      const pendingImageStage =
-        !hasMeaningfulToolActivity && agentResult.success && hasUsableMessage
-          ? await getPendingImageStage({
-              restaurantId,
-              senderPhone: sender.normalizedPhone,
-              senderRole: sender.role
-            })
-          : null;
-      const shouldUsePendingImageWorkflow = Boolean(
-        pendingImageStage &&
-          shouldHandlePendingMenuItemImageReply(pendingImageStage, message)
-      );
-
-      if (shouldUsePendingImageWorkflow) {
-        prefetchedPendingImageResult = await handlePendingImageReply({
-          restaurantId,
-          senderPhone: sender.normalizedPhone,
-          senderRole: sender.role,
-          message
-        });
-      }
-
-      const pendingImageNeedsFallback = Boolean(
-        prefetchedPendingImageResult?.handled
-      );
       const looksLikePendingDecision =
         !hasMeaningfulToolActivity &&
         agentResult.success &&
@@ -655,11 +687,11 @@ export const handleRestaurantAgentMessage = async (
         : null;
       const pendingDecisionNeedsFallback = Boolean(pendingAction);
       const handledByAi =
-        hasMeaningfulToolActivity ||
+        (!imageWorkflowNeedsFallback && hasMeaningfulToolActivity) ||
         (agentResult.success &&
           hasUsableMessage &&
-          !pendingDecisionNeedsFallback &&
-          !pendingImageNeedsFallback);
+          !imageWorkflowNeedsFallback &&
+          !pendingDecisionNeedsFallback);
 
       if (handledByAi) {
         await saveAgentConversationMessage({
@@ -696,8 +728,8 @@ export const handleRestaurantAgentMessage = async (
       }
 
       staffAgentFallbackResult = agentResult;
-      staffAgentFallbackReason = pendingImageNeedsFallback
-        ? "pending_image_requires_backend_workflow"
+      staffAgentFallbackReason = imageWorkflowNeedsFallback
+        ? "agent_did_not_complete_image_workflow"
         : pendingDecisionNeedsFallback
           ? "pending_action_requires_backend_confirmation"
           : agentResult.errorCode || "unusable_response";
@@ -838,16 +870,24 @@ export const handleRestaurantAgentMessage = async (
     aiProviderName === "openrouter" ? "legacy_owner" : "hermes_tools";
 
   if (sender.role === "owner" || sender.role === "manager") {
-    const pendingImageResult =
-      prefetchedPendingImageResult ??
-      (await handlePendingImageReply({
-        restaurantId,
-        senderPhone: sender.normalizedPhone,
-        senderRole: sender.role,
-        message
-      }));
+    const pendingImageResult = await handlePendingImageReply({
+      restaurantId,
+      senderPhone: sender.normalizedPhone,
+      senderRole: sender.role,
+      message,
+      pendingActionId: staffImageWorkflow?.pendingActionId
+    });
 
     if (pendingImageResult.handled) {
+      console.warn("[imageWorkflow] legacy fallback", {
+        restaurantId,
+        senderRole: sender.role,
+        reason:
+          staffAgentFallbackReason ??
+          (aiProviderName === "openrouter"
+            ? "agent_did_not_complete_image_workflow"
+            : "legacy_provider")
+      });
       await saveAssistantResponse(
         restaurantId,
         sender,
@@ -881,6 +921,11 @@ export const handleRestaurantAgentMessage = async (
     });
 
     if (imageRequestResult.handled) {
+      console.warn("[imageWorkflow] legacy fallback", {
+        restaurantId,
+        senderRole: sender.role,
+        reason: staffAgentFallbackReason ?? "agent_unavailable"
+      });
       await saveAssistantResponse(
         restaurantId,
         sender,

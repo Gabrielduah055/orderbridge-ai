@@ -4,7 +4,8 @@ const { v2: cloudinary } = require("cloudinary");
 
 const {
   decryptWasenderMedia,
-  normalizeIncomingWebhook
+  normalizeIncomingWebhook,
+  validateWasenderMenuItemImageMetadata
 } = require("../dist/services/wasender.service");
 const {
   extractCloudinaryPublicId,
@@ -15,6 +16,7 @@ const {
 const {
   confirmPendingMenuItemImage,
   extractMenuItemNameFromImageReply,
+  extractMenuItemNameFromImageRetargetReply,
   handlePendingMenuItemImageReply,
   isMenuItemImageConfirmationMessage,
   prepareUploadedMenuItemImage,
@@ -75,7 +77,7 @@ const makePendingImage = (overrides = {}) => ({
   senderPhone,
   senderRole: "manager",
   action: "IMAGE_ASSIGNMENT",
-  toolName: "set_menu_item_image",
+  toolName: "confirm_pending_image_assignment",
   arguments: { itemId: menuItemId },
   data: { stage: "awaiting_confirmation", itemName: "Chicken Salad" },
   imageSecureUrl: cloudinaryUrl,
@@ -146,6 +148,38 @@ test("webhook normalization preserves the complete raw WhatsApp image message", 
   assert.equal(normalized.messageType, "image");
   assert.equal(normalized.mediaUrl, encryptedUrl);
   assert.deepEqual(normalized.rawMessage, rawMessage);
+});
+
+test("deterministic image metadata validation rejects unsupported and oversized media", () => {
+  assert.doesNotThrow(() => validateWasenderMenuItemImageMetadata(rawMessage));
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        message: {
+          imageMessage: { mimetype: "image/gif", fileLength: "1024" }
+        }
+      }),
+    /JPG, PNG, or WEBP/
+  );
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        message: {
+          imageMessage: {
+            mimetype: "image/jpeg",
+            fileLength: String(5 * 1024 * 1024 + 1)
+          }
+        }
+      }),
+    /5 MB or smaller/
+  );
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        imageMessage: { mimetype: "image/png", fileLength: "not-a-number" }
+      }),
+    /size metadata is invalid/
+  );
 });
 
 test("WaSender media decryption posts the complete message with the restaurant token", async () => {
@@ -415,14 +449,74 @@ test("an awaiting-item image resolves a relational item reply without using the 
   }
 });
 
+test("legacy safety fallback retargets awaiting-confirmation without confirming the old item", async () => {
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalMenuFind = MenuItem.find;
+  const pending = makePendingImage();
+  const menuQueries = [];
+
+  PendingAgentAction.findOne = async () => pending;
+  MenuItem.find = (query) => {
+    menuQueries.push(query);
+    return sortable([
+      {
+        _id: "64b000000000000000000302",
+        restaurantId,
+        name: "Jollof"
+      }
+    ]);
+  };
+
+  try {
+    for (const [message, itemName] of [
+      ["actually use it for Jollof instead", "Jollof"],
+      ["use it for Jollof instead", "Jollof"],
+      ["no, make it the Jollof picture", "Jollof"],
+      ["change it to Fried Rice instead", "Fried Rice"]
+    ]) {
+      assert.equal(extractMenuItemNameFromImageRetargetReply(message), itemName);
+      assert.equal(
+        shouldHandlePendingMenuItemImageReply("awaiting_confirmation", message),
+        true
+      );
+    }
+
+    const result = await handlePendingMenuItemImageReply({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      pendingActionId: String(pending._id),
+      message: "actually use it for Jollof instead"
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.success, true);
+    assert.equal(result.message, "Use the uploaded image for Jollof instead?");
+    assert.equal(pending.status, "pending");
+    assert.equal(pending.data.stage, "awaiting_confirmation");
+    assert.equal(pending.data.itemName, "Jollof");
+    assert.equal(String(pending.selectedMenuItemId), "64b000000000000000000302");
+    assert.equal(menuQueries[0].restaurantId, restaurantId);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalPendingFindOne);
+    restore(MenuItem, "find", originalMenuFind);
+  }
+});
+
 test("uploaded Cloudinary metadata is stored outside AI tool arguments", async () => {
   const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
   const originalUpdateMany = PendingAgentAction.updateMany;
   const originalCreate = PendingAgentAction.create;
   const updateFilters = [];
+  let supersedeFilter;
   let created;
 
   PendingAgentAction.findOne = () => sortable(null);
+  PendingAgentAction.findOneAndUpdate = async (filter) => {
+    supersedeFilter = filter;
+    return null;
+  };
   PendingAgentAction.updateMany = async (filter) => {
     updateFilters.push(filter);
     return { modifiedCount: 0 };
@@ -445,10 +539,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     assert.deepEqual(created.arguments, {});
     assert.doesNotMatch(JSON.stringify(created.arguments), /imageUrl|cloudinary/i);
     assert.ok(updateFilters.every((filter) => filter.action !== "TOOL_CALL"));
-    const replacementFilter = updateFilters.find(
-      (filter) => filter.action === "IMAGE_ASSIGNMENT"
-    );
-    assert.deepEqual(replacementFilter, {
+    assert.deepEqual(supersedeFilter, {
       restaurantId,
       senderPhone,
       senderRole: "manager",
@@ -457,18 +548,34 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     });
   } finally {
     restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
     restore(PendingAgentAction, "updateMany", originalUpdateMany);
     restore(PendingAgentAction, "create", originalCreate);
   }
 });
 
-test("AI-facing set_menu_item_image schema cannot accept imageUrl", async () => {
+test("AI-facing image workflow schemas cannot accept image URLs", async () => {
   const definitions = getAgentToolDefinitionsForRole("manager");
-  const imageTool = definitions.find((tool) => tool.function.name === "set_menu_item_image");
-  assert.deepEqual(Object.keys(imageTool.function.parameters.properties).sort(), ["itemId", "itemName"]);
+  const imageToolNames = [
+    "start_menu_item_image_upload",
+    "assign_pending_image_to_menu_item",
+    "confirm_pending_image_assignment",
+    "cancel_pending_image_assignment"
+  ];
+
+  for (const toolName of imageToolNames) {
+    const imageTool = definitions.find((tool) => tool.function.name === toolName);
+
+    assert.ok(imageTool, toolName);
+    const serialized = JSON.stringify(imageTool.function.parameters);
+    assert.doesNotMatch(
+      serialized,
+      /imageUrl|secureUrl|imageSecureUrl|publicId|imagePublicId/i
+    );
+  }
 
   const result = await executeAgentTool(
-    "set_menu_item_image",
+    "start_menu_item_image_upload",
     { itemName: "Chicken Salad", imageUrl: cloudinaryUrl },
     {
       restaurantId,
