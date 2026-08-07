@@ -30,6 +30,12 @@ export interface WasenderSendOptions {
 }
 
 const defaultWasenderApiUrl = "https://www.wasenderapi.com";
+const allowedMenuItemImageMimeTypes = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp"
+]);
+const maxMenuItemImageBytes = 5 * 1024 * 1024;
 
 const getWasenderConfig = (
   options: WasenderSendOptions = {}
@@ -109,6 +115,50 @@ const firstBoolean = (payload: unknown, paths: string[]): boolean | undefined =>
 
 const hasNestedValue = (value: unknown, path: string): boolean => {
   return getNestedValue(value, path) !== undefined;
+};
+
+export const validateWasenderMenuItemImageMetadata = (
+  rawMessage: Record<string, unknown>
+): void => {
+  const mimeType = firstString(rawMessage, [
+    "message.imageMessage.mimetype",
+    "imageMessage.mimetype",
+    "message.imageMessage.mimeType",
+    "imageMessage.mimeType"
+  ])?.toLowerCase();
+  const fileLengthValue = [
+    "message.imageMessage.fileLength",
+    "imageMessage.fileLength",
+    "message.imageMessage.fileSize",
+    "imageMessage.fileSize"
+  ]
+    .map((path) => getNestedValue(rawMessage, path))
+    .find((value) => value !== undefined && value !== null);
+  const fileLength =
+    typeof fileLengthValue === "number"
+      ? fileLengthValue
+      : typeof fileLengthValue === "string" && fileLengthValue.trim()
+        ? Number(fileLengthValue)
+        : undefined;
+
+  if (mimeType && !allowedMenuItemImageMimeTypes.has(mimeType)) {
+    throw new Error("The image must be a JPG, PNG, or WEBP file.");
+  }
+
+  if (
+    fileLengthValue !== undefined &&
+    (fileLength === undefined || !Number.isFinite(fileLength) || fileLength < 0)
+  ) {
+    throw new Error("The image size metadata is invalid.");
+  }
+
+  if (
+    fileLength !== undefined &&
+    Number.isFinite(fileLength) &&
+    fileLength > maxMenuItemImageBytes
+  ) {
+    throw new Error("The image must be 5 MB or smaller.");
+  }
 };
 
 const getPrimaryMessagePayload = (payload: Record<string, unknown>): unknown => {

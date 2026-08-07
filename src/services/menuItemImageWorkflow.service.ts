@@ -277,7 +277,11 @@ export const getActivePendingMenuItemImageStage = async (
 
 const setPendingImageTarget = async (
   pendingImage: IPendingAgentActionDocument,
-  item: { itemId: string; itemName: string }
+  item: {
+    itemId: string;
+    itemName: string;
+    confirmationMessage?: string;
+  }
 ): Promise<void> => {
   pendingImage.selectedMenuItemId = new Types.ObjectId(item.itemId);
   pendingImage.arguments = { itemId: item.itemId };
@@ -287,9 +291,65 @@ const setPendingImageTarget = async (
     itemName: item.itemName
   };
   pendingImage.summary = `Set the uploaded image for ${item.itemName}`;
-  pendingImage.confirmationMessage = `I received the image. Should I use it for ${item.itemName}?`;
+  pendingImage.confirmationMessage =
+    item.confirmationMessage ??
+    `I received the image. Should I use it for ${item.itemName}?`;
   await pendingImage.save();
 };
+
+const createMenuItemImageUploadContext = async (
+  input: MenuItemImageWorkflowInput & {
+    itemId?: string;
+    itemName?: string;
+  }
+): Promise<ToolResult> => {
+  await cancelPendingImageRequestContexts(
+    input.restaurantId,
+    input.senderPhone,
+    input.senderRole,
+    "Superseded by a newer menu item image request."
+  );
+
+  const itemKnown = Boolean(input.itemId && input.itemName);
+  const message = itemKnown
+    ? `Send me the image you'd like to use for ${input.itemName}.`
+    : "Send me the image you'd like to use. After it uploads, tell me which menu item should use it.";
+  const pendingAction = await PendingAgentAction.create({
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    action: "MENU_ITEM_IMAGE_CONTEXT",
+    data: {
+      stage: "awaiting_image",
+      ...(itemKnown
+        ? { itemId: input.itemId, itemName: input.itemName }
+        : {})
+    },
+    ...(itemKnown ? { selectedMenuItemId: input.itemId } : {}),
+    status: "pending",
+    summary: itemKnown
+      ? `Waiting for an image for ${input.itemName}`
+      : "Waiting for a menu item image upload",
+    confirmationMessage: message,
+    expiresAt: new Date(Date.now() + imageContextTtlMs)
+  });
+  const pendingActionId = String(pendingAction._id);
+
+  return {
+    success: true,
+    pendingActionId,
+    message,
+    data: {
+      stage: "awaiting_image",
+      imageUploaded: false,
+      ...(itemKnown
+        ? { itemId: input.itemId, itemName: input.itemName }
+        : {})
+    }
+  };
+};
+
+export const startMenuItemImageUpload = createMenuItemImageUploadContext;
 
 export const rememberMenuItemImageRequest = async (
   input: MenuItemImageWorkflowInput & { message: string }
@@ -310,33 +370,18 @@ export const rememberMenuItemImageRequest = async (
     };
   }
 
-  await cancelPendingImageRequestContexts(
-    input.restaurantId,
-    input.senderPhone,
-    input.senderRole,
-    "Superseded by a newer menu item image request."
-  );
-  await PendingAgentAction.create({
-    restaurantId: input.restaurantId,
-    senderPhone: input.senderPhone,
-    senderRole: input.senderRole,
-    action: "MENU_ITEM_IMAGE_CONTEXT",
-    data: {
-      stage: "awaiting_image",
-      itemId: String(match.item._id),
-      itemName: match.item.name
-    },
-    status: "pending",
-    summary: `Waiting for an image for ${match.item.name}`,
-    confirmationMessage: `Please send the image you'd like to use for ${match.item.name}.`,
-    expiresAt: new Date(Date.now() + imageContextTtlMs)
+  const result = await createMenuItemImageUploadContext({
+    ...input,
+    itemId: String(match.item._id),
+    itemName: match.item.name
   });
 
   return {
     handled: true,
-    success: true,
+    success: result.success,
     itemName: match.item.name,
-    message: `Please send the image you'd like to use for ${match.item.name}.`
+    pendingActionId: result.pendingActionId,
+    message: result.message
   };
 };
 
@@ -382,7 +427,7 @@ export const prepareUploadedMenuItemImage = async (
     senderPhone: input.senderPhone,
     senderRole: input.senderRole,
     action: "IMAGE_ASSIGNMENT",
-    toolName: "set_menu_item_image",
+    toolName: "confirm_pending_image_assignment",
     arguments: itemId ? { itemId } : {},
     data: {
       stage: itemId && itemName ? "awaiting_confirmation" : "awaiting_item",
@@ -418,14 +463,20 @@ export const prepareUploadedMenuItemImage = async (
   };
 };
 
-export const selectPendingMenuItemImage = async (
+export const assignPendingImageToMenuItem = async (
   input: MenuItemImageWorkflowInput & {
+    pendingActionId: string;
     itemId: string;
     itemName: string;
-    confirmImmediately?: boolean;
   }
 ): Promise<ToolResult> => {
-  const pendingImage = await findActivePendingImage(input);
+  const pendingImage = await PendingAgentAction.findOne({
+    _id: input.pendingActionId,
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    action: "IMAGE_ASSIGNMENT"
+  });
 
   if (!pendingImage) {
     return {
@@ -435,20 +486,70 @@ export const selectPendingMenuItemImage = async (
     };
   }
 
-  await setPendingImageTarget(pendingImage, input);
+  if (
+    pendingImage.status !== "pending" ||
+    pendingImage.expiresAt.getTime() <= Date.now()
+  ) {
+    if (pendingImage.status === "pending") {
+      pendingImage.status = "expired";
+      pendingImage.resultMessage = missingImageMessage;
+      await pendingImage.save();
+    }
 
-  if (input.confirmImmediately) {
-    return confirmPendingMenuItemImage({
-      ...input,
-      pendingActionId: String(pendingImage._id)
-    });
+    return {
+      success: false,
+      code: "PENDING_IMAGE_NOT_FOUND",
+      message: missingImageMessage
+    };
   }
+
+  if (
+    pendingImage.data?.stage !== "awaiting_item" &&
+    pendingImage.data?.stage !== "awaiting_confirmation"
+  ) {
+    return {
+      success: false,
+      code: "PENDING_IMAGE_WRONG_STAGE",
+      message: "That image is not waiting for a menu item selection."
+    };
+  }
+
+  if (
+    !pendingImage.imageSecureUrl ||
+    !pendingImage.imagePublicId ||
+    !validateTrustedCloudinaryImage({
+      secureUrl: pendingImage.imageSecureUrl,
+      publicId: pendingImage.imagePublicId
+    })
+  ) {
+    return {
+      success: false,
+      code: "PENDING_IMAGE_INVALID",
+      message: missingImageMessage
+    };
+  }
+
+  const isRetarget =
+    pendingImage.data?.stage === "awaiting_confirmation" &&
+    String(pendingImage.selectedMenuItemId ?? "") !== input.itemId;
+  const message = `Use the uploaded image for ${input.itemName}${
+    isRetarget ? " instead" : ""
+  }?`;
+  await setPendingImageTarget(pendingImage, {
+    ...input,
+    confirmationMessage: message
+  });
 
   return {
     success: true,
     requiresConfirmation: true,
     pendingActionId: String(pendingImage._id),
-    message: pendingImage.confirmationMessage
+    message,
+    data: {
+      stage: "awaiting_confirmation",
+      itemId: input.itemId,
+      itemName: input.itemName
+    }
   };
 };
 
@@ -489,6 +590,14 @@ export const confirmPendingMenuItemImage = async (
     return { success: false, code: "PENDING_IMAGE_NOT_FOUND", message: missingImageMessage };
   }
 
+  if (existing.data?.stage !== "awaiting_confirmation") {
+    return {
+      success: false,
+      code: "PENDING_IMAGE_WRONG_STAGE",
+      message: "That image is not waiting for confirmation."
+    };
+  }
+
   if (
     !existing.selectedMenuItemId ||
     !existing.imageSecureUrl ||
@@ -505,19 +614,32 @@ export const confirmPendingMenuItemImage = async (
   }
 
   const claimed = await PendingAgentAction.findOneAndUpdate(
-    { ...scopedFilter, status: "pending" },
+    {
+      ...scopedFilter,
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+      "data.stage": "awaiting_confirmation",
+      actionVersion: existing.actionVersion
+    },
     { $set: { status: "processing" } },
     { new: true }
   );
 
   if (!claimed) {
-    const completed = await PendingAgentAction.findOne(scopedFilter);
-    return completed?.status === "completed"
+    const latest = await PendingAgentAction.findOne(scopedFilter);
+    return latest?.status === "completed"
       ? {
           success: true,
-          message: completed.resultMessage ?? "The uploaded image was already assigned.",
-          data: { itemId: String(completed.selectedMenuItemId), idempotent: true }
+          message: latest.resultMessage ?? "The uploaded image was already assigned.",
+          data: { itemId: String(latest.selectedMenuItemId), idempotent: true }
         }
+      : latest?.status === "pending"
+        ? {
+            success: false,
+            code: "PENDING_IMAGE_CHANGED",
+            message:
+              "That image assignment changed before confirmation. Please review it and confirm again."
+          }
       : {
           success: false,
           code: "IMAGE_ASSIGNMENT_IN_PROGRESS",
@@ -594,23 +716,57 @@ export const confirmPendingMenuItemImage = async (
 export const cancelPendingMenuItemImageConfirmation = async (
   input: MenuItemImageWorkflowInput & { pendingActionId: string }
 ): Promise<ToolResult> => {
-  const pendingAction = await PendingAgentAction.findOne({
+  const scopedFilter = {
     _id: input.pendingActionId,
     restaurantId: input.restaurantId,
     senderPhone: input.senderPhone,
     senderRole: input.senderRole,
-    action: "IMAGE_ASSIGNMENT",
-    status: "pending",
-    expiresAt: { $gt: new Date() }
-  });
+    action: "IMAGE_ASSIGNMENT"
+  };
+  const existing = await PendingAgentAction.findOne(scopedFilter);
 
-  if (!pendingAction) {
+  if (!existing) {
     return { success: false, code: "PENDING_IMAGE_NOT_FOUND", message: missingImageMessage };
   }
 
-  pendingAction.status = "cancelled";
-  pendingAction.resultMessage = "Pending image action cancelled.";
-  await pendingAction.save();
+  if (existing.status === "cancelled") {
+    return {
+      success: true,
+      message: existing.resultMessage ?? "That pending image action was already cancelled.",
+      data: { idempotent: true }
+    };
+  }
+
+  if (
+    existing.status !== "pending" ||
+    existing.expiresAt.getTime() <= Date.now()
+  ) {
+    return { success: false, code: "PENDING_IMAGE_NOT_FOUND", message: missingImageMessage };
+  }
+
+  const pendingAction = await PendingAgentAction.findOneAndUpdate(
+    {
+      ...scopedFilter,
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+      actionVersion: existing.actionVersion
+    },
+    {
+      $set: {
+        status: "cancelled",
+        resultMessage: "Pending image action cancelled."
+      }
+    },
+    { new: true }
+  );
+
+  if (!pendingAction) {
+    return {
+      success: false,
+      code: "PENDING_IMAGE_CHANGED",
+      message: "That image workflow changed before it could be cancelled. Please try again."
+    };
+  }
 
   return { success: true, message: "Okay, I cancelled that pending image action." };
 };

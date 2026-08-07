@@ -4,7 +4,8 @@ const { v2: cloudinary } = require("cloudinary");
 
 const {
   decryptWasenderMedia,
-  normalizeIncomingWebhook
+  normalizeIncomingWebhook,
+  validateWasenderMenuItemImageMetadata
 } = require("../dist/services/wasender.service");
 const {
   extractCloudinaryPublicId,
@@ -75,7 +76,7 @@ const makePendingImage = (overrides = {}) => ({
   senderPhone,
   senderRole: "manager",
   action: "IMAGE_ASSIGNMENT",
-  toolName: "set_menu_item_image",
+  toolName: "confirm_pending_image_assignment",
   arguments: { itemId: menuItemId },
   data: { stage: "awaiting_confirmation", itemName: "Chicken Salad" },
   imageSecureUrl: cloudinaryUrl,
@@ -146,6 +147,38 @@ test("webhook normalization preserves the complete raw WhatsApp image message", 
   assert.equal(normalized.messageType, "image");
   assert.equal(normalized.mediaUrl, encryptedUrl);
   assert.deepEqual(normalized.rawMessage, rawMessage);
+});
+
+test("deterministic image metadata validation rejects unsupported and oversized media", () => {
+  assert.doesNotThrow(() => validateWasenderMenuItemImageMetadata(rawMessage));
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        message: {
+          imageMessage: { mimetype: "image/gif", fileLength: "1024" }
+        }
+      }),
+    /JPG, PNG, or WEBP/
+  );
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        message: {
+          imageMessage: {
+            mimetype: "image/jpeg",
+            fileLength: String(5 * 1024 * 1024 + 1)
+          }
+        }
+      }),
+    /5 MB or smaller/
+  );
+  assert.throws(
+    () =>
+      validateWasenderMenuItemImageMetadata({
+        imageMessage: { mimetype: "image/png", fileLength: "not-a-number" }
+      }),
+    /size metadata is invalid/
+  );
 });
 
 test("WaSender media decryption posts the complete message with the restaurant token", async () => {
@@ -462,13 +495,28 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
   }
 });
 
-test("AI-facing set_menu_item_image schema cannot accept imageUrl", async () => {
+test("AI-facing image workflow schemas cannot accept image URLs", async () => {
   const definitions = getAgentToolDefinitionsForRole("manager");
-  const imageTool = definitions.find((tool) => tool.function.name === "set_menu_item_image");
-  assert.deepEqual(Object.keys(imageTool.function.parameters.properties).sort(), ["itemId", "itemName"]);
+  const imageToolNames = [
+    "start_menu_item_image_upload",
+    "assign_pending_image_to_menu_item",
+    "confirm_pending_image_assignment",
+    "cancel_pending_image_assignment"
+  ];
+
+  for (const toolName of imageToolNames) {
+    const imageTool = definitions.find((tool) => tool.function.name === toolName);
+
+    assert.ok(imageTool, toolName);
+    const serialized = JSON.stringify(imageTool.function.parameters);
+    assert.doesNotMatch(
+      serialized,
+      /imageUrl|secureUrl|imageSecureUrl|publicId|imagePublicId/i
+    );
+  }
 
   const result = await executeAgentTool(
-    "set_menu_item_image",
+    "start_menu_item_image_upload",
     { itemName: "Chicken Salad", imageUrl: cloudinaryUrl },
     {
       restaurantId,

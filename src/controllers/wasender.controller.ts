@@ -3,6 +3,7 @@ import {
   decryptWasenderMedia,
   sendTextMessage,
   sendImageMessage,
+  validateWasenderMenuItemImageMetadata,
   type WasenderSendResult
 } from "../services/wasender.service";
 import { Order } from "../models/order.model";
@@ -551,6 +552,7 @@ const processNormalizedWebhook = async (
         }
 
         try {
+          validateWasenderMenuItemImageMetadata(webhook.rawMessage);
           const decryptedPublicUrl = await decryptWasenderMedia(webhook.rawMessage, {
             apiKey: restaurant.wasenderApiToken
           });
