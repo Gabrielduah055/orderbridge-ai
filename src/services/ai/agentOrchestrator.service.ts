@@ -286,7 +286,9 @@ export const runAgentOrchestrator = async (
   const systemPrompt = await buildSystemPrompt(
     input.restaurant,
     input.sender,
-    Array.from(permittedToolNames)
+    Array.from(permittedToolNames),
+    {},
+    input.staffState
   );
   const history = await getHistory(restaurantId, input.sender.normalizedPhone, 14);
   const messages: AiMessage[] = [

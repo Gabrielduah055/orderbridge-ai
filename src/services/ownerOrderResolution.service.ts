@@ -1,5 +1,6 @@
 import { Order, type IOrderDocument } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
+import type { SenderRole } from "../types/agent.types";
 import * as orderService from "./order.service";
 
 export type OwnerOrderDecision = "accept" | "reject";
@@ -102,10 +103,15 @@ const getFreshPendingOrders = async (restaurantId: string): Promise<IOrderDocume
   return orders.filter((order) => orderService.isPendingOrderActionable(order));
 };
 
-const findPendingSelection = async (restaurantId: string, senderPhone: string) => {
+const findPendingSelection = async (
+  restaurantId: string,
+  senderPhone: string,
+  senderRole?: Extract<SenderRole, "owner" | "manager">
+) => {
   return PendingAgentAction.findOne({
     restaurantId,
     senderPhone,
+    ...(senderRole ? { senderRole } : {}),
     action: "OWNER_ORDER_SELECTION",
     status: "pending",
     expiresAt: { $gt: new Date() }
@@ -176,9 +182,14 @@ export const resolveQuotedOwnerOrderDecision = async (
 export const handleSavedOwnerSelectionReply = async (
   restaurantId: string,
   senderPhone: string,
-  message: string
+  message: string,
+  senderRole?: Extract<SenderRole, "owner" | "manager">
 ): Promise<OwnerOrderResolutionResult> => {
-  const pendingSelection = await findPendingSelection(restaurantId, senderPhone);
+  const pendingSelection = await findPendingSelection(
+    restaurantId,
+    senderPhone,
+    senderRole
+  );
 
   if (!pendingSelection) {
     return { handled: false, success: false, message: "" };
@@ -248,7 +259,8 @@ export const handleSavedOwnerSelectionReply = async (
 export const handleUnquotedOwnerOrderDecision = async (
   restaurantId: string,
   senderPhone: string,
-  decision: OwnerOrderDecision
+  decision: OwnerOrderDecision,
+  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner"
 ): Promise<OwnerOrderResolutionResult> => {
   const freshOrders = await getFreshPendingOrders(restaurantId);
 
@@ -280,7 +292,7 @@ export const handleUnquotedOwnerOrderDecision = async (
   const pendingSelection = await PendingAgentAction.create({
     restaurantId,
     senderPhone,
-    senderRole: "owner",
+    senderRole,
     action: "OWNER_ORDER_SELECTION",
     data: {
       decision,

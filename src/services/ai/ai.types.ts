@@ -1,6 +1,7 @@
 import type { IOrderDocument } from "../../models/order.model";
 import type { IRestaurantDocument } from "../../models/Restaurant";
 import type { ResolvedSender, ToolResult } from "../../types/agent.types";
+import type { StaffOperationalState } from "./staffOperationalState.service";
 
 export type AiProviderName = "hermes" | "openrouter";
 
@@ -70,6 +71,7 @@ export interface AgentOrchestratorInput {
   restaurant: IRestaurantDocument;
   sender: ResolvedSender;
   message: string;
+  staffState?: StaffOperationalState;
 }
 
 export interface AgentOrchestratorResult {

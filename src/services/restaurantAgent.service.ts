@@ -35,6 +35,10 @@ import type {
   RestaurantAgentResponse
 } from "../types/agent.types";
 import type { AgentOrchestratorResult } from "./ai/ai.types";
+import {
+  buildStaffOperationalState,
+  createEmptyStaffOperationalState
+} from "./ai/staffOperationalState.service";
 
 const temporaryHermesErrorMessage =
   "I'm having trouble reaching the restaurant assistant right now. Please try again in a few minutes.";
@@ -195,6 +199,7 @@ export const shouldUseAiFirstStaffTextRouting = (
 
 export interface RestaurantAgentRoutingDependencies {
   runOrchestrator?: typeof runAgentOrchestrator;
+  buildStaffState?: typeof buildStaffOperationalState;
   handlePendingImageReply?: typeof handlePendingMenuItemImageReply;
   rememberImageRequest?: typeof rememberMenuItemImageRequest;
   parseOrderDecision?: typeof parseOwnerOrderDecision;
@@ -422,6 +427,8 @@ export const handleRestaurantAgentMessage = async (
     openRouterConfig.customerAgentEnabled
   );
   const runOrchestrator = dependencies.runOrchestrator ?? runAgentOrchestrator;
+  const buildStaffState =
+    dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
     dependencies.handlePendingImageReply ?? handlePendingMenuItemImageReply;
   const rememberImageRequest =
@@ -574,12 +581,27 @@ export const handleRestaurantAgentMessage = async (
 
   if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
     let agentResult: AgentOrchestratorResult | undefined;
+    let staffState = createEmptyStaffOperationalState(sender.role);
+
+    try {
+      staffState = await buildStaffState({
+        restaurant: input.restaurant,
+        sender
+      });
+    } catch (error) {
+      console.error("[staffState] build failed", {
+        restaurantId,
+        role: sender.role,
+        errorType: error instanceof Error ? error.name : "UnknownError"
+      });
+    }
 
     try {
       agentResult = await runOrchestrator({
         restaurant: input.restaurant,
         sender,
-        message
+        message,
+        staffState
       });
     } catch {
       staffAgentFallbackReason = "orchestrator_exception";
@@ -896,7 +918,8 @@ export const handleRestaurantAgentMessage = async (
     const selectionResult = await handleSavedSelection(
       restaurantId,
       sender.normalizedPhone,
-      message
+      message,
+      sender.role
     );
 
     if (selectionResult.handled) {
@@ -933,7 +956,8 @@ export const handleRestaurantAgentMessage = async (
       : await handleUnquotedOwnerOrderDecision(
           restaurantId,
           sender.normalizedPhone,
-          simpleOwnerDecision
+          simpleOwnerDecision,
+          sender.role
         );
 
     await saveAgentConversationMessage({
