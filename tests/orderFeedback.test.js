@@ -1154,6 +1154,7 @@ test("another restaurant cannot resolve a feedback record", async () => {
 
 test("complaint resolution is confirmation-gated in the owner tool", async () => {
   const originalFeedbackFindOne = OrderFeedback.findOne;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
   const originalPendingCreate = PendingAgentAction.create;
   let pending;
   const context = {
@@ -1170,6 +1171,7 @@ test("complaint resolution is confirmation-gated in the owner tool", async () =>
 
   try {
     OrderFeedback.findOne = async () => makeFeedback();
+    PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
     PendingAgentAction.create = async (input) => {
       pending = { _id: "pending-feedback-resolution", ...input };
       return pending;
@@ -1185,6 +1187,7 @@ test("complaint resolution is confirmation-gated in the owner tool", async () =>
     assert.deepEqual(pending.arguments, { feedbackId });
   } finally {
     OrderFeedback.findOne = originalFeedbackFindOne;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
     PendingAgentAction.create = originalPendingCreate;
   }
 });

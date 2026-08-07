@@ -22,7 +22,10 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
+  getActivePendingMenuItemImageStage,
   handlePendingMenuItemImageReply,
+  shouldHandlePendingMenuItemImageReply,
+  type MenuItemImageStage,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -31,6 +34,7 @@ import type {
   RestaurantAgentMessageInput,
   RestaurantAgentResponse
 } from "../types/agent.types";
+import type { AgentOrchestratorResult } from "./ai/ai.types";
 
 const temporaryHermesErrorMessage =
   "I'm having trouble reaching the restaurant assistant right now. Please try again in a few minutes.";
@@ -109,7 +113,7 @@ export const isPendingActionConfirmationMessage = (message: string): boolean => 
   );
 };
 
-const parseOwnerOrderDecision = (
+export const parseOwnerOrderDecision = (
   message: string
 ): { decision: "accept" | "reject"; orderReference: string; reason?: string } | null => {
   const normalized = message.trim();
@@ -182,6 +186,36 @@ export const shouldUseOpenRouterCustomerAgent = (
   aiProviderName: string,
   customerAgentEnabled: boolean
 ): boolean => aiProviderName === "openrouter" && customerAgentEnabled;
+
+export const shouldUseAiFirstStaffTextRouting = (
+  role: ReturnType<typeof resolveSenderIdentity>["role"],
+  aiProviderName: string
+): role is "owner" | "manager" =>
+  aiProviderName === "openrouter" && (role === "owner" || role === "manager");
+
+export interface RestaurantAgentRoutingDependencies {
+  runOrchestrator?: typeof runAgentOrchestrator;
+  handlePendingImageReply?: typeof handlePendingMenuItemImageReply;
+  rememberImageRequest?: typeof rememberMenuItemImageRequest;
+  parseOrderDecision?: typeof parseOwnerOrderDecision;
+  parseSimpleDecision?: typeof parseSimpleOwnerDecision;
+  handleSavedSelection?: typeof handleSavedOwnerSelectionReply;
+  executeTool?: typeof executeAgentTool;
+  findLatestPendingAction?: typeof findLatestPendingToolAction;
+  findPendingActions?: typeof findPendingToolActions;
+  executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
+  cancelPendingAction?: typeof cancelPendingToolAction;
+  getPendingImageStage?: (input: {
+    restaurantId: string;
+    senderPhone: string;
+    senderRole: "owner" | "manager";
+  }) => Promise<MenuItemImageStage | null>;
+}
+
+export const hasMeaningfulAgentToolActivity = (
+  executedTools: AgentOrchestratorResult["executedTools"]
+): boolean =>
+  executedTools.some((tool) => tool.success || Boolean(tool.pendingActionId));
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -375,7 +409,8 @@ const saveAssistantResponse = async (
 };
 
 export const handleRestaurantAgentMessage = async (
-  input: RestaurantAgentMessageInput
+  input: RestaurantAgentMessageInput,
+  dependencies: RestaurantAgentRoutingDependencies = {}
 ): Promise<RestaurantAgentResponse> => {
   const restaurantId = String(input.restaurant._id);
   const sender = resolveSenderIdentity(input.restaurant, input.senderPhone);
@@ -386,6 +421,28 @@ export const handleRestaurantAgentMessage = async (
     aiProviderName,
     openRouterConfig.customerAgentEnabled
   );
+  const runOrchestrator = dependencies.runOrchestrator ?? runAgentOrchestrator;
+  const handlePendingImageReply =
+    dependencies.handlePendingImageReply ?? handlePendingMenuItemImageReply;
+  const rememberImageRequest =
+    dependencies.rememberImageRequest ?? rememberMenuItemImageRequest;
+  const parseOrderDecision =
+    dependencies.parseOrderDecision ?? parseOwnerOrderDecision;
+  const parseSimpleDecision =
+    dependencies.parseSimpleDecision ?? parseSimpleOwnerDecision;
+  const handleSavedSelection =
+    dependencies.handleSavedSelection ?? handleSavedOwnerSelectionReply;
+  const executeTool = dependencies.executeTool ?? executeAgentTool;
+  const findLatestPendingAction =
+    dependencies.findLatestPendingAction ?? findLatestPendingToolAction;
+  const findPendingActions =
+    dependencies.findPendingActions ?? findPendingToolActions;
+  const executeConfirmedAction =
+    dependencies.executeConfirmedAction ?? executeConfirmedPendingToolAction;
+  const cancelPendingAction =
+    dependencies.cancelPendingAction ?? cancelPendingToolAction;
+  const getPendingImageStage =
+    dependencies.getPendingImageStage ?? getActivePendingMenuItemImageStage;
 
   console.info("Restaurant agent sender resolved", {
     restaurantId,
@@ -507,6 +564,129 @@ export const handleRestaurantAgentMessage = async (
         source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_agent"
       }
     });
+  }
+
+  let staffAgentFallbackResult: AgentOrchestratorResult | undefined;
+  let staffAgentFallbackReason: string | undefined;
+  let prefetchedPendingImageResult:
+    | Awaited<ReturnType<typeof handlePendingMenuItemImageReply>>
+    | undefined;
+
+  if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
+    let agentResult: AgentOrchestratorResult | undefined;
+
+    try {
+      agentResult = await runOrchestrator({
+        restaurant: input.restaurant,
+        sender,
+        message
+      });
+    } catch {
+      staffAgentFallbackReason = "orchestrator_exception";
+    }
+
+    if (agentResult) {
+      const hasMeaningfulToolActivity = hasMeaningfulAgentToolActivity(
+        agentResult.executedTools
+      );
+      const hasUsableMessage = Boolean(agentResult.message?.trim());
+      const pendingImageStage =
+        !hasMeaningfulToolActivity && agentResult.success && hasUsableMessage
+          ? await getPendingImageStage({
+              restaurantId,
+              senderPhone: sender.normalizedPhone,
+              senderRole: sender.role
+            })
+          : null;
+      const shouldUsePendingImageWorkflow = Boolean(
+        pendingImageStage &&
+          shouldHandlePendingMenuItemImageReply(pendingImageStage, message)
+      );
+
+      if (shouldUsePendingImageWorkflow) {
+        prefetchedPendingImageResult = await handlePendingImageReply({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          message
+        });
+      }
+
+      const pendingImageNeedsFallback = Boolean(
+        prefetchedPendingImageResult?.handled
+      );
+      const looksLikePendingDecision =
+        !hasMeaningfulToolActivity &&
+        agentResult.success &&
+        hasUsableMessage &&
+        (isPendingActionConfirmationMessage(message) ||
+          isPendingActionCancellationMessage(message));
+      const pendingAction = looksLikePendingDecision
+        ? await findLatestPendingAction({
+            restaurantId,
+            restaurant: input.restaurant,
+            sender,
+            originalMessage: message,
+            quotedMessageId: input.quotedMessageId
+          })
+        : null;
+      const pendingDecisionNeedsFallback = Boolean(pendingAction);
+      const handledByAi =
+        hasMeaningfulToolActivity ||
+        (agentResult.success &&
+          hasUsableMessage &&
+          !pendingDecisionNeedsFallback &&
+          !pendingImageNeedsFallback);
+
+      if (handledByAi) {
+        await saveAgentConversationMessage({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          direction: "assistant",
+          content: agentResult.message || temporaryAgentErrorMessage,
+          metadata: {
+            source: "openrouter_agent",
+            provider: agentResult.provider,
+            model: agentResult.model,
+            responseId: agentResult.responseId,
+            success: agentResult.success,
+            executedTools: agentResult.executedTools,
+            usage: agentResult.usage
+          }
+        });
+
+        console.info("[restaurantAgent] staff text routing", {
+          role: sender.role,
+          path: "ai",
+          success: agentResult.success,
+          toolNames: agentResult.executedTools.map((tool) => tool.name)
+        });
+
+        return {
+          success: agentResult.success,
+          message: agentResult.message || temporaryAgentErrorMessage,
+          data: agentResult.data,
+          source: "openrouter_agent",
+          sender
+        };
+      }
+
+      staffAgentFallbackResult = agentResult;
+      staffAgentFallbackReason = pendingImageNeedsFallback
+        ? "pending_image_requires_backend_workflow"
+        : pendingDecisionNeedsFallback
+          ? "pending_action_requires_backend_confirmation"
+          : agentResult.errorCode || "unusable_response";
+    }
+
+    console.warn(
+      "[restaurantAgent] staff AI routing failed; using legacy fallback",
+      {
+        role: sender.role,
+        reason: staffAgentFallbackReason || "unknown_failure"
+      }
+    );
   }
 
   const parsedSpecificItemName = parseSpecificMenuItemViewRequest(message);
@@ -631,14 +811,18 @@ export const handleRestaurantAgentMessage = async (
     originalMessage: message,
     quotedMessageId: input.quotedMessageId
   };
+  const legacyStaffSource =
+    aiProviderName === "openrouter" ? "legacy_owner" : "hermes_tools";
 
   if (sender.role === "owner" || sender.role === "manager") {
-    const pendingImageResult = await handlePendingMenuItemImageReply({
-      restaurantId,
-      senderPhone: sender.normalizedPhone,
-      senderRole: sender.role,
-      message
-    });
+    const pendingImageResult =
+      prefetchedPendingImageResult ??
+      (await handlePendingImageReply({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        message
+      }));
 
     if (pendingImageResult.handled) {
       await saveAssistantResponse(
@@ -647,7 +831,7 @@ export const handleRestaurantAgentMessage = async (
         {
           success: pendingImageResult.success,
           message: pendingImageResult.message,
-          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          source: legacyStaffSource,
           sender
         },
         {
@@ -661,12 +845,12 @@ export const handleRestaurantAgentMessage = async (
       return {
         success: pendingImageResult.success,
         message: pendingImageResult.message,
-        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        source: legacyStaffSource,
         sender
       };
     }
 
-    const imageRequestResult = await rememberMenuItemImageRequest({
+    const imageRequestResult = await rememberImageRequest({
       restaurantId,
       senderPhone: sender.normalizedPhone,
       senderRole: sender.role,
@@ -680,7 +864,7 @@ export const handleRestaurantAgentMessage = async (
         {
           success: imageRequestResult.success,
           message: imageRequestResult.message,
-          source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+          source: legacyStaffSource,
           sender
         },
         {
@@ -693,7 +877,7 @@ export const handleRestaurantAgentMessage = async (
       return {
         success: imageRequestResult.success,
         message: imageRequestResult.message,
-        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        source: legacyStaffSource,
         sender
       };
     }
@@ -701,15 +885,15 @@ export const handleRestaurantAgentMessage = async (
 
   const ownerOrderDecision =
     sender.role === "owner" || sender.role === "manager"
-      ? parseOwnerOrderDecision(message)
+      ? parseOrderDecision(message)
       : null;
   const simpleOwnerDecision =
     sender.role === "owner" || sender.role === "manager"
-      ? parseSimpleOwnerDecision(message)
+      ? parseSimpleDecision(message)
       : null;
 
   if (sender.role === "owner" || sender.role === "manager") {
-    const selectionResult = await handleSavedOwnerSelectionReply(
+    const selectionResult = await handleSavedSelection(
       restaurantId,
       sender.normalizedPhone,
       message
@@ -732,7 +916,7 @@ export const handleRestaurantAgentMessage = async (
         success: selectionResult.success,
         message: selectionResult.message,
         data: selectionResult.data,
-        source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+        source: legacyStaffSource,
         sender
       };
     }
@@ -770,13 +954,13 @@ export const handleRestaurantAgentMessage = async (
       success: result.success,
       message: result.message,
       data: result.data,
-      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+      source: legacyStaffSource,
       sender
     };
   }
 
   if (ownerOrderDecision) {
-    const result = await executeAgentTool(
+    const result = await executeTool(
       ownerOrderDecision.decision === "accept" ? "confirm_order" : "reject_order",
       {
         orderReference: ownerOrderDecision.orderReference,
@@ -802,14 +986,14 @@ export const handleRestaurantAgentMessage = async (
       success: result.success,
       message: result.message,
       data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-      source: aiProviderName === "openrouter" ? "openrouter_agent" : "hermes_tools",
+      source: legacyStaffSource,
       sender
     };
   }
 
   const pendingAction =
     aiProviderName === "openrouter"
-      ? await findLatestPendingToolAction(executionContext)
+      ? await findLatestPendingAction(executionContext)
       : null;
 
   if (
@@ -817,7 +1001,7 @@ export const handleRestaurantAgentMessage = async (
     pendingAction &&
     isPendingActionConfirmationMessage(message)
   ) {
-    const pendingActions = await findPendingToolActions(executionContext);
+    const pendingActions = await findPendingActions(executionContext);
 
     if (pendingActions.length > 1) {
       // Handle numbered replies: "1", "2", "Yes 1", "Yes 2", etc.
@@ -846,7 +1030,7 @@ export const handleRestaurantAgentMessage = async (
             );
           }
 
-          const result = await executeConfirmedPendingToolAction(
+          const result = await executeConfirmedAction(
             String(selectedAction._id),
             executionContext
           );
@@ -858,7 +1042,7 @@ export const handleRestaurantAgentMessage = async (
             direction: "assistant",
             content: result.message,
             metadata: {
-              source: "openrouter_agent",
+              source: "legacy_owner",
               deterministicAction: "confirm_pending_action_by_number",
               selectedIndex,
               success: result.success,
@@ -870,7 +1054,7 @@ export const handleRestaurantAgentMessage = async (
             success: result.success,
             message: result.message,
             data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-            source: "openrouter_agent",
+            source: legacyStaffSource,
             sender
           };
         }
@@ -885,7 +1069,7 @@ export const handleRestaurantAgentMessage = async (
         direction: "assistant",
         content: clarificationMessage,
         metadata: {
-          source: "openrouter_agent",
+          source: "legacy_owner",
           deterministicAction: "ambiguous_pending_action",
           pendingActionCount: pendingActions.length
         }
@@ -894,12 +1078,12 @@ export const handleRestaurantAgentMessage = async (
       return {
         success: false,
         message: clarificationMessage,
-        source: "openrouter_agent",
+        source: legacyStaffSource,
         sender
       };
     }
 
-    const result = await executeConfirmedPendingToolAction(
+    const result = await executeConfirmedAction(
       String(pendingAction._id),
       executionContext
     );
@@ -911,7 +1095,7 @@ export const handleRestaurantAgentMessage = async (
       direction: "assistant",
       content: result.message,
       metadata: {
-        source: "openrouter_agent",
+        source: "legacy_owner",
         deterministicAction: "confirm_pending_action",
         success: result.success,
         code: result.code
@@ -922,7 +1106,7 @@ export const handleRestaurantAgentMessage = async (
       success: result.success,
       message: result.message,
       data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-      source: "openrouter_agent",
+      source: legacyStaffSource,
       sender
     };
   }
@@ -932,7 +1116,7 @@ export const handleRestaurantAgentMessage = async (
     pendingAction &&
     isPendingActionCancellationMessage(message)
   ) {
-    const result = await cancelPendingToolAction(executionContext);
+    const result = await cancelPendingAction(executionContext);
 
     await saveAgentConversationMessage({
       restaurantId,
@@ -941,7 +1125,7 @@ export const handleRestaurantAgentMessage = async (
       direction: "assistant",
       content: result.message,
       metadata: {
-        source: "openrouter_agent",
+        source: "legacy_owner",
         deterministicAction: "cancel_pending_action",
         success: result.success,
         code: result.code
@@ -952,39 +1136,39 @@ export const handleRestaurantAgentMessage = async (
       success: result.success,
       message: result.message,
       data: result.data && typeof result.data === "object" ? { ...result.data } : undefined,
-      source: "openrouter_agent",
+      source: legacyStaffSource,
       sender
     };
   }
 
   if (aiProviderName === "openrouter") {
-    const agentResult = await runAgentOrchestrator({
-      restaurant: input.restaurant,
-      sender,
-      message
-    });
-
+    const safeMessage =
+      staffAgentFallbackReason === "pending_action_requires_backend_confirmation"
+        ? "I couldn't confirm that pending action safely. Please try again."
+        : staffAgentFallbackResult?.message || temporaryAgentErrorMessage;
     await saveAgentConversationMessage({
       restaurantId,
       senderPhone: sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
-      content: agentResult.message,
+      content: safeMessage,
       metadata: {
         source: "openrouter_agent",
-        provider: agentResult.provider,
-        model: agentResult.model,
-        responseId: agentResult.responseId,
-        success: agentResult.success,
-        executedTools: agentResult.executedTools,
-        usage: agentResult.usage
+        routingPath: "legacy_fallback_unhandled",
+        fallbackReason: staffAgentFallbackReason,
+        provider: staffAgentFallbackResult?.provider,
+        model: staffAgentFallbackResult?.model,
+        responseId: staffAgentFallbackResult?.responseId,
+        success: false,
+        executedTools: staffAgentFallbackResult?.executedTools,
+        usage: staffAgentFallbackResult?.usage
       }
     });
 
     return {
-      success: agentResult.success,
-      message: agentResult.message || temporaryAgentErrorMessage,
-      data: agentResult.data,
+      success: false,
+      message: safeMessage,
+      data: staffAgentFallbackResult?.data,
       source: "openrouter_agent",
       sender
     };

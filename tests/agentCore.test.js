@@ -2381,6 +2381,12 @@ test("owner prompts never load or include customer memory", async () => {
   assert.equal(memoryLoads, 0);
   assert.equal(prompt.includes("customerState"), false);
   assert.equal(prompt.includes("Wrong customer"), false);
+  assert.match(
+    prompt,
+    /every owner or manager request involving current restaurant data or an operational action/
+  );
+  assert.match(prompt, /today's order count or sales/);
+  assert.match(prompt, /Ordinary conversation such as greetings, thanks, 'you there\?'/);
 });
 
 test("customer memory lookup failure does not block the ordering prompt", async () => {
