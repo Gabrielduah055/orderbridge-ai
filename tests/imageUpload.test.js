@@ -274,6 +274,14 @@ test("natural image confirmations include yes, yea, yeah, and action phrases", (
     extractMenuItemNameFromImageReply("yes use it for chicken salad"),
     "chicken salad"
   );
+  assert.equal(
+    extractMenuItemNameFromImageReply("it belongs to Chicken Salad"),
+    "Chicken Salad"
+  );
+  assert.equal(
+    extractMenuItemNameFromImageReply("this is for Check Check Fried Rice"),
+    "Check Check Fried Rice"
+  );
 });
 
 test("pending image routing distinguishes conversation from image workflow replies", () => {
@@ -366,6 +374,44 @@ test("yea add it to the chicken salad resolves the item and completes assignment
     restore(MenuItem, "find", originalMenuFind);
     restore(MenuItem, "findOne", originalMenuFindOne);
     restore(menuItemService, "updateTrustedMenuItemImage", originalTrustedUpdate);
+  }
+});
+
+test("an awaiting-item image resolves a relational item reply without using the full sentence", async () => {
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalMenuFind = MenuItem.find;
+  const pending = makePendingImage({
+    arguments: {},
+    data: { stage: "awaiting_item" },
+    selectedMenuItemId: undefined,
+    confirmationMessage: "Which menu item does this image belong to?"
+  });
+  const menuQueries = [];
+
+  PendingAgentAction.findOne = () => sortable(pending);
+  MenuItem.find = (query) => {
+    menuQueries.push(query);
+    return sortable([{ _id: menuItemId, name: "Chicken Salad" }]);
+  };
+
+  try {
+    const result = await handlePendingMenuItemImageReply({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      message: "it belongs to Chicken Salad"
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.success, true);
+    assert.equal(result.itemName, "Chicken Salad");
+    assert.equal(menuQueries.length, 1);
+    assert.equal(menuQueries[0].name.$regex, "^Chicken Salad$");
+    assert.equal(pending.data.stage, "awaiting_confirmation");
+    assert.equal(String(pending.selectedMenuItemId), menuItemId);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalPendingFindOne);
+    restore(MenuItem, "find", originalMenuFind);
   }
 });
 

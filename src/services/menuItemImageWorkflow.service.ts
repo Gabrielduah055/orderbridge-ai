@@ -128,7 +128,8 @@ export const extractMenuItemNameFromImageReply = (message: string): string | nul
   );
   const actionPatterns = [
     /^(?:please\s+)?(?:add|set|use|put|attach|assign)\s+(?:(?:the|this|that|uploaded)\s+)?(?:image|photo|picture|it)\s+(?:to|for|on)\s+(.+)$/i,
-    /^(?:do it|add it|use it)\s+(?:to|for|on)\s+(.+)$/i
+    /^(?:do it|add it|use it)\s+(?:to|for|on)\s+(.+)$/i,
+    /^(?:(?:it|this|that)|(?:the|this|that)\s+(?:image|photo|picture))\s+(?:belongs\s+to|is\s+for)\s+(.+)$/i
   ];
 
   for (const pattern of actionPatterns) {
