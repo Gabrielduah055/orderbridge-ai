@@ -103,6 +103,7 @@ export interface StaffOperationalState {
     recentActive: StaffOrderView[];
   };
   recentReferences: {
+    quotedOrder?: StaffOrderView;
     orderSelection?: StaffOrderSelectionReference;
     menuItem?: {
       id?: string;
@@ -245,6 +246,7 @@ export const buildStaffOperationalState = async (
   input: {
     restaurant: IRestaurantDocument;
     sender: ResolvedSender;
+    quotedMessageId?: string;
   },
   dependencies: StaffOperationalStateDependencies = {}
 ): Promise<StaffOperationalState> => {
@@ -259,6 +261,10 @@ export const buildStaffOperationalState = async (
   const findOrders = dependencies.findOrders ?? defaultFindOrders;
   const getPermissions =
     dependencies.getPermissions ?? getAllowedToolNamesForRole;
+  const quotedMessageId =
+    typeof input.quotedMessageId === "string" && input.quotedMessageId.trim()
+      ? input.quotedMessageId
+      : undefined;
 
   const pendingActions = await findPendingActions(
     {
@@ -293,7 +299,7 @@ export const buildStaffOperationalState = async (
       $or: [
         { customerConfirmedAt: { $gte: freshnessCutoff } },
         {
-          customerConfirmedAt: { $exists: false },
+          customerConfirmedAt: null,
           createdAt: { $gte: freshnessCutoff }
         }
       ]
@@ -322,11 +328,28 @@ export const buildStaffOperationalState = async (
         .sort({ createdAt: 1 })
         .limit(staffOperationalStateLimits.orderSelectionCandidates)
     : Promise.resolve([]);
-  const [freshPendingOrders, recentActiveOrders, selectionOrders] =
+  const quotedOrderPromise = quotedMessageId
+    ? findOrders(
+        {
+          restaurantId,
+          ownerNotificationProviderMessageId: quotedMessageId
+        },
+        orderProjection
+      )
+        .sort({ createdAt: -1 })
+        .limit(1)
+    : Promise.resolve([]);
+  const [
+    freshPendingOrders,
+    recentActiveOrders,
+    selectionOrders,
+    quotedOrders
+  ] =
     await Promise.all([
       freshPendingPromise,
       recentActivePromise,
-      selectionOrdersPromise
+      selectionOrdersPromise,
+      quotedOrderPromise
     ]);
 
   const imageWorkflow = getImageWorkflow(pendingActions);
@@ -383,6 +406,9 @@ export const buildStaffOperationalState = async (
       recentActive: recentActiveOrders.map(toOrderView)
     },
     recentReferences: {
+      quotedOrder: quotedOrders[0]
+        ? toOrderView(quotedOrders[0])
+        : undefined,
       orderSelection,
       menuItem: menuItemReference
     },
@@ -394,7 +420,8 @@ export const buildStaffOperationalState = async (
     role: input.sender.role,
     pendingActionCount: state.pendingActions.length,
     imageWorkflowStage: state.imageWorkflow?.stage ?? null,
-    freshPendingOrderCount: state.orders.freshPending.length
+    freshPendingOrderCount: state.orders.freshPending.length,
+    hasQuotedOrder: Boolean(state.recentReferences.quotedOrder)
   });
 
   return state;

@@ -205,6 +205,49 @@ test("a successful staff AI response prevents every legacy handler and saves one
   });
 });
 
+test("quoted provider message ID is passed to the staff state builder", async () => {
+  await runWithRoutingHarness(async () => {
+    const quotedMessageId = "provider-order-message-102";
+    let stateBuilderInput;
+    let orchestratorInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "reject this",
+        quotedMessageId
+      },
+      {
+        buildStaffState: async (input) => {
+          stateBuilderInput = input;
+          return makeStaffState({
+            recentReferences: {
+              quotedOrder: {
+                id: "order-102",
+                orderNumber: "ORD-102",
+                status: "pending"
+              }
+            }
+          });
+        },
+        runOrchestrator: async (input) => {
+          orchestratorInput = input;
+          return makeAgentResult({
+            executedTools: [{ name: "reject_order", success: true }]
+          });
+        }
+      }
+    );
+
+    assert.equal(stateBuilderInput.quotedMessageId, quotedMessageId);
+    assert.equal(
+      orchestratorInput.staffState.recentReferences.quotedOrder.orderNumber,
+      "ORD-102"
+    );
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
 test("OpenRouter failure preserves the deterministic image-intent text fallback", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];

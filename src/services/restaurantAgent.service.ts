@@ -586,7 +586,8 @@ export const handleRestaurantAgentMessage = async (
     try {
       staffState = await buildStaffState({
         restaurant: input.restaurant,
-        sender
+        sender,
+        quotedMessageId: input.quotedMessageId
       });
     } catch (error) {
       console.error("[staffState] build failed", {

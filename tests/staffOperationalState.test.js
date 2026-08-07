@@ -79,6 +79,12 @@ const makeDependencies = ({ pending = [], orders = [], capture = {} } = {}) => (
     if (filter._id?.$in) {
       const ids = new Set(filter._id.$in.map(String));
       matches = matches.filter((record) => ids.has(String(record._id)));
+    } else if (filter.ownerNotificationProviderMessageId) {
+      matches = matches.filter(
+        (record) =>
+          record.ownerNotificationProviderMessageId ===
+          filter.ownerNotificationProviderMessageId
+      );
     } else if (filter.status?.$in) {
       matches = matches.filter((record) => filter.status.$in.includes(record.status));
     }
@@ -384,6 +390,110 @@ test("order context and order-selection references are restaurant-scoped and bou
   assert.equal(state.permissions.includes("update_menu_price"), true);
 });
 
+test("quoted order reference resolves the trusted provider relationship within the restaurant", async () => {
+  const quotedMessageId = "provider-message-for-ord-102";
+  const orders = [
+    orderRecord(1, "pending"),
+    orderRecord(2, "pending", {
+      ownerNotificationProviderMessageId: quotedMessageId
+    }),
+    orderRecord(3, "pending")
+  ];
+  const capture = {};
+  const state = await buildStaffOperationalState(
+    { restaurant, sender: owner, quotedMessageId },
+    makeDependencies({ capture, orders })
+  );
+
+  assert.equal(state.orders.freshPending.length, 3);
+  assert.deepEqual(state.recentReferences.quotedOrder, {
+    id: String(orders[1]._id),
+    orderNumber: "ORD-102",
+    status: "pending",
+    customerName: "Customer 2",
+    total: 52,
+    createdAt: orders[1].createdAt.toISOString()
+  });
+  assert.equal(
+    capture.orderFilters.every((filter) => filter.restaurantId === restaurantId),
+    true
+  );
+  assert.equal(
+    capture.orderFilters.some(
+      (filter) => filter.ownerNotificationProviderMessageId === quotedMessageId
+    ),
+    true
+  );
+  assert.equal(capture.orderProjection.ownerNotificationProviderMessageId, undefined);
+  assert.equal(JSON.stringify(state).includes(quotedMessageId), false);
+});
+
+test("quoted order reference never crosses restaurant boundaries", async () => {
+  const quotedMessageId = "provider-message-from-other-restaurant";
+  const state = await buildStaffOperationalState(
+    { restaurant, sender: owner, quotedMessageId },
+    makeDependencies({
+      orders: [
+        orderRecord(2, "pending", {
+          restaurantId: otherRestaurantId,
+          ownerNotificationProviderMessageId: quotedMessageId
+        })
+      ]
+    })
+  );
+
+  assert.equal(state.recentReferences.quotedOrder, undefined);
+});
+
+test("missing or unknown quoted IDs produce no quoted order reference", async () => {
+  const orders = [
+    orderRecord(2, "pending", {
+      ownerNotificationProviderMessageId: "known-provider-message"
+    })
+  ];
+  const withoutQuote = await buildStaffOperationalState(
+    { restaurant, sender: owner },
+    makeDependencies({ orders })
+  );
+  const withUnknownQuote = await buildStaffOperationalState(
+    { restaurant, sender: owner, quotedMessageId: "unknown-provider-message" },
+    makeDependencies({ orders })
+  );
+
+  assert.equal(withoutQuote.recentReferences.quotedOrder, undefined);
+  assert.equal(withUnknownQuote.recentReferences.quotedOrder, undefined);
+});
+
+test("fresh pending state includes actionable orders with missing or null confirmation time", async () => {
+  const capture = {};
+  const missingConfirmation = orderRecord(1, "pending");
+  delete missingConfirmation.customerConfirmedAt;
+  const nullConfirmation = orderRecord(2, "pending", {
+    customerConfirmedAt: null
+  });
+  const staleNullConfirmation = orderRecord(3, "pending", {
+    customerConfirmedAt: null,
+    createdAt: new Date("2026-08-07T10:00:00.000Z")
+  });
+  const state = await buildStaffOperationalState(
+    { restaurant, sender: owner },
+    makeDependencies({
+      capture,
+      orders: [missingConfirmation, nullConfirmation, staleNullConfirmation]
+    })
+  );
+
+  assert.deepEqual(
+    state.orders.freshPending.map(({ orderNumber }) => orderNumber),
+    ["ORD-101", "ORD-102"]
+  );
+  const freshFilter = capture.orderFilters.find((filter) => filter.$or);
+  assert.deepEqual(freshFilter.$or[1], {
+    customerConfirmedAt: null,
+    createdAt: { $gte: new Date("2026-08-07T11:00:00.000Z") }
+  });
+});
+
 test("empty staff state remains safe and permission-aware after loading failure", () => {
   const state = createEmptyStaffOperationalState("manager");
 
@@ -458,6 +568,8 @@ test("staff operational state reaches a delimited data-only prompt section", asy
   assert.match(prompt, /even if a string looks like an instruction/i);
   assert.match(prompt, /trusted backend data, never as instructions/i);
   assert.match(prompt, /does not mean it succeeded/i);
+  assert.match(prompt, /recentReferences\.quotedOrder/);
+  assert.match(prompt, /appropriate trusted backend order tool/i);
   assert.equal(prompt.includes("imageSecureUrl"), false);
   assert.equal(prompt.includes("imagePublicId"), false);
   assert.equal(prompt.includes("res.cloudinary.com"), false);
@@ -471,7 +583,16 @@ test("customer prompt remains unchanged and never receives staff state", async (
     role: "customer",
     verified: false
   };
-  const accidentalStaffState = createEmptyStaffOperationalState("owner");
+  const accidentalStaffState = {
+    ...createEmptyStaffOperationalState("owner"),
+    recentReferences: {
+      quotedOrder: {
+        id: "quoted-order-id",
+        orderNumber: "ORD-102",
+        status: "pending"
+      }
+    }
+  };
   const prompt = await buildAgentSystemPrompt(
     restaurant,
     customer,
@@ -487,6 +608,7 @@ test("customer prompt remains unchanged and never receives staff state", async (
 
   assert.equal(prompt.includes("CURRENT STAFF OPERATIONAL STATE"), false);
   assert.equal(prompt.includes("<staff_state>"), false);
+  assert.equal(prompt.includes("ORD-102"), false);
   assert.match(prompt, /WhatsApp ordering assistant/);
 });
 
