@@ -391,9 +391,9 @@ test("daily and weekly completed periods respect the configured timezone", () =>
 
 test("restaurant summary settings have safe defaults and validation", () => {
   assert.equal(Restaurant.schema.path("timezone").options.default, "Africa/Accra");
-  assert.equal(Restaurant.schema.path("ownerDailySummaryEnabled").options.default, false);
+  assert.equal(Restaurant.schema.path("ownerDailySummaryEnabled").options.default, true);
   assert.equal(Restaurant.schema.path("ownerDailySummaryTime").options.default, "08:00");
-  assert.equal(Restaurant.schema.path("ownerWeeklySummaryEnabled").options.default, false);
+  assert.equal(Restaurant.schema.path("ownerWeeklySummaryEnabled").options.default, true);
   assert.equal(Restaurant.schema.path("ownerWeeklySummaryDay").options.default, "monday");
   assert.equal(Restaurant.schema.path("ownerWeeklySummaryTime").options.default, "08:00");
 

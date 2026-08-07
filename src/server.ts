@@ -8,6 +8,7 @@ import { startCustomerCampaignScheduler } from "./services/customerCampaignSched
 import { startOrderFeedbackScheduler } from "./services/orderFeedbackScheduler.service";
 import { startWasenderQueueWorker } from "./services/wasenderQueue.service";
 import { startPostDeliveryFollowUpScheduler } from "./services/postDeliveryFollowUp.service";
+import { logScheduledMessagingCredentialDiagnostics } from "./services/schedulerDiagnostics.service";
 
 const startServer = async (): Promise<void> => {
   await connectDb();
@@ -16,6 +17,11 @@ const startServer = async (): Promise<void> => {
     console.log(`OrderBridge AI backend listening on port ${env.port}`);
   });
   startWasenderQueueWorker();
+  void logScheduledMessagingCredentialDiagnostics().catch((error) => {
+    console.error("[schedulerCredentials] Startup check failed", {
+      error: error instanceof Error ? error.message : "Unknown scheduler credential diagnostic error"
+    });
+  });
   startFollowUpScheduler();
   startOwnerSummaryScheduler();
   startOwnerPendingActionReminderScheduler();

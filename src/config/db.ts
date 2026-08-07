@@ -19,16 +19,28 @@ const getMongoErrorMessage = (error: unknown): string => {
   return error.message;
 };
 
-export const connectDb = async (): Promise<void> => {
+export interface ConnectDbOptions {
+  ensureIndexes?: boolean;
+  autoIndex?: boolean;
+}
+
+export const connectDb = async (
+  options: ConnectDbOptions = {}
+): Promise<void> => {
   try {
     if (env.mongodbUri.startsWith("mongodb+srv://") && env.mongodbDnsServers.length > 0) {
       dns.setServers(env.mongodbDnsServers);
     }
 
     await mongoose.connect(env.mongodbUri, {
-      serverSelectionTimeoutMS: 10000
+      serverSelectionTimeoutMS: 10000,
+      ...(options.autoIndex === undefined ? {} : { autoIndex: options.autoIndex })
     });
-    await ensureCustomerCampaignRecipientIndexes();
+
+    if (options.ensureIndexes !== false) {
+      await ensureCustomerCampaignRecipientIndexes();
+    }
+
     console.log("MongoDB connected successfully");
   } catch (error) {
     console.error(`MongoDB connection failed: ${getMongoErrorMessage(error)}`);

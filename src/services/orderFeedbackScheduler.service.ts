@@ -23,6 +23,7 @@ export const ORDER_FEEDBACK_MAX_MESSAGES_PER_PASS = 25;
 export const ORDER_FEEDBACK_RESTAURANT_BATCH_SIZE = 100;
 let schedulerStarted = false;
 let schedulerBusy = false;
+let schedulerPassLogged = false;
 
 type FeedbackRestaurant = Pick<
   IRestaurantDocument,
@@ -508,6 +509,27 @@ export const startOrderFeedbackScheduler = (): void => {
 
     schedulerBusy = true;
     void runOrderFeedbackSchedulerPass()
+      .then((result) => {
+        if (
+          !schedulerPassLogged ||
+          result.followUpsScheduled > 0 ||
+          result.remindersQueued > 0 ||
+          result.ordersAutomaticallyCompleted > 0 ||
+          result.staleMessagesCancelled > 0 ||
+          result.errors > 0
+        ) {
+          console.info("[orderFeedback] Scheduler pass", {
+            eligibleRestaurants: result.restaurantsChecked,
+            ordersChecked: result.ordersChecked,
+            followUpsScheduled: result.followUpsScheduled,
+            remindersQueued: result.remindersQueued,
+            ordersAutomaticallyCompleted: result.ordersAutomaticallyCompleted,
+            staleMessagesCancelled: result.staleMessagesCancelled,
+            errors: result.errors
+          });
+          schedulerPassLogged = true;
+        }
+      })
       .catch((error) => {
         console.error("Order feedback scheduler pass failed", {
           error:

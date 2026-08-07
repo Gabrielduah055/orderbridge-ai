@@ -22,6 +22,7 @@ const DEFAULT_TIMEZONE = "Africa/Accra";
 const DEFAULT_SUMMARY_TIME = "08:00";
 let schedulerStarted = false;
 let schedulerBusy = false;
+let schedulerPassLogged = false;
 
 export type OwnerSummaryRestaurant = Pick<
   IRestaurantDocument,
@@ -57,15 +58,15 @@ export interface OwnerSummarySchedulerPassResult {
   errors: number;
 }
 
-const loadEligibleRestaurants = async (): Promise<OwnerSummaryRestaurant[]> => {
+export const loadEligibleOwnerSummaryRestaurants = async (): Promise<OwnerSummaryRestaurant[]> => {
   return Restaurant.find({
     status: { $in: ["trial", "active"] },
     ownerPhone: { $exists: true, $ne: "" },
     wasenderSessionId: { $exists: true, $ne: "" },
     wasenderApiToken: { $exists: true, $ne: "" },
     $or: [
-      { ownerDailySummaryEnabled: true },
-      { ownerWeeklySummaryEnabled: true }
+      { ownerDailySummaryEnabled: { $ne: false } },
+      { ownerWeeklySummaryEnabled: { $ne: false } }
     ]
   }).select("+wasenderApiToken");
 };
@@ -188,7 +189,8 @@ export const runOwnerSummarySchedulerPass = async (
   now = new Date(),
   dependencies: OwnerSummarySchedulerDependencies = {}
 ): Promise<OwnerSummarySchedulerPassResult> => {
-  const loadRestaurants = dependencies.loadRestaurants ?? loadEligibleRestaurants;
+  const loadRestaurants =
+    dependencies.loadRestaurants ?? loadEligibleOwnerSummaryRestaurants;
   const getMetrics = dependencies.getMetrics ?? getOwnerSummaryMetrics;
   const summaryExists = dependencies.summaryExists ?? defaultSummaryExists;
   const enqueueMessage = dependencies.enqueueMessage ?? enqueueWasenderMessage;
@@ -214,12 +216,12 @@ export const runOwnerSummarySchedulerPass = async (
     }> = [
       {
         type: "daily",
-        enabled: restaurant.ownerDailySummaryEnabled,
+        enabled: restaurant.ownerDailySummaryEnabled !== false,
         time: restaurant.ownerDailySummaryTime || DEFAULT_SUMMARY_TIME
       },
       {
         type: "weekly",
-        enabled: restaurant.ownerWeeklySummaryEnabled,
+        enabled: restaurant.ownerWeeklySummaryEnabled !== false,
         time: restaurant.ownerWeeklySummaryTime || DEFAULT_SUMMARY_TIME,
         day: restaurant.ownerWeeklySummaryDay || "monday"
       }
@@ -275,6 +277,16 @@ export const startOwnerSummaryScheduler = (): void => {
 
     schedulerBusy = true;
     void runOwnerSummarySchedulerPass()
+      .then((result) => {
+        if (!schedulerPassLogged || result.summariesQueued > 0 || result.errors > 0) {
+          console.info("[ownerSummary] Scheduler pass", {
+            eligibleRestaurants: result.restaurantsChecked,
+            summariesQueued: result.summariesQueued,
+            errors: result.errors
+          });
+          schedulerPassLogged = true;
+        }
+      })
       .catch((error) => {
         console.error("Owner summary scheduler pass failed", {
           error: error instanceof Error ? error.message : "Unknown owner summary scheduler error"
