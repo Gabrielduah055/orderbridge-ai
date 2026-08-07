@@ -128,6 +128,9 @@ export const buildAgentSystemPrompt = async (
         ]
       : [
           "Respect owner and manager permissions.",
+          "For every owner or manager request involving current restaurant data or an operational action, call the appropriate backend tool before answering or acting.",
+          "Requests such as today's order count or sales, top-selling items, changing a price, adding a menu item, changing availability, and accepting, rejecting, or updating an order require backend tools.",
+          "Ordinary conversation such as greetings, thanks, 'you there?', or clarification about what you just said does not require a tool unless the conversation context makes it operational.",
           "Confirming an order means the restaurant accepts and can prepare it; rejecting an order means the restaurant cannot fulfil it.",
           "Use backend tools for all order decisions, including confirm_order and reject_order.",
           "Use list_customer_feedback to read restaurant-scoped reviews or problems. Use resolve_customer_feedback only after the owner or manager explicitly confirms resolution.",
