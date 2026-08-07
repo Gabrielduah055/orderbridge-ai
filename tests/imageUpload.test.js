@@ -17,7 +17,8 @@ const {
   extractMenuItemNameFromImageReply,
   handlePendingMenuItemImageReply,
   isMenuItemImageConfirmationMessage,
-  prepareUploadedMenuItemImage
+  prepareUploadedMenuItemImage,
+  shouldHandlePendingMenuItemImageReply
 } = require("../dist/services/menuItemImageWorkflow.service");
 const {
   getAgentToolDefinitionsForRole
@@ -272,6 +273,36 @@ test("natural image confirmations include yes, yea, yeah, and action phrases", (
   assert.equal(
     extractMenuItemNameFromImageReply("yes use it for chicken salad"),
     "chicken salad"
+  );
+});
+
+test("pending image routing distinguishes conversation from image workflow replies", () => {
+  for (const message of ["you there?", "hello", "wait", "what do you mean?"]) {
+    assert.equal(
+      shouldHandlePendingMenuItemImageReply("awaiting_item", message),
+      false,
+      message
+    );
+  }
+
+  assert.equal(
+    shouldHandlePendingMenuItemImageReply("awaiting_item", "Chicken Salad"),
+    true
+  );
+  assert.equal(
+    shouldHandlePendingMenuItemImageReply("awaiting_confirmation", "yes use it"),
+    true
+  );
+  assert.equal(
+    shouldHandlePendingMenuItemImageReply(
+      "awaiting_confirmation",
+      "no, cancel it"
+    ),
+    true
+  );
+  assert.equal(
+    shouldHandlePendingMenuItemImageReply("awaiting_confirmation", "Done"),
+    false
   );
 });
 

@@ -29,6 +29,8 @@ interface ImageWorkflowResult {
   pendingActionId?: string;
 }
 
+export type MenuItemImageStage = "awaiting_item" | "awaiting_confirmation";
+
 interface MenuItemMatchResult {
   kind: "one" | "multiple" | "none";
   item?: IMenuItemDocument;
@@ -66,13 +68,55 @@ export const isMenuItemImageConfirmationMessage = (message: string): boolean => 
   );
 };
 
-const isImageCancellationMessage = (message: string): boolean => {
+export const isMenuItemImageCancellationMessage = (message: string): boolean => {
   const normalized = normalizeDecisionText(message);
 
   return (
     /^(?:no|nope|nah|cancel|stop|abort)\b/.test(normalized) ||
     /^(?:don't|dont)\s+(?:use|add|save|update|change|do it|proceed)\b/.test(normalized) ||
     /^(?:never mind|nevermind|not now|leave it|ignore it)\b/.test(normalized)
+  );
+};
+
+const isLikelyMenuItemNameReply = (message: string): boolean => {
+  const normalized = message.trim().replace(/\s+/g, " ");
+  const decisionText = normalizeDecisionText(message);
+
+  if (
+    !normalized ||
+    normalized.length > 100 ||
+    normalized.includes("?") ||
+    normalized.split(" ").length > 8
+  ) {
+    return false;
+  }
+
+  if (
+    /^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|you\s+there|are\s+you\s+there|wait|hold\s+on|what|why|how|when|where|who|thanks|thank\s+you|help)\b/.test(
+      decisionText
+    )
+  ) {
+    return false;
+  }
+
+  return /^[\p{L}\p{N}][\p{L}\p{N}\s&'\u2019().-]*[.!]?$/u.test(normalized);
+};
+
+export const shouldHandlePendingMenuItemImageReply = (
+  stage: MenuItemImageStage,
+  message: string
+): boolean => {
+  if (isMenuItemImageCancellationMessage(message)) {
+    return true;
+  }
+
+  if (stage === "awaiting_confirmation") {
+    return isMenuItemImageConfirmationMessage(message);
+  }
+
+  const requestedItemName = extractMenuItemNameFromImageReply(message);
+  return Boolean(
+    requestedItemName && isLikelyMenuItemNameReply(requestedItemName)
   );
 };
 
@@ -217,6 +261,17 @@ const findActivePendingImage = async (
     status: "pending",
     expiresAt: { $gt: new Date() }
   }).sort({ createdAt: -1 });
+};
+
+export const getActivePendingMenuItemImageStage = async (
+  input: MenuItemImageWorkflowInput
+): Promise<MenuItemImageStage | null> => {
+  const pendingImage = await findActivePendingImage(input);
+  const stage = pendingImage?.data?.stage;
+
+  return stage === "awaiting_item" || stage === "awaiting_confirmation"
+    ? stage
+    : null;
 };
 
 const setPendingImageTarget = async (
@@ -644,16 +699,20 @@ export const handlePendingMenuItemImageReply = async (
     return { handled: false, success: false, message: "" };
   }
 
-  if (pendingImage.data?.stage === "awaiting_item") {
-    return attachPendingImageToNamedMenuItem(input);
-  }
-
-  if (isImageCancellationMessage(input.message)) {
+  if (isMenuItemImageCancellationMessage(input.message)) {
     const result = await cancelPendingMenuItemImageConfirmation({
       ...input,
       pendingActionId: String(pendingImage._id)
     });
     return { handled: true, success: result.success, message: result.message };
+  }
+
+  if (pendingImage.data?.stage === "awaiting_item") {
+    if (!shouldHandlePendingMenuItemImageReply("awaiting_item", input.message)) {
+      return { handled: false, success: false, message: "" };
+    }
+
+    return attachPendingImageToNamedMenuItem(input);
   }
 
   if (!isMenuItemImageConfirmationMessage(input.message)) {

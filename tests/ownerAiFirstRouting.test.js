@@ -166,7 +166,7 @@ test("a successful staff AI response prevents every legacy handler and saves one
           orchestratorCalls += 1;
           return makeAgentResult();
         },
-        hasPendingImageAction: async () => false,
+        getPendingImageStage: async () => null,
         handlePendingImageReply: shouldNotRun,
         rememberImageRequest: shouldNotRun,
         handleSavedSelection: shouldNotRun,
@@ -220,7 +220,7 @@ test("OpenRouter failure preserves the deterministic image-intent text fallback"
   });
 });
 
-test("a conversational owner message reaches AI without image or menu parsing", async () => {
+test("an awaiting-item image does not hijack an ordinary conversational message", async () => {
   await runWithRoutingHarness(async () => {
     let legacyCalls = 0;
     const response = await handleRestaurantAgentMessage(
@@ -231,7 +231,7 @@ test("a conversational owner message reaches AI without image or menu parsing", 
       },
       {
         runOrchestrator: async () => makeAgentResult({ message: "Yes, I'm here." }),
-        hasPendingImageAction: async () => false,
+        getPendingImageStage: async () => "awaiting_item",
         handlePendingImageReply: async () => {
           legacyCalls += 1;
           return unhandledImageReply();
@@ -244,6 +244,7 @@ test("a conversational owner message reaches AI without image or menu parsing", 
     );
 
     assert.equal(response.message, "Yes, I'm here.");
+    assert.equal(response.source, "openrouter_agent");
     assert.equal(legacyCalls, 0);
   });
 });
@@ -263,7 +264,7 @@ test("pending mutation confirmation falls back safely after a no-tool AI answer"
           events.push("ai");
           return makeAgentResult({ message: "Done." });
         },
-        hasPendingImageAction: async () => false,
+        getPendingImageStage: async () => null,
         findLatestPendingAction: async () => pendingAction,
         findPendingActions: async () => [pendingAction],
         handlePendingImageReply: unhandledImageReply,
@@ -324,21 +325,95 @@ test("tool activity consumes a staff turn even if the provider fails afterward",
   });
 });
 
-test("a successful no-tool AI answer cannot bypass an active pending image workflow", async () => {
+test("a failed tool attempt does not prevent deterministic fallback", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Accept ORD-456"
+      },
+      {
+        runOrchestrator: async () =>
+          makeAgentResult({
+            success: false,
+            message: "I couldn't do that.",
+            errorCode: "TOOL_EXECUTION_FAILED",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: false,
+                code: "FORBIDDEN",
+                message: "Tool execution was forbidden."
+              }
+            ]
+          }),
+        handlePendingImageReply: unhandledImageReply,
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection,
+        parseSimpleDecision: () => null,
+        parseOrderDecision: (message) => parseOwnerOrderDecision(message),
+        executeTool: async (toolName) => {
+          events.push(toolName);
+          return { success: true, message: "Order accepted.", data: {} };
+        }
+      }
+    );
+
+    assert.deepEqual(events, ["confirm_order"]);
+    assert.equal(response.message, "Order accepted.");
+    assert.equal(response.source, "legacy_owner");
+  });
+});
+
+test("an awaiting-item image progresses for a genuine menu item answer", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken Salad"
+      },
+      {
+        runOrchestrator: async () => {
+          events.push("ai");
+          return makeAgentResult({ message: "Chicken Salad is on your menu." });
+        },
+        getPendingImageStage: async () => "awaiting_item",
+        handlePendingImageReply: async () => {
+          events.push("pendingImageReply");
+          return {
+            handled: true,
+            success: true,
+            message: "Use this image for Chicken Salad?"
+          };
+        }
+      }
+    );
+
+    assert.deepEqual(events, ["ai", "pendingImageReply"]);
+    assert.equal(response.message, "Use this image for Chicken Salad?");
+    assert.equal(response.source, "legacy_owner");
+  });
+});
+
+test("awaiting image confirmation executes the backend despite an AI Done response", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
         senderPhone: managerPhone,
-        message: "yeah, use it"
+        message: "yes"
       },
       {
         runOrchestrator: async () => {
           events.push("ai");
           return makeAgentResult({ message: "Done." });
         },
-        hasPendingImageAction: async () => true,
+        getPendingImageStage: async () => "awaiting_confirmation",
         findLatestPendingAction: async () => null,
         handlePendingImageReply: async () => {
           events.push("pendingImageReply");
@@ -353,6 +428,39 @@ test("a successful no-tool AI answer cannot bypass an active pending image workf
 
     assert.deepEqual(events, ["ai", "pendingImageReply"]);
     assert.equal(response.message, "Done — I added the uploaded image.");
+    assert.equal(response.source, "legacy_owner");
+  });
+});
+
+test("awaiting image confirmation preserves explicit backend cancellation", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: managerPhone,
+        message: "no, cancel it"
+      },
+      {
+        runOrchestrator: async () => {
+          events.push("ai");
+          return makeAgentResult({ message: "Okay." });
+        },
+        getPendingImageStage: async () => "awaiting_confirmation",
+        findLatestPendingAction: async () => null,
+        handlePendingImageReply: async () => {
+          events.push("pendingImageReply");
+          return {
+            handled: true,
+            success: true,
+            message: "Okay, I cancelled that pending image action."
+          };
+        }
+      }
+    );
+
+    assert.deepEqual(events, ["ai", "pendingImageReply"]);
+    assert.equal(response.message, "Okay, I cancelled that pending image action.");
     assert.equal(response.source, "legacy_owner");
   });
 });

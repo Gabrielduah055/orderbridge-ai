@@ -22,7 +22,10 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
+  getActivePendingMenuItemImageStage,
   handlePendingMenuItemImageReply,
+  shouldHandlePendingMenuItemImageReply,
+  type MenuItemImageStage,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
@@ -202,12 +205,17 @@ export interface RestaurantAgentRoutingDependencies {
   findPendingActions?: typeof findPendingToolActions;
   executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
   cancelPendingAction?: typeof cancelPendingToolAction;
-  hasPendingImageAction?: (input: {
+  getPendingImageStage?: (input: {
     restaurantId: string;
     senderPhone: string;
     senderRole: "owner" | "manager";
-  }) => Promise<boolean>;
+  }) => Promise<MenuItemImageStage | null>;
 }
+
+export const hasMeaningfulAgentToolActivity = (
+  executedTools: AgentOrchestratorResult["executedTools"]
+): boolean =>
+  executedTools.some((tool) => tool.success || Boolean(tool.pendingActionId));
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -433,19 +441,8 @@ export const handleRestaurantAgentMessage = async (
     dependencies.executeConfirmedAction ?? executeConfirmedPendingToolAction;
   const cancelPendingAction =
     dependencies.cancelPendingAction ?? cancelPendingToolAction;
-  const hasPendingImageAction =
-    dependencies.hasPendingImageAction ??
-    (async (pendingInput) =>
-      Boolean(
-        await PendingAgentAction.exists({
-          restaurantId: pendingInput.restaurantId,
-          senderPhone: pendingInput.senderPhone,
-          senderRole: pendingInput.senderRole,
-          action: "IMAGE_ASSIGNMENT",
-          status: "pending",
-          expiresAt: { $gt: new Date() }
-        })
-      ));
+  const getPendingImageStage =
+    dependencies.getPendingImageStage ?? getActivePendingMenuItemImageStage;
 
   console.info("Restaurant agent sender resolved", {
     restaurantId,
@@ -589,18 +586,24 @@ export const handleRestaurantAgentMessage = async (
     }
 
     if (agentResult) {
-      const hasToolActivity = agentResult.executedTools.length > 0;
+      const hasMeaningfulToolActivity = hasMeaningfulAgentToolActivity(
+        agentResult.executedTools
+      );
       const hasUsableMessage = Boolean(agentResult.message?.trim());
-      const hasPendingImageWorkflow =
-        !hasToolActivity && agentResult.success && hasUsableMessage
-          ? await hasPendingImageAction({
+      const pendingImageStage =
+        !hasMeaningfulToolActivity && agentResult.success && hasUsableMessage
+          ? await getPendingImageStage({
               restaurantId,
               senderPhone: sender.normalizedPhone,
               senderRole: sender.role
             })
-          : false;
+          : null;
+      const shouldUsePendingImageWorkflow = Boolean(
+        pendingImageStage &&
+          shouldHandlePendingMenuItemImageReply(pendingImageStage, message)
+      );
 
-      if (hasPendingImageWorkflow) {
+      if (shouldUsePendingImageWorkflow) {
         prefetchedPendingImageResult = await handlePendingImageReply({
           restaurantId,
           senderPhone: sender.normalizedPhone,
@@ -613,7 +616,7 @@ export const handleRestaurantAgentMessage = async (
         prefetchedPendingImageResult?.handled
       );
       const looksLikePendingDecision =
-        !hasToolActivity &&
+        !hasMeaningfulToolActivity &&
         agentResult.success &&
         hasUsableMessage &&
         (isPendingActionConfirmationMessage(message) ||
@@ -629,7 +632,7 @@ export const handleRestaurantAgentMessage = async (
         : null;
       const pendingDecisionNeedsFallback = Boolean(pendingAction);
       const handledByAi =
-        hasToolActivity ||
+        hasMeaningfulToolActivity ||
         (agentResult.success &&
           hasUsableMessage &&
           !pendingDecisionNeedsFallback &&
