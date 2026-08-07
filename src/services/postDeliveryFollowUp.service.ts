@@ -7,6 +7,9 @@ import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
 const SCHEDULER_INTERVAL_MS = 60_000;
 const DEFAULT_DELAY_MINUTES = 45;
+let schedulerStarted = false;
+let schedulerBusy = false;
+let schedulerPassLogged = false;
 
 // Statuses that are terminal — no point sending a follow-up
 const skipStatuses = [
@@ -35,7 +38,21 @@ const buildCustomerDeliveryFollowUpMessage = (
   ].join("\n");
 };
 
-const runPostDeliveryFollowUpPass = async (): Promise<void> => {
+export interface PostDeliveryFollowUpSchedulerPassResult {
+  eligibleRestaurants: number;
+  ordersChecked: number;
+  followUpsQueued: number;
+  errors: number;
+}
+
+export const runPostDeliveryFollowUpPass = async (): Promise<PostDeliveryFollowUpSchedulerPassResult> => {
+  const result: PostDeliveryFollowUpSchedulerPassResult = {
+    eligibleRestaurants: 0,
+    ordersChecked: 0,
+    followUpsQueued: 0,
+    errors: 0
+  };
+
   try {
     // Fix A: use $ne: false so existing restaurants (field = undefined) are included
     const restaurants = await Restaurant.find({
@@ -45,9 +62,10 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
     }).select(
       "_id name ownerPhone postDeliveryFollowUpDelayMinutes wasenderSessionId +wasenderApiToken"
     );
+    result.eligibleRestaurants = restaurants.length;
 
     if (restaurants.length === 0) {
-      return;
+      return result;
     }
 
     const restaurantMap = new Map<string, IRestaurantDocument>(
@@ -70,6 +88,8 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
     );
 
     for (const order of orders) {
+      result.ordersChecked += 1;
+
       try {
         const restaurant = restaurantMap.get(String(order.restaurantId));
 
@@ -100,6 +120,7 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
               orderNumber: order.orderNumber
             });
           } catch (completionError) {
+            result.errors += 1;
             console.error(
               `[postDeliveryFollowUp] Could not auto-complete order ${orderId}:`,
               completionError
@@ -114,6 +135,7 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
             await notifyOwnerOfCompletedOrder(restaurant, order);
             order.ownerCompletionNotifiedAt = now;
           } catch (ownerError) {
+            result.errors += 1;
             console.error(
               `[postDeliveryFollowUp] Failed to notify owner for order ${orderId}:`,
               ownerError
@@ -143,14 +165,15 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
 
         order.deliveryFollowUpSentAt = now;
         await order.save();
+        result.followUpsQueued += 1;
 
         console.info("[postDeliveryFollowUp] Follow-up queued", {
           restaurantId: String(restaurant._id),
           orderId,
-          orderNumber: order.orderNumber,
-          customerPhone: order.customerPhone
+          orderNumber: order.orderNumber
         });
       } catch (orderError) {
+        result.errors += 1;
         console.error(
           `[postDeliveryFollowUp] Error processing order ${String(order._id)}:`,
           orderError
@@ -158,14 +181,42 @@ const runPostDeliveryFollowUpPass = async (): Promise<void> => {
       }
     }
   } catch (error) {
+    result.errors += 1;
     console.error("[postDeliveryFollowUp] Scheduler pass failed:", error);
   }
+
+  return result;
 };
 
 export const startPostDeliveryFollowUpScheduler = (): void => {
+  if (schedulerStarted) {
+    return;
+  }
+
+  schedulerStarted = true;
   console.log(
     `[postDeliveryFollowUp] Scheduler started (check every ${SCHEDULER_INTERVAL_MS / 1000}s)`
   );
-  void runPostDeliveryFollowUpPass();
-  setInterval(() => void runPostDeliveryFollowUpPass(), SCHEDULER_INTERVAL_MS);
+
+  const runPass = (): void => {
+    if (schedulerBusy) {
+      return;
+    }
+
+    schedulerBusy = true;
+    void runPostDeliveryFollowUpPass()
+      .then((result) => {
+        if (!schedulerPassLogged || result.followUpsQueued > 0 || result.errors > 0) {
+          console.info("[postDeliveryFollowUp] Scheduler pass", result);
+          schedulerPassLogged = true;
+        }
+      })
+      .finally(() => {
+        schedulerBusy = false;
+      });
+  };
+
+  runPass();
+  const timer = setInterval(runPass, SCHEDULER_INTERVAL_MS);
+  timer.unref?.();
 };

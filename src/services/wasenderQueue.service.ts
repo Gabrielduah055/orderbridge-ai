@@ -1049,6 +1049,9 @@ export const startWasenderQueueWorker = (): void => {
   }
 
   workerStarted = true;
+  console.log(
+    `[wasenderQueue] Worker started (check every ${workerIntervalMs / 1000}s)`
+  );
 
   void recoverStaleSendingWasenderMessages().catch((error) => {
     console.error("Wasender queue recovery failed", {

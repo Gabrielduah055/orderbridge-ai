@@ -26,6 +26,7 @@ export const CUSTOMER_CAMPAIGN_BATCH_SIZE = 100;
 export const CUSTOMER_CAMPAIGN_MAX_MESSAGES_PER_PASS = 500;
 let schedulerStarted = false;
 let schedulerBusy = false;
+let schedulerPassLogged = false;
 
 type CampaignDeliveryRestaurant = Pick<
   IRestaurantDocument,
@@ -87,6 +88,7 @@ export interface CustomerCampaignSchedulerDependencies {
 }
 
 export interface CustomerCampaignSchedulerPassResult {
+  eligibleRestaurants: number;
   campaignsChecked: number;
   recipientsChecked: number;
   messagesQueued: number;
@@ -316,6 +318,7 @@ export const runCustomerCampaignSchedulerPass = async (
       console.error(message, context));
   const restaurants = await loadRestaurants();
   const result: CustomerCampaignSchedulerPassResult = {
+    eligibleRestaurants: restaurants.length,
     campaignsChecked: 0,
     recipientsChecked: 0,
     messagesQueued: 0,
@@ -531,6 +534,12 @@ export const startCustomerCampaignScheduler = (): void => {
 
     schedulerBusy = true;
     void runCustomerCampaignSchedulerPass()
+      .then((result) => {
+        if (!schedulerPassLogged || result.messagesQueued > 0 || result.errors > 0) {
+          console.info("[customerCampaign] Scheduler pass", result);
+          schedulerPassLogged = true;
+        }
+      })
       .catch((error) => {
         console.error("Customer campaign scheduler pass failed", {
           error:
