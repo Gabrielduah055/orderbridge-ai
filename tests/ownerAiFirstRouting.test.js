@@ -516,6 +516,97 @@ test("actionable image confirmation falls back when AI falsely claims success wi
   });
 });
 
+test("awaiting-confirmation retarget falls back when AI returns text without the assignment tool", async () => {
+  await runWithRoutingHarness(async () => {
+    const workflow = {
+      active: true,
+      type: "menu_item_image",
+      stage: "awaiting_confirmation",
+      imageUploaded: true,
+      itemName: "Chicken Salad",
+      pendingActionId: "64b000000000000000000901"
+    };
+    let fallbackInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "actually use it for Jollof instead"
+      },
+      {
+        buildStaffState: async () => makeStaffState({ imageWorkflow: workflow }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Done — I'll use it for Jollof.",
+            executedTools: []
+          }),
+        handlePendingImageReply: async (input) => {
+          fallbackInput = input;
+          workflow.itemName = "Jollof";
+          return {
+            handled: true,
+            success: true,
+            itemName: "Jollof",
+            pendingActionId: input.pendingActionId,
+            message: "Use the uploaded image for Jollof instead?"
+          };
+        }
+      }
+    );
+
+    assert.equal(fallbackInput.pendingActionId, workflow.pendingActionId);
+    assert.equal(workflow.itemName, "Jollof");
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(response.message, "Use the uploaded image for Jollof instead?");
+  });
+});
+
+test("awaiting-image cancellation falls back with the exact workflow ID when AI omits the cancel tool", async () => {
+  await runWithRoutingHarness(async () => {
+    const pendingActionId = "64b000000000000000000811";
+    let fallbackInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "never mind, cancel it"
+      },
+      {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: {
+              active: true,
+              type: "menu_item_image",
+              stage: "awaiting_image",
+              imageUploaded: false,
+              itemName: "Chicken Salad",
+              pendingActionId
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Okay, cancelled.",
+            executedTools: []
+          }),
+        findLatestPendingAction: async () => null,
+        handlePendingImageReply: async (input) => {
+          fallbackInput = input;
+          return {
+            handled: true,
+            success: true,
+            pendingActionId: input.pendingActionId,
+            message: "Okay, I cancelled that pending image action."
+          };
+        }
+      }
+    );
+
+    assert.equal(fallbackInput.pendingActionId, pendingActionId);
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(response.message, "Okay, I cancelled that pending image action.");
+  });
+});
+
 test("an unrelated successful tool cannot consume an actionable image turn", async () => {
   await runWithRoutingHarness(async () => {
     let legacyCalls = 0;

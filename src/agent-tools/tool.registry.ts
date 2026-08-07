@@ -1550,7 +1550,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "cancel_pending_image_assignment",
       description:
-        "Cancel one exact pending image assignment using its pendingActionId from staff operational state.",
+        "Cancel one exact pending menu-item image workflow using its pendingActionId from staff operational state, including a workflow still waiting for the WhatsApp image.",
       parameters: {
         pendingActionId: "Exact pending image action ID from staff operational state."
       }

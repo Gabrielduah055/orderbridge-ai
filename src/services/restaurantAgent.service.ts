@@ -22,6 +22,7 @@ import {
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
+  extractMenuItemNameFromImageRetargetReply,
   handlePendingMenuItemImageReply,
   isMenuItemImageCancellationMessage,
   isMenuItemImageConfirmationMessage,
@@ -228,10 +229,16 @@ const getRequiredImageWorkflowTool = (
 ): RequiredImageWorkflowTool | null => {
   if (
     !imageWorkflow ||
-    imageWorkflow.stage === "awaiting_image" ||
     !shouldHandlePendingMenuItemImageReply(imageWorkflow.stage, message)
   ) {
     return null;
+  }
+
+  if (
+    imageWorkflow.stage === "awaiting_confirmation" &&
+    extractMenuItemNameFromImageRetargetReply(message)
+  ) {
+    return "assign_pending_image_to_menu_item";
   }
 
   if (isMenuItemImageCancellationMessage(message)) {
@@ -245,7 +252,8 @@ const getRequiredImageWorkflowTool = (
     return "confirm_pending_image_assignment";
   }
 
-  return imageWorkflow.stage === "awaiting_item"
+  return imageWorkflow.stage === "awaiting_item" ||
+    imageWorkflow.stage === "awaiting_confirmation"
     ? "assign_pending_image_to_menu_item"
     : null;
 };
@@ -611,6 +619,9 @@ export const handleRestaurantAgentMessage = async (
 
   let staffAgentFallbackResult: AgentOrchestratorResult | undefined;
   let staffAgentFallbackReason: string | undefined;
+  let staffImageWorkflow: Awaited<
+    ReturnType<typeof buildStaffOperationalState>
+  >["imageWorkflow"] = null;
 
   if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
     let agentResult: AgentOrchestratorResult | undefined;
@@ -629,6 +640,8 @@ export const handleRestaurantAgentMessage = async (
         errorType: error instanceof Error ? error.name : "UnknownError"
       });
     }
+
+    staffImageWorkflow = staffState.imageWorkflow;
 
     try {
       agentResult = await runOrchestrator({
@@ -861,7 +874,8 @@ export const handleRestaurantAgentMessage = async (
       restaurantId,
       senderPhone: sender.normalizedPhone,
       senderRole: sender.role,
-      message
+      message,
+      pendingActionId: staffImageWorkflow?.pendingActionId
     });
 
     if (pendingImageResult.handled) {

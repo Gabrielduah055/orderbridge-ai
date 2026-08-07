@@ -247,6 +247,7 @@ test("start image tool safely accepts a missing item without inventing one", asy
 
 test("deterministic upload with a known target becomes awaiting_confirmation", async () => {
   const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
   const originalUpdateMany = PendingAgentAction.updateMany;
   const originalCreate = PendingAgentAction.create;
   let created;
@@ -259,6 +260,7 @@ test("deterministic upload with a known target becomes awaiting_confirmation", a
         itemName: "Chicken Salad"
       }
     });
+  PendingAgentAction.findOneAndUpdate = async () => null;
   PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
   PendingAgentAction.create = async (input) => {
     created = { _id: imageActionId, ...input };
@@ -282,8 +284,83 @@ test("deterministic upload with a known target becomes awaiting_confirmation", a
     assert.doesNotMatch(JSON.stringify(created.arguments), /url|public/i);
   } finally {
     restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
     restore(PendingAgentAction, "updateMany", originalUpdateMany);
     restore(PendingAgentAction, "create", originalCreate);
+  }
+});
+
+test("a newer deterministic upload cancels and deletes the superseded trusted upload", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
+  const originalUpdateMany = PendingAgentAction.updateMany;
+  const originalCreate = PendingAgentAction.create;
+  const originalDestroy = cloudinary.uploader.destroy;
+  const originalApiKey = process.env.CLOUDINARY_API_KEY;
+  const originalApiSecret = process.env.CLOUDINARY_API_SECRET;
+  const oldUpload = pendingImage();
+  let supersedeAttempts = 0;
+  let deletes = 0;
+  let created;
+
+  process.env.CLOUDINARY_API_KEY = "test-key";
+  process.env.CLOUDINARY_API_SECRET = "test-secret";
+  PendingAgentAction.findOne = () => queryResult(null);
+  PendingAgentAction.findOneAndUpdate = async (filter, update) => {
+    supersedeAttempts += 1;
+    assert.equal(filter.restaurantId, restaurantId);
+    assert.equal(filter.senderPhone, senderPhone);
+    assert.equal(filter.senderRole, "owner");
+    assert.equal(filter.action, "IMAGE_ASSIGNMENT");
+    assert.equal(filter.status, "pending");
+
+    if (supersedeAttempts > 1) {
+      return null;
+    }
+
+    Object.assign(oldUpload, update.$set);
+    return oldUpload;
+  };
+  PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
+  PendingAgentAction.create = async (input) => {
+    created = { _id: "64b000000000000000000902", ...input };
+    return created;
+  };
+  cloudinary.uploader.destroy = async (deletedPublicId) => {
+    assert.equal(deletedPublicId, publicId);
+    deletes += 1;
+    return { result: "ok" };
+  };
+
+  try {
+    const result = await prepareUploadedMenuItemImage({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      image: {
+        secureUrl:
+          "https://res.cloudinary.com/demo/image/upload/v124/menu-items/new-pending-image.jpg",
+        publicId: "menu-items/new-pending-image",
+        uploadedAt: new Date()
+      }
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(oldUpload.status, "cancelled");
+    assert.equal(oldUpload.resultMessage, "Superseded by a newer uploaded image.");
+    assert.equal(deletes, 1);
+    assert.equal(created.status, "pending");
+    assert.equal(created.imagePublicId, "menu-items/new-pending-image");
+  } finally {
+    restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
+    restore(PendingAgentAction, "updateMany", originalUpdateMany);
+    restore(PendingAgentAction, "create", originalCreate);
+    restore(cloudinary.uploader, "destroy", originalDestroy);
+    if (originalApiKey === undefined) delete process.env.CLOUDINARY_API_KEY;
+    else process.env.CLOUDINARY_API_KEY = originalApiKey;
+    if (originalApiSecret === undefined) delete process.env.CLOUDINARY_API_SECRET;
+    else process.env.CLOUDINARY_API_SECRET = originalApiSecret;
   }
 });
 
@@ -552,6 +629,159 @@ test("cancel tool binds to the exact action and cancelled work cannot execute", 
   } finally {
     restore(PendingAgentAction, "findOne", originalFindOne);
     restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
+  }
+});
+
+test("cancel tool safely cancels an exact awaiting-image context", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
+  const awaitingImage = pendingImage({
+    action: "MENU_ITEM_IMAGE_CONTEXT",
+    toolName: undefined,
+    arguments: undefined,
+    data: {
+      stage: "awaiting_image",
+      itemId: chickenId,
+      itemName: "Chicken Salad"
+    },
+    imageSecureUrl: undefined,
+    imagePublicId: undefined,
+    uploadedAt: undefined,
+    selectedMenuItemId: chickenId
+  });
+  let cancellationWrites = 0;
+  let initialFilter;
+
+  PendingAgentAction.findOne = async (filter) => {
+    initialFilter = filter;
+    return awaitingImage;
+  };
+  PendingAgentAction.findOneAndUpdate = async (filter, update) => {
+    cancellationWrites += 1;
+    assert.equal(filter._id, imageActionId);
+    assert.equal(filter.restaurantId, restaurantId);
+    assert.equal(filter.senderPhone, senderPhone);
+    assert.equal(filter.senderRole, "owner");
+    assert.equal(filter.action, "MENU_ITEM_IMAGE_CONTEXT");
+    Object.assign(awaitingImage, update.$set);
+    return awaitingImage;
+  };
+
+  try {
+    const first = await executeAgentTool(
+      "cancel_pending_image_assignment",
+      { pendingActionId: imageActionId },
+      context({ originalMessage: "never mind, cancel it" })
+    );
+    const repeated = await executeAgentTool(
+      "cancel_pending_image_assignment",
+      { pendingActionId: imageActionId },
+      context({ originalMessage: "cancel it" })
+    );
+
+    assert.deepEqual(initialFilter.action.$in, [
+      "MENU_ITEM_IMAGE_CONTEXT",
+      "IMAGE_ASSIGNMENT"
+    ]);
+    assert.equal(first.success, true);
+    assert.equal(repeated.success, true);
+    assert.equal(repeated.data.idempotent, true);
+    assert.equal(awaitingImage.status, "cancelled");
+    assert.equal(cancellationWrites, 1);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
+  }
+});
+
+test("explicit uploaded-image cancellation cleanup is non-fatal and idempotent", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
+  const originalDestroy = cloudinary.uploader.destroy;
+  const originalApiKey = process.env.CLOUDINARY_API_KEY;
+  const originalApiSecret = process.env.CLOUDINARY_API_SECRET;
+  const pending = pendingImage({
+    data: { stage: "awaiting_confirmation", itemName: "Chicken Salad" },
+    selectedMenuItemId: chickenId
+  });
+  let cancellationWrites = 0;
+  let deleteAttempts = 0;
+
+  process.env.CLOUDINARY_API_KEY = "test-key";
+  process.env.CLOUDINARY_API_SECRET = "test-secret";
+  PendingAgentAction.findOne = async () => pending;
+  PendingAgentAction.findOneAndUpdate = async (_filter, update) => {
+    cancellationWrites += 1;
+    Object.assign(pending, update.$set);
+    return pending;
+  };
+  cloudinary.uploader.destroy = async () => {
+    deleteAttempts += 1;
+    throw new Error("simulated cleanup outage");
+  };
+
+  try {
+    const first = await executeAgentTool(
+      "cancel_pending_image_assignment",
+      { pendingActionId: imageActionId },
+      context({ originalMessage: "no, cancel it" })
+    );
+    const repeated = await executeAgentTool(
+      "cancel_pending_image_assignment",
+      { pendingActionId: imageActionId },
+      context({ originalMessage: "cancel it" })
+    );
+
+    assert.equal(first.success, true);
+    assert.equal(repeated.success, true);
+    assert.equal(repeated.data.idempotent, true);
+    assert.equal(pending.status, "cancelled");
+    assert.equal(cancellationWrites, 1);
+    assert.equal(deleteAttempts, 1);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
+    restore(cloudinary.uploader, "destroy", originalDestroy);
+    if (originalApiKey === undefined) delete process.env.CLOUDINARY_API_KEY;
+    else process.env.CLOUDINARY_API_KEY = originalApiKey;
+    if (originalApiSecret === undefined) delete process.env.CLOUDINARY_API_SECRET;
+    else process.env.CLOUDINARY_API_SECRET = originalApiSecret;
+  }
+});
+
+test("a completed image assignment cannot be cancelled or deleted", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
+  const originalDestroy = cloudinary.uploader.destroy;
+  const completed = pendingImage({ status: "completed", completedAt: new Date() });
+  let cancellationWrites = 0;
+  let deletes = 0;
+
+  PendingAgentAction.findOne = async () => completed;
+  PendingAgentAction.findOneAndUpdate = async () => {
+    cancellationWrites += 1;
+    return null;
+  };
+  cloudinary.uploader.destroy = async () => {
+    deletes += 1;
+  };
+
+  try {
+    const result = await executeAgentTool(
+      "cancel_pending_image_assignment",
+      { pendingActionId: imageActionId },
+      context()
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.code, "PENDING_IMAGE_NOT_FOUND");
+    assert.equal(cancellationWrites, 0);
+    assert.equal(deletes, 0);
+    assert.equal(completed.status, "completed");
+  } finally {
+    restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
+    restore(cloudinary.uploader, "destroy", originalDestroy);
   }
 });
 

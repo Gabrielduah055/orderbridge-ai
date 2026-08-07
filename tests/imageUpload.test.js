@@ -16,6 +16,7 @@ const {
 const {
   confirmPendingMenuItemImage,
   extractMenuItemNameFromImageReply,
+  extractMenuItemNameFromImageRetargetReply,
   handlePendingMenuItemImageReply,
   isMenuItemImageConfirmationMessage,
   prepareUploadedMenuItemImage,
@@ -448,14 +449,74 @@ test("an awaiting-item image resolves a relational item reply without using the 
   }
 });
 
+test("legacy safety fallback retargets awaiting-confirmation without confirming the old item", async () => {
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalMenuFind = MenuItem.find;
+  const pending = makePendingImage();
+  const menuQueries = [];
+
+  PendingAgentAction.findOne = async () => pending;
+  MenuItem.find = (query) => {
+    menuQueries.push(query);
+    return sortable([
+      {
+        _id: "64b000000000000000000302",
+        restaurantId,
+        name: "Jollof"
+      }
+    ]);
+  };
+
+  try {
+    for (const [message, itemName] of [
+      ["actually use it for Jollof instead", "Jollof"],
+      ["use it for Jollof instead", "Jollof"],
+      ["no, make it the Jollof picture", "Jollof"],
+      ["change it to Fried Rice instead", "Fried Rice"]
+    ]) {
+      assert.equal(extractMenuItemNameFromImageRetargetReply(message), itemName);
+      assert.equal(
+        shouldHandlePendingMenuItemImageReply("awaiting_confirmation", message),
+        true
+      );
+    }
+
+    const result = await handlePendingMenuItemImageReply({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      pendingActionId: String(pending._id),
+      message: "actually use it for Jollof instead"
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.success, true);
+    assert.equal(result.message, "Use the uploaded image for Jollof instead?");
+    assert.equal(pending.status, "pending");
+    assert.equal(pending.data.stage, "awaiting_confirmation");
+    assert.equal(pending.data.itemName, "Jollof");
+    assert.equal(String(pending.selectedMenuItemId), "64b000000000000000000302");
+    assert.equal(menuQueries[0].restaurantId, restaurantId);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalPendingFindOne);
+    restore(MenuItem, "find", originalMenuFind);
+  }
+});
+
 test("uploaded Cloudinary metadata is stored outside AI tool arguments", async () => {
   const originalFindOne = PendingAgentAction.findOne;
+  const originalFindOneAndUpdate = PendingAgentAction.findOneAndUpdate;
   const originalUpdateMany = PendingAgentAction.updateMany;
   const originalCreate = PendingAgentAction.create;
   const updateFilters = [];
+  let supersedeFilter;
   let created;
 
   PendingAgentAction.findOne = () => sortable(null);
+  PendingAgentAction.findOneAndUpdate = async (filter) => {
+    supersedeFilter = filter;
+    return null;
+  };
   PendingAgentAction.updateMany = async (filter) => {
     updateFilters.push(filter);
     return { modifiedCount: 0 };
@@ -478,10 +539,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     assert.deepEqual(created.arguments, {});
     assert.doesNotMatch(JSON.stringify(created.arguments), /imageUrl|cloudinary/i);
     assert.ok(updateFilters.every((filter) => filter.action !== "TOOL_CALL"));
-    const replacementFilter = updateFilters.find(
-      (filter) => filter.action === "IMAGE_ASSIGNMENT"
-    );
-    assert.deepEqual(replacementFilter, {
+    assert.deepEqual(supersedeFilter, {
       restaurantId,
       senderPhone,
       senderRole: "manager",
@@ -490,6 +548,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     });
   } finally {
     restore(PendingAgentAction, "findOne", originalFindOne);
+    restore(PendingAgentAction, "findOneAndUpdate", originalFindOneAndUpdate);
     restore(PendingAgentAction, "updateMany", originalUpdateMany);
     restore(PendingAgentAction, "create", originalCreate);
   }
