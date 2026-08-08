@@ -33,7 +33,10 @@ import {
 } from "../services/staffReminder.service";
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
 import {
+  businessReportPeriodTypes,
   getCurrentDailySummaryPeriod,
+  getBusinessReport,
+  getPreviousDailySummaryPeriod,
   getOwnerSummaryMetrics
 } from "../services/ownerSummary.service";
 import {
@@ -85,6 +88,12 @@ import {
 } from "../services/menuItemImageWorkflow.service";
 
 const emptySchema = z.object({}).strict();
+const businessReportSchema = z
+  .object({
+    period: z.enum(businessReportPeriodTypes),
+    compareWithPrevious: z.boolean().optional()
+  })
+  .strict();
 const orderLookupSchema = z
   .object({
     orderReference: z.string().trim().min(1).optional(),
@@ -826,6 +835,35 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  get_business_report: {
+    definition: {
+      name: "get_business_report",
+      description:
+        "Owner/manager only. Return authoritative restaurant business facts and a WhatsApp-formatted report for today, yesterday, this week, or last week. Optionally include a backend-calculated comparison with the previous equivalent period.",
+      parameters: {
+        period: businessReportPeriodTypes.join(" | "),
+        compareWithPrevious:
+          "Optional boolean. Compare with the previous equivalent period."
+      }
+    },
+    roles: toolPermissions.get_business_report,
+    schema: businessReportSchema,
+    handler: async (args, context) => {
+      const report = await getBusinessReport({
+        restaurantId: context.restaurantId,
+        restaurantName: context.restaurant.name,
+        timezone: context.restaurant.timezone,
+        period: args.period,
+        compareWithPrevious: args.compareWithPrevious
+      });
+
+      return {
+        success: true,
+        message: "Business report retrieved successfully.",
+        data: report
+      };
+    }
+  },
   get_yesterday_orders: {
     definition: {
       name: "get_yesterday_orders",
@@ -833,11 +871,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         "Return yesterday's order counts and completed-order revenue for the current restaurant.",
       parameters: {}
     },
-    roles: toolPermissions.get_today_orders,
+    roles: toolPermissions.get_yesterday_orders,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const period = getCurrentDailySummaryPeriod(
-        new Date(Date.now() - 24 * 60 * 60 * 1000),
+      const period = getPreviousDailySummaryPeriod(
+        new Date(),
         context.restaurant.timezone
       );
       const metrics = await getOwnerSummaryMetrics({
