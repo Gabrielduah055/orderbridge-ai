@@ -17,8 +17,20 @@ import {
   createCustomerCampaignDraftSchema,
   listCustomerCampaigns,
   listCustomerCampaignsSchema,
-  previewCustomerCampaign
+  previewCustomerCampaign,
+  updateCustomerCampaignDraft,
+  updateCustomerCampaignDraftSchema
 } from "../services/customerCampaign.service";
+import {
+  cancelStaffReminder,
+  cancelStaffReminderSchema,
+  createStaffReminder,
+  createStaffReminderSchema,
+  listStaffReminders,
+  listStaffRemindersSchema,
+  rescheduleStaffReminder,
+  rescheduleStaffReminderSchema
+} from "../services/staffReminder.service";
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
 import {
   getCurrentDailySummaryPeriod,
@@ -1162,7 +1174,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         context,
         "approve_campaign",
         {
-          campaignId: String(campaign._id)
+          campaignId: String(campaign._id),
+          expectedCampaignVersion: campaign.campaignVersion
         },
         previewMessage
       );
@@ -1171,6 +1184,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         ...pending,
         data: {
           campaignId: String(campaign._id),
+          campaignVersion: campaign.campaignVersion,
           status: campaign.status,
           preview: {
             targetingDescription: preview.targetingDescription,
@@ -1181,6 +1195,82 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             excludedInvalidPhone: preview.excludedInvalidPhone,
             plannedSend:
               campaign.scheduledAt?.toISOString() ?? null,
+            timezone: campaign.timezone
+          }
+        }
+      };
+    }
+  },
+  update_campaign_draft: {
+    definition: {
+      name: "update_campaign_draft",
+      description:
+        "Owner/manager only. Edit a campaign that is still pending approval, recalculate its backend audience preview, and replace its approval confirmation with the new exact version.",
+      parameters: {
+        campaignId: "Exact internal campaign ID from trusted conversation context or list_campaigns.",
+        name: "Optional updated campaign name.",
+        message: "Optional updated final campaign wording.",
+        campaignType:
+          "Optional promotion | inactivity_reengagement | holiday | announcement.",
+        targeting:
+          "Optional strict backend targeting rule.",
+        scheduledAt:
+          "Optional ISO or restaurant-local date-time; null removes the scheduled time.",
+        referencedMenuItemId:
+          "Optional restaurant menu item reference; null removes it."
+      }
+    },
+    roles: toolPermissions.update_campaign_draft,
+    sensitive: true,
+    schema: updateCustomerCampaignDraftSchema,
+    handler: async (args, context) => {
+      if (
+        context.sender.role !== "owner" &&
+        context.sender.role !== "manager"
+      ) {
+        return {
+          success: false,
+          code: "CAMPAIGN_FORBIDDEN",
+          message:
+            "Only a verified owner or manager can update a campaign."
+        };
+      }
+
+      const { campaign, preview } =
+        await updateCustomerCampaignDraft({
+          ...args,
+          restaurantId: context.restaurantId,
+          updatedByPhone: context.sender.normalizedPhone,
+          updatedByRole: context.sender.role
+        });
+      const previewMessage = buildCustomerCampaignPreviewMessage(
+        campaign,
+        preview
+      );
+      const pending = await createPendingToolAction(
+        context,
+        "approve_campaign",
+        {
+          campaignId: String(campaign._id),
+          expectedCampaignVersion: campaign.campaignVersion
+        },
+        previewMessage
+      );
+
+      return {
+        ...pending,
+        data: {
+          campaignId: String(campaign._id),
+          campaignVersion: campaign.campaignVersion,
+          status: campaign.status,
+          preview: {
+            targetingDescription: preview.targetingDescription,
+            estimatedEligibleRecipients:
+              preview.estimatedEligibleRecipients,
+            excludedNoConsent: preview.excludedNoConsent,
+            excludedOptOut: preview.excludedOptOut,
+            excludedInvalidPhone: preview.excludedInvalidPhone,
+            plannedSend: campaign.scheduledAt?.toISOString() ?? null,
             timezone: campaign.timezone
           }
         }
@@ -1246,6 +1336,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             expectedCampaignVersion: campaign.campaignVersion
           },
           buildCustomerCampaignPreviewMessage(campaign, preview)
+        );
+      }
+
+      if (args.expectedCampaignVersion === undefined) {
+        throw new BadRequestError(
+          "This campaign approval preview is stale. Please preview the campaign again before approving it.",
+          "CAMPAIGN_VERSION_REQUIRED"
         );
       }
 
@@ -1336,6 +1433,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         message: "Campaigns retrieved.",
         data: campaigns.map((campaign) => ({
           id: String(campaign._id),
+          campaignVersion: campaign.campaignVersion,
           name: campaign.name,
           campaignType: campaign.campaignType,
           status: campaign.status,
@@ -1349,6 +1447,112 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             campaign.cancelledRecipientCount,
           createdAt: campaign.createdAt
         }))
+      };
+    }
+  },
+  create_staff_reminder: {
+    definition: {
+      name: "create_staff_reminder",
+      description:
+        "Owner/manager only. Schedule a one-time personal WhatsApp reminder for the current verified staff sender. It executes immediately without another confirmation.",
+      parameters: {
+        text: "The final reminder text, maximum 500 characters.",
+        scheduledAt:
+          "Future offset-aware ISO timestamp or restaurant-local YYYY-MM-DDTHH:mm."
+      }
+    },
+    roles: toolPermissions.create_staff_reminder,
+    schema: createStaffReminderSchema,
+    handler: async (args, context) => {
+      const reminder = await createStaffReminder({
+        ...args,
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        requestId: context.requestId
+      });
+
+      return {
+        success: true,
+        message: `Reminder scheduled for ${reminder.scheduledFor.toISOString()}.`,
+        data: reminder
+      };
+    }
+  },
+  list_staff_reminders: {
+    definition: {
+      name: "list_staff_reminders",
+      description:
+        "Owner/manager only. List personal reminders belonging to the current verified sender.",
+      parameters: {
+        status: "Optional pending | sending | sent | failed | cancelled.",
+        limit: "Optional result limit, maximum 25."
+      }
+    },
+    roles: toolPermissions.list_staff_reminders,
+    schema: listStaffRemindersSchema,
+    handler: async (args, context) => {
+      const reminders = await listStaffReminders({
+        ...args,
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone
+      });
+
+      return {
+        success: true,
+        message: "Personal reminders retrieved.",
+        data: reminders
+      };
+    }
+  },
+  reschedule_staff_reminder: {
+    definition: {
+      name: "reschedule_staff_reminder",
+      description:
+        "Owner/manager only. Reschedule one pending personal reminder belonging to the current verified sender.",
+      parameters: {
+        reminderId: "Exact internal reminder ID from list_staff_reminders.",
+        scheduledAt:
+          "Future offset-aware ISO timestamp or restaurant-local YYYY-MM-DDTHH:mm."
+      }
+    },
+    roles: toolPermissions.reschedule_staff_reminder,
+    schema: rescheduleStaffReminderSchema,
+    handler: async (args, context) => {
+      const reminder = await rescheduleStaffReminder({
+        ...args,
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone
+      });
+
+      return {
+        success: true,
+        message: `Reminder rescheduled for ${reminder.scheduledFor.toISOString()}.`,
+        data: reminder
+      };
+    }
+  },
+  cancel_staff_reminder: {
+    definition: {
+      name: "cancel_staff_reminder",
+      description:
+        "Owner/manager only. Cancel one pending personal reminder belonging to the current verified sender.",
+      parameters: {
+        reminderId: "Exact internal reminder ID from list_staff_reminders."
+      }
+    },
+    roles: toolPermissions.cancel_staff_reminder,
+    schema: cancelStaffReminderSchema,
+    handler: async (args, context) => {
+      const reminder = await cancelStaffReminder({
+        ...args,
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone
+      });
+
+      return {
+        success: true,
+        message: "Reminder cancelled.",
+        data: reminder
       };
     }
   },

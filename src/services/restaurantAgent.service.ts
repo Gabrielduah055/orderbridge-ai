@@ -1030,6 +1030,7 @@ export const handleRestaurantAgentMessage = async (
         restaurant: input.restaurant,
         sender,
         message,
+        requestId: input.inboundEventId,
         quotedMessageId: input.quotedMessageId,
         staffState
       });
@@ -1313,6 +1314,7 @@ export const handleRestaurantAgentMessage = async (
         restaurant: input.restaurant,
         sender,
         message,
+        requestId: input.inboundEventId,
         quotedMessageId: input.quotedMessageId
       });
 
