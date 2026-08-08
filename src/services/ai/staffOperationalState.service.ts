@@ -97,6 +97,13 @@ export interface StaffOrderSelectionReference {
   candidates: Array<StaffOrderView & { position: number }>;
 }
 
+export interface StaffCampaignReference {
+  id: string;
+  campaignVersion: number;
+  pendingActionId: string;
+  status: "pending_approval";
+}
+
 export interface StaffOperationalState {
   pendingActions: StaffPendingActionView[];
   imageWorkflow: StaffImageWorkflowView | null;
@@ -111,6 +118,7 @@ export interface StaffOperationalState {
       id?: string;
       name?: string;
     };
+    campaign?: StaffCampaignReference;
   };
   permissions: string[];
 }
@@ -405,6 +413,23 @@ export const buildStaffOperationalState = async (
         name: imageWorkflow.itemName
       }
     : undefined;
+  const campaignApprovalAction = pendingActions.find(
+    (action) =>
+      action.action === "TOOL_CALL" &&
+      action.toolName === "approve_campaign" &&
+      safeId(action.data?.campaignId) &&
+      Number.isInteger(Number(action.data?.expectedCampaignVersion))
+  );
+  const campaignReference = campaignApprovalAction
+    ? {
+        id: safeId(campaignApprovalAction.data?.campaignId) as string,
+        campaignVersion: Number(
+          campaignApprovalAction.data?.expectedCampaignVersion
+        ),
+        pendingActionId: safeId(campaignApprovalAction._id) ?? "unknown",
+        status: "pending_approval" as const
+      }
+    : undefined;
   const state: StaffOperationalState = {
     pendingActions: visiblePendingActions,
     imageWorkflow,
@@ -417,7 +442,8 @@ export const buildStaffOperationalState = async (
         ? toOrderView(quotedOrders[0])
         : undefined,
       orderSelection,
-      menuItem: menuItemReference
+      menuItem: menuItemReference,
+      campaign: campaignReference
     },
     permissions: getPermissions(input.sender.role)
   };

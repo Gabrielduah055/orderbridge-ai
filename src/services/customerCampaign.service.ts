@@ -19,6 +19,7 @@ import {
 import { MenuItem } from "../models/MenuItem";
 import { Order } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
+import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import {
   Restaurant,
   type IRestaurantDocument
@@ -30,6 +31,7 @@ import {
   NotFoundError
 } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import { resolveZonedDateTime } from "../utils/zonedDateTime.util";
 import { isCustomerEligibleForMarketing } from "./customerMarketingPreference.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 
@@ -126,6 +128,26 @@ export const createCustomerCampaignDraftSchema = z
   })
   .strict();
 
+export const updateCustomerCampaignDraftSchema = z
+  .object({
+    campaignId: z.string().trim().min(1),
+    name: z.string().trim().min(1).max(120).optional(),
+    message: z.string().trim().min(1).max(2000).optional(),
+    campaignType: z.enum(customerCampaignTypes).optional(),
+    targeting: customerCampaignTargetingSchema.optional(),
+    scheduledAt: z.string().trim().min(1).nullable().optional(),
+    referencedMenuItemId: z.string().trim().min(1).nullable().optional()
+  })
+  .strict()
+  .refine(
+    (value) =>
+      Object.entries(value).some(
+        ([key, fieldValue]) =>
+          key !== "campaignId" && fieldValue !== undefined
+      ),
+    "At least one editable campaign field is required"
+  );
+
 export const campaignIdSchema = z
   .object({
     campaignId: z.string().trim().min(1)
@@ -172,6 +194,13 @@ export interface CreateCustomerCampaignDraftInput
   createdByRole: CampaignStaffRole;
 }
 
+export interface UpdateCustomerCampaignDraftInput
+  extends z.infer<typeof updateCustomerCampaignDraftSchema> {
+  restaurantId: string;
+  updatedByPhone: string;
+  updatedByRole: CampaignStaffRole;
+}
+
 type CampaignProfile = Pick<
   ICustomerProfileDocument,
   | "_id"
@@ -193,122 +222,10 @@ const ensureObjectId = (value: string, label: string): void => {
 const isValidMarketingPhone = (phone: string): boolean =>
   /^\+[1-9]\d{7,14}$/.test(phone);
 
-const getLocalDateTimeParts = (
-  value: Date,
-  timezone: string
-): {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
-} => {
-  const values = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23"
-    })
-      .formatToParts(value)
-      .filter((part) => part.type !== "literal")
-      .map((part) => [part.type, Number(part.value)])
-  ) as Record<string, number>;
-
-  return {
-    year: values.year,
-    month: values.month,
-    day: values.day,
-    hour: values.hour,
-    minute: values.minute,
-    second: values.second
-  };
-};
-
 export const resolveCustomerCampaignScheduledAt = (
   scheduledAt: string | Date | undefined,
   timezone: string
-): Date | undefined => {
-  if (!scheduledAt) {
-    return undefined;
-  }
-
-  new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
-
-  if (scheduledAt instanceof Date) {
-    if (Number.isNaN(scheduledAt.getTime())) {
-      throw new BadRequestError("Invalid scheduledAt");
-    }
-
-    return scheduledAt;
-  }
-
-  if (/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledAt)) {
-    const parsed = new Date(scheduledAt);
-
-    if (Number.isNaN(parsed.getTime())) {
-      throw new BadRequestError("Invalid scheduledAt");
-    }
-
-    return parsed;
-  }
-
-  const match = scheduledAt.match(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/
-  );
-
-  if (!match) {
-    throw new BadRequestError(
-      "scheduledAt must be an ISO date-time or local YYYY-MM-DDTHH:mm"
-    );
-  }
-
-  const target = {
-    year: Number(match[1]),
-    month: Number(match[2]),
-    day: Number(match[3]),
-    hour: Number(match[4]),
-    minute: Number(match[5]),
-    second: Number(match[6] ?? 0)
-  };
-  const targetTimestamp = Date.UTC(
-    target.year,
-    target.month - 1,
-    target.day,
-    target.hour,
-    target.minute,
-    target.second
-  );
-  let utcTimestamp = targetTimestamp;
-
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const observed = getLocalDateTimeParts(
-      new Date(utcTimestamp),
-      timezone
-    );
-    const observedTimestamp = Date.UTC(
-      observed.year,
-      observed.month - 1,
-      observed.day,
-      observed.hour,
-      observed.minute,
-      observed.second
-    );
-    const adjustment = targetTimestamp - observedTimestamp;
-    utcTimestamp += adjustment;
-
-    if (adjustment === 0) {
-      break;
-    }
-  }
-
-  return new Date(utcTimestamp);
-};
+): Date | undefined => resolveZonedDateTime(scheduledAt, timezone);
 
 const loadCurrentCampaignStaff = async (
   restaurantId: string,
@@ -613,7 +530,7 @@ export const createCustomerCampaignDraft = async (
     staff.restaurant.timezone || "Africa/Accra"
   );
 
-  if (scheduledAt && scheduledAt.getTime() < now.getTime() - 60_000) {
+  if (scheduledAt && scheduledAt.getTime() <= now.getTime()) {
     throw new BadRequestError("scheduledAt cannot be in the past");
   }
 
@@ -646,6 +563,122 @@ export const createCustomerCampaignDraft = async (
     campaign,
     preview
   };
+};
+
+export const updateCustomerCampaignDraft = async (
+  input: UpdateCustomerCampaignDraftInput,
+  now = new Date()
+): Promise<{
+  campaign: ICustomerCampaignDocument;
+  preview: CustomerCampaignAudiencePreview;
+}> => {
+  const parsed = updateCustomerCampaignDraftSchema.parse({
+    campaignId: input.campaignId,
+    name: input.name,
+    message: input.message,
+    campaignType: input.campaignType,
+    targeting: input.targeting,
+    scheduledAt: input.scheduledAt,
+    referencedMenuItemId: input.referencedMenuItemId
+  });
+  const staff = await loadCurrentCampaignStaff(
+    input.restaurantId,
+    input.updatedByPhone
+  );
+  const campaign = await getCustomerCampaignForRestaurant(
+    input.restaurantId,
+    parsed.campaignId
+  );
+
+  if (campaign.status !== "pending_approval") {
+    throw new BadRequestError(
+      "Only campaigns awaiting approval can be edited",
+      "CAMPAIGN_NOT_EDITABLE"
+    );
+  }
+  const previousCampaignVersion = campaign.campaignVersion;
+
+  if (parsed.targeting?.type === "ordered_menu_item") {
+    await getTargetingMenuItem(
+      input.restaurantId,
+      parsed.targeting.menuItemId as string
+    );
+  }
+
+  if (parsed.referencedMenuItemId !== undefined) {
+    await validateCustomerCampaignReferencedItem(
+      input.restaurantId,
+      parsed.referencedMenuItemId ?? undefined
+    );
+  }
+
+  const targeting = parsed.targeting
+    ? normalizeTargetingRule(parsed.targeting)
+    : campaign.targeting;
+  const scheduledAt =
+    parsed.scheduledAt === undefined
+      ? campaign.scheduledAt
+      : parsed.scheduledAt === null
+        ? undefined
+        : resolveCustomerCampaignScheduledAt(
+            parsed.scheduledAt,
+            staff.restaurant.timezone || campaign.timezone
+          );
+
+  if (scheduledAt && scheduledAt.getTime() <= now.getTime()) {
+    throw new BadRequestError("scheduledAt cannot be in the past");
+  }
+
+  const preview = await selectCustomerCampaignAudience(
+    input.restaurantId,
+    targeting,
+    now
+  );
+
+  if (parsed.name !== undefined) campaign.name = parsed.name;
+  if (parsed.message !== undefined) campaign.message = parsed.message;
+  if (parsed.campaignType !== undefined) {
+    campaign.campaignType = parsed.campaignType;
+  }
+  if (parsed.targeting !== undefined) campaign.targeting = targeting;
+  if (parsed.scheduledAt !== undefined) campaign.scheduledAt = scheduledAt;
+  if (parsed.referencedMenuItemId !== undefined) {
+    campaign.referencedMenuItemId = parsed.referencedMenuItemId
+      ? new Types.ObjectId(parsed.referencedMenuItemId)
+      : undefined;
+  }
+  campaign.timezone = staff.restaurant.timezone || campaign.timezone;
+  campaign.estimatedRecipientCount = preview.estimatedEligibleRecipients;
+  campaign.excludedNoConsentCount = preview.excludedNoConsent;
+  campaign.excludedOptOutCount = preview.excludedOptOut;
+  campaign.excludedInvalidPhoneCount = preview.excludedInvalidPhone;
+  campaign.$where = {
+    status: "pending_approval",
+    campaignVersion: previousCampaignVersion
+  };
+  await campaign.save();
+
+  await PendingAgentAction.updateMany(
+    {
+      restaurantId: input.restaurantId,
+      action: "TOOL_CALL",
+      toolName: "approve_campaign",
+      status: "pending",
+      "arguments.campaignId": String(campaign._id),
+      "arguments.expectedCampaignVersion": {
+        $ne: campaign.campaignVersion
+      }
+    },
+    {
+      $set: {
+        status: "cancelled",
+        resultMessage:
+          "Campaign approval superseded by a newer campaign preview."
+      }
+    }
+  );
+
+  return { campaign, preview };
 };
 
 export const getCustomerCampaignForRestaurant = async (
@@ -718,9 +751,9 @@ export const approveCustomerCampaign = async (
   approverPhone: string,
   now = new Date(),
   options: {
-    expectedCampaignVersion?: number;
+    expectedCampaignVersion: number;
     startSession?: () => Promise<ClientSession>;
-  } = {}
+  }
 ): Promise<ICustomerCampaignDocument> => {
   const campaign = await getCustomerCampaignForRestaurant(
     restaurantId,
@@ -733,8 +766,17 @@ export const approveCustomerCampaign = async (
     );
   }
 
-  const expectedCampaignVersion =
-    options.expectedCampaignVersion ?? campaign.campaignVersion;
+  const expectedCampaignVersion = options.expectedCampaignVersion;
+
+  if (
+    !Number.isInteger(expectedCampaignVersion) ||
+    expectedCampaignVersion < 1
+  ) {
+    throw new BadRequestError(
+      "Campaign approval requires the exact preview version",
+      "CAMPAIGN_VERSION_REQUIRED"
+    );
+  }
 
   if (campaign.campaignVersion !== expectedCampaignVersion) {
     throw new BadRequestError(
@@ -1138,6 +1180,7 @@ export const updateCustomerCampaignAggregate = async (
 };
 
 export const createCampaignDraft = createCustomerCampaignDraft;
+export const updateCampaignDraft = updateCustomerCampaignDraft;
 export const previewCampaign = previewCustomerCampaign;
 export const approveCampaign = approveCustomerCampaign;
 export const cancelCampaign = cancelCustomerCampaign;

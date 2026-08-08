@@ -78,6 +78,7 @@ export interface AgentOrchestratorInput {
   restaurant: IRestaurantDocument;
   sender: ResolvedSender;
   message: string;
+  requestId?: string;
   quotedMessageId?: string;
   staffState?: StaffOperationalState;
 }

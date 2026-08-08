@@ -56,6 +56,7 @@ const getErrorMessage = (result: WasenderSendResult): string =>
 const transactionalKinds = new Set([
   "owner_order_notification",
   "owner_action_reminder",
+  "staff_reminder",
   "owner_summary",
   "customer_order_confirmed_notification",
   "customer_order_rejected_notification",
@@ -369,6 +370,105 @@ export const getQueuedCustomerCampaignStaleReason = async (
     restaurant.wasenderApiToken !== queuedApiKey
   ) {
     return "restaurant_wasender_token_changed";
+  }
+
+  return null;
+};
+
+export const getQueuedStaffReminderStaleReason = async (
+  metadata: Record<string, unknown> | undefined,
+  now = new Date(),
+  queuedRecipientPhone?: string,
+  queuedSessionId?: string,
+  queuedApiKey?: string,
+  queuedRestaurantId?: string
+): Promise<string | null> => {
+  if (metadata?.kind !== "staff_reminder") {
+    return null;
+  }
+
+  const restaurantId =
+    typeof metadata.restaurantId === "string" ? metadata.restaurantId : "";
+  const createdByPhone =
+    typeof metadata.createdByPhone === "string"
+      ? normalizeGhanaPhone(metadata.createdByPhone)
+      : "";
+  const recipientPhone =
+    typeof metadata.recipientPhone === "string"
+      ? normalizeGhanaPhone(metadata.recipientPhone)
+      : "";
+  const createdByRole =
+    metadata.createdByRole === "owner" || metadata.createdByRole === "manager"
+      ? metadata.createdByRole
+      : undefined;
+  const recipientRole =
+    metadata.recipientRole === "owner" || metadata.recipientRole === "manager"
+      ? metadata.recipientRole
+      : undefined;
+  const scheduledFor =
+    typeof metadata.scheduledFor === "string"
+      ? new Date(metadata.scheduledFor)
+      : undefined;
+  const queuedPhone = queuedRecipientPhone
+    ? normalizeGhanaPhone(queuedRecipientPhone)
+    : "";
+
+  if (
+    !Types.ObjectId.isValid(restaurantId) ||
+    !/^\+[1-9]\d{7,14}$/.test(createdByPhone) ||
+    createdByPhone !== recipientPhone ||
+    !createdByRole ||
+    createdByRole !== recipientRole ||
+    !scheduledFor ||
+    Number.isNaN(scheduledFor.getTime())
+  ) {
+    return "invalid_metadata";
+  }
+
+  if (queuedRestaurantId && queuedRestaurantId !== restaurantId) {
+    return "queued_restaurant_changed";
+  }
+
+  if (queuedPhone && queuedPhone !== recipientPhone) {
+    return "queued_recipient_changed";
+  }
+
+  if (scheduledFor > now) {
+    return "reminder_not_due";
+  }
+
+  const restaurant = await Restaurant.findOne({
+    _id: restaurantId,
+    status: { $in: ["trial", "active"] }
+  }).select("+wasenderApiToken");
+
+  if (!restaurant) {
+    return "restaurant_inactive_or_missing";
+  }
+
+  if (
+    !restaurant.wasenderSessionId?.trim() ||
+    !restaurant.wasenderApiToken?.trim()
+  ) {
+    return "restaurant_wasender_credentials_missing";
+  }
+
+  if (queuedSessionId && restaurant.wasenderSessionId !== queuedSessionId) {
+    return "restaurant_wasender_session_changed";
+  }
+
+  if (queuedApiKey && restaurant.wasenderApiToken !== queuedApiKey) {
+    return "restaurant_wasender_token_changed";
+  }
+
+  const currentIdentity = resolveSenderIdentity(restaurant, createdByPhone);
+
+  if (
+    !currentIdentity.verified ||
+    currentIdentity.normalizedPhone !== recipientPhone ||
+    currentIdentity.role !== createdByRole
+  ) {
+    return "staff_recipient_removed_or_changed";
   }
 
   return null;
@@ -901,6 +1001,27 @@ export const processNextQueuedWasenderMessage = async (
       console.info("Stale owner pending-action reminder cancelled", {
         restaurantId: locked.metadata.restaurantId,
         pendingActionId: locked.metadata.pendingActionId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (locked.metadata?.kind === "staff_reminder") {
+    const staleReason = await getQueuedStaffReminderStaleReason(
+      locked.metadata,
+      new Date(),
+      locked.to,
+      locked.sessionId,
+      locked.apiKey,
+      locked.restaurantId ? String(locked.restaurantId) : undefined
+    );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale staff reminder: ${staleReason}`;
+      await locked.save();
+      console.info("Stale staff reminder cancelled", {
+        restaurantId: locked.metadata.restaurantId,
         queueMessageId: String(locked._id),
         staleReason
       });

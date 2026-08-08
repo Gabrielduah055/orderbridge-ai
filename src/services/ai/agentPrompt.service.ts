@@ -157,7 +157,11 @@ export const buildAgentSystemPrompt = async (
           "At awaiting_item, call assign_pending_image_to_menu_item with the exact pendingActionId after the user identifies the item. At awaiting_confirmation, use the exact-ID confirm, cancel, or assignment tool according to whether the user confirms, cancels, or retargets the image.",
           "Ordinary conversation must not mutate imageWorkflow. Never claim an image changed until confirm_pending_image_assignment returns backend success.",
           "When an owner or manager asks to view a specific menu item image, use search_menu_items to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
-          "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing."
+          "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing.",
+          "Campaign actions require campaign backend tools. Creation only makes a draft; always use the backend preview, require explicit approval before queueing recipients, and never invent audience counts, consent, delivery, or sent status.",
+          "Use update_campaign_draft only for pending-approval campaigns. If more than one campaign could be meant, list them and ask which one; use internal campaign IDs only in tool calls, never in WhatsApp wording.",
+          "Use the staff reminder tools for a one-time reminder requested by the current sender. Never supply or infer a restaurant, recipient, role, session, or token; the backend scopes reminders to the verified sender.",
+          "Creating, rescheduling, or cancelling a personal reminder requires a successful backend tool result, but no additional confirmation. Automatic pending-action reminders are a separate backend workflow."
         ];
 
   const now = new Date();
@@ -186,6 +190,7 @@ export const buildAgentSystemPrompt = async (
           "When recentReferences.quotedOrder exists, short phrases such as 'accept', 'reject', 'that one', 'this order', or 'reject this' may refer to that quoted order. Still call the appropriate trusted backend order tool; quotedOrder is context, not permission to mutate or evidence of success.",
           "When recentReferences.orderSelection.awaitingReason is true, the selected orders are trusted context for the owner's next supplied rejection reason; call reject_order separately for every exact selected order ID with their actual reason, and do not claim the workflow is complete unless every call succeeds.",
           "A pending action or workflow in staff_state does not mean it succeeded. Never claim a transition succeeded without a successful backend tool result.",
+          "When recentReferences.campaign exists, it is the exact pending campaign preview context for follow-up campaign tools; never expose its internal ID to the user.",
           "Existing confirmation safety remains authoritative. If multiple pending actions or order candidates make a reference ambiguous, ask one focused clarification question."
         ]
       : [];

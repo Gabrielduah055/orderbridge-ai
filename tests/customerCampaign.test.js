@@ -17,6 +17,9 @@ const { Restaurant } = require("../dist/models/Restaurant");
 const { MenuItem } = require("../dist/models/MenuItem");
 const { Order } = require("../dist/models/order.model");
 const {
+  PendingAgentAction
+} = require("../dist/models/pendingAgentAction.model");
+const {
   AgentConversationMessage
 } = require("../dist/models/agentConversation.model");
 const {
@@ -30,9 +33,12 @@ const {
 const {
   approveCustomerCampaign,
   customerCampaignTargetingSchema,
+  createCustomerCampaignDraft,
   createCustomerCampaignDraftSchema,
   resolveCustomerCampaignScheduledAt,
   selectCustomerCampaignAudience,
+  updateCustomerCampaignDraft,
+  updateCustomerCampaignDraftSchema,
   updateCustomerCampaignAggregate
 } = require("../dist/services/customerCampaign.service");
 const {
@@ -51,6 +57,10 @@ const {
 const {
   getAgentToolDefinitionsForRole
 } = require("../dist/services/ai/agentToolDefinitions.service");
+const { toolRegistry } = require("../dist/agent-tools/tool.registry");
+const {
+  executeAgentTool
+} = require("../dist/agent-tools/tool.executor");
 const {
   handleRestaurantAgentMessage
 } = require("../dist/services/restaurantAgent.service");
@@ -671,6 +681,7 @@ test("transactional customer messages remain allowed after opt-out", () => {
 test("campaign permissions and schemas reject customers and injected scope", () => {
   for (const toolName of [
     "create_campaign_draft",
+    "update_campaign_draft",
     "approve_campaign",
     "cancel_campaign",
     "list_campaigns"
@@ -696,6 +707,18 @@ test("campaign permissions and schemas reject customers and injected scope", () 
   assert.equal(
     createCustomerCampaignDraftSchema.safeParse({
       ...validDraft,
+      restaurantId
+    }).success,
+    false
+  );
+  assert.equal(
+    updateCustomerCampaignDraftSchema.safeParse({ campaignId }).success,
+    false
+  );
+  assert.equal(
+    updateCustomerCampaignDraftSchema.safeParse({
+      campaignId,
+      message: "Shorter message",
       restaurantId
     }).success,
     false
@@ -729,6 +752,329 @@ test("campaign permissions and schemas reject customers and injected scope", () 
       ownerDefinition.function.parameters.properties,
     false
   );
+});
+
+test("campaign creation creates a version-bound approval action and no outbound customer message", async () => {
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalProfileFind = CustomerProfile.find;
+  const originalCampaignCreate = CustomerCampaign.create;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  const originalPendingCreate = PendingAgentAction.create;
+  const originalOutboundCreate = OutboundMessage.create;
+  let pendingInput;
+  let outboundCreateCount = 0;
+
+  try {
+    Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+    CustomerProfile.find = () => resolvedQuery([]);
+    CustomerCampaign.create = async (input) =>
+      makeCampaign({
+        ...input,
+        _id: campaignId,
+        status: "pending_approval",
+        campaignVersion: 1
+      });
+    PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
+    PendingAgentAction.create = async (input) => {
+      pendingInput = input;
+      return { _id: "64b000000000000000000b91", ...input };
+    };
+    OutboundMessage.create = async () => {
+      outboundCreateCount += 1;
+      throw new Error("Campaign draft must not create outbound messages");
+    };
+
+    const result = await toolRegistry.create_campaign_draft.handler(
+      {
+        name: "Weekend offer",
+        message: "Try our weekend special.",
+        campaignType: "promotion",
+        targeting: { type: "all_eligible_customers" }
+      },
+      {
+        restaurantId,
+        restaurant: makeRestaurant(),
+        sender: {
+          role: "manager",
+          verified: true,
+          normalizedPhone: "+233241234567",
+          phone: "+233241234567"
+        }
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.requiresConfirmation, true);
+    assert.equal(result.data.campaignVersion, 1);
+    assert.equal(pendingInput.toolName, "approve_campaign");
+    assert.deepEqual(pendingInput.arguments, {
+      campaignId,
+      expectedCampaignVersion: 1
+    });
+    assert.equal(outboundCreateCount, 0);
+  } finally {
+    Restaurant.findOne = originalRestaurantFindOne;
+    CustomerProfile.find = originalProfileFind;
+    CustomerCampaign.create = originalCampaignCreate;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
+    PendingAgentAction.create = originalPendingCreate;
+    OutboundMessage.create = originalOutboundCreate;
+  }
+});
+
+test("updating a pending campaign increments its version, recalculates preview, and supersedes old approval", async () => {
+  const originalCampaignFindOne = CustomerCampaign.findOne;
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalProfileFind = CustomerProfile.find;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  const campaign = makeCampaign({
+    status: "pending_approval",
+    campaignVersion: 1,
+    estimatedRecipientCount: 0
+  });
+  let staleActionUpdate;
+  let savedWhere;
+
+  campaign.save = async function saveCampaign() {
+    savedWhere = this.$where;
+    this.campaignVersion += 1;
+    return this;
+  };
+
+  try {
+    CustomerCampaign.findOne = async (filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return campaign;
+    };
+    Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+    CustomerProfile.find = () =>
+      resolvedQuery([
+        {
+          _id: profileId,
+          customerPhone,
+          orderCount: 3,
+          marketingConsent: true,
+          isOptedOut: false,
+          marketingPreferenceUpdatedAt: now,
+          updatedAt: now
+        }
+      ]);
+    PendingAgentAction.updateMany = async (filter, update) => {
+      staleActionUpdate = { filter, update };
+      return { modifiedCount: 1 };
+    };
+
+    const result = await updateCustomerCampaignDraft(
+      {
+        restaurantId,
+        updatedByPhone: "+233241234567",
+        updatedByRole: "manager",
+        campaignId,
+        name: "Returning customer weekend",
+        message: "Come back this weekend.",
+        targeting: { type: "returning_customers" },
+        scheduledAt: "2026-07-31T18:00"
+      },
+      now
+    );
+
+    assert.equal(result.campaign.campaignVersion, 2);
+    assert.equal(result.campaign.name, "Returning customer weekend");
+    assert.equal(result.campaign.message, "Come back this weekend.");
+    assert.equal(result.campaign.scheduledAt.toISOString(), "2026-07-31T18:00:00.000Z");
+    assert.equal(result.preview.estimatedEligibleRecipients, 1);
+    assert.match(result.preview.targetingDescription, /at least two/i);
+    assert.deepEqual(savedWhere, {
+      status: "pending_approval",
+      campaignVersion: 1
+    });
+    assert.equal(staleActionUpdate.filter.toolName, "approve_campaign");
+    assert.equal(staleActionUpdate.filter["arguments.campaignId"], campaignId);
+    assert.equal(
+      staleActionUpdate.filter["arguments.expectedCampaignVersion"].$ne,
+      2
+    );
+    assert.equal(staleActionUpdate.update.$set.status, "cancelled");
+  } finally {
+    CustomerCampaign.findOne = originalCampaignFindOne;
+    Restaurant.findOne = originalRestaurantFindOne;
+    CustomerProfile.find = originalProfileFind;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
+  }
+});
+
+test("update_campaign_draft creates a fresh approval action for the exact new preview version", async () => {
+  const originalCampaignFindOne = CustomerCampaign.findOne;
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalProfileFind = CustomerProfile.find;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  const originalPendingCreate = PendingAgentAction.create;
+  const campaign = makeCampaign({ status: "pending_approval", campaignVersion: 4 });
+  const pendingCreates = [];
+
+  campaign.save = async function saveCampaign() {
+    this.campaignVersion += 1;
+    return this;
+  };
+
+  try {
+    CustomerCampaign.findOne = async () => campaign;
+    Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+    CustomerProfile.find = () => resolvedQuery([]);
+    PendingAgentAction.updateMany = async () => ({ modifiedCount: 1 });
+    PendingAgentAction.create = async (input) => {
+      pendingCreates.push(input);
+      return { _id: "64b000000000000000000b92", ...input };
+    };
+
+    const result = await toolRegistry.update_campaign_draft.handler(
+      { campaignId, message: "A shorter weekend message." },
+      {
+        restaurantId,
+        restaurant: makeRestaurant(),
+        sender: {
+          role: "owner",
+          verified: true,
+          normalizedPhone: "+233507879374",
+          phone: "+233507879374"
+        }
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.requiresConfirmation, true);
+    assert.equal(result.data.campaignVersion, 5);
+    assert.deepEqual(pendingCreates[0].arguments, {
+      campaignId,
+      expectedCampaignVersion: 5
+    });
+  } finally {
+    CustomerCampaign.findOne = originalCampaignFindOne;
+    Restaurant.findOne = originalRestaurantFindOne;
+    CustomerProfile.find = originalProfileFind;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
+    PendingAgentAction.create = originalPendingCreate;
+  }
+});
+
+test("a legacy approval without the exact preview version cannot approve an edited campaign", async () => {
+  const result = await executeAgentTool(
+    "approve_campaign",
+    { campaignId },
+    {
+      restaurantId,
+      restaurant: makeRestaurant(),
+      sender: {
+        role: "owner",
+        verified: true,
+        normalizedPhone: "+233507879374",
+        phone: "+233507879374"
+      },
+      confirmed: true
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.equal(result.code, "CAMPAIGN_VERSION_REQUIRED");
+  assert.match(result.message, /preview.*stale/i);
+});
+
+test("live and terminal campaigns cannot be edited", async () => {
+  const originalCampaignFindOne = CustomerCampaign.findOne;
+  const originalRestaurantFindOne = Restaurant.findOne;
+
+  try {
+    Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+
+    for (const status of [
+      "approved",
+      "scheduled",
+      "sending",
+      "sent",
+      "partially_failed",
+      "failed",
+      "cancelled"
+    ]) {
+      CustomerCampaign.findOne = async () => makeCampaign({ status });
+      await assert.rejects(
+        updateCustomerCampaignDraft(
+          {
+            restaurantId,
+            updatedByPhone: "+233507879374",
+            updatedByRole: "owner",
+            campaignId,
+            message: "This must not be saved."
+          },
+          now
+        ),
+        /awaiting approval/i
+      );
+    }
+  } finally {
+    CustomerCampaign.findOne = originalCampaignFindOne;
+    Restaurant.findOne = originalRestaurantFindOne;
+  }
+});
+
+test("campaign edits are restaurant-scoped and validate targeting menu ownership and future schedules", async () => {
+  const originalCampaignFindOne = CustomerCampaign.findOne;
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalMenuFindOne = MenuItem.findOne;
+
+  try {
+    Restaurant.findOne = () => resolvedQuery(makeRestaurant());
+    CustomerCampaign.findOne = async (filter) => {
+      if (filter.restaurantId === otherRestaurantId) return null;
+      return makeCampaign({ status: "pending_approval" });
+    };
+
+    await assert.rejects(
+      updateCustomerCampaignDraft(
+        {
+          restaurantId: otherRestaurantId,
+          updatedByPhone: "+233507879374",
+          updatedByRole: "owner",
+          campaignId,
+          message: "Cross tenant edit"
+        },
+        now
+      ),
+      /not found/i
+    );
+
+    MenuItem.findOne = () => resolvedQuery(null);
+    await assert.rejects(
+      updateCustomerCampaignDraft(
+        {
+          restaurantId,
+          updatedByPhone: "+233507879374",
+          updatedByRole: "owner",
+          campaignId,
+          targeting: { type: "ordered_menu_item", menuItemId }
+        },
+        now
+      ),
+      /does not belong/i
+    );
+
+    await assert.rejects(
+      updateCustomerCampaignDraft(
+        {
+          restaurantId,
+          updatedByPhone: "+233507879374",
+          updatedByRole: "owner",
+          campaignId,
+          scheduledAt: "2026-07-30T11:59"
+        },
+        now
+      ),
+      /past/i
+    );
+  } finally {
+    CustomerCampaign.findOne = originalCampaignFindOne;
+    Restaurant.findOne = originalRestaurantFindOne;
+    MenuItem.findOne = originalMenuFindOne;
+  }
 });
 
 test("campaign approval revalidates staff and creates one immutable scoped snapshot", async () => {
@@ -840,6 +1186,7 @@ test("campaign approval revalidates staff and creates one immutable scoped snaps
       "+233507879374",
       now,
       {
+        expectedCampaignVersion: 1,
         startSession: async () => session
       }
     );

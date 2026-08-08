@@ -201,6 +201,31 @@ test("manager pending state uses the manager phone and role scope", async () => 
   assert.equal(state.permissions.includes("update_menu_price"), false);
 });
 
+test("a version-bound pending campaign approval becomes trusted follow-up context", async () => {
+  const state = await buildStaffOperationalState(
+    { restaurant, sender: owner },
+    makeDependencies({
+      pending: [
+        pendingAction({
+          _id: "64b000000000000000000190",
+          toolName: "approve_campaign",
+          data: {
+            campaignId: "64b000000000000000000191",
+            expectedCampaignVersion: 3
+          }
+        })
+      ]
+    })
+  );
+
+  assert.deepEqual(state.recentReferences.campaign, {
+    id: "64b000000000000000000191",
+    campaignVersion: 3,
+    pendingActionId: "64b000000000000000000190",
+    status: "pending_approval"
+  });
+});
+
 test("manager order-selection state is persisted with the manager role", async () => {
   const originalOrderUpdateMany = Order.updateMany;
   const originalOrderFind = Order.find;
@@ -614,6 +639,10 @@ test("staff operational state reaches a delimited data-only prompt section", asy
   assert.match(prompt, /assign_pending_image_to_menu_item/);
   assert.match(prompt, /confirm_pending_image_assignment/);
   assert.match(prompt, /Ordinary conversation must not mutate imageWorkflow/);
+  assert.match(prompt, /Campaign actions require campaign backend tools/);
+  assert.match(prompt, /update_campaign_draft/);
+  assert.match(prompt, /staff reminder tools/);
+  assert.match(prompt, /Automatic pending-action reminders are a separate backend workflow/);
   assert.equal(prompt.includes("imageSecureUrl"), false);
   assert.equal(prompt.includes("imagePublicId"), false);
   assert.equal(prompt.includes("res.cloudinary.com"), false);

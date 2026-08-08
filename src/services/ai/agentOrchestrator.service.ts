@@ -70,6 +70,16 @@ const trustedArgumentNames = new Set([
   "sender_phone",
   "senderRole",
   "sender_role",
+  "recipientPhone",
+  "recipient_phone",
+  "apiKey",
+  "api_key",
+  "wasenderSessionId",
+  "wasender_session_id",
+  "wasenderApiToken",
+  "wasender_api_token",
+  "accessToken",
+  "access_token",
   "sessionKey",
   "session_key",
   "conversationKey",
@@ -356,9 +366,152 @@ const mergeUsage = (current: AiUsage | undefined, next: AiUsage | undefined): Ai
 };
 
 const looksLikeSuccessClaim = (message: string): boolean => {
-  return /\b(done|completed|confirmed|placed|updated|cancelled|successfully|has been|is now)\b/i.test(
+  return /\b(done|completed|confirmed|placed|created|scheduled|rescheduled|updated|cancelled|sent|delivered|successfully|has been|is now|set up)\b/i.test(
     message
   );
+};
+
+interface RequiredOperationalTool {
+  toolName: string;
+  requireCompletedMutation?: boolean;
+  safeMessage: string;
+}
+
+const getRequiredCampaignOrReminderTool = (
+  input: AgentOrchestratorInput
+): RequiredOperationalTool | null => {
+  const message = input.message.toLowerCase();
+  const mentionsCampaign = /\bcampaigns?\b/.test(message);
+  const hasTrustedCampaignReference = Boolean(
+    input.staffState?.recentReferences.campaign
+  );
+  const mentionsReminder = /\breminders?\b/.test(message);
+
+  if (
+    (mentionsCampaign || hasTrustedCampaignReference) &&
+    /\b(cancel|discard|delete|stop)\b/.test(message) &&
+    (mentionsCampaign || /\b(it|that|this)\b/.test(message))
+  ) {
+    return {
+      toolName: "cancel_campaign",
+      requireCompletedMutation: true,
+      safeMessage:
+        "I haven't cancelled that campaign. Please identify which campaign you mean so I can use the campaign controls safely."
+    };
+  }
+
+  if (
+    (mentionsCampaign || hasTrustedCampaignReference) &&
+    /\b(approve|confirm|send it|go ahead)\b/.test(message)
+  ) {
+    return {
+      toolName: "approve_campaign",
+      requireCompletedMutation: true,
+      safeMessage:
+        "I haven't approved that campaign. Please confirm the exact backend preview first."
+    };
+  }
+
+  if (
+    (mentionsCampaign || hasTrustedCampaignReference) &&
+    (/\b(change|edit|update|shorten|rewrite|reschedule|move)\b/.test(
+      message
+    ) || /\bmake\b.*\b(shorter|longer|less|more)\b/.test(message))
+  ) {
+    return {
+      toolName: "update_campaign_draft",
+      safeMessage:
+        "I couldn't confirm that the campaign was updated. The previous preview remains authoritative."
+    };
+  }
+
+  if (
+    mentionsCampaign &&
+    /\b(create|start|draft|make|set up|launch)\b/.test(message)
+  ) {
+    return {
+      toolName: "create_campaign_draft",
+      safeMessage:
+        "I couldn't confirm that a campaign draft was created. No campaign has been sent."
+    };
+  }
+
+  if (
+    (/\bremind me\b/.test(message) ||
+      (mentionsReminder && /\b(create|set|schedule|add)\b/.test(message))) &&
+    !/\b(cancel|delete|remove)\b/.test(message)
+  ) {
+    return {
+      toolName: "create_staff_reminder",
+      safeMessage:
+        "I couldn't confirm that the reminder was scheduled. Please try again."
+    };
+  }
+
+  if (
+    mentionsReminder &&
+    /\b(cancel|delete|remove)\b/.test(message)
+  ) {
+    return {
+      toolName: "cancel_staff_reminder",
+      safeMessage:
+        "I couldn't confirm that the reminder was cancelled. It remains unchanged."
+    };
+  }
+
+  if (
+    mentionsReminder &&
+    /\b(reschedule|move|change)\b/.test(message)
+  ) {
+    return {
+      toolName: "reschedule_staff_reminder",
+      safeMessage:
+        "I couldn't confirm that the reminder was rescheduled. It remains unchanged."
+    };
+  }
+
+  return null;
+};
+
+const getCampaignOrReminderFalseSuccessMessage = (
+  input: AgentOrchestratorInput,
+  finalMessage: string,
+  executedTools: ExecutedAgentTool[]
+): string | null => {
+  if (
+    (input.sender.role !== "owner" && input.sender.role !== "manager") ||
+    !looksLikeSuccessClaim(finalMessage)
+  ) {
+    return null;
+  }
+
+  const required = getRequiredCampaignOrReminderTool(input);
+
+  if (!required) {
+    return null;
+  }
+
+  const matchingSuccess = executedTools.some(
+    (tool) =>
+      tool.name === required.toolName &&
+      tool.success &&
+      (!required.requireCompletedMutation || !tool.requiresConfirmation)
+  );
+
+  if (!matchingSuccess) {
+    return required.safeMessage;
+  }
+
+  if (
+    required.toolName.startsWith("create_campaign") ||
+    required.toolName === "approve_campaign"
+  ) {
+    if (/\b(sent|delivered)\b/i.test(finalMessage)) {
+      return "The campaign has not been reported as sent. Creation and approval only prepare it for the existing scheduled delivery queue.";
+    }
+  }
+
+  return null;
 };
 
 const getFailedToolSuccessClaimMessage = (
@@ -445,6 +598,7 @@ export const runAgentOrchestrator = async (
     restaurantId,
     restaurant: input.restaurant,
     sender: input.sender,
+    requestId: input.requestId,
     originalMessage: normalizedInputMessage,
     quotedMessageId: input.quotedMessageId
   };
@@ -474,6 +628,25 @@ export const runAgentOrchestrator = async (
           return {
             success: false,
             message: failedToolMessage,
+            data: importantData,
+            provider: provider.name,
+            model: provider.model,
+            responseId,
+            executedTools,
+            usage
+          };
+        }
+
+        const falseSuccessMessage = getCampaignOrReminderFalseSuccessMessage(
+          input,
+          finalMessage,
+          executedTools
+        );
+
+        if (falseSuccessMessage) {
+          return {
+            success: false,
+            message: falseSuccessMessage,
             data: importantData,
             provider: provider.name,
             model: provider.model,

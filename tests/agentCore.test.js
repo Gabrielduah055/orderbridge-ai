@@ -994,6 +994,9 @@ test("OpenRouter tool loop ignores model-supplied trusted identity arguments", a
               arguments: {
                 restaurantId: "64b000000000000000000999",
                 senderRole: "owner",
+                recipientPhone: "+233200000000",
+                apiKey: "model-secret",
+                wasenderSessionId: "model-session",
                 itemName: "Jollof Rice",
                 newPrice: 70
               }
@@ -1034,6 +1037,113 @@ test("OpenRouter tool loop ignores model-supplied trusted identity arguments", a
   );
 
   assert.deepEqual(receivedArgs, { itemName: "Jollof Rice", newPrice: 70 });
+});
+
+const runNoToolStaffResponse = async (message, responseText) =>
+  runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({ text: responseText, toolCalls: [] })
+      },
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        throw new Error("No tool should execute");
+      }
+    }
+  );
+
+test("no-tool campaign creation and cancellation claims are not trusted", async () => {
+  const created = await runNoToolStaffResponse(
+    "Create a campaign for inactive customers tomorrow.",
+    "Done, the campaign was created."
+  );
+  const cancelled = await runNoToolStaffResponse(
+    "Cancel the weekend campaign.",
+    "Done, cancelled."
+  );
+
+  assert.equal(created.success, false);
+  assert.match(created.message, /couldn't confirm.*created/i);
+  assert.deepEqual(created.executedTools, []);
+  assert.equal(cancelled.success, false);
+  assert.match(cancelled.message, /haven't cancelled/i);
+  assert.deepEqual(cancelled.executedTools, []);
+});
+
+test("no-tool reminder creation and cancellation claims are not trusted", async () => {
+  const created = await runNoToolStaffResponse(
+    "Remind me tomorrow at 8 to check stock.",
+    "Done, your reminder is scheduled."
+  );
+  const cancelled = await runNoToolStaffResponse(
+    "Cancel my 8am reminder.",
+    "Done, reminder cancelled."
+  );
+
+  assert.equal(created.success, false);
+  assert.match(created.message, /couldn't confirm.*scheduled/i);
+  assert.equal(cancelled.success, false);
+  assert.match(cancelled.message, /couldn't confirm.*cancelled/i);
+});
+
+test("read-only campaign questions do not trigger mutation false-success safety", async () => {
+  const result = await runNoToolStaffResponse(
+    "When is the weekend campaign scheduled?",
+    "The schedule is not available yet."
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.message, "The schedule is not available yet.");
+  assert.deepEqual(result.executedTools, []);
+});
+
+test("a trusted pending campaign reference protects no-tool natural follow-up edits", async () => {
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Make that message shorter.",
+      staffState: {
+        pendingActions: [],
+        imageWorkflow: null,
+        orders: { freshPending: [], recentActive: [] },
+        recentReferences: {
+          campaign: {
+            id: "64b000000000000000000c01",
+            campaignVersion: 2,
+            pendingActionId: "64b000000000000000000c02",
+            status: "pending_approval"
+          }
+        },
+        permissions: ["update_campaign_draft"]
+      }
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({
+          text: "Done, the message has been updated.",
+          toolCalls: []
+        })
+      },
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.match(result.message, /couldn't confirm.*updated/i);
 });
 
 test("OpenRouter blocks a rejection outside the trusted awaiting-reason selection before execution", async () => {
