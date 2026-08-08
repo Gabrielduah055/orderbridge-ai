@@ -1030,6 +1030,7 @@ export const handleRestaurantAgentMessage = async (
         restaurant: input.restaurant,
         sender,
         message,
+        quotedMessageId: input.quotedMessageId,
         staffState
       });
     } catch {
@@ -1311,7 +1312,8 @@ export const handleRestaurantAgentMessage = async (
       const agentResult = await runAgentOrchestrator({
         restaurant: input.restaurant,
         sender,
-        message
+        message,
+        quotedMessageId: input.quotedMessageId
       });
 
       // Now that the orchestrator has run and built its context from the uncontaminated

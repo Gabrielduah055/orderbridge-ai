@@ -256,6 +256,7 @@ test("quoted provider message ID is passed to the staff state builder", async ()
     );
 
     assert.equal(stateBuilderInput.quotedMessageId, quotedMessageId);
+    assert.equal(orchestratorInput.quotedMessageId, quotedMessageId);
     assert.equal(
       orchestratorInput.staffState.recentReferences.quotedOrder.orderNumber,
       "ORD-102"
@@ -1321,6 +1322,73 @@ test("awaiting rejection reason blocks a no-tool false rejection claim", async (
     assert.equal(pendingSelectionStatus, "pending");
     assert.equal(deterministicMutations, 0);
     assert.equal(reconciliationCalls, 0);
+  });
+});
+
+test("awaiting rejection reason keeps the selection pending after a pre-execution mismatch", async () => {
+  await runWithRoutingHarness(async () => {
+    const unchangedWrongOrder = { id: "order-105", status: "pending" };
+    let pendingSelectionStatus = "pending";
+    let deterministicMutations = 0;
+    let reconciliationCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            success: false,
+            message: "The requested order does not match the active order selection.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: false,
+                code: "ORDER_REFERENCE_MISMATCH",
+                message: "The requested order does not match the active order selection."
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          unchangedWrongOrder.status = "rejected";
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(unchangedWrongOrder.status, "pending");
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(deterministicMutations, 0);
+    assert.equal(reconciliationCalls, 0);
+    assert.match(response.message, /haven't confirmed/i);
   });
 });
 
