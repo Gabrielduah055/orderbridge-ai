@@ -65,6 +65,9 @@ export interface ExecutedAgentTool {
   message: string;
   requiresConfirmation?: boolean;
   pendingActionId?: string;
+  resultOrderId?: string;
+  resultOrderNumber?: string;
+  resultOrderStatus?: string;
 }
 
 export interface AgentOrchestratorInput {

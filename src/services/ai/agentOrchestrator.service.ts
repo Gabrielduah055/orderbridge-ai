@@ -31,7 +31,8 @@ const recoverableToolCodes = new Set([
   "ORDER_ITEM_QUANTITY_REQUIRED",
   "ORDER_ITEM_CLARIFICATION_NO_MATCH",
   "ORDER_DRAFT_INCOMPLETE",
-  "CUSTOMER_NAME_REQUIRED"
+  "CUSTOMER_NAME_REQUIRED",
+  "ORDER_REJECTION_REASON_REQUIRED"
 ]);
 
 const classifyOrchestratorError = (error: unknown): string => {
@@ -104,6 +105,29 @@ const buildToolResultForModel = (toolName: string, result: ToolResult) => ({
   requiresConfirmation: result.requiresConfirmation,
   pendingActionId: result.pendingActionId
 });
+
+const getExecutedOrderMetadata = (data: unknown) => {
+  if (!data || typeof data !== "object") {
+    return {};
+  }
+
+  const order = (data as Record<string, unknown>).order;
+  if (!order || typeof order !== "object") {
+    return {};
+  }
+
+  const source = order as Record<string, unknown>;
+  const rawId = source.id ?? source._id;
+
+  return {
+    resultOrderId:
+      rawId === undefined || rawId === null ? undefined : String(rawId),
+    resultOrderNumber:
+      typeof source.orderNumber === "string" ? source.orderNumber : undefined,
+    resultOrderStatus:
+      typeof source.status === "string" ? source.status : undefined
+  };
+};
 
 const removeImageUrlsForModel = (value: unknown): unknown => {
   if (Array.isArray(value)) {
@@ -417,7 +441,8 @@ export const runAgentOrchestrator = async (
           code: result.code,
           message: result.message,
           requiresConfirmation: result.requiresConfirmation,
-          pendingActionId: result.pendingActionId
+          pendingActionId: result.pendingActionId,
+          ...getExecutedOrderMetadata(result.data)
         });
         importantData = getImportantData(importantData, result, toolName);
 

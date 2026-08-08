@@ -4,6 +4,7 @@ import type { ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { isToolAllowedForRole, type ToolName } from "./tool.permissions";
 import { toolRegistry } from "./tool.registry";
 import { getSafeErrorMessage } from "../utils/error.util";
+import { BadRequestError } from "../utils/httpErrors";
 
 const isToolName = (toolName: string): toolName is ToolName => {
   return toolName in toolRegistry;
@@ -53,10 +54,18 @@ export const executeAgentTool = async (
   const parseResult = tool.schema.safeParse(rawArgs ?? {});
 
   if (!parseResult.success) {
+    const rejectionReasonMissing =
+      toolName === "reject_order" &&
+      parseResult.error.issues.some((issue) => issue.path[0] === "reason");
+
     return {
       success: false,
-      code: "TOOL_INVALID_ARGUMENTS",
-      message: safeValidationMessage(parseResult.error)
+      code: rejectionReasonMissing
+        ? "ORDER_REJECTION_REASON_REQUIRED"
+        : "TOOL_INVALID_ARGUMENTS",
+      message: rejectionReasonMissing
+        ? "Please provide a meaningful reason for rejecting the order."
+        : safeValidationMessage(parseResult.error)
     };
   }
 
@@ -80,6 +89,14 @@ export const executeAgentTool = async (
       toolName,
       error: getSafeErrorMessage(error, "Agent tool execution failed without an error message")
     });
+
+    if (error instanceof BadRequestError && error.code) {
+      return {
+        success: false,
+        code: error.code,
+        message: error.message
+      };
+    }
 
     return {
       success: false,

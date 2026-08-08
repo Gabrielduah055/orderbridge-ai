@@ -17,7 +17,9 @@ import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import {
   handleSavedOwnerSelectionReply,
   handleUnquotedOwnerOrderDecision,
+  parseOwnerSelectionReply,
   parseSimpleOwnerDecision,
+  requestOwnerOrderRejectionReason,
   resolveQuotedOwnerOrderDecision
 } from "./ownerOrderResolution.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
@@ -123,7 +125,7 @@ export const parseOwnerOrderDecision = (
 ): { decision: "accept" | "reject"; orderReference: string; reason?: string } | null => {
   const normalized = message.trim();
   const match = normalized.match(
-    /^(?:accept|confirm(?:\s+order)?|reject|cancel)\s+(?:order\s+)?(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:\s+(.+))?$/i
+    /^(?:accept|confirm(?:\s+order)?|reject|cancel)\s+(?:order\s+)?(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:(?:\s*[,;:\-—]\s*|\s+because\s+|\s+)(.+))?$/i
   );
 
   if (!match) {
@@ -206,6 +208,9 @@ export interface RestaurantAgentRoutingDependencies {
   parseOrderDecision?: typeof parseOwnerOrderDecision;
   parseSimpleDecision?: typeof parseSimpleOwnerDecision;
   handleSavedSelection?: typeof handleSavedOwnerSelectionReply;
+  handleUnquotedDecision?: typeof handleUnquotedOwnerOrderDecision;
+  requestRejectionReason?: typeof requestOwnerOrderRejectionReason;
+  resolveQuotedDecision?: typeof resolveQuotedOwnerOrderDecision;
   executeTool?: typeof executeAgentTool;
   findLatestPendingAction?: typeof findLatestPendingToolAction;
   findPendingActions?: typeof findPendingToolActions;
@@ -267,6 +272,223 @@ const hasMeaningfulNamedToolActivity = (
       tool.name === toolName &&
       (tool.success || Boolean(tool.pendingActionId))
   );
+
+type StaffOrderMutationKind = "accept" | "reject" | "complete" | "progress";
+
+export interface StaffOrderMutationIntent {
+  kind: StaffOrderMutationKind;
+  requiredTool: "confirm_order" | "reject_order" | "update_order_status";
+  orderReference?: string;
+  reason?: string;
+  targetStatus?: "preparing" | "ready" | "out_for_delivery" | "completed";
+  missingReason: boolean;
+  ambiguous: boolean;
+}
+
+const cleanInlineRejectionReason = (value?: string): string | undefined => {
+  const normalized = value
+    ?.trim()
+    .replace(/^[,;:\s\-—]+/, "")
+    .replace(/^because\s+/i, "")
+    .trim();
+
+  return normalized && normalized.length >= 3 ? normalized : undefined;
+};
+
+const isTrustedRejectionReasonAnswer = (message: string): boolean => {
+  const normalized = message.trim().replace(/\s+/g, " ");
+
+  return (
+    normalized.length >= 3 &&
+    normalized.length <= 500 &&
+    !normalized.includes("?") &&
+    !/^(?:hello|hi|hey|you there|what do you mean|wait|thanks?|okay|ok)[.!]*$/i.test(
+      normalized
+    )
+  );
+};
+
+export const getStaffOrderMutationIntent = (
+  staffState: Awaited<ReturnType<typeof buildStaffOperationalState>>,
+  message: string
+): StaffOrderMutationIntent | null => {
+  const normalized = normalizeText(message);
+  const explicitDecision = parseOwnerOrderDecision(normalized);
+  const selection = staffState.recentReferences.orderSelection;
+  let kind: StaffOrderMutationKind | null = explicitDecision?.decision ?? null;
+  let orderReference = explicitDecision?.orderReference;
+  let reason = cleanInlineRejectionReason(explicitDecision?.reason);
+  let selectedCandidateIds: string[] | undefined;
+  let targetStatus: StaffOrderMutationIntent["targetStatus"];
+
+  if (!kind && selection?.decision === "reject" && selection.awaitingReason) {
+    if (!isTrustedRejectionReasonAnswer(normalized)) {
+      return null;
+    }
+    kind = "reject";
+    reason = normalized;
+  }
+
+  if (!kind && selection && !selection.awaitingReason) {
+    const selectionReply = parseOwnerSelectionReply(
+      normalized,
+      selection.candidates.length
+    );
+
+    if (selectionReply && selectionReply.type !== "cancel") {
+      kind = selection.decision;
+      reason = selection.rejectionReason;
+      selectedCandidateIds =
+        selectionReply.type === "all"
+          ? selection.candidates.map((candidate) => candidate.id)
+          : selectionReply.indexes
+              .map((index) => selection.candidates[index - 1]?.id)
+              .filter((id): id is string => Boolean(id));
+    }
+  }
+
+  if (!kind) {
+    const acceptMatch = normalized.match(
+      /^(?:accept|confirm)(?:\s+(?:it|this|that|that one|this order|the order))?[.!]?$/i
+    );
+    const rejectMatch = normalized.match(
+      /^(?:reject|decline)(?:\s+(?:it|this|that|that one|this order|the order))?(?:(?:\s+because\s+|\s*[,;:\-—]\s*)(.+))?[.!]?$/i
+    );
+    const cannotFulfilMatch = normalized.match(
+      /^(?:can'?t|cannot)\s+fulfil(?:l)?(?:\s+(?:it|this|that|that order|this order))?(?:(?:\s+because\s+|\s*[,;:\-—]\s*)(.+))?[.!]?$/i
+    );
+
+    if (acceptMatch) {
+      kind = "accept";
+    } else if (rejectMatch || cannotFulfilMatch) {
+      kind = "reject";
+      reason = cleanInlineRejectionReason(
+        rejectMatch?.[1] ?? cannotFulfilMatch?.[1]
+      );
+    }
+  }
+
+  if (!kind) {
+    const completionWithReference = normalized.match(
+      /^(?:mark\s+)?(?:order\s+)?(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:\s+as)?\s+(?:done|completed|delivered)[.!]?$/i
+    );
+    const simpleCompletion = /^(?:done|order done|mark (?:it|this|that|that one|this order|the order) (?:done|completed)|(?:this|that|the) order is done|delivered|completed)[.!]?$/i.test(
+      normalized
+    );
+
+    if (completionWithReference || simpleCompletion) {
+      kind = "complete";
+      targetStatus = "completed";
+      orderReference = completionWithReference?.[1];
+    }
+  }
+
+  if (!kind) {
+    const progressWithReference = normalized.match(
+      /^(?:mark|set|update)?\s*(?:order\s+)?(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:\s+(?:as|to|is))?\s+(preparing|ready|out for delivery)[.!]?$/i
+    );
+    const simpleProgress = normalized.match(
+      /^(?:mark|set|update)\s+(?:it|this|that|that one|this order|the order)(?:\s+(?:as|to))?\s+(preparing|ready|out for delivery)[.!]?$/i
+    );
+    const rawStatus = progressWithReference?.[2] ?? simpleProgress?.[1];
+
+    if (rawStatus) {
+      kind = "progress";
+      targetStatus = rawStatus.toLowerCase().replace(/\s+/g, "_") as
+        | "preparing"
+        | "ready"
+        | "out_for_delivery";
+      orderReference = progressWithReference?.[1];
+    }
+  }
+
+  if (!kind) {
+    return null;
+  }
+
+  if (!orderReference) {
+    const quotedOrder = staffState.recentReferences.quotedOrder;
+    const selectionCandidates = selection?.candidates ?? [];
+    const relevantOrders =
+      kind === "complete" || kind === "progress"
+        ? staffState.orders.recentActive
+        : staffState.orders.freshPending;
+
+    if (quotedOrder?.id) {
+      orderReference = quotedOrder.id;
+    } else if (selectedCandidateIds?.length === 1) {
+      orderReference = selectedCandidateIds[0];
+    } else if (selectedCandidateIds && selectedCandidateIds.length !== 1) {
+      return {
+        kind,
+        requiredTool: kind === "accept" ? "confirm_order" : "reject_order",
+        reason,
+        missingReason: kind === "reject" && !reason,
+        ambiguous: true
+      };
+    } else if (selectionCandidates.length === 1) {
+      orderReference = selectionCandidates[0].id;
+    } else if (relevantOrders.length === 1) {
+      orderReference = relevantOrders[0].id;
+    } else {
+      return {
+        kind,
+        requiredTool:
+          kind === "accept"
+            ? "confirm_order"
+            : kind === "reject"
+              ? "reject_order"
+              : "update_order_status",
+        reason,
+        targetStatus,
+        missingReason: kind === "reject" && !reason,
+        ambiguous: relevantOrders.length > 1 || selectionCandidates.length > 1
+      };
+    }
+  }
+
+  return {
+    kind,
+    requiredTool:
+      kind === "accept"
+        ? "confirm_order"
+        : kind === "reject"
+          ? "reject_order"
+          : "update_order_status",
+    orderReference,
+    reason,
+    targetStatus,
+    missingReason: kind === "reject" && !reason,
+    ambiguous: false
+  };
+};
+
+const hasSuccessfulOrderMutationTool = (
+  intent: StaffOrderMutationIntent,
+  result: AgentOrchestratorResult
+): boolean => {
+  const matchingTool = result.executedTools.find(
+    (tool) => tool.name === intent.requiredTool && tool.success
+  );
+
+  if (!matchingTool) {
+    return false;
+  }
+
+  if (
+    intent.orderReference &&
+    intent.orderReference !== matchingTool.resultOrderId &&
+    intent.orderReference.toLowerCase() !==
+      matchingTool.resultOrderNumber?.toLowerCase()
+  ) {
+    return false;
+  }
+
+  return (
+    intent.requiredTool !== "update_order_status" ||
+    matchingTool.resultOrderStatus === intent.targetStatus
+  );
+};
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
   const categories = Array.isArray(data) ? (data as AgentMenuCategoryView[]) : [];
@@ -485,6 +707,12 @@ export const handleRestaurantAgentMessage = async (
     dependencies.parseSimpleDecision ?? parseSimpleOwnerDecision;
   const handleSavedSelection =
     dependencies.handleSavedSelection ?? handleSavedOwnerSelectionReply;
+  const handleUnquotedDecision =
+    dependencies.handleUnquotedDecision ?? handleUnquotedOwnerOrderDecision;
+  const requestRejectionReason =
+    dependencies.requestRejectionReason ?? requestOwnerOrderRejectionReason;
+  const resolveQuotedDecision =
+    dependencies.resolveQuotedDecision ?? resolveQuotedOwnerOrderDecision;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
   const findLatestPendingAction =
     dependencies.findLatestPendingAction ?? findLatestPendingToolAction;
@@ -622,6 +850,10 @@ export const handleRestaurantAgentMessage = async (
   let staffImageWorkflow: Awaited<
     ReturnType<typeof buildStaffOperationalState>
   >["imageWorkflow"] = null;
+  let staffOperationalState: Awaited<
+    ReturnType<typeof buildStaffOperationalState>
+  > | undefined;
+  let staffOrderMutationIntent: StaffOrderMutationIntent | null = null;
 
   if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
     let agentResult: AgentOrchestratorResult | undefined;
@@ -642,6 +874,8 @@ export const handleRestaurantAgentMessage = async (
     }
 
     staffImageWorkflow = staffState.imageWorkflow;
+    staffOperationalState = staffState;
+    staffOrderMutationIntent = getStaffOrderMutationIntent(staffState, message);
 
     try {
       agentResult = await runOrchestrator({
@@ -669,6 +903,10 @@ export const handleRestaurantAgentMessage = async (
             requiredImageWorkflowTool
           )
       );
+      const orderWorkflowNeedsFallback = Boolean(
+        staffOrderMutationIntent &&
+          !hasSuccessfulOrderMutationTool(staffOrderMutationIntent, agentResult)
+      );
       const hasUsableMessage = Boolean(agentResult.message?.trim());
       const looksLikePendingDecision =
         !hasMeaningfulToolActivity &&
@@ -687,10 +925,13 @@ export const handleRestaurantAgentMessage = async (
         : null;
       const pendingDecisionNeedsFallback = Boolean(pendingAction);
       const handledByAi =
-        (!imageWorkflowNeedsFallback && hasMeaningfulToolActivity) ||
+        (!imageWorkflowNeedsFallback &&
+          !orderWorkflowNeedsFallback &&
+          hasMeaningfulToolActivity) ||
         (agentResult.success &&
           hasUsableMessage &&
           !imageWorkflowNeedsFallback &&
+          !orderWorkflowNeedsFallback &&
           !pendingDecisionNeedsFallback);
 
       if (handledByAi) {
@@ -730,6 +971,8 @@ export const handleRestaurantAgentMessage = async (
       staffAgentFallbackResult = agentResult;
       staffAgentFallbackReason = imageWorkflowNeedsFallback
         ? "agent_did_not_complete_image_workflow"
+        : orderWorkflowNeedsFallback
+          ? "agent_did_not_complete_order_mutation"
         : pendingDecisionNeedsFallback
           ? "pending_action_requires_backend_confirmation"
           : agentResult.errorCode || "unusable_response";
@@ -991,15 +1234,153 @@ export const handleRestaurantAgentMessage = async (
     }
   }
 
+  if (
+    aiProviderName === "openrouter" &&
+    (sender.role === "owner" || sender.role === "manager") &&
+    staffOrderMutationIntent
+  ) {
+    let fallbackResponse: RestaurantAgentResponse;
+    let fallbackMetadata: Record<string, unknown>;
+
+    if (
+      staffOrderMutationIntent.kind === "reject" &&
+      staffOrderMutationIntent.missingReason &&
+      staffOrderMutationIntent.orderReference
+    ) {
+      const result = await requestRejectionReason({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        orderReference: staffOrderMutationIntent.orderReference
+      });
+      fallbackResponse = {
+        success: result.success,
+        message: result.message,
+        data: result.data,
+        source: legacyStaffSource,
+        sender
+      };
+      fallbackMetadata = {
+        source: "deterministic_owner_order_safety",
+        reason: "rejection_reason_required",
+        pendingActionId: result.data?.pendingActionId
+      };
+    } else if (!staffOrderMutationIntent.orderReference) {
+      if (
+        staffOrderMutationIntent.kind === "complete" ||
+        staffOrderMutationIntent.kind === "progress"
+      ) {
+        const activeOrders = staffOperationalState?.orders.recentActive ?? [];
+        const clarificationMessage = activeOrders.length
+          ? `Which order should I mark as ${
+              staffOrderMutationIntent.targetStatus?.replace(/_/g, " ") ?? "updated"
+            }?`
+          : "There are no active orders to update.";
+        fallbackResponse = {
+          success: activeOrders.length > 0,
+          message: clarificationMessage,
+          source: legacyStaffSource,
+          sender
+        };
+        fallbackMetadata = {
+          source: "deterministic_owner_order_safety",
+          reason: activeOrders.length ? "ambiguous_active_orders" : "no_active_orders"
+        };
+      } else {
+        const quotedResult = await resolveQuotedDecision(
+          restaurantId,
+          input.quotedMessageId,
+          staffOrderMutationIntent.kind,
+          staffOrderMutationIntent.reason,
+          sender.normalizedPhone,
+          sender.role
+        );
+        const result = quotedResult.handled
+          ? quotedResult
+          : await handleUnquotedDecision(
+              restaurantId,
+              sender.normalizedPhone,
+              staffOrderMutationIntent.kind,
+              sender.role,
+              staffOrderMutationIntent.reason
+            );
+        fallbackResponse = {
+          success: result.success,
+          message: result.message,
+          data: result.data,
+          source: legacyStaffSource,
+          sender
+        };
+        fallbackMetadata = {
+          source: "deterministic_owner_order_safety",
+          reason: quotedResult.handled
+            ? "trusted_quoted_order"
+            : staffOrderMutationIntent.ambiguous
+              ? "ambiguous_pending_orders"
+              : "trusted_unique_pending_order"
+        };
+      }
+    } else {
+      const toolName = staffOrderMutationIntent.requiredTool;
+      const result = await executeTool(
+        toolName,
+        {
+          orderId: staffOrderMutationIntent.orderReference,
+          ...(staffOrderMutationIntent.reason
+            ? { reason: staffOrderMutationIntent.reason }
+            : {}),
+          ...(staffOrderMutationIntent.requiredTool === "update_order_status"
+            ? { status: staffOrderMutationIntent.targetStatus }
+            : {})
+        },
+        executionContext
+      );
+      fallbackResponse = {
+        success: result.success,
+        message: result.message,
+        data:
+          result.data && typeof result.data === "object"
+            ? { ...result.data }
+            : undefined,
+        source: legacyStaffSource,
+        sender
+      };
+      fallbackMetadata = {
+        source: "deterministic_owner_order_safety",
+        reason: staffAgentFallbackReason,
+        toolName,
+        success: result.success,
+        code: result.code
+      };
+    }
+
+    console.warn("[orderWorkflow] deterministic safety fallback", {
+      restaurantId,
+      senderRole: sender.role,
+      kind: staffOrderMutationIntent.kind,
+      reason: staffAgentFallbackReason
+    });
+    await saveAssistantResponse(
+      restaurantId,
+      sender,
+      fallbackResponse,
+      fallbackMetadata
+    );
+    return fallbackResponse;
+  }
+
   if (simpleOwnerDecision) {
-    const quotedResult = await resolveQuotedOwnerOrderDecision(
+    const quotedResult = await resolveQuotedDecision(
       restaurantId,
       input.quotedMessageId,
-      simpleOwnerDecision
+      simpleOwnerDecision,
+      undefined,
+      sender.normalizedPhone,
+      sender.role
     );
     const result = quotedResult.handled
       ? quotedResult
-      : await handleUnquotedOwnerOrderDecision(
+      : await handleUnquotedDecision(
           restaurantId,
           sender.normalizedPhone,
           simpleOwnerDecision,
@@ -1030,11 +1411,46 @@ export const handleRestaurantAgentMessage = async (
   }
 
   if (ownerOrderDecision) {
+    if (
+      ownerOrderDecision.decision === "reject" &&
+      !cleanInlineRejectionReason(ownerOrderDecision.reason)
+    ) {
+      const result = await requestRejectionReason({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        orderReference: ownerOrderDecision.orderReference
+      });
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: result.message,
+        metadata: {
+          source: "deterministic_owner_order_decision",
+          reason: "rejection_reason_required",
+          success: result.success
+        }
+      });
+
+      return {
+        success: result.success,
+        message: result.message,
+        data: result.data,
+        source: legacyStaffSource,
+        sender
+      };
+    }
+
     const result = await executeTool(
       ownerOrderDecision.decision === "accept" ? "confirm_order" : "reject_order",
       {
         orderReference: ownerOrderDecision.orderReference,
-        reason: ownerOrderDecision.reason
+        ...(ownerOrderDecision.reason
+          ? { reason: cleanInlineRejectionReason(ownerOrderDecision.reason) }
+          : {})
       },
       executionContext
     );

@@ -1,3 +1,4 @@
+import { Types } from "mongoose";
 import { Order, type IOrderDocument } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import type { SenderRole } from "../types/agent.types";
@@ -118,14 +119,117 @@ const findPendingSelection = async (
   }).sort({ createdAt: -1 });
 };
 
+const orderReference = (order: IOrderDocument): string =>
+  order.orderNumber || String(order._id);
+
+const buildRejectionReasonQuestion = (orders: IOrderDocument[]): string =>
+  orders.length === 1
+    ? `What's the reason for rejecting ${orderReference(orders[0])}?`
+    : orders.length > 1
+      ? `What's the reason for rejecting these ${orders.length} orders?`
+      : "What's the reason for rejecting that order?";
+
+const createOwnerOrderSelection = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+  senderRole: Extract<SenderRole, "owner" | "manager">;
+  decision: OwnerOrderDecision;
+  orders: IOrderDocument[];
+  awaitingReason?: boolean;
+  reason?: string;
+  confirmationMessage: string;
+}) => {
+  return PendingAgentAction.create({
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    action: "OWNER_ORDER_SELECTION",
+    data: {
+      decision: input.decision,
+      orderIds: input.orders.map((order) => String(order._id)),
+      awaitingReason: input.awaitingReason ?? false,
+      ...(input.reason ? { reason: input.reason } : {})
+    },
+    status: "pending",
+    confirmationMessage: input.confirmationMessage,
+    expiresAt: new Date(Date.now() + selectionTtlMs)
+  });
+};
+
+export const requestOwnerOrderRejectionReason = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+  senderRole: Extract<SenderRole, "owner" | "manager">;
+  orderReference: string;
+}): Promise<OwnerOrderResolutionResult> => {
+  const reference = input.orderReference.trim();
+  const order = await Order.findOne({
+    restaurantId: input.restaurantId,
+    ...(Types.ObjectId.isValid(reference)
+      ? { _id: reference }
+      : { orderNumber: reference })
+  });
+
+  if (!order) {
+    return {
+      handled: true,
+      success: false,
+      message: "I couldn't find that order for this restaurant."
+    };
+  }
+
+  if (
+    !["awaiting_restaurant_confirmation", "pending"].includes(order.status) ||
+    !orderService.isPendingOrderActionable(order)
+  ) {
+    return {
+      handled: true,
+      success: false,
+      message: "That order cannot be rejected in its current state."
+    };
+  }
+
+  const message = buildRejectionReasonQuestion([order]);
+  const pendingSelection = await createOwnerOrderSelection({
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    decision: "reject",
+    orders: [order],
+    awaitingReason: true,
+    confirmationMessage: message
+  });
+
+  return {
+    handled: true,
+    success: true,
+    message,
+    data: { pendingActionId: String(pendingSelection._id) }
+  };
+};
+
+const isLikelyRejectionReasonReply = (message: string): boolean => {
+  const normalized = message.trim().replace(/\s+/g, " ");
+
+  return (
+    normalized.length >= 3 &&
+    normalized.length <= 500 &&
+    !normalized.includes("?") &&
+    !/^(?:hello|hi|hey|you there|what do you mean|wait|thanks?|okay|ok)$/i.test(
+      normalized.replace(/[.!]+$/g, "")
+    )
+  );
+};
+
 const applyDecision = async (
+  restaurantId: string,
   orderId: string,
   decision: OwnerOrderDecision,
   reason?: string
 ): Promise<Awaited<ReturnType<typeof orderService.confirmRestaurantOrder>>> => {
   return decision === "accept"
-    ? orderService.confirmRestaurantOrder(orderId)
-    : orderService.rejectRestaurantOrder(orderId, reason);
+    ? orderService.confirmRestaurantOrder(orderId, restaurantId)
+    : orderService.rejectRestaurantOrder(orderId, reason, restaurantId);
 };
 
 const formatDecisionDoneMessage = (
@@ -148,7 +252,9 @@ export const resolveQuotedOwnerOrderDecision = async (
   restaurantId: string,
   quotedMessageId: string | undefined,
   decision: OwnerOrderDecision,
-  reason?: string
+  reason?: string,
+  senderPhone?: string,
+  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner"
 ): Promise<OwnerOrderResolutionResult> => {
   if (!quotedMessageId) {
     return { handled: false, success: false, message: "" };
@@ -163,7 +269,26 @@ export const resolveQuotedOwnerOrderDecision = async (
     return { handled: false, success: false, message: "" };
   }
 
-  const result = await applyDecision(String(order._id), decision, reason);
+  if (decision === "reject" && !reason?.trim()) {
+    if (senderPhone) {
+      return requestOwnerOrderRejectionReason({
+        restaurantId,
+        senderPhone,
+        senderRole,
+        orderReference: String(order._id)
+      });
+    }
+
+    const message = buildRejectionReasonQuestion([order]);
+
+    return {
+      handled: true,
+      success: true,
+      message
+    };
+  }
+
+  const result = await applyDecision(restaurantId, String(order._id), decision, reason);
 
   return {
     handled: true,
@@ -201,6 +326,72 @@ export const handleSavedOwnerSelectionReply = async (
   const decision = pendingSelection.data.decision === "reject" ? "reject" : "accept";
   const reply = parseOwnerSelectionReply(message, orderIds.length);
 
+  if (pendingSelection.data.awaitingReason === true) {
+    if (reply?.type === "cancel") {
+      pendingSelection.status = "cancelled";
+      pendingSelection.resultMessage = "Order rejection cancelled.";
+      await pendingSelection.save();
+
+      return {
+        handled: true,
+        success: true,
+        message: "Okay, I cancelled that order rejection."
+      };
+    }
+
+    if (!isLikelyRejectionReasonReply(message)) {
+      return { handled: false, success: false, message: "" };
+    }
+
+    const orders = await Order.find({
+      restaurantId,
+      _id: { $in: orderIds }
+    });
+    const orderMap = new Map(orders.map((order) => [String(order._id), order]));
+    const orderedSelection = orderIds
+      .map((orderId) => orderMap.get(orderId))
+      .filter((order) => order !== undefined);
+    const reason = message.trim().replace(/\s+/g, " ");
+    const succeeded: IOrderDocument[] = [];
+    const failed: string[] = [];
+
+    for (const selectedOrder of orderedSelection) {
+      try {
+        const result = await applyDecision(
+          restaurantId,
+          String(selectedOrder._id),
+          "reject",
+          reason
+        );
+        succeeded.push(result.order);
+      } catch (error) {
+        failed.push(error instanceof Error ? error.message : "Order rejection failed");
+      }
+    }
+
+    pendingSelection.status = failed.length === 0 ? "completed" : "failed";
+    pendingSelection.resultMessage = `${succeeded.length} order(s) rejected.`;
+    pendingSelection.errorMessage = failed.join("; ") || undefined;
+    await pendingSelection.save();
+
+    return {
+      handled: true,
+      success: failed.length === 0,
+      message:
+        failed.length === 0
+          ? `${succeeded.length} order${succeeded.length === 1 ? "" : "s"} rejected. The customer${
+              succeeded.length === 1 ? "" : "s"
+            } will be notified.`
+          : `I could not reject ${failed.length} order${failed.length === 1 ? "" : "s"}: ${failed.join("; ")}`,
+      data: {
+        orders: succeeded,
+        orderEvent: "rejected",
+        notifyCustomer: true,
+        receiptRequired: false
+      }
+    };
+  }
+
   if (!reply) {
     return { handled: false, success: false, message: "" };
   }
@@ -219,12 +410,41 @@ export const handleSavedOwnerSelectionReply = async (
 
   const selectedIds =
     reply.type === "all" ? orderIds : reply.indexes.map((index) => orderIds[index - 1]).filter(Boolean);
+  const selectedOrders = await Order.find({
+    restaurantId,
+    _id: { $in: selectedIds }
+  });
+
+  if (decision === "reject" && !pendingSelection.data.reason) {
+    pendingSelection.data = {
+      ...pendingSelection.data,
+      orderIds: selectedIds,
+      awaitingReason: true
+    };
+    pendingSelection.confirmationMessage = buildRejectionReasonQuestion(selectedOrders);
+    pendingSelection.actionVersion += 1;
+    await pendingSelection.save();
+
+    return {
+      handled: true,
+      success: true,
+      message: pendingSelection.confirmationMessage,
+      data: { pendingActionId: String(pendingSelection._id) }
+    };
+  }
   const succeeded: IOrderDocument[] = [];
   const failed: string[] = [];
 
   for (const orderId of selectedIds) {
     try {
-      const result = await applyDecision(orderId, decision);
+      const result = await applyDecision(
+        restaurantId,
+        orderId,
+        decision,
+        typeof pendingSelection.data.reason === "string"
+          ? pendingSelection.data.reason
+          : undefined
+      );
       succeeded.push(result.order);
     } catch (error) {
       failed.push(error instanceof Error ? error.message : `Order ${orderId} failed`);
@@ -260,7 +480,8 @@ export const handleUnquotedOwnerOrderDecision = async (
   restaurantId: string,
   senderPhone: string,
   decision: OwnerOrderDecision,
-  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner"
+  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner",
+  reason?: string
 ): Promise<OwnerOrderResolutionResult> => {
   const freshOrders = await getFreshPendingOrders(restaurantId);
 
@@ -273,7 +494,32 @@ export const handleUnquotedOwnerOrderDecision = async (
   }
 
   if (freshOrders.length === 1) {
-    const result = await applyDecision(String(freshOrders[0]._id), decision);
+    if (decision === "reject" && !reason?.trim()) {
+      const message = buildRejectionReasonQuestion(freshOrders);
+      const pendingSelection = await createOwnerOrderSelection({
+        restaurantId,
+        senderPhone,
+        senderRole,
+        decision,
+        orders: freshOrders,
+        awaitingReason: true,
+        confirmationMessage: message
+      });
+
+      return {
+        handled: true,
+        success: true,
+        message,
+        data: { pendingActionId: String(pendingSelection._id) }
+      };
+    }
+
+    const result = await applyDecision(
+      restaurantId,
+      String(freshOrders[0]._id),
+      decision,
+      reason
+    );
 
     return {
       handled: true,
@@ -289,18 +535,14 @@ export const handleUnquotedOwnerOrderDecision = async (
     };
   }
 
-  const pendingSelection = await PendingAgentAction.create({
+  const pendingSelection = await createOwnerOrderSelection({
     restaurantId,
     senderPhone,
     senderRole,
-    action: "OWNER_ORDER_SELECTION",
-    data: {
-      decision,
-      orderIds: freshOrders.map((order) => String(order._id))
-    },
-    status: "pending",
-    confirmationMessage: buildOwnerSelectionMessage(decision, freshOrders),
-    expiresAt: new Date(Date.now() + selectionTtlMs)
+    decision,
+    orders: freshOrders,
+    reason: reason?.trim(),
+    confirmationMessage: buildOwnerSelectionMessage(decision, freshOrders)
   });
 
   return {

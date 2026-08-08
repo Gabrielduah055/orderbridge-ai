@@ -254,6 +254,46 @@ test("manager order-selection state is persisted with the manager role", async (
   }
 });
 
+test("pending rejection reason context is exposed as a scoped trusted order selection", async () => {
+  const selectedOrder = orderRecord(4, "pending");
+  const state = await buildStaffOperationalState(
+    { restaurant, sender: owner },
+    makeDependencies({
+      pending: [
+        pendingAction({
+          _id: "reason-action-104",
+          action: "OWNER_ORDER_SELECTION",
+          toolName: undefined,
+          data: {
+            decision: "reject",
+            orderIds: [String(selectedOrder._id)],
+            awaitingReason: true
+          }
+        })
+      ],
+      orders: [selectedOrder]
+    })
+  );
+
+  assert.deepEqual(state.recentReferences.orderSelection, {
+    pendingActionId: "reason-action-104",
+    decision: "reject",
+    awaitingReason: true,
+    rejectionReason: undefined,
+    candidates: [
+      {
+        id: String(selectedOrder._id),
+        orderNumber: selectedOrder.orderNumber,
+        status: "pending",
+        customerName: selectedOrder.customerName,
+        total: selectedOrder.total,
+        createdAt: selectedOrder.createdAt.toISOString(),
+        position: 1
+      }
+    ]
+  });
+});
+
 test("image workflow normalizes awaiting-image, awaiting-item, and confirmation safely", async () => {
   const cases = [
     {

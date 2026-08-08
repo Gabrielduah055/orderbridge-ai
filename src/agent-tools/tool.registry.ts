@@ -2,7 +2,7 @@ import { Types } from "mongoose";
 import { z } from "zod";
 import { MenuCategory } from "../models/MenuCategory";
 import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
-import { Order, orderStatuses, type IOrderDocument, type OrderStatus } from "../models/order.model";
+import { Order, orderStatuses, type IOrderDocument } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import * as menuItemService from "../services/menuItem.service";
 import * as orderService from "../services/order.service";
@@ -81,7 +81,13 @@ const orderLookupSchema = z
   .strict();
 const rejectOrderSchema = orderLookupSchema
   .extend({
-    reason: z.string().trim().min(1).optional()
+    reason: z
+      .string({
+        required_error: "A meaningful rejection reason is required."
+      })
+      .trim()
+      .min(3, "A meaningful rejection reason is required.")
+      .max(500, "The rejection reason is too long.")
   })
   .strict();
 const listOrdersSchema = z
@@ -458,7 +464,74 @@ const findOrderForRestaurant = async (
     };
   }
 
+  const isStaff = context.sender.role === "owner" || context.sender.role === "manager";
+  const explicitReference = isStaff
+    ? context.originalMessage?.match(
+        /\b(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})\b/i
+      )?.[1]
+    : undefined;
+  const orderMatchesReference = (trustedReference: string): boolean =>
+    trustedReference.toLowerCase() === String(order._id).toLowerCase() ||
+    trustedReference.toLowerCase() === order.orderNumber?.toLowerCase();
+
+  if (explicitReference && !orderMatchesReference(explicitReference)) {
+    return {
+      success: false,
+      code: "ORDER_REFERENCE_MISMATCH",
+      message: "The requested order does not match the explicit order reference."
+    };
+  }
+
+  if (isStaff && !explicitReference && context.quotedMessageId) {
+    const quotedOrder = await Order.findOne({
+      restaurantId: context.restaurantId,
+      ownerNotificationProviderMessageId: context.quotedMessageId
+    });
+
+    if (quotedOrder && String(quotedOrder._id) !== String(order._id)) {
+      return {
+        success: false,
+        code: "ORDER_REFERENCE_MISMATCH",
+        message: "The requested order does not match the quoted order."
+      };
+    }
+  }
+
   return order;
+};
+
+const completeMatchingOwnerOrderSelection = async (
+  context: ToolExecutionContext,
+  orderId: string,
+  decision: "accept" | "reject"
+): Promise<void> => {
+  try {
+    await PendingAgentAction.updateMany(
+      {
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        senderRole: context.sender.role,
+        action: "OWNER_ORDER_SELECTION",
+        status: "pending",
+        expiresAt: { $gt: new Date() },
+        "data.decision": decision,
+        "data.orderIds": orderId
+      },
+      {
+        $set: {
+          status: "completed",
+          resultMessage: `Order selection ${decision === "accept" ? "accepted" : "rejected"}.`
+        },
+        $inc: { actionVersion: 1 }
+      }
+    );
+  } catch {
+    console.warn("[orderWorkflow] selection cleanup failed", {
+      restaurantId: context.restaurantId,
+      senderRole: context.sender.role,
+      decision
+    });
+  }
 };
 
 const createPendingToolAction = async (
@@ -1640,7 +1713,15 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return order;
       }
 
-      const result = await orderService.confirmRestaurantOrder(String(order._id));
+      const result = await orderService.confirmRestaurantOrder(
+        String(order._id),
+        context.restaurantId
+      );
+      await completeMatchingOwnerOrderSelection(
+        context,
+        String(result.order._id),
+        "accept"
+      );
 
       return {
         success: true,
@@ -1664,7 +1745,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         "Owner/manager only. Reject a pending customer-submitted order when the restaurant cannot fulfil it.",
       parameters: {
         orderReference: "Order number or order ID.",
-        reason: "Optional concise reason to share with the customer."
+        reason: "Required reason supplied by the owner/manager to share with the customer."
       }
     },
     roles: toolPermissions.reject_order,
@@ -1676,7 +1757,16 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return order;
       }
 
-      const result = await orderService.rejectRestaurantOrder(String(order._id), args.reason);
+      const result = await orderService.rejectRestaurantOrder(
+        String(order._id),
+        args.reason,
+        context.restaurantId
+      );
+      await completeMatchingOwnerOrderSelection(
+        context,
+        String(result.order._id),
+        "reject"
+      );
 
       return {
         success: true,
@@ -1696,16 +1786,16 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
   update_order_status: {
     definition: {
       name: "update_order_status",
-      description: "Update an order status.",
+      description: "Move an accepted active order through preparation, delivery, or completion.",
       parameters: {
         orderReference: "Order number or order ID.",
-        status: orderStatuses.join(" | ")
+        status: orderService.staffOrderProgressStatuses.join(" | ")
       }
     },
     roles: toolPermissions.update_order_status,
     schema: orderLookupSchema
       .extend({
-        status: z.enum(orderStatuses)
+        status: z.enum(orderService.staffOrderProgressStatuses)
       })
       .strict(),
     handler: async (args, context) => {
@@ -1715,13 +1805,18 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return order;
       }
 
-      const result = await orderService.updateOrderStatus(String(order._id), args.status as OrderStatus);
+      const result = await orderService.updateRestaurantOrderStatus(
+        context.restaurantId,
+        String(order._id),
+        args.status
+      );
 
       return {
         success: true,
         message: `Order status updated to ${result.order.status}.`,
         data: {
-          order: safeOrderView(result.order, true)
+          order: safeOrderView(result.order, true),
+          idempotent: result.idempotent ?? false
         }
       };
     }

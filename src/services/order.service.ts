@@ -41,6 +41,7 @@ export interface CreateOrderInput {
 export interface UpdateOrderStatusResult {
   order: IOrderDocument;
   warning?: string;
+  idempotent?: boolean;
 }
 
 export interface RestaurantOrderDecisionResult {
@@ -88,15 +89,52 @@ export const formatGhanaCedi = (value: number): string => {
   return `GHS ${value.toFixed(2)}`;
 };
 
-const getOrderOrThrow = async (orderId: string): Promise<IOrderDocument> => {
+const getOrderOrThrow = async (
+  orderId: string,
+  restaurantId?: string
+): Promise<IOrderDocument> => {
   ensureValidObjectId(orderId, "orderId");
-  const order = await Order.findById(orderId);
+  if (restaurantId) {
+    ensureValidObjectId(restaurantId, "restaurantId");
+  }
+  const order = restaurantId
+    ? await Order.findOne({ _id: orderId, restaurantId })
+    : await Order.findById(orderId);
 
   if (!order) {
     throw new NotFoundError("Order not found");
   }
 
   return order;
+};
+
+export const staffOrderProgressStatuses = [
+  "preparing",
+  "ready",
+  "out_for_delivery",
+  "completed"
+] as const;
+
+export type StaffOrderProgressStatus = (typeof staffOrderProgressStatuses)[number];
+
+const allowedStaffOrderTransitions: Record<StaffOrderProgressStatus, readonly StaffOrderProgressStatus[]> = {
+  preparing: ["ready", "out_for_delivery", "completed"],
+  ready: ["out_for_delivery", "completed"],
+  out_for_delivery: ["completed"],
+  completed: []
+};
+
+export const normalizeRestaurantRejectionReason = (reason?: string): string => {
+  const normalized = reason?.trim().replace(/\s+/g, " ") ?? "";
+
+  if (normalized.length < 3 || normalized.length > 500) {
+    throw new BadRequestError(
+      "Please provide a meaningful reason for rejecting the order.",
+      "ORDER_REJECTION_REASON_REQUIRED"
+    );
+  }
+
+  return normalized;
 };
 
 const normalizeOrderItems = (items: CreateOrderItemInput[]): CreateOrderItemInput[] => {
@@ -452,6 +490,13 @@ export const updateOrderStatus = async (
   status: OrderStatus
 ): Promise<UpdateOrderStatusResult> => {
   const order = await getOrderOrThrow(orderId);
+  return applyOrderStatusUpdate(order, status);
+};
+
+const applyOrderStatusUpdate = async (
+  order: IOrderDocument,
+  status: OrderStatus
+): Promise<UpdateOrderStatusResult> => {
   const hadActiveFeedbackFollowUp = Boolean(
     order.feedbackFollowUpStatus &&
       order.feedbackFollowUpStatus !== "not_scheduled"
@@ -493,10 +538,46 @@ export const updateOrderStatus = async (
   };
 };
 
+export const updateRestaurantOrderStatus = async (
+  restaurantId: string,
+  orderId: string,
+  status: StaffOrderProgressStatus
+): Promise<UpdateOrderStatusResult> => {
+  const order = await getOrderOrThrow(orderId, restaurantId);
+
+  if (order.status === status) {
+    return {
+      order,
+      idempotent: true
+    };
+  }
+
+  const allowedTargets = allowedStaffOrderTransitions[
+    order.status as StaffOrderProgressStatus
+  ];
+  const mayBeginProgress =
+    (order.status === "accepted" || order.status === "confirmed") &&
+    staffOrderProgressStatuses.includes(status);
+
+  if (!mayBeginProgress && !allowedTargets?.includes(status)) {
+    throw new BadRequestError(
+      `Order ${order.orderNumber ?? String(order._id)} cannot move from ${order.status} to ${status}.`,
+      "ORDER_STATUS_TRANSITION_INVALID"
+    );
+  }
+
+  const result = await applyOrderStatusUpdate(order, status);
+  return {
+    ...result,
+    idempotent: false
+  };
+};
+
 export const confirmRestaurantOrder = async (
-  orderId: string
+  orderId: string,
+  restaurantId?: string
 ): Promise<RestaurantOrderDecisionResult> => {
-  const order = await getOrderOrThrow(orderId);
+  const order = await getOrderOrThrow(orderId, restaurantId);
 
   if (order.status === "accepted" || order.status === "confirmed") {
     return {
@@ -506,30 +587,60 @@ export const confirmRestaurantOrder = async (
   }
 
   if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
-    throw new BadRequestError("Only pending orders can be confirmed by the restaurant");
+    throw new BadRequestError(
+      "Only pending orders can be confirmed by the restaurant.",
+      "ORDER_STATUS_TRANSITION_INVALID"
+    );
   }
 
   if (!isPendingOrderActionable(order)) {
     order.status = "expired";
     await order.save();
-    throw new BadRequestError("This order has expired and cannot be accepted.");
+    throw new BadRequestError(
+      "This order has expired and cannot be accepted.",
+      "ORDER_EXPIRED"
+    );
   }
 
-  order.status = "accepted";
-  order.restaurantConfirmedAt = order.restaurantConfirmedAt ?? new Date();
-  await order.save();
+  const acceptedOrder = await Order.findOneAndUpdate(
+    {
+      _id: order._id,
+      ...(restaurantId ? { restaurantId } : {}),
+      status: { $in: ["awaiting_restaurant_confirmation", "pending"] }
+    },
+    {
+      $set: {
+        status: "accepted",
+        restaurantConfirmedAt: order.restaurantConfirmedAt ?? new Date()
+      }
+    },
+    { new: true }
+  );
+
+  if (!acceptedOrder) {
+    const currentOrder = await getOrderOrThrow(orderId, restaurantId);
+    if (currentOrder.status === "accepted" || currentOrder.status === "confirmed") {
+      return { order: currentOrder, idempotent: true };
+    }
+    throw new BadRequestError(
+      "This order changed before it could be accepted.",
+      "ORDER_STATUS_TRANSITION_INVALID"
+    );
+  }
 
   return {
-    order,
+    order: acceptedOrder,
     idempotent: false
   };
 };
 
 export const rejectRestaurantOrder = async (
   orderId: string,
-  reason?: string
+  reason?: string,
+  restaurantId?: string
 ): Promise<RestaurantOrderDecisionResult> => {
-  const order = await getOrderOrThrow(orderId);
+  const normalizedReason = normalizeRestaurantRejectionReason(reason);
+  const order = await getOrderOrThrow(orderId, restaurantId);
 
   if ((order.status === "cancelled" || order.status === "rejected") && order.restaurantRejectedAt) {
     return {
@@ -539,28 +650,59 @@ export const rejectRestaurantOrder = async (
   }
 
   if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
-    throw new BadRequestError("Only pending orders can be rejected by the restaurant");
+    throw new BadRequestError(
+      "Only pending orders can be rejected by the restaurant.",
+      "ORDER_STATUS_TRANSITION_INVALID"
+    );
   }
 
   if (!isPendingOrderActionable(order)) {
     order.status = "expired";
     await order.save();
-    throw new BadRequestError("This order has expired and cannot be rejected.");
+    throw new BadRequestError(
+      "This order has expired and cannot be rejected.",
+      "ORDER_EXPIRED"
+    );
   }
 
-  order.status = "rejected";
-  order.feedbackFollowUpStatus = "cancelled";
-  order.restaurantRejectedAt = order.restaurantRejectedAt ?? new Date();
-  order.restaurantRejectionReason = reason?.trim() || order.restaurantRejectionReason;
-  await order.save();
+  const rejectedOrder = await Order.findOneAndUpdate(
+    {
+      _id: order._id,
+      ...(restaurantId ? { restaurantId } : {}),
+      status: { $in: ["awaiting_restaurant_confirmation", "pending"] }
+    },
+    {
+      $set: {
+        status: "rejected",
+        feedbackFollowUpStatus: "cancelled",
+        restaurantRejectedAt: order.restaurantRejectedAt ?? new Date(),
+        restaurantRejectionReason: normalizedReason
+      }
+    },
+    { new: true }
+  );
+
+  if (!rejectedOrder) {
+    const currentOrder = await getOrderOrThrow(orderId, restaurantId);
+    if (
+      (currentOrder.status === "cancelled" || currentOrder.status === "rejected") &&
+      currentOrder.restaurantRejectedAt
+    ) {
+      return { order: currentOrder, idempotent: true };
+    }
+    throw new BadRequestError(
+      "This order changed before it could be rejected.",
+      "ORDER_STATUS_TRANSITION_INVALID"
+    );
+  }
   await cancelQueuedOrderFeedbackMessages(
-    String(order.restaurantId),
-    String(order._id),
+    String(rejectedOrder.restaurantId),
+    String(rejectedOrder._id),
     "Order rejected"
   );
 
   return {
-    order,
+    order: rejectedOrder,
     idempotent: false
   };
 };
