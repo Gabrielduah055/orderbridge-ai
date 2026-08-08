@@ -860,6 +860,57 @@ const fakeOwner = {
 const buildTestPrompt = async () => "Test system prompt";
 const getEmptyHistory = async () => [];
 const saveNoop = async () => {};
+const makeAwaitingRejectionStaffState = (orderIds) => ({
+  pendingActions: [],
+  imageWorkflow: null,
+  orders: { freshPending: [], recentActive: [] },
+  recentReferences: {
+    orderSelection: {
+      pendingActionId: "selection-awaiting-reason",
+      decision: "reject",
+      awaitingReason: true,
+      candidates: orderIds.map((id, index) => ({
+        id,
+        orderNumber: `ORD-${104 + index}`,
+        status: "pending",
+        position: index + 1
+      }))
+    }
+  },
+  permissions: [
+    "cancel_order",
+    "confirm_order",
+    "reject_order",
+    "update_order_status",
+    "list_orders"
+  ]
+});
+const makeSingleToolProvider = (toolName, args, finalText) => {
+  const provider = {
+    name: "openrouter",
+    model: "google/gemini-3.1-flash-lite",
+    calls: 0,
+    complete: async () => {
+      provider.calls += 1;
+
+      if (provider.calls === 1) {
+        return {
+          toolCalls: [
+            {
+              id: `call_${toolName}`,
+              name: toolName,
+              arguments: args
+            }
+          ]
+        };
+      }
+
+      return { text: finalText, toolCalls: [] };
+    }
+  };
+
+  return provider;
+};
 const restoreEnv = (key, value) => {
   if (value === undefined) {
     delete process.env[key];
@@ -1061,6 +1112,195 @@ test("OpenRouter blocks a rejection outside the trusted awaiting-reason selectio
   assert.match(result.message, /active order selection/i);
 });
 
+test("OpenRouter awaiting-reason workflow blocks confirm_order for selected and other orders", async () => {
+  const expectedOrderId = "64b000000000000000000104";
+  const wrongOrderId = "64b000000000000000000105";
+
+  for (const requestedOrderId of [expectedOrderId, wrongOrderId]) {
+    const order = { id: requestedOrderId, status: "pending" };
+    let executionCount = 0;
+    const result = await runAgentOrchestrator(
+      {
+        restaurant: fakeRestaurant,
+        sender: fakeOwner,
+        message: "Chicken is finished",
+        staffState: makeAwaitingRejectionStaffState([expectedOrderId])
+      },
+      {
+        provider: makeSingleToolProvider(
+          "confirm_order",
+          { orderId: requestedOrderId },
+          "Done, confirmed."
+        ),
+        getHistory: getEmptyHistory,
+        saveMessage: saveNoop,
+        buildSystemPrompt: buildTestPrompt,
+        executeTool: async () => {
+          executionCount += 1;
+          order.status = "accepted";
+          return { success: true, message: "Order confirmed." };
+        }
+      }
+    );
+
+    assert.equal(executionCount, 0);
+    assert.equal(order.status, "pending");
+    assert.equal(result.success, false);
+    assert.equal(result.executedTools[0].code, "ORDER_WORKFLOW_CONFLICT");
+  }
+});
+
+test("OpenRouter awaiting-reason workflow blocks update_order_status before execution", async () => {
+  const expectedOrderId = "64b000000000000000000104";
+  const otherOrder = {
+    id: "64b000000000000000000105",
+    status: "accepted"
+  };
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Chicken is finished",
+      staffState: makeAwaitingRejectionStaffState([expectedOrderId])
+    },
+    {
+      provider: makeSingleToolProvider(
+        "update_order_status",
+        { orderId: otherOrder.id, status: "completed" },
+        "Done, completed."
+      ),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        executionCount += 1;
+        otherOrder.status = "completed";
+        return { success: true, message: "Order completed." };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 0);
+  assert.equal(otherOrder.status, "accepted");
+  assert.equal(result.success, false);
+  assert.equal(result.executedTools[0].code, "ORDER_WORKFLOW_CONFLICT");
+});
+
+test("OpenRouter awaiting-reason workflow blocks every other staff order mutation", async () => {
+  const expectedOrder = {
+    id: "64b000000000000000000104",
+    status: "pending"
+  };
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Chicken is finished",
+      staffState: makeAwaitingRejectionStaffState([expectedOrder.id])
+    },
+    {
+      provider: makeSingleToolProvider(
+        "cancel_order",
+        { orderId: expectedOrder.id },
+        "Done, cancelled."
+      ),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        executionCount += 1;
+        expectedOrder.status = "cancelled";
+        return { success: true, message: "Order cancelled." };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 0);
+  assert.equal(expectedOrder.status, "pending");
+  assert.equal(result.success, false);
+  assert.equal(result.executedTools[0].code, "ORDER_WORKFLOW_CONFLICT");
+});
+
+test("OpenRouter awaiting-reason workflow still permits exact reject_order execution", async () => {
+  const expectedOrder = {
+    id: "64b000000000000000000104",
+    status: "pending"
+  };
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Chicken is finished",
+      staffState: makeAwaitingRejectionStaffState([expectedOrder.id])
+    },
+    {
+      provider: makeSingleToolProvider(
+        "reject_order",
+        { orderId: expectedOrder.id, reason: "Chicken is finished" },
+        "Done, rejected."
+      ),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async (_toolName, args) => {
+        executionCount += 1;
+        expectedOrder.status = "rejected";
+        return {
+          success: true,
+          message: "Order rejected.",
+          data: {
+            order: {
+              _id: args.orderId,
+              orderNumber: "ORD-104",
+              status: "rejected"
+            }
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 1);
+  assert.equal(expectedOrder.status, "rejected");
+  assert.equal(result.success, true);
+  assert.equal(result.executedTools[0].success, true);
+  assert.equal(result.executedTools[0].resultOrderId, expectedOrder.id);
+});
+
+test("OpenRouter awaiting-reason workflow keeps read-only order tools available", async () => {
+  const expectedOrderId = "64b000000000000000000104";
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "Show me the orders while I check",
+      staffState: makeAwaitingRejectionStaffState([expectedOrderId])
+    },
+    {
+      provider: makeSingleToolProvider(
+        "list_orders",
+        { status: "pending" },
+        "Here are the pending orders."
+      ),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        executionCount += 1;
+        return { success: true, message: "Orders loaded.", data: [] };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 1);
+  assert.equal(result.success, true);
+  assert.equal(result.executedTools[0].success, true);
+});
+
 test("OpenRouter awaiting-reason guard permits every selected order and blocks extras", async () => {
   const expectedOrderIds = [
     "64b000000000000000000104",
@@ -1148,11 +1388,11 @@ test("OpenRouter awaiting-reason guard permits every selected order and blocks e
   );
 });
 
-test("OpenRouter blocks quoted-order confirm and reject calls for a different order", async () => {
+test("OpenRouter blocks quoted-order mutations for a different order", async () => {
   const quotedOrderId = "64b000000000000000000104";
   const wrongOrderId = "64b000000000000000000105";
 
-  for (const toolName of ["confirm_order", "reject_order"]) {
+  for (const toolName of ["confirm_order", "reject_order", "update_order_status"]) {
     let executionCount = 0;
     const provider = {
       name: "openrouter",
@@ -1171,7 +1411,9 @@ test("OpenRouter blocks quoted-order confirm and reject calls for a different or
                   orderId: wrongOrderId,
                   ...(toolName === "reject_order"
                     ? { reason: "Chicken is finished" }
-                    : {})
+                    : toolName === "update_order_status"
+                      ? { status: "completed" }
+                      : {})
                 }
               }
             ]
@@ -1186,7 +1428,12 @@ test("OpenRouter blocks quoted-order confirm and reject calls for a different or
       {
         restaurant: fakeRestaurant,
         sender: fakeOwner,
-        message: toolName === "confirm_order" ? "accept" : "reject this",
+        message:
+          toolName === "confirm_order"
+            ? "accept"
+            : toolName === "reject_order"
+              ? "reject this"
+              : "mark it completed",
         quotedMessageId: "provider-order-104",
         staffState: {
           pendingActions: [],
@@ -1199,7 +1446,7 @@ test("OpenRouter blocks quoted-order confirm and reject calls for a different or
               status: "pending"
             }
           },
-          permissions: ["confirm_order", "reject_order"]
+          permissions: ["confirm_order", "reject_order", "update_order_status"]
         }
       },
       {

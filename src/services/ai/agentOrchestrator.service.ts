@@ -86,7 +86,12 @@ const stripTrustedModelArguments = (
   );
 };
 
-const orderMutationToolNames = new Set(["confirm_order", "reject_order"]);
+const orderMutationToolNames = new Set([
+  "cancel_order",
+  "confirm_order",
+  "reject_order",
+  "update_order_status"
+]);
 
 const getRequestedOrderReferences = (
   args: Record<string, unknown>
@@ -130,11 +135,16 @@ const getTrustedOrderReferenceGuardResult = (
   const requestedReferences = getRequestedOrderReferences(args);
   const selection = input.staffState?.recentReferences.orderSelection;
 
-  if (
-    toolName === "reject_order" &&
-    selection?.decision === "reject" &&
-    selection.awaitingReason
-  ) {
+  if (selection?.decision === "reject" && selection.awaitingReason) {
+    if (toolName !== "reject_order") {
+      return {
+        success: false,
+        code: "ORDER_WORKFLOW_CONFLICT",
+        message:
+          "Only rejecting one of the selected orders is allowed while the rejection reason is pending."
+      };
+    }
+
     const allowedOrderIds = selection.candidates.map((candidate) => candidate.id);
 
     if (!referencesMatchAllowedValues(requestedReferences, allowedOrderIds)) {

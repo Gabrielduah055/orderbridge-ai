@@ -1392,6 +1392,75 @@ test("awaiting rejection reason keeps the selection pending after a pre-executio
   });
 });
 
+test("awaiting rejection reason keeps the selection pending after a conflicting confirm attempt", async () => {
+  await runWithRoutingHarness(async () => {
+    const selectedOrder = { id: "order-104", status: "pending" };
+    let pendingSelectionStatus = "pending";
+    let deterministicMutations = 0;
+    let reconciliationCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: selectedOrder.id,
+                    orderNumber: "ORD-104",
+                    status: selectedOrder.status,
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            success: false,
+            message:
+              "Only rejecting one of the selected orders is allowed while the rejection reason is pending.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: false,
+                code: "ORDER_WORKFLOW_CONFLICT",
+                message:
+                  "Only rejecting one of the selected orders is allowed while the rejection reason is pending."
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          selectedOrder.status = "accepted";
+          return { success: true, message: "Order confirmed." };
+        }
+      })
+    );
+
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(selectedOrder.status, "pending");
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(deterministicMutations, 0);
+    assert.equal(reconciliationCalls, 0);
+    assert.match(response.message, /haven't confirmed/i);
+  });
+});
+
 test("awaiting rejection reason conversational text cannot trigger deterministic rejection", async () => {
   await runWithRoutingHarness(async () => {
     const mutations = [];
