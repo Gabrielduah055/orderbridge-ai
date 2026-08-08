@@ -118,7 +118,7 @@ test("backend rejection validation runs before order lookup", async () => {
   }
 });
 
-test("missing reason state is scoped and the next owner answer rejects the exact order", async () => {
+test("missing reason state is scoped and deterministic fallback never infers a reason", async () => {
   const originalOrderFindOne = Order.findOne;
   const originalOrderFindOneAndUpdate = Order.findOneAndUpdate;
   const originalOrderFind = Order.find;
@@ -127,7 +127,6 @@ test("missing reason state is scoped and the next owner answer rejects the exact
   const originalPendingFindOne = PendingAgentAction.findOne;
   const pendingOrder = makeOrder();
   let createdAction;
-  let savedAction;
   let rejectionUpdate;
 
   Order.findOne = async (filter) => {
@@ -156,8 +155,7 @@ test("missing reason state is scoped and the next owner answer rejects the exact
       ...createdAction,
       data: { ...createdAction.data },
       async save() {
-        savedAction = this;
-        return this;
+        throw new Error("a conversational reply must not complete the pending action");
       }
     };
     PendingAgentAction.findOne = (filter) => ({
@@ -182,13 +180,14 @@ test("missing reason state is scoped and the next owner answer rejects the exact
     const result = await handleSavedOwnerSelectionReply(
       restaurantId,
       ownerPhone,
-      "Chicken is finished.",
+      "hold on let me check the kitchen",
       "owner"
     );
 
-    assert.equal(result.success, true);
-    assert.equal(rejectionUpdate.restaurantRejectionReason, "Chicken is finished.");
-    assert.equal(savedAction.status, "completed");
+    assert.equal(result.handled, false);
+    assert.equal(result.success, false);
+    assert.equal(rejectionUpdate, undefined);
+    assert.equal(pendingSelection.status, "pending");
   } finally {
     Order.findOne = originalOrderFindOne;
     Order.findOneAndUpdate = originalOrderFindOneAndUpdate;
@@ -196,6 +195,169 @@ test("missing reason state is scoped and the next owner answer rejects the exact
     OutboundMessage.updateMany = originalOutboundUpdateMany;
     PendingAgentAction.create = originalPendingCreate;
     PendingAgentAction.findOne = originalPendingFindOne;
+  }
+});
+
+test("cancel and never mind cancel an awaiting rejection without mutation", async () => {
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalRejectOrder = orderService.rejectRestaurantOrder;
+  const originalOrderFind = Order.find;
+  const unchangedOrder = makeOrder();
+  let rejectionCalls = 0;
+  let orderLookups = 0;
+
+  orderService.rejectRestaurantOrder = async () => {
+    rejectionCalls += 1;
+    throw new Error("reject_order must not run for cancellation");
+  };
+  Order.find = async () => {
+    orderLookups += 1;
+    return [unchangedOrder];
+  };
+
+  try {
+    for (const message of ["cancel", "never mind"]) {
+      const pendingSelection = {
+        _id: `reason-${message}`,
+        status: "pending",
+        resultMessage: undefined,
+        data: {
+          decision: "reject",
+          awaitingReason: true,
+          orderIds: [orderId]
+        },
+        saveCalls: 0,
+        async save() {
+          this.saveCalls += 1;
+          return this;
+        }
+      };
+      PendingAgentAction.findOne = () => ({
+        sort: async () => pendingSelection
+      });
+
+      const result = await handleSavedOwnerSelectionReply(
+        restaurantId,
+        ownerPhone,
+        message,
+        "owner"
+      );
+
+      assert.equal(result.handled, true);
+      assert.equal(result.success, true);
+      assert.equal(pendingSelection.status, "cancelled");
+      assert.equal(pendingSelection.saveCalls, 1);
+    }
+
+    assert.equal(rejectionCalls, 0);
+    assert.equal(orderLookups, 0);
+    assert.equal(unchangedOrder.status, "pending");
+  } finally {
+    PendingAgentAction.findOne = originalPendingFindOne;
+    orderService.rejectRestaurantOrder = originalRejectOrder;
+    Order.find = originalOrderFind;
+  }
+});
+
+test("saved multi-order selections process all exact choices", async () => {
+  const originalOrderFind = Order.find;
+  const originalPendingFindOne = PendingAgentAction.findOne;
+  const originalConfirmOrder = orderService.confirmRestaurantOrder;
+  const firstOrderId = "64b000000000000000000104";
+  const secondOrderId = "64b000000000000000000105";
+
+  try {
+    for (const message of ["all", "1 and 2"]) {
+      const confirmedOrderIds = [];
+      const pendingSelection = {
+        _id: `selection-${message}`,
+        actionVersion: 1,
+        status: "pending",
+        data: {
+          decision: "accept",
+          orderIds: [firstOrderId, secondOrderId],
+          awaitingReason: false
+        },
+        async save() {
+          return this;
+        }
+      };
+
+      PendingAgentAction.findOne = () => ({
+        sort: async () => pendingSelection
+      });
+      Order.find = async () => [
+        makeOrder({ _id: firstOrderId, orderNumber: "ORD-104" }),
+        makeOrder({ _id: secondOrderId, orderNumber: "ORD-105" })
+      ];
+      orderService.confirmRestaurantOrder = async (selectedOrderId) => {
+        confirmedOrderIds.push(selectedOrderId);
+        return {
+          order: makeOrder({
+            _id: selectedOrderId,
+            orderNumber: selectedOrderId === firstOrderId ? "ORD-104" : "ORD-105",
+            status: "accepted"
+          }),
+          idempotent: false
+        };
+      };
+
+      const result = await handleSavedOwnerSelectionReply(
+        restaurantId,
+        ownerPhone,
+        message,
+        "owner"
+      );
+
+      assert.equal(result.success, true);
+      assert.deepEqual(confirmedOrderIds, [firstOrderId, secondOrderId]);
+      assert.equal(pendingSelection.status, "completed");
+    }
+  } finally {
+    Order.find = originalOrderFind;
+    PendingAgentAction.findOne = originalPendingFindOne;
+    orderService.confirmRestaurantOrder = originalConfirmOrder;
+  }
+});
+
+test("one successful order tool only closes a single-order saved selection", async () => {
+  const originalOrderFindOne = Order.findOne;
+  const originalConfirmOrder = orderService.confirmRestaurantOrder;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  let cleanupFilter;
+  const acceptedOrder = makeOrder({
+    status: "accepted",
+    items: [
+      { name: "Jollof Rice", quantity: 1, unitPrice: 25, totalPrice: 25 }
+    ]
+  });
+
+  Order.findOne = async () => acceptedOrder;
+  orderService.confirmRestaurantOrder = async () => ({
+    order: acceptedOrder,
+    idempotent: false
+  });
+  PendingAgentAction.updateMany = async (filter) => {
+    cleanupFilter = filter;
+    return { modifiedCount: 1 };
+  };
+
+  try {
+    const result = await executeAgentTool(
+      "confirm_order",
+      { orderId },
+      { ...context, originalMessage: "accept" }
+    );
+
+    assert.equal(result.success, true);
+    assert.deepEqual(cleanupFilter["data.orderIds"], {
+      $size: 1,
+      $all: [orderId]
+    });
+  } finally {
+    Order.findOne = originalOrderFindOne;
+    orderService.confirmRestaurantOrder = originalConfirmOrder;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
   }
 });
 

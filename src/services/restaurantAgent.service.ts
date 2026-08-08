@@ -35,7 +35,8 @@ import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPre
 import { handleOrderFeedbackCustomerResponse } from "./orderFeedback.service";
 import type {
   RestaurantAgentMessageInput,
-  RestaurantAgentResponse
+  RestaurantAgentResponse,
+  SenderRole
 } from "../types/agent.types";
 import type { AgentOrchestratorResult } from "./ai/ai.types";
 import {
@@ -281,6 +282,7 @@ export interface StaffOrderMutationIntent {
   orderReference?: string;
   reason?: string;
   targetStatus?: "preparing" | "ready" | "out_for_delivery" | "completed";
+  expectedOrderIds?: string[];
   missingReason: boolean;
   ambiguous: boolean;
 }
@@ -295,19 +297,6 @@ const cleanInlineRejectionReason = (value?: string): string | undefined => {
   return normalized && normalized.length >= 3 ? normalized : undefined;
 };
 
-const isTrustedRejectionReasonAnswer = (message: string): boolean => {
-  const normalized = message.trim().replace(/\s+/g, " ");
-
-  return (
-    normalized.length >= 3 &&
-    normalized.length <= 500 &&
-    !normalized.includes("?") &&
-    !/^(?:hello|hi|hey|you there|what do you mean|wait|thanks?|okay|ok)[.!]*$/i.test(
-      normalized
-    )
-  );
-};
-
 export const getStaffOrderMutationIntent = (
   staffState: Awaited<ReturnType<typeof buildStaffOperationalState>>,
   message: string
@@ -320,14 +309,6 @@ export const getStaffOrderMutationIntent = (
   let reason = cleanInlineRejectionReason(explicitDecision?.reason);
   let selectedCandidateIds: string[] | undefined;
   let targetStatus: StaffOrderMutationIntent["targetStatus"];
-
-  if (!kind && selection?.decision === "reject" && selection.awaitingReason) {
-    if (!isTrustedRejectionReasonAnswer(normalized)) {
-      return null;
-    }
-    kind = "reject";
-    reason = normalized;
-  }
 
   if (!kind && selection && !selection.awaitingReason) {
     const selectionReply = parseOwnerSelectionReply(
@@ -418,13 +399,14 @@ export const getStaffOrderMutationIntent = (
       orderReference = quotedOrder.id;
     } else if (selectedCandidateIds?.length === 1) {
       orderReference = selectedCandidateIds[0];
-    } else if (selectedCandidateIds && selectedCandidateIds.length !== 1) {
+    } else if (selectedCandidateIds && selectedCandidateIds.length > 1) {
       return {
         kind,
         requiredTool: kind === "accept" ? "confirm_order" : "reject_order",
         reason,
+        expectedOrderIds: selectedCandidateIds,
         missingReason: kind === "reject" && !reason,
-        ambiguous: true
+        ambiguous: false
       };
     } else if (selectionCandidates.length === 1) {
       orderReference = selectionCandidates[0].id;
@@ -467,6 +449,13 @@ const hasSuccessfulOrderMutationTool = (
   intent: StaffOrderMutationIntent,
   result: AgentOrchestratorResult
 ): boolean => {
+  if ((intent.expectedOrderIds?.length ?? 0) > 1) {
+    // The saved selection closes the pending workflow and safely replays any
+    // idempotent mutation the AI may already have completed. In particular, one
+    // successful tool call must never consume a multi-order selection turn.
+    return false;
+  }
+
   const matchingTool = result.executedTools.find(
     (tool) => tool.name === intent.requiredTool && tool.success
   );
@@ -875,6 +864,53 @@ export const handleRestaurantAgentMessage = async (
 
     staffImageWorkflow = staffState.imageWorkflow;
     staffOperationalState = staffState;
+
+    const pendingOrderSelection = staffState.recentReferences.orderSelection;
+    const pendingSelectionReply = pendingOrderSelection
+      ? parseOwnerSelectionReply(
+          message,
+          pendingOrderSelection.candidates.length
+        )
+      : null;
+
+    if (
+      pendingOrderSelection?.decision === "reject" &&
+      pendingOrderSelection.awaitingReason &&
+      pendingSelectionReply?.type === "cancel"
+    ) {
+      // Cancellation is resolved before the AI can execute tools. This prevents
+      // an awaiting-reason turn such as "cancel" from ever being supplied to
+      // reject_order as though it were the owner's rejection reason.
+      const cancellationResult = await handleSavedSelection(
+        restaurantId,
+        sender.normalizedPhone,
+        message,
+        sender.role as Extract<SenderRole, "owner" | "manager">
+      );
+      const cancellationResponse: RestaurantAgentResponse = {
+        success: cancellationResult.handled && cancellationResult.success,
+        message: cancellationResult.handled
+          ? cancellationResult.message
+          : "That pending order selection is no longer active.",
+        data: cancellationResult.data,
+        source: "legacy_owner",
+        sender
+      };
+
+      await saveAssistantResponse(
+        restaurantId,
+        sender,
+        cancellationResponse,
+        {
+          source: "deterministic_owner_order_selection",
+          reason: "explicit_selection_cancellation",
+          success: cancellationResponse.success
+        }
+      );
+
+      return cancellationResponse;
+    }
+
     staffOrderMutationIntent = getStaffOrderMutationIntent(staffState, message);
 
     try {

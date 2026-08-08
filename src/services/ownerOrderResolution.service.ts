@@ -46,7 +46,12 @@ export const parseOwnerSelectionReply = (
 ): { type: "cancel" } | { type: "all" } | { type: "indexes"; indexes: number[] } | null => {
   const normalized = normalizeDecisionText(message);
 
-  if (normalized === "cancel" || normalized === "stop") {
+  if (
+    normalized === "cancel" ||
+    normalized === "stop" ||
+    normalized === "never mind" ||
+    normalized === "nevermind"
+  ) {
     return { type: "cancel" };
   }
 
@@ -208,19 +213,6 @@ export const requestOwnerOrderRejectionReason = async (input: {
   };
 };
 
-const isLikelyRejectionReasonReply = (message: string): boolean => {
-  const normalized = message.trim().replace(/\s+/g, " ");
-
-  return (
-    normalized.length >= 3 &&
-    normalized.length <= 500 &&
-    !normalized.includes("?") &&
-    !/^(?:hello|hi|hey|you there|what do you mean|wait|thanks?|okay|ok)$/i.test(
-      normalized.replace(/[.!]+$/g, "")
-    )
-  );
-};
-
 const applyDecision = async (
   restaurantId: string,
   orderId: string,
@@ -339,57 +331,10 @@ export const handleSavedOwnerSelectionReply = async (
       };
     }
 
-    if (!isLikelyRejectionReasonReply(message)) {
-      return { handled: false, success: false, message: "" };
-    }
-
-    const orders = await Order.find({
-      restaurantId,
-      _id: { $in: orderIds }
-    });
-    const orderMap = new Map(orders.map((order) => [String(order._id), order]));
-    const orderedSelection = orderIds
-      .map((orderId) => orderMap.get(orderId))
-      .filter((order) => order !== undefined);
-    const reason = message.trim().replace(/\s+/g, " ");
-    const succeeded: IOrderDocument[] = [];
-    const failed: string[] = [];
-
-    for (const selectedOrder of orderedSelection) {
-      try {
-        const result = await applyDecision(
-          restaurantId,
-          String(selectedOrder._id),
-          "reject",
-          reason
-        );
-        succeeded.push(result.order);
-      } catch (error) {
-        failed.push(error instanceof Error ? error.message : "Order rejection failed");
-      }
-    }
-
-    pendingSelection.status = failed.length === 0 ? "completed" : "failed";
-    pendingSelection.resultMessage = `${succeeded.length} order(s) rejected.`;
-    pendingSelection.errorMessage = failed.join("; ") || undefined;
-    await pendingSelection.save();
-
-    return {
-      handled: true,
-      success: failed.length === 0,
-      message:
-        failed.length === 0
-          ? `${succeeded.length} order${succeeded.length === 1 ? "" : "s"} rejected. The customer${
-              succeeded.length === 1 ? "" : "s"
-            } will be notified.`
-          : `I could not reject ${failed.length} order${failed.length === 1 ? "" : "s"}: ${failed.join("; ")}`,
-      data: {
-        orders: succeeded,
-        orderEvent: "rejected",
-        notifyCustomer: true,
-        receiptRequired: false
-      }
-    };
+    // Natural-language rejection reasons are intentionally left to the AI tool
+    // path. The deterministic selection fallback must never infer that arbitrary
+    // conversational text is a reason and reject an order on its own.
+    return { handled: false, success: false, message: "" };
   }
 
   if (!reply) {

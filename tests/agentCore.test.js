@@ -1375,6 +1375,8 @@ test("owner simple decisions and saved selections parse safely", () => {
   assert.deepEqual(parseOwnerSelectionReply("1", 2), { type: "indexes", indexes: [1] });
   assert.deepEqual(parseOwnerSelectionReply("both", 2), { type: "all" });
   assert.deepEqual(parseOwnerSelectionReply("cancel", 2), { type: "cancel" });
+  assert.deepEqual(parseOwnerSelectionReply("never mind", 2), { type: "cancel" });
+  assert.deepEqual(parseOwnerSelectionReply("nevermind", 2), { type: "cancel" });
 });
 
 test("owner selection message preserves numbered order list", () => {

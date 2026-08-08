@@ -1207,6 +1207,235 @@ test("reject without a reason creates an exact reason request and never mutates"
   });
 });
 
+test("awaiting rejection reason cancellation bypasses AI and never rejects", async () => {
+  for (const message of ["cancel", "never mind"]) {
+    await runWithRoutingHarness(async () => {
+      const events = [];
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: ownerPhone,
+          message
+        },
+        makeOrderSafetyDependencies({
+          buildStaffState: async () =>
+            makeStaffState({
+              recentReferences: {
+                orderSelection: {
+                  pendingActionId: "reason-action-104",
+                  decision: "reject",
+                  awaitingReason: true,
+                  candidates: [
+                    {
+                      id: "order-104",
+                      orderNumber: "ORD-104",
+                      status: "pending",
+                      position: 1
+                    }
+                  ]
+                }
+              }
+            }),
+          runOrchestrator: async () => {
+            events.push("ai");
+            return makeAgentResult({
+              executedTools: [{ name: "reject_order", success: true }]
+            });
+          },
+          handleSavedSelection: async () => {
+            events.push("cancel-selection");
+            return {
+              handled: true,
+              success: true,
+              message: "Okay, I cancelled that order rejection."
+            };
+          },
+          executeTool: async () => {
+            events.push("reject_order");
+            return { success: true, message: "Order rejected." };
+          }
+        })
+      );
+
+      assert.deepEqual(events, ["cancel-selection"]);
+      assert.equal(response.source, "legacy_owner");
+      assert.match(response.message, /cancelled/i);
+    });
+  }
+});
+
+test("awaiting rejection reason conversational text cannot trigger deterministic rejection", async () => {
+  await runWithRoutingHarness(async () => {
+    const mutations = [];
+    let savedSelectionCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "hold on let me check"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Okay, let me know when you have checked." }),
+        handleSavedSelection: async () => {
+          savedSelectionCalls += 1;
+          return { handled: false, success: false, message: "" };
+        },
+        executeTool: async (...args) => mutations.push(args)
+      })
+    );
+
+    assert.equal(mutations.length, 0);
+    assert.equal(savedSelectionCalls, 0);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("AI can reject the selected order with the owner's actual supplied reason", async () => {
+  await runWithRoutingHarness(async () => {
+    let deterministicMutations = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "ORD-104 was rejected because chicken is finished.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "rejected"
+              }
+            ]
+          }),
+        executeTool: async () => {
+          deterministicMutations += 1;
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.equal(deterministicMutations, 0);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("one AI mutation cannot consume a two-order saved selection", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "all"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [
+                { id: "order-104", orderNumber: "ORD-104", status: "pending" },
+                { id: "order-105", orderNumber: "ORD-105", status: "pending" }
+              ],
+              recentActive: []
+            },
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "selection-action",
+                decision: "accept",
+                awaitingReason: false,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  },
+                  {
+                    id: "order-105",
+                    orderNumber: "ORD-105",
+                    status: "pending",
+                    position: 2
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () => {
+          events.push("ai-one-order");
+          return makeAgentResult({
+            message: "ORD-104 was accepted.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "accepted"
+              }
+            ]
+          });
+        },
+        handleSavedSelection: async () => {
+          events.push("saved-selection-all");
+          return {
+            handled: true,
+            success: true,
+            message: "2 orders accepted.",
+            data: { orders: [{ id: "order-104" }, { id: "order-105" }] }
+          };
+        }
+      })
+    );
+
+    assert.deepEqual(events, ["ai-one-order", "saved-selection-all"]);
+    assert.equal(response.source, "legacy_owner");
+    assert.match(response.message, /2 orders accepted/i);
+  });
+});
+
 test("ambiguous reject does not default to the newest pending order", async () => {
   await runWithRoutingHarness(async () => {
     const mutations = [];

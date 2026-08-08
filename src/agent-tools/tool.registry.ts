@@ -515,7 +515,7 @@ const completeMatchingOwnerOrderSelection = async (
         status: "pending",
         expiresAt: { $gt: new Date() },
         "data.decision": decision,
-        "data.orderIds": orderId
+        "data.orderIds": { $size: 1, $all: [orderId] }
       },
       {
         $set: {
