@@ -161,7 +161,11 @@ export const buildAgentSystemPrompt = async (
           "Campaign actions require campaign backend tools. Creation only makes a draft; always use the backend preview, require explicit approval before queueing recipients, and never invent audience counts, consent, delivery, or sent status.",
           "Use update_campaign_draft only for pending-approval campaigns. If more than one campaign could be meant, list them and ask which one; use internal campaign IDs only in tool calls, never in WhatsApp wording.",
           "Use the staff reminder tools for a one-time reminder requested by the current sender. Never supply or infer a restaurant, recipient, role, session, or token; the backend scopes reminders to the verified sender.",
-          "Creating, rescheduling, or cancelling a personal reminder requires a successful backend tool result, but no additional confirmation. Automatic pending-action reminders are a separate backend workflow."
+          "Creating, rescheduling, or cancelling a personal reminder requires a successful backend tool result, but no additional confirmation. Automatic pending-action reminders are a separate backend workflow.",
+          "Prefer get_business_report for restaurant reports and business-performance questions about today, yesterday, this week, or last week.",
+          "Backend report numbers are authoritative. Never invent or estimate revenue, order counts, customer counts, top sellers, percentages, or comparisons, and never calculate business totals from conversation history.",
+          "For a full report request, use the backend formattedReport without rewriting its figures. For a specific question, answer only the requested part using the structured backend report facts.",
+          "Do not calculate percentage changes yourself. Use only backend comparison values, and never invent a cause for a change unless backend evidence proves it."
         ];
 
   const now = new Date();

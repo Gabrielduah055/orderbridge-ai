@@ -643,6 +643,11 @@ test("staff operational state reaches a delimited data-only prompt section", asy
   assert.match(prompt, /update_campaign_draft/);
   assert.match(prompt, /staff reminder tools/);
   assert.match(prompt, /Automatic pending-action reminders are a separate backend workflow/);
+  assert.match(prompt, /Prefer get_business_report/);
+  assert.match(prompt, /Backend report numbers are authoritative/);
+  assert.match(prompt, /never calculate business totals from conversation history/i);
+  assert.match(prompt, /use the backend formattedReport/i);
+  assert.match(prompt, /never invent a cause/i);
   assert.equal(prompt.includes("imageSecureUrl"), false);
   assert.equal(prompt.includes("imagePublicId"), false);
   assert.equal(prompt.includes("res.cloudinary.com"), false);

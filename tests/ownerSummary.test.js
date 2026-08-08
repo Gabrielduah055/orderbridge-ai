@@ -3,16 +3,24 @@ const test = require("node:test");
 
 const { Order, orderStatuses } = require("../dist/models/order.model");
 const { Restaurant } = require("../dist/models/Restaurant");
+const { MenuItem } = require("../dist/models/MenuItem");
 const {
   createRestaurantSchema
 } = require("../dist/middleware/validateRequest");
+const ownerSummaryService = require("../dist/services/ownerSummary.service");
 const {
   buildOwnerSummaryMetrics,
+  calculatePercentageChange,
+  formatGhsCurrency,
   formatOwnerSummaryMessage,
+  getActiveOrderCount,
+  getBusinessReport,
   getOwnerSummaryMetrics,
   getPreviousDailySummaryPeriod,
-  getPreviousWeeklySummaryPeriod
-} = require("../dist/services/ownerSummary.service");
+  getPreviousWeeklySummaryPeriod,
+  resolveBusinessReportPeriod,
+  resolvePreviousEquivalentBusinessReportPeriod
+} = ownerSummaryService;
 const {
   runOwnerSummarySchedulerPass
 } = require("../dist/services/ownerSummaryScheduler.service");
@@ -20,6 +28,12 @@ const {
   isTransactionalQueuedMessage
 } = require("../dist/services/wasenderQueue.service");
 const { toolRegistry } = require("../dist/agent-tools/tool.registry");
+const {
+  isToolAllowedForRole
+} = require("../dist/agent-tools/tool.permissions");
+const {
+  getAgentToolDefinitionsForRole
+} = require("../dist/services/ai/agentToolDefinitions.service");
 
 const restaurantId = "64b000000000000000000901";
 const periodStart = new Date("2026-07-20T00:00:00.000Z");
@@ -69,6 +83,33 @@ const makeMetrics = (input) => ({
   returningCustomers: 0,
   busiestDay: null
 });
+
+const makeDetailedMetrics = (input, overrides = {}) => {
+  const countsByStatus = emptyCountsByStatus();
+  countsByStatus.completed = 18;
+  countsByStatus.rejected = 2;
+  countsByStatus.cancelled = 1;
+  countsByStatus.pending = 1;
+
+  return {
+    ...makeMetrics(input),
+    totalOrders: 22,
+    countsByStatus,
+    completedOrders: 18,
+    cancelledOrders: 1,
+    completedRevenue: 4280,
+    averageCompletedOrderValue: 237.78,
+    topSellingItems: [
+      { name: "Jollof Rice", quantity: 51, revenue: 1785 },
+      { name: "Fried Rice", quantity: 38, revenue: 1520 },
+      { name: "Chicken Salad", quantity: 19, revenue: 665 }
+    ],
+    uniqueCustomers: 17,
+    newCustomers: 5,
+    returningCustomers: 12,
+    ...overrides
+  };
+};
 
 const makeRestaurant = (overrides = {}) => ({
   _id: restaurantId,
@@ -196,7 +237,7 @@ test("owner summary revenue, average, status counts, and top items use completed
       },
       metrics
     ),
-    /Busiest day by orders received: 2026-07-22 \(2 orders\)/
+    /BUSIEST DAY[\s\S]*Wednesday — 2 orders/
   );
 });
 
@@ -308,6 +349,7 @@ test("owner summary order queries are all scoped by restaurantId", async () => {
 
 test("today orders and sales tools expose completed-only reporting metrics", async () => {
   const originalFind = Order.find;
+  const originalCountDocuments = MenuItem.countDocuments;
   const completedItemId = "64b000000000000000000941";
   const periodOrders = [
     makeOrder({
@@ -346,17 +388,31 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
   const context = {
     restaurantId,
     restaurant: {
+      name: "Tenant Restaurant",
       timezone: "Africa/Accra"
-    }
+    },
+    sender: { role: "owner", normalizedPhone: "+233557038547" }
   };
 
   try {
     Order.find = (filter) => ({
       select: async () => (filter.createdAt.$gte ? periodOrders : [])
     });
+    MenuItem.countDocuments = async (filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return 3;
+    };
 
     const today = await toolRegistry.get_today_orders.handler({}, context);
+    const yesterday = await toolRegistry.get_yesterday_orders.handler(
+      {},
+      context
+    );
     const sales = await toolRegistry.get_sales_summary.handler({}, context);
+    const business = await toolRegistry.get_business_summary.handler(
+      {},
+      context
+    );
 
     assert.equal(today.data.totalOrders, 3);
     assert.equal(today.data.revenue, 75);
@@ -371,9 +427,85 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
       quantity: 2,
       revenue: 60
     });
+    assert.equal(yesterday.success, true);
+    assert.equal(yesterday.data.revenue, 75);
+    assert.equal(business.data.todayOrderCount, 3);
+    assert.equal(business.data.todayRevenue, 75);
+    assert.equal(business.data.unavailableItems, 3);
+  } finally {
+    Order.find = originalFind;
+    MenuItem.countDocuments = originalCountDocuments;
+  }
+});
+
+test("get_business_report supports all periods and remains context scoped", async () => {
+  const originalFind = Order.find;
+  const filters = [];
+  const context = {
+    restaurantId,
+    restaurant: {
+      name: "Tenant Restaurant",
+      timezone: "Africa/Accra"
+    },
+    sender: { role: "owner", normalizedPhone: "+233557038547" }
+  };
+
+  try {
+    Order.find = (filter) => {
+      filters.push(filter);
+      return { select: async () => [] };
+    };
+
+    for (const period of [
+      "today",
+      "yesterday",
+      "this_week",
+      "last_week"
+    ]) {
+      const result = await toolRegistry.get_business_report.handler(
+        { period },
+        context
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.data.period.type, period);
+      assert.match(result.data.formattedReport, /TENANT RESTAURANT/);
+    }
   } finally {
     Order.find = originalFind;
   }
+
+  assert.equal(filters.length, 8);
+  for (const filter of filters) {
+    assert.equal(filter.restaurantId, restaurantId);
+  }
+  assert.equal(
+    toolRegistry.get_business_report.schema.safeParse({
+      period: "today",
+      restaurantId: "64b000000000000000000999"
+    }).success,
+    false
+  );
+});
+
+test("business report permissions allow staff and deny customers", () => {
+  assert.equal(isToolAllowedForRole("get_business_report", "owner"), true);
+  assert.equal(isToolAllowedForRole("get_business_report", "manager"), true);
+  assert.equal(isToolAllowedForRole("get_business_report", "customer"), false);
+
+  const ownerTools = getAgentToolDefinitionsForRole("owner").map(
+    (tool) => tool.function.name
+  );
+  const managerTools = getAgentToolDefinitionsForRole("manager").map(
+    (tool) => tool.function.name
+  );
+  const customerTools = getAgentToolDefinitionsForRole("customer").map(
+    (tool) => tool.function.name
+  );
+
+  assert.equal(ownerTools.includes("get_business_report"), true);
+  assert.equal(managerTools.includes("get_business_report"), true);
+  assert.equal(customerTools.includes("get_business_report"), false);
 });
 
 test("daily and weekly completed periods respect the configured timezone", () => {
@@ -387,6 +519,219 @@ test("daily and weekly completed periods respect the configured timezone", () =>
   assert.equal(weekly.periodStart.toISOString(), "2026-03-02T05:00:00.000Z");
   assert.equal(weekly.periodEnd.toISOString(), "2026-03-09T04:00:00.000Z");
   assert.equal(weekly.key, "2026-03-02_to_2026-03-08");
+});
+
+test("today and yesterday business periods use restaurant-local calendar boundaries", () => {
+  const now = new Date("2026-08-08T02:30:00.000Z");
+  const today = resolveBusinessReportPeriod(
+    "today",
+    now,
+    "America/New_York"
+  );
+  const yesterday = resolveBusinessReportPeriod(
+    "yesterday",
+    now,
+    "America/New_York"
+  );
+
+  assert.equal(today.periodStart.toISOString(), "2026-08-07T04:00:00.000Z");
+  assert.equal(today.periodEnd.toISOString(), now.toISOString());
+  assert.equal(today.key, "2026-08-07");
+  assert.equal(
+    yesterday.periodStart.toISOString(),
+    "2026-08-06T04:00:00.000Z"
+  );
+  assert.equal(
+    yesterday.periodEnd.toISOString(),
+    "2026-08-07T04:00:00.000Z"
+  );
+  assert.equal(yesterday.key, "2026-08-06");
+});
+
+test("this week starts Monday and compares the same local elapsed time", () => {
+  const now = new Date("2026-08-05T19:00:00.000Z");
+  const current = resolveBusinessReportPeriod(
+    "this_week",
+    now,
+    "America/New_York"
+  );
+  const previous = resolvePreviousEquivalentBusinessReportPeriod(current);
+
+  assert.equal(
+    current.periodStart.toISOString(),
+    "2026-08-03T04:00:00.000Z"
+  );
+  assert.equal(current.periodEnd.toISOString(), now.toISOString());
+  assert.equal(
+    previous.periodStart.toISOString(),
+    "2026-07-27T04:00:00.000Z"
+  );
+  assert.equal(
+    previous.periodEnd.toISOString(),
+    "2026-07-29T19:00:00.000Z"
+  );
+});
+
+test("last week resolves the previous restaurant-local Monday through Sunday", () => {
+  const period = resolveBusinessReportPeriod(
+    "last_week",
+    new Date("2026-08-05T19:00:00.000Z"),
+    "America/New_York"
+  );
+
+  assert.equal(
+    period.periodStart.toISOString(),
+    "2026-07-27T04:00:00.000Z"
+  );
+  assert.equal(
+    period.periodEnd.toISOString(),
+    "2026-08-03T04:00:00.000Z"
+  );
+  assert.equal(period.key, "2026-07-27_to_2026-08-02");
+});
+
+test("active order count excludes every terminal report status", () => {
+  const counts = emptyCountsByStatus();
+  counts.completed = 4;
+  counts.cancelled = 3;
+  counts.rejected = 2;
+  counts.expired = 1;
+  counts.pending = 2;
+  counts.preparing = 1;
+
+  assert.equal(getActiveOrderCount(counts), 3);
+});
+
+test("historical top-seller revenue uses completed order item snapshots", () => {
+  const historicalUnitPrice = 35;
+  const currentMenuPrice = 45;
+  const metrics = buildOwnerSummaryMetrics(
+    metricInput({ periodType: "daily" }),
+    [
+      makeOrder({
+        status: "completed",
+        total: 70,
+        customerPhone: "0557038547",
+        items: [
+          {
+            menuItemId: "64b000000000000000000951",
+            name: "Jollof Rice",
+            quantity: 2,
+            unitPrice: historicalUnitPrice,
+            totalPrice: 70
+          }
+        ]
+      })
+    ],
+    []
+  );
+
+  assert.notEqual(historicalUnitPrice, currentMenuPrice);
+  assert.equal(metrics.topSellingItems[0].revenue, 70);
+  assert.equal(metrics.completedRevenue, 70);
+});
+
+test("daily WhatsApp report contains detailed sales, orders, top items, and customers", async () => {
+  const report = await getBusinessReport(
+    {
+      restaurantId,
+      restaurantName: "Golden Grill",
+      timezone: "Africa/Accra",
+      period: "today",
+      now: new Date("2026-08-08T15:00:00.000Z")
+    },
+    {
+      getMetrics: async (input) => makeDetailedMetrics(input)
+    }
+  );
+
+  assert.equal(report.period.type, "today");
+  assert.equal(report.orders.active, 1);
+  assert.equal(report.topSellingItems[0].menuItemId, undefined);
+  assert.match(report.formattedReport, /TODAY'S REPORT/);
+  assert.match(report.formattedReport, /💰 SALES SUMMARY/);
+  assert.match(report.formattedReport, /Revenue: GHS 4,280\.00/);
+  assert.match(report.formattedReport, /📦 ORDER SUMMARY/);
+  assert.match(report.formattedReport, /🍽️ TOP SELLING ITEMS/);
+  assert.match(report.formattedReport, /👥 CUSTOMERS/);
+  assert.doesNotMatch(report.formattedReport, /BUSIEST DAY/);
+  assert.equal(formatGhsCurrency(4280), "GHS 4,280.00");
+});
+
+test("weekly formatter includes busiest day and shows at most five top items", async () => {
+  const topSellingItems = Array.from({ length: 6 }, (_, index) => ({
+    name: `Item ${index + 1}`,
+    quantity: 10 - index,
+    revenue: 100 - index
+  }));
+  const report = await getBusinessReport(
+    {
+      restaurantId,
+      restaurantName: "Golden Grill",
+      timezone: "Africa/Accra",
+      period: "this_week",
+      now: new Date("2026-08-08T15:00:00.000Z")
+    },
+    {
+      getMetrics: async (input) =>
+        makeDetailedMetrics(input, {
+          topSellingItems,
+          busiestDay: {
+            date: "2026-08-07",
+            day: "friday",
+            totalOrders: 24
+          }
+        })
+    }
+  );
+
+  assert.equal(report.topSellingItems.length, 5);
+  assert.match(report.formattedReport, /📅 BUSIEST DAY/);
+  assert.match(report.formattedReport, /Friday — 24 orders/);
+  assert.match(report.formattedReport, /5\. Item 5/);
+  assert.doesNotMatch(report.formattedReport, /Item 6/);
+});
+
+test("comparison percentages are backend-calculated with safe zero baselines", async () => {
+  let metricsCall = 0;
+  const report = await getBusinessReport(
+    {
+      restaurantId,
+      restaurantName: "Golden Grill",
+      timezone: "Africa/Accra",
+      period: "this_week",
+      compareWithPrevious: true,
+      now: new Date("2026-08-05T15:00:00.000Z")
+    },
+    {
+      getMetrics: async (input) => {
+        metricsCall += 1;
+        return makeDetailedMetrics(
+          input,
+          metricsCall === 1
+            ? {
+                totalOrders: 12,
+                completedRevenue: 120,
+                averageCompletedOrderValue: 10
+              }
+            : {
+                totalOrders: 10,
+                completedRevenue: 60,
+                averageCompletedOrderValue: 6
+              }
+        );
+      }
+    }
+  );
+
+  assert.equal(report.comparison.previousPeriodLabel, "Last week");
+  assert.equal(report.comparison.revenue.percentageChange, 100);
+  assert.equal(report.comparison.totalOrders.percentageChange, 20);
+  assert.equal(report.comparison.averageOrderValue.percentageChange, 66.7);
+  assert.match(report.formattedReport, /📈 VS LAST WEEK/);
+  assert.equal(calculatePercentageChange(0, 0), 0);
+  assert.equal(calculatePercentageChange(10, 0), null);
+  assert.equal(JSON.stringify(report).includes("Infinity"), false);
 });
 
 test("restaurant summary settings have safe defaults and validation", () => {
@@ -524,11 +869,13 @@ test("daily and weekly summaries are queued to each restaurant owner", async () 
   assert.equal(daily.to, "+233557038547");
   assert.equal(daily.sessionId, "daily-session");
   assert.equal(daily.apiKey, "daily-key");
-  assert.match(daily.text, /Daily summary/);
+  assert.match(daily.text, /YESTERDAY'S REPORT/);
+  assert.match(daily.text, /SALES SUMMARY/);
+  assert.match(daily.text, /ORDER SUMMARY/);
   assert.equal(weekly.to, "+233241234567");
   assert.equal(weekly.sessionId, "weekly-session");
   assert.equal(weekly.apiKey, "weekly-key");
-  assert.match(weekly.text, /Weekly summary/);
+  assert.match(weekly.text, /LAST WEEK'S REPORT/);
 });
 
 test("disabled owner summary settings do not queue messages", async () => {

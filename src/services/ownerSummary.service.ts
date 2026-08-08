@@ -8,6 +8,14 @@ import { ownerSummaryWeekdays, type OwnerSummaryWeekday } from "../types/restaur
 import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export type OwnerSummaryPeriodType = "daily" | "weekly" | "custom";
+export const businessReportPeriodTypes = [
+  "today",
+  "yesterday",
+  "this_week",
+  "last_week"
+] as const;
+export type BusinessReportPeriodType =
+  (typeof businessReportPeriodTypes)[number];
 
 export interface OwnerSummaryPeriod {
   type: OwnerSummaryPeriodType;
@@ -49,6 +57,73 @@ export interface OwnerSummaryMetrics {
   busiestDay: OwnerSummaryBusiestDay | null;
 }
 
+export interface BusinessReportPeriod {
+  type: BusinessReportPeriodType;
+  label: string;
+  summaryType: "daily" | "weekly";
+  timezone: string;
+  periodStart: Date;
+  periodEnd: Date;
+  key: string;
+}
+
+export interface BusinessReportComparisonValue {
+  current: number;
+  previous: number;
+  percentageChange: number | null;
+}
+
+export interface BusinessReportComparison {
+  previousPeriodLabel: string;
+  revenue: BusinessReportComparisonValue;
+  totalOrders: BusinessReportComparisonValue;
+  averageOrderValue: BusinessReportComparisonValue;
+}
+
+export interface BusinessReportData {
+  period: {
+    type: BusinessReportPeriodType;
+    label: string;
+    start: string;
+    end: string;
+    timezone: string;
+  };
+  sales: {
+    revenue: number;
+    completedOrders: number;
+    averageOrderValue: number;
+  };
+  orders: {
+    total: number;
+    completed: number;
+    rejected: number;
+    cancelled: number;
+    active: number;
+  };
+  topSellingItems: Array<{
+    name: string;
+    quantity: number;
+    revenue: number;
+  }>;
+  customers: {
+    unique: number;
+    new: number;
+    returning: number;
+  };
+  busiestDay: OwnerSummaryBusiestDay | null;
+  comparison: BusinessReportComparison | null;
+  formattedReport: string;
+}
+
+export interface GetBusinessReportInput {
+  restaurantId: string;
+  restaurantName: string;
+  timezone?: string;
+  period: BusinessReportPeriodType;
+  compareWithPrevious?: boolean;
+  now?: Date;
+}
+
 export interface GetOwnerSummaryMetricsInput {
   restaurantId: string;
   periodStart: Date;
@@ -72,6 +147,7 @@ interface ZonedDateTimeParts extends LocalDateParts {
   hour: number;
   minute: number;
   second: number;
+  millisecond: number;
 }
 
 const DEFAULT_TIMEZONE = "Africa/Accra";
@@ -142,21 +218,23 @@ export const getZonedDateTimeParts = (
     day: parts.day,
     hour: parts.hour,
     minute: parts.minute,
-    second: parts.second
+    second: parts.second,
+    millisecond: value.getUTCMilliseconds()
   };
 };
 
-const localMidnightToUtc = (
-  localDate: LocalDateParts,
+const localDateTimeToUtc = (
+  localDateTime: ZonedDateTimeParts,
   timezone: string
 ): Date => {
   const targetTimestamp = Date.UTC(
-    localDate.year,
-    localDate.month - 1,
-    localDate.day,
-    0,
-    0,
-    0
+    localDateTime.year,
+    localDateTime.month - 1,
+    localDateTime.day,
+    localDateTime.hour,
+    localDateTime.minute,
+    localDateTime.second,
+    localDateTime.millisecond
   );
   let utcTimestamp = targetTimestamp;
 
@@ -168,7 +246,8 @@ const localMidnightToUtc = (
       observed.day,
       observed.hour,
       observed.minute,
-      observed.second
+      observed.second,
+      observed.millisecond
     );
     const adjustment = targetTimestamp - observedTimestamp;
 
@@ -182,83 +261,184 @@ const localMidnightToUtc = (
   return new Date(utcTimestamp);
 };
 
-const buildPeriod = (
-  type: OwnerSummaryPeriodType,
-  timezone: string,
-  startLocalDate: LocalDateParts,
-  endLocalDate: LocalDateParts
-): OwnerSummaryPeriod => {
-  const periodStart = localMidnightToUtc(startLocalDate, timezone);
-  const periodEnd = localMidnightToUtc(endLocalDate, timezone);
-  const key =
-    type === "weekly"
-      ? `${localDateKey(startLocalDate)}_to_${localDateKey(shiftLocalDate(endLocalDate, -1))}`
-      : localDateKey(startLocalDate);
-
-  return {
-    type,
-    timezone,
-    periodStart,
-    periodEnd,
-    key
-  };
-};
+const localMidnightToUtc = (
+  localDate: LocalDateParts,
+  timezone: string
+): Date =>
+  localDateTimeToUtc(
+    {
+      ...localDate,
+      hour: 0,
+      minute: 0,
+      second: 0,
+      millisecond: 0
+    },
+    timezone
+  );
 
 export const getCurrentDailySummaryPeriod = (
   now = new Date(),
   timezone = DEFAULT_TIMEZONE
 ): OwnerSummaryPeriod => {
-  const zonedNow = getZonedDateTimeParts(now, timezone);
-  const startLocalDate: LocalDateParts = {
-    year: zonedNow.year,
-    month: zonedNow.month,
-    day: zonedNow.day
-  };
+  const period = resolveBusinessReportPeriod("today", now, timezone);
 
-  return buildPeriod(
-    "daily",
+  return {
+    type: "daily",
     timezone,
-    startLocalDate,
-    shiftLocalDate(startLocalDate, 1)
-  );
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    key: period.key
+  };
 };
 
 export const getPreviousDailySummaryPeriod = (
   now = new Date(),
   timezone = DEFAULT_TIMEZONE
 ): OwnerSummaryPeriod => {
-  const zonedNow = getZonedDateTimeParts(now, timezone);
-  const endLocalDate: LocalDateParts = {
-    year: zonedNow.year,
-    month: zonedNow.month,
-    day: zonedNow.day
-  };
+  const period = resolveBusinessReportPeriod("yesterday", now, timezone);
 
-  return buildPeriod(
-    "daily",
+  return {
+    type: "daily",
     timezone,
-    shiftLocalDate(endLocalDate, -1),
-    endLocalDate
-  );
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    key: period.key
+  };
 };
 
 export const getPreviousWeeklySummaryPeriod = (
   now = new Date(),
   timezone = DEFAULT_TIMEZONE
 ): OwnerSummaryPeriod => {
-  const zonedNow = getZonedDateTimeParts(now, timezone);
-  const endLocalDate: LocalDateParts = {
-    year: zonedNow.year,
-    month: zonedNow.month,
-    day: zonedNow.day
-  };
+  const period = resolveBusinessReportPeriod("last_week", now, timezone);
 
-  return buildPeriod(
-    "weekly",
+  return {
+    type: "weekly",
     timezone,
-    shiftLocalDate(endLocalDate, -7),
-    endLocalDate
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    key: period.key
+  };
+};
+
+const getLocalDate = (value: Date, timezone: string): LocalDateParts => {
+  const parts = getZonedDateTimeParts(value, timezone);
+
+  return { year: parts.year, month: parts.month, day: parts.day };
+};
+
+const getMonday = (localDate: LocalDateParts): LocalDateParts => {
+  const weekday = new Date(
+    Date.UTC(localDate.year, localDate.month - 1, localDate.day)
+  ).getUTCDay();
+  const daysSinceMonday = (weekday + 6) % 7;
+
+  return shiftLocalDate(localDate, -daysSinceMonday);
+};
+
+const buildBusinessReportPeriod = (
+  type: BusinessReportPeriodType,
+  timezone: string,
+  startLocalDate: LocalDateParts,
+  periodEnd: Date
+): BusinessReportPeriod => {
+  const periodStart = localMidnightToUtc(startLocalDate, timezone);
+  const endLocalDate = getLocalDate(
+    new Date(Math.max(periodStart.getTime(), periodEnd.getTime() - 1)),
+    timezone
   );
+
+  return {
+    type,
+    label: {
+      today: "Today",
+      yesterday: "Yesterday",
+      this_week: "This week",
+      last_week: "Last week"
+    }[type],
+    summaryType:
+      type === "today" || type === "yesterday" ? "daily" : "weekly",
+    timezone,
+    periodStart,
+    periodEnd,
+    key:
+      type === "today" || type === "yesterday"
+        ? localDateKey(startLocalDate)
+        : `${localDateKey(startLocalDate)}_to_${localDateKey(endLocalDate)}`
+  };
+};
+
+export const resolveBusinessReportPeriod = (
+  type: BusinessReportPeriodType,
+  now = new Date(),
+  timezone = DEFAULT_TIMEZONE
+): BusinessReportPeriod => {
+  const today = getLocalDate(now, timezone);
+  const currentMonday = getMonday(today);
+
+  if (type === "today") {
+    return buildBusinessReportPeriod(type, timezone, today, now);
+  }
+
+  if (type === "yesterday") {
+    return buildBusinessReportPeriod(
+      type,
+      timezone,
+      shiftLocalDate(today, -1),
+      localMidnightToUtc(today, timezone)
+    );
+  }
+
+  if (type === "this_week") {
+    return buildBusinessReportPeriod(type, timezone, currentMonday, now);
+  }
+
+  return buildBusinessReportPeriod(
+    type,
+    timezone,
+    shiftLocalDate(currentMonday, -7),
+    localMidnightToUtc(currentMonday, timezone)
+  );
+};
+
+const shiftZonedDateTime = (
+  value: Date,
+  days: number,
+  timezone: string
+): Date => {
+  const local = getZonedDateTimeParts(value, timezone);
+
+  return localDateTimeToUtc(
+    {
+      ...shiftLocalDate(local, days),
+      hour: local.hour,
+      minute: local.minute,
+      second: local.second,
+      millisecond: local.millisecond
+    },
+    timezone
+  );
+};
+
+export const resolvePreviousEquivalentBusinessReportPeriod = (
+  period: BusinessReportPeriod
+): BusinessReportPeriod => {
+  const shiftDays =
+    period.type === "today" || period.type === "yesterday" ? -1 : -7;
+
+  return {
+    ...period,
+    periodStart: shiftZonedDateTime(
+      period.periodStart,
+      shiftDays,
+      period.timezone
+    ),
+    periodEnd: shiftZonedDateTime(
+      period.periodEnd,
+      shiftDays,
+      period.timezone
+    )
+  };
 };
 
 const getNormalizedCustomerPhones = (
@@ -394,9 +574,9 @@ export const getOwnerSummaryMetrics = async (
   if (
     Number.isNaN(input.periodStart.getTime()) ||
     Number.isNaN(input.periodEnd.getTime()) ||
-    input.periodStart >= input.periodEnd
+    input.periodStart > input.periodEnd
   ) {
-    throw new Error("periodStart must be before periodEnd");
+    throw new Error("periodStart must not be after periodEnd");
   }
 
   const [periodOrders, priorCustomerOrders] = await Promise.all([
@@ -419,10 +599,130 @@ export const getOwnerSummaryMetrics = async (
   return buildOwnerSummaryMetrics(input, periodOrders, priorCustomerOrders);
 };
 
-const formatCurrency = (value: number): string => `GHS ${value.toFixed(2)}`;
+export const calculatePercentageChange = (
+  current: number,
+  previous: number
+): number | null => {
+  if (previous === 0) {
+    return current === 0 ? 0 : null;
+  }
 
-const formatPeriodLabel = (period: OwnerSummaryPeriod): string => {
-  const endInclusive = new Date(period.periodEnd.getTime() - 1);
+  return Math.round((((current - previous) / previous) * 100) * 10) / 10;
+};
+
+export const formatGhsCurrency = (value: number): string =>
+  `GHS ${new Intl.NumberFormat("en-GH", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(value)}`;
+
+const terminalReportStatuses = new Set<OrderStatus>([
+  "completed",
+  "cancelled",
+  "rejected",
+  "expired"
+]);
+
+export const getActiveOrderCount = (
+  countsByStatus: Record<OrderStatus, number>
+): number =>
+  orderStatuses.reduce(
+    (total, status) =>
+      terminalReportStatuses.has(status)
+        ? total
+        : total + countsByStatus[status],
+    0
+  );
+
+const getPreviousPeriodLabel = (
+  type: BusinessReportPeriodType
+): string => {
+  switch (type) {
+    case "today":
+      return "Yesterday";
+    case "yesterday":
+      return "Day before yesterday";
+    case "this_week":
+      return "Last week";
+    case "last_week":
+      return "Week before last";
+  }
+};
+
+const buildComparisonValue = (
+  current: number,
+  previous: number
+): BusinessReportComparisonValue => ({
+  current,
+  previous,
+  percentageChange: calculatePercentageChange(current, previous)
+});
+
+export const buildBusinessReportComparison = (
+  type: BusinessReportPeriodType,
+  current: OwnerSummaryMetrics,
+  previous: OwnerSummaryMetrics
+): BusinessReportComparison => ({
+  previousPeriodLabel: getPreviousPeriodLabel(type),
+  revenue: buildComparisonValue(
+    current.completedRevenue,
+    previous.completedRevenue
+  ),
+  totalOrders: buildComparisonValue(current.totalOrders, previous.totalOrders),
+  averageOrderValue: buildComparisonValue(
+    current.averageCompletedOrderValue,
+    previous.averageCompletedOrderValue
+  )
+});
+
+type BusinessReportFacts = Omit<BusinessReportData, "formattedReport">;
+
+const buildBusinessReportFacts = (
+  period: BusinessReportPeriod,
+  metrics: OwnerSummaryMetrics,
+  comparison: BusinessReportComparison | null
+): BusinessReportFacts => ({
+  period: {
+    type: period.type,
+    label: period.label,
+    start: period.periodStart.toISOString(),
+    end: period.periodEnd.toISOString(),
+    timezone: period.timezone
+  },
+  sales: {
+    revenue: metrics.completedRevenue,
+    completedOrders: metrics.completedOrders,
+    averageOrderValue: metrics.averageCompletedOrderValue
+  },
+  orders: {
+    total: metrics.totalOrders,
+    completed: metrics.completedOrders,
+    rejected: metrics.countsByStatus.rejected,
+    cancelled: metrics.countsByStatus.cancelled,
+    active: getActiveOrderCount(metrics.countsByStatus)
+  },
+  topSellingItems: metrics.topSellingItems.slice(0, 5).map((item) => ({
+    name: item.name,
+    quantity: item.quantity,
+    revenue: item.revenue
+  })),
+  customers: {
+    unique: metrics.uniqueCustomers,
+    new: metrics.newCustomers,
+    returning: metrics.returningCustomers
+  },
+  busiestDay: metrics.busiestDay,
+  comparison
+});
+
+const formatBusinessPeriodLabel = (period: {
+  periodStart: Date;
+  periodEnd: Date;
+  timezone: string;
+}): string => {
+  const endInclusive = new Date(
+    Math.max(period.periodStart.getTime(), period.periodEnd.getTime() - 1)
+  );
   const formatter = new Intl.DateTimeFormat("en-GB", {
     timeZone: period.timezone,
     day: "numeric",
@@ -435,33 +735,183 @@ const formatPeriodLabel = (period: OwnerSummaryPeriod): string => {
   return start === end ? start : `${start} – ${end}`;
 };
 
+const formatComparisonChange = (
+  value: BusinessReportComparisonValue
+): string => {
+  if (value.percentageChange === null) {
+    return "New / no previous baseline";
+  }
+
+  if (value.percentageChange > 0) {
+    return `↑ ${value.percentageChange.toFixed(1)}%`;
+  }
+
+  if (value.percentageChange < 0) {
+    return `↓ ${Math.abs(value.percentageChange).toFixed(1)}%`;
+  }
+
+  return "→ 0.0%";
+};
+
+const getReportTitle = (type: BusinessReportPeriodType): string => {
+  switch (type) {
+    case "today":
+      return "TODAY'S REPORT";
+    case "yesterday":
+      return "YESTERDAY'S REPORT";
+    case "this_week":
+      return "WEEKLY REPORT";
+    case "last_week":
+      return "LAST WEEK'S REPORT";
+  }
+};
+
+export const formatBusinessReportMessage = (
+  restaurantName: string,
+  period: BusinessReportPeriod,
+  report: BusinessReportFacts
+): string => {
+  const sections: string[] = [
+    `📊 ${restaurantName.toUpperCase()} — ${getReportTitle(period.type)}`,
+    formatBusinessPeriodLabel(period),
+    [
+      "💰 SALES SUMMARY",
+      `Revenue: ${formatGhsCurrency(report.sales.revenue)}`,
+      `Completed orders: ${report.sales.completedOrders}`,
+      `Average order value: ${formatGhsCurrency(
+        report.sales.averageOrderValue
+      )}`
+    ].join("\n"),
+    [
+      "📦 ORDER SUMMARY",
+      `Total orders: ${report.orders.total}`,
+      `Completed: ${report.orders.completed}`,
+      `Rejected: ${report.orders.rejected}`,
+      `Cancelled: ${report.orders.cancelled}`,
+      `Active: ${report.orders.active}`
+    ].join("\n")
+  ];
+
+  if (report.topSellingItems.length > 0) {
+    sections.push(
+      [
+        "🍽️ TOP SELLING ITEMS",
+        ...report.topSellingItems.map(
+          (item, index) =>
+            `${index + 1}. ${item.name} — ${item.quantity} sold — ${formatGhsCurrency(
+              item.revenue
+            )}`
+        )
+      ].join("\n")
+    );
+  }
+
+  if (report.customers.unique > 0) {
+    sections.push(
+      [
+        "👥 CUSTOMERS",
+        `Unique customers: ${report.customers.unique}`,
+        `New customers: ${report.customers.new}`,
+        `Returning customers: ${report.customers.returning}`
+      ].join("\n")
+    );
+  }
+
+  if (period.summaryType === "weekly" && report.busiestDay) {
+    const day =
+      report.busiestDay.day.charAt(0).toUpperCase() +
+      report.busiestDay.day.slice(1);
+    sections.push(
+      [
+        "📅 BUSIEST DAY",
+        `${day} — ${report.busiestDay.totalOrders} order${
+          report.busiestDay.totalOrders === 1 ? "" : "s"
+        }`
+      ].join("\n")
+    );
+  }
+
+  if (report.comparison) {
+    sections.push(
+      [
+        `📈 VS ${report.comparison.previousPeriodLabel.toUpperCase()}`,
+        `Revenue: ${formatComparisonChange(report.comparison.revenue)}`,
+        `Orders: ${formatComparisonChange(report.comparison.totalOrders)}`,
+        `Average order value: ${formatComparisonChange(
+          report.comparison.averageOrderValue
+        )}`
+      ].join("\n")
+    );
+  }
+
+  return sections.join("\n\n");
+};
+
+export const getBusinessReport = async (
+  input: GetBusinessReportInput,
+  dependencies: {
+    getMetrics?: typeof getOwnerSummaryMetrics;
+  } = {}
+): Promise<BusinessReportData> => {
+  const timezone = input.timezone || DEFAULT_TIMEZONE;
+  const period = resolveBusinessReportPeriod(
+    input.period,
+    input.now ?? new Date(),
+    timezone
+  );
+  const getMetrics = dependencies.getMetrics ?? getOwnerSummaryMetrics;
+  const currentMetrics = await getMetrics({
+    restaurantId: input.restaurantId,
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    timezone,
+    periodType: period.summaryType
+  });
+  let comparison: BusinessReportComparison | null = null;
+
+  if (input.compareWithPrevious) {
+    const previousPeriod = resolvePreviousEquivalentBusinessReportPeriod(period);
+    const previousMetrics = await getMetrics({
+      restaurantId: input.restaurantId,
+      periodStart: previousPeriod.periodStart,
+      periodEnd: previousPeriod.periodEnd,
+      timezone,
+      periodType: previousPeriod.summaryType
+    });
+    comparison = buildBusinessReportComparison(
+      period.type,
+      currentMetrics,
+      previousMetrics
+    );
+  }
+
+  const facts = buildBusinessReportFacts(period, currentMetrics, comparison);
+
+  return {
+    ...facts,
+    formattedReport: formatBusinessReportMessage(
+      input.restaurantName,
+      period,
+      facts
+    )
+  };
+};
+
 export const formatOwnerSummaryMessage = (
   restaurantName: string,
   period: OwnerSummaryPeriod,
   metrics: OwnerSummaryMetrics
 ): string => {
-  const title = period.type === "weekly" ? "Weekly" : "Daily";
-  const rejectedOrders = metrics.countsByStatus.rejected;
-  const topItems =
-    metrics.topSellingItems.length > 0
-      ? metrics.topSellingItems
-          .map(
-            (item, index) =>
-              `${index + 1}. ${item.name}: ${item.quantity} (${formatCurrency(item.revenue)})`
-          )
-          .join("\n")
-      : "None";
-  const busiestDayLine =
-    period.type === "weekly" && metrics.busiestDay
-      ? `\nBusiest day by orders received: ${metrics.busiestDay.date} (${metrics.busiestDay.totalOrders} orders)`
-      : "";
+  const reportPeriod: BusinessReportPeriod = {
+    type: period.type === "weekly" ? "last_week" : "yesterday",
+    label: period.type === "weekly" ? "Last week" : "Yesterday",
+    summaryType: period.type === "weekly" ? "weekly" : "daily",
+    timezone: period.timezone,
+    periodStart: period.periodStart,
+    periodEnd: period.periodEnd,
+    key: period.key
+  };
+  const facts = buildBusinessReportFacts(reportPeriod, metrics, null);
 
-  return [
-    `${restaurantName} — ${title} summary`,
-    formatPeriodLabel(period),
-    `Orders: ${metrics.totalOrders} | Completed: ${metrics.completedOrders} | Cancelled: ${metrics.cancelledOrders} | Rejected: ${rejectedOrders}`,
-    `Revenue: ${formatCurrency(metrics.completedRevenue)} | Average: ${formatCurrency(metrics.averageCompletedOrderValue)}`,
-    `Customers: ${metrics.uniqueCustomers} | New: ${metrics.newCustomers} | Returning: ${metrics.returningCustomers}${busiestDayLine}`,
-    `Top items:\n${topItems}`
-  ].join("\n");
+  return formatBusinessReportMessage(restaurantName, reportPeriod, facts);
 };

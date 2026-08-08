@@ -2577,6 +2577,7 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(ownerTools.includes("update_menu_price"), true);
   assert.equal(ownerTools.includes("confirm_order"), true);
   assert.equal(ownerTools.includes("reject_order"), true);
+  assert.equal(ownerTools.includes("get_business_report"), true);
   assert.equal(customerTools.includes("get_restaurant_profile"), true);
   assert.equal(customerTools.includes("get_menu"), true);
   assert.equal(customerTools.includes("search_menu_items"), true);
@@ -2594,6 +2595,7 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(customerTools.includes("confirm_order"), false);
   assert.equal(customerTools.includes("reject_order"), false);
   assert.equal(customerTools.includes("get_sales_summary"), false);
+  assert.equal(customerTools.includes("get_business_report"), false);
 });
 
 test("customer OpenRouter routing is controlled by explicit feature switch", () => {
