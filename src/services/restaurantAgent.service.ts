@@ -19,6 +19,7 @@ import {
   handleUnquotedOwnerOrderDecision,
   parseOwnerSelectionReply,
   parseSimpleOwnerDecision,
+  reconcileAwaitingOwnerRejectionSelection,
   requestOwnerOrderRejectionReason,
   resolveQuotedOwnerOrderDecision
 } from "./ownerOrderResolution.service";
@@ -209,6 +210,7 @@ export interface RestaurantAgentRoutingDependencies {
   parseOrderDecision?: typeof parseOwnerOrderDecision;
   parseSimpleDecision?: typeof parseSimpleOwnerDecision;
   handleSavedSelection?: typeof handleSavedOwnerSelectionReply;
+  reconcileAwaitingSelection?: typeof reconcileAwaitingOwnerRejectionSelection;
   handleUnquotedDecision?: typeof handleUnquotedOwnerOrderDecision;
   requestRejectionReason?: typeof requestOwnerOrderRejectionReason;
   resolveQuotedDecision?: typeof resolveQuotedOwnerOrderDecision;
@@ -283,6 +285,8 @@ export interface StaffOrderMutationIntent {
   reason?: string;
   targetStatus?: "preparing" | "ready" | "out_for_delivery" | "completed";
   expectedOrderIds?: string[];
+  pendingSelectionActionId?: string;
+  awaitingRejectionReason?: boolean;
   missingReason: boolean;
   ambiguous: boolean;
 }
@@ -309,6 +313,18 @@ export const getStaffOrderMutationIntent = (
   let reason = cleanInlineRejectionReason(explicitDecision?.reason);
   let selectedCandidateIds: string[] | undefined;
   let targetStatus: StaffOrderMutationIntent["targetStatus"];
+
+  if (!kind && selection?.decision === "reject" && selection.awaitingReason) {
+    return {
+      kind: "reject",
+      requiredTool: "reject_order",
+      expectedOrderIds: selection.candidates.map((candidate) => candidate.id),
+      pendingSelectionActionId: selection.pendingActionId,
+      awaitingRejectionReason: true,
+      missingReason: false,
+      ambiguous: false
+    };
+  }
 
   if (!kind && selection && !selection.awaitingReason) {
     const selectionReply = parseOwnerSelectionReply(
@@ -449,11 +465,30 @@ const hasSuccessfulOrderMutationTool = (
   intent: StaffOrderMutationIntent,
   result: AgentOrchestratorResult
 ): boolean => {
-  if ((intent.expectedOrderIds?.length ?? 0) > 1) {
+  if (
+    (intent.expectedOrderIds?.length ?? 0) > 1 &&
+    !intent.awaitingRejectionReason
+  ) {
     // The saved selection closes the pending workflow and safely replays any
     // idempotent mutation the AI may already have completed. In particular, one
     // successful tool call must never consume a multi-order selection turn.
     return false;
+  }
+
+  if (intent.awaitingRejectionReason) {
+    const expectedOrderIds = intent.expectedOrderIds ?? [];
+
+    return (
+      expectedOrderIds.length > 0 &&
+      expectedOrderIds.every((orderId) =>
+        result.executedTools.some(
+          (tool) =>
+            tool.name === "reject_order" &&
+            tool.success &&
+            tool.resultOrderId === orderId
+        )
+      )
+    );
   }
 
   const matchingTool = result.executedTools.find(
@@ -477,6 +512,80 @@ const hasSuccessfulOrderMutationTool = (
     intent.requiredTool !== "update_order_status" ||
     matchingTool.resultOrderStatus === intent.targetStatus
   );
+};
+
+const getSuccessfulAwaitingRejectionOrderIds = (
+  intent: StaffOrderMutationIntent,
+  result: AgentOrchestratorResult
+): string[] => {
+  const expectedOrderIds = intent.expectedOrderIds ?? [];
+
+  return expectedOrderIds.filter((orderId) =>
+    result.executedTools.some(
+      (tool) =>
+        tool.name === "reject_order" &&
+        tool.success &&
+        tool.resultOrderId === orderId
+    )
+  );
+};
+
+const looksLikeRejectionCompletionClaim = (message: string): boolean => {
+  const normalized = normalizeText(message).toLowerCase();
+
+  if (/^(?:done|completed|successfully done)[.!]*$/.test(normalized)) {
+    return true;
+  }
+
+  if (!/\b(?:reject(?:ed|ion)?|declin(?:ed|e)?)\b/.test(normalized)) {
+    return false;
+  }
+
+  if (
+    /\b(?:no order|nothing)\b.{0,30}\breject/.test(normalized) ||
+    /\b(?:not|never)\b.{0,15}\breject/.test(normalized) ||
+    /\breject(?:ed|ion)?\b.{0,15}\b(?:not|never|yet)\b/.test(normalized) ||
+    /\b(?:can|could|should|would|will|ready to|want me to)\b.{0,25}\b(?:reject|decline)\b/.test(
+      normalized
+    ) ||
+    normalized.endsWith("?")
+  ) {
+    return false;
+  }
+
+  return true;
+};
+
+const buildAwaitingRejectionSafetyMessage = (
+  candidates: Array<{ id: string; orderNumber?: string }>,
+  successfulOrderIds: string[],
+  remainingOrderIds: string[]
+): string => {
+  const candidateMap = new Map(
+    candidates.map((candidate) => [
+      candidate.id,
+      candidate.orderNumber || candidate.id
+    ])
+  );
+  const labelsFor = (orderIds: string[]): string =>
+    orderIds.map((orderId) => candidateMap.get(orderId) || orderId).join(", ");
+
+  if (successfulOrderIds.length > 0 && remainingOrderIds.length > 0) {
+    return `I confirmed the rejection for ${labelsFor(successfulOrderIds)}, but ${labelsFor(
+      remainingOrderIds
+    )} is still pending. Please provide the rejection reason again so I can safely retry the remaining order${
+      remainingOrderIds.length === 1 ? "" : "s"
+    }.`;
+  }
+
+  if (successfulOrderIds.length > 0) {
+    return "The rejection tool succeeded, but I couldn't safely close the pending rejection workflow. Please provide the rejection reason again so I can retry safely.";
+  }
+
+  const expectedOrderIds = candidates.map((candidate) => candidate.id);
+  const reference = labelsFor(expectedOrderIds);
+
+  return `I haven't confirmed the rejection${reference ? ` for ${reference}` : ""}. Please provide the rejection reason again so I can retry safely.`;
 };
 
 const formatMenuResponse = (restaurantName: string, data: unknown): string => {
@@ -696,6 +805,9 @@ export const handleRestaurantAgentMessage = async (
     dependencies.parseSimpleDecision ?? parseSimpleOwnerDecision;
   const handleSavedSelection =
     dependencies.handleSavedSelection ?? handleSavedOwnerSelectionReply;
+  const reconcileAwaitingSelection =
+    dependencies.reconcileAwaitingSelection ??
+    reconcileAwaitingOwnerRejectionSelection;
   const handleUnquotedDecision =
     dependencies.handleUnquotedDecision ?? handleUnquotedOwnerOrderDecision;
   const requestRejectionReason =
@@ -925,6 +1037,120 @@ export const handleRestaurantAgentMessage = async (
     }
 
     if (agentResult) {
+      let awaitingReasonConversationalResponse = false;
+      let completedAwaitingRejectionOrderIds: string[] | undefined;
+
+      if (staffOrderMutationIntent?.awaitingRejectionReason) {
+        const expectedOrderIds =
+          staffOrderMutationIntent.expectedOrderIds ?? [];
+        const successfulOrderIds =
+          getSuccessfulAwaitingRejectionOrderIds(
+            staffOrderMutationIntent,
+            agentResult
+          );
+        const allExpectedOrdersRejected =
+          expectedOrderIds.length > 0 &&
+          expectedOrderIds.every((orderId) =>
+            successfulOrderIds.includes(orderId)
+          );
+        const attemptedRejection = agentResult.executedTools.some(
+          (tool) => tool.name === "reject_order"
+        );
+        const claimedRejection = looksLikeRejectionCompletionClaim(
+          agentResult.message || ""
+        );
+        let reconciliationResult:
+          | Awaited<ReturnType<typeof reconcileAwaitingSelection>>
+          | undefined;
+
+        if (
+          successfulOrderIds.length > 0 &&
+          staffOrderMutationIntent.pendingSelectionActionId
+        ) {
+          try {
+            reconciliationResult = await reconcileAwaitingSelection({
+              restaurantId,
+              senderPhone: sender.normalizedPhone,
+              senderRole: sender.role,
+              pendingActionId:
+                staffOrderMutationIntent.pendingSelectionActionId,
+              expectedOrderIds,
+              successfulOrderIds
+            });
+          } catch (error) {
+            console.error("[orderWorkflow] selection reconciliation failed", {
+              restaurantId,
+              senderRole: sender.role,
+              errorType: error instanceof Error ? error.name : "UnknownError"
+            });
+          }
+        }
+
+        const selectionCompleted = Boolean(
+          allExpectedOrdersRejected && reconciliationResult?.completed
+        );
+        const hasUsableMessage = Boolean(agentResult.message?.trim());
+
+        if (!selectionCompleted) {
+          const mustReturnSafeWorkflowResponse =
+            successfulOrderIds.length > 0 ||
+            attemptedRejection ||
+            claimedRejection ||
+            !agentResult.success ||
+            !hasUsableMessage;
+
+          if (mustReturnSafeWorkflowResponse) {
+            const remainingOrderIds =
+              reconciliationResult?.remainingOrderIds ??
+              expectedOrderIds.filter(
+                (orderId) => !successfulOrderIds.includes(orderId)
+              );
+            const safetyResponse: RestaurantAgentResponse = {
+              success: false,
+              message: buildAwaitingRejectionSafetyMessage(
+                pendingOrderSelection?.candidates ?? [],
+                successfulOrderIds,
+                remainingOrderIds
+              ),
+              data:
+                successfulOrderIds.length > 0
+                  ? {
+                      orders: successfulOrderIds.map((orderId) => ({
+                        id: orderId
+                      })),
+                      orderEvent: "rejected",
+                      notifyCustomer: true,
+                      receiptRequired: false
+                    }
+                  : undefined,
+              source: "legacy_owner",
+              sender
+            };
+
+            await saveAssistantResponse(
+              restaurantId,
+              sender,
+              safetyResponse,
+              {
+                source: "deterministic_owner_order_safety",
+                reason: "awaiting_rejection_reason_not_fully_completed",
+                pendingActionId:
+                  staffOrderMutationIntent.pendingSelectionActionId,
+                expectedOrderIds,
+                successfulOrderIds,
+                remainingOrderIds
+              }
+            );
+
+            return safetyResponse;
+          }
+
+          awaitingReasonConversationalResponse = true;
+        } else {
+          completedAwaitingRejectionOrderIds = successfulOrderIds;
+        }
+      }
+
       const hasMeaningfulToolActivity = hasMeaningfulAgentToolActivity(
         agentResult.executedTools
       );
@@ -941,6 +1167,7 @@ export const handleRestaurantAgentMessage = async (
       );
       const orderWorkflowNeedsFallback = Boolean(
         staffOrderMutationIntent &&
+          !awaitingReasonConversationalResponse &&
           !hasSuccessfulOrderMutationTool(staffOrderMutationIntent, agentResult)
       );
       const hasUsableMessage = Boolean(agentResult.message?.trim());
@@ -971,6 +1198,18 @@ export const handleRestaurantAgentMessage = async (
           !pendingDecisionNeedsFallback);
 
       if (handledByAi) {
+        const responseData = completedAwaitingRejectionOrderIds
+          ? {
+              ...(agentResult.data ?? {}),
+              orders: completedAwaitingRejectionOrderIds.map((orderId) => ({
+                id: orderId
+              })),
+              orderEvent: "rejected" as const,
+              notifyCustomer: true,
+              receiptRequired: false
+            }
+          : agentResult.data;
+
         await saveAgentConversationMessage({
           restaurantId,
           senderPhone: sender.normalizedPhone,
@@ -998,7 +1237,7 @@ export const handleRestaurantAgentMessage = async (
         return {
           success: agentResult.success,
           message: agentResult.message || temporaryAgentErrorMessage,
-          data: agentResult.data,
+          data: responseData,
           source: "openrouter_agent",
           sender
         };

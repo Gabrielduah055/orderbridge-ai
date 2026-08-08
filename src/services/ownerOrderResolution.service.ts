@@ -21,6 +21,12 @@ export interface OwnerOrderResolutionResult {
   };
 }
 
+export interface AwaitingRejectionSelectionReconciliation {
+  completed: boolean;
+  remainingOrderIds: string[];
+  updated: boolean;
+}
+
 const selectionTtlMs = 5 * 60 * 1000;
 
 const normalizeDecisionText = (message: string): string =>
@@ -210,6 +216,103 @@ export const requestOwnerOrderRejectionReason = async (input: {
     success: true,
     message,
     data: { pendingActionId: String(pendingSelection._id) }
+  };
+};
+
+export const reconcileAwaitingOwnerRejectionSelection = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+  senderRole: Extract<SenderRole, "owner" | "manager">;
+  pendingActionId: string;
+  expectedOrderIds: string[];
+  successfulOrderIds: string[];
+}): Promise<AwaitingRejectionSelectionReconciliation> => {
+  const expectedOrderIds = Array.from(
+    new Set(input.expectedOrderIds.map(String).filter(Boolean))
+  );
+  const expectedOrderIdSet = new Set(expectedOrderIds);
+  const successfulOrderIds = Array.from(
+    new Set(
+      input.successfulOrderIds
+        .map(String)
+        .filter((orderId) => expectedOrderIdSet.has(orderId))
+    )
+  );
+  const successfulOrderIdSet = new Set(successfulOrderIds);
+  const remainingOrderIds = expectedOrderIds.filter(
+    (orderId) => !successfulOrderIdSet.has(orderId)
+  );
+
+  if (expectedOrderIds.length === 0 || successfulOrderIds.length === 0) {
+    return {
+      completed: false,
+      remainingOrderIds: expectedOrderIds,
+      updated: false
+    };
+  }
+
+  const exactSelectionScope = {
+    _id: input.pendingActionId,
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole,
+    action: "OWNER_ORDER_SELECTION",
+    expiresAt: { $gt: new Date() },
+    "data.decision": "reject",
+    "data.awaitingReason": true,
+    "data.orderIds": { $size: expectedOrderIds.length, $all: expectedOrderIds }
+  };
+
+  if (remainingOrderIds.length === 0) {
+    const updateResult = await PendingAgentAction.updateOne(
+      { ...exactSelectionScope, status: "pending" },
+      {
+        $set: {
+          status: "completed",
+          completedAt: new Date(),
+          resultMessage: `${expectedOrderIds.length} order(s) rejected.`
+        },
+        $unset: { errorMessage: 1 },
+        $inc: { actionVersion: 1 }
+      }
+    );
+
+    if (updateResult.matchedCount > 0) {
+      return { completed: true, remainingOrderIds: [], updated: true };
+    }
+
+    const alreadyCompleted = await PendingAgentAction.exists({
+      ...exactSelectionScope,
+      status: "completed"
+    });
+
+    return {
+      completed: Boolean(alreadyCompleted),
+      remainingOrderIds: [],
+      updated: false
+    };
+  }
+
+  const updateResult = await PendingAgentAction.updateOne(
+    { ...exactSelectionScope, status: "pending" },
+    {
+      $set: {
+        "data.orderIds": remainingOrderIds,
+        confirmationMessage:
+          remainingOrderIds.length === 1
+            ? "Please provide the rejection reason again for the remaining order."
+            : `Please provide the rejection reason again for the ${remainingOrderIds.length} remaining orders.`,
+        resultMessage: `${successfulOrderIds.length} order(s) rejected; ${remainingOrderIds.length} still pending.`
+      },
+      $unset: { errorMessage: 1 },
+      $inc: { actionVersion: 1 }
+    }
+  );
+
+  return {
+    completed: false,
+    remainingOrderIds,
+    updated: updateResult.matchedCount > 0
   };
 };
 

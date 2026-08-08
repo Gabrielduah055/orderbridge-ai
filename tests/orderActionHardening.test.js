@@ -13,6 +13,7 @@ const { PendingAgentAction } = require("../dist/models/pendingAgentAction.model"
 const orderService = require("../dist/services/order.service");
 const {
   handleSavedOwnerSelectionReply,
+  reconcileAwaitingOwnerRejectionSelection,
   requestOwnerOrderRejectionReason
 } = require("../dist/services/ownerOrderResolution.service");
 
@@ -358,6 +359,88 @@ test("one successful order tool only closes a single-order saved selection", asy
     Order.findOne = originalOrderFindOne;
     orderService.confirmRestaurantOrder = originalConfirmOrder;
     PendingAgentAction.updateMany = originalPendingUpdateMany;
+  }
+});
+
+test("awaiting rejection reconciliation is exact, scoped, and preserves remaining orders", async () => {
+  const originalPendingUpdateOne = PendingAgentAction.updateOne;
+  const originalPendingExists = PendingAgentAction.exists;
+  const updateCalls = [];
+  const existsCalls = [];
+  let simulateAlreadyCompleted = false;
+  const firstOrderId = "64b000000000000000000104";
+  const secondOrderId = "64b000000000000000000105";
+
+  PendingAgentAction.updateOne = async (filter, update) => {
+    updateCalls.push({ filter, update });
+    return simulateAlreadyCompleted
+      ? { matchedCount: 0, modifiedCount: 0 }
+      : { matchedCount: 1, modifiedCount: 1 };
+  };
+  PendingAgentAction.exists = async (filter) => {
+    existsCalls.push(filter);
+    return { _id: filter._id };
+  };
+
+  try {
+    const partial = await reconcileAwaitingOwnerRejectionSelection({
+      restaurantId,
+      senderPhone: ownerPhone,
+      senderRole: "owner",
+      pendingActionId: "64b000000000000000000999",
+      expectedOrderIds: [firstOrderId, secondOrderId],
+      successfulOrderIds: [firstOrderId]
+    });
+    const completed = await reconcileAwaitingOwnerRejectionSelection({
+      restaurantId,
+      senderPhone: ownerPhone,
+      senderRole: "owner",
+      pendingActionId: "64b000000000000000000999",
+      expectedOrderIds: [secondOrderId],
+      successfulOrderIds: [secondOrderId]
+    });
+    simulateAlreadyCompleted = true;
+    const alreadyCompleted = await reconcileAwaitingOwnerRejectionSelection({
+      restaurantId,
+      senderPhone: ownerPhone,
+      senderRole: "owner",
+      pendingActionId: "64b000000000000000000998",
+      expectedOrderIds: [firstOrderId],
+      successfulOrderIds: [firstOrderId]
+    });
+
+    assert.deepEqual(partial, {
+      completed: false,
+      remainingOrderIds: [secondOrderId],
+      updated: true
+    });
+    assert.deepEqual(completed, {
+      completed: true,
+      remainingOrderIds: [],
+      updated: true
+    });
+    assert.deepEqual(alreadyCompleted, {
+      completed: true,
+      remainingOrderIds: [],
+      updated: false
+    });
+    assert.equal(String(updateCalls[0].filter.restaurantId), restaurantId);
+    assert.equal(updateCalls[0].filter.senderPhone, ownerPhone);
+    assert.equal(updateCalls[0].filter.senderRole, "owner");
+    assert.equal(updateCalls[0].filter.action, "OWNER_ORDER_SELECTION");
+    assert.equal(updateCalls[0].filter["data.decision"], "reject");
+    assert.equal(updateCalls[0].filter["data.awaitingReason"], true);
+    assert.deepEqual(updateCalls[0].filter["data.orderIds"], {
+      $size: 2,
+      $all: [firstOrderId, secondOrderId]
+    });
+    assert.deepEqual(updateCalls[0].update.$set["data.orderIds"], [secondOrderId]);
+    assert.equal(updateCalls[1].update.$set.status, "completed");
+    assert.equal(existsCalls[0].status, "completed");
+    assert.equal(existsCalls[0].senderPhone, ownerPhone);
+  } finally {
+    PendingAgentAction.updateOne = originalPendingUpdateOne;
+    PendingAgentAction.exists = originalPendingExists;
   }
 });
 
