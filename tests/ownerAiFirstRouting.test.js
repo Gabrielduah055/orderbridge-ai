@@ -93,6 +93,14 @@ const unhandledSelection = async () => ({
   message: ""
 });
 
+const makeOrderSafetyDependencies = (overrides = {}) => ({
+  handlePendingImageReply: unhandledImageReply,
+  rememberImageRequest: unhandledImageReply,
+  handleSavedSelection: unhandledSelection,
+  findLatestPendingAction: async () => null,
+  ...overrides
+});
+
 test("owner text reaches the orchestrator before owner order parsing", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];
@@ -214,7 +222,7 @@ test("quoted provider message ID is passed to the staff state builder", async ()
       {
         restaurant: makeRestaurant(),
         senderPhone: ownerPhone,
-        message: "reject this",
+        message: "reject this, no chicken left",
         quotedMessageId
       },
       {
@@ -233,13 +241,22 @@ test("quoted provider message ID is passed to the staff state builder", async ()
         runOrchestrator: async (input) => {
           orchestratorInput = input;
           return makeAgentResult({
-            executedTools: [{ name: "reject_order", success: true }]
+            executedTools: [
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-102",
+                resultOrderNumber: "ORD-102",
+                resultOrderStatus: "rejected"
+              }
+            ]
           });
         }
       }
     );
 
     assert.equal(stateBuilderInput.quotedMessageId, quotedMessageId);
+    assert.equal(orchestratorInput.quotedMessageId, quotedMessageId);
     assert.equal(
       orchestratorInput.staffState.recentReferences.quotedOrder.orderNumber,
       "ORD-102"
@@ -972,6 +989,1012 @@ test("awaiting image confirmation uses the exact typed cancellation tool", async
     assert.deepEqual(events, ["ai"]);
     assert.equal(response.message, "Okay, I cancelled that pending image action.");
     assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("quoted accept cannot be falsely completed by a no-tool AI response", async () => {
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "accept",
+        quotedMessageId: "provider-order-104"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [
+                { id: "order-104", orderNumber: "ORD-104", status: "pending" },
+                { id: "order-105", orderNumber: "ORD-105", status: "pending" }
+              ],
+              recentActive: []
+            },
+            recentReferences: {
+              quotedOrder: { id: "order-104", orderNumber: "ORD-104", status: "pending" }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Done — ORD-104 was accepted." }),
+        executeTool: async (name, args) => {
+          toolCalls.push({ name, args });
+          return { success: true, message: "Order confirmed successfully." };
+        }
+      })
+    );
+
+    assert.deepEqual(toolCalls, [
+      { name: "confirm_order", args: { orderId: "order-104" } }
+    ]);
+    assert.equal(response.source, "legacy_owner");
+  });
+});
+
+test("successful exact order tool execution bypasses the deterministic order parser", async () => {
+  await runWithRoutingHarness(async () => {
+    let legacyCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Accept ORD-104"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "ORD-104 has been accepted.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "accepted"
+              }
+            ]
+          }),
+        executeTool: async () => {
+          legacyCalls += 1;
+          return { success: true, message: "legacy" };
+        }
+      })
+    );
+
+    assert.equal(legacyCalls, 0);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("a successful mutation for the wrong order does not consume the intended turn", async () => {
+  await runWithRoutingHarness(async () => {
+    const fallbackCalls = [];
+    await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Accept ORD-104"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "ORD-104 has been accepted.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: true,
+                resultOrderId: "order-105",
+                resultOrderNumber: "ORD-105",
+                resultOrderStatus: "accepted"
+              }
+            ]
+          }),
+        executeTool: async (name, args) => {
+          fallbackCalls.push({ name, args });
+          return { success: true, message: "ORD-104 accepted." };
+        }
+      })
+    );
+
+    assert.deepEqual(fallbackCalls, [
+      { name: "confirm_order", args: { orderId: "ORD-104" } }
+    ]);
+  });
+});
+
+test("an unrelated successful tool cannot complete a quoted accept", async () => {
+  await runWithRoutingHarness(async () => {
+    const tools = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "accept"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: { freshPending: [], recentActive: [] },
+            recentReferences: {
+              quotedOrder: { id: "order-104", orderNumber: "ORD-104", status: "pending" }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Done, accepted.",
+            executedTools: [{ name: "list_orders", success: true }]
+          }),
+        executeTool: async (name, args) => {
+          tools.push({ name, args });
+          return { success: true, message: "Order accepted." };
+        }
+      })
+    );
+
+    assert.deepEqual(tools, [
+      { name: "confirm_order", args: { orderId: "order-104" } }
+    ]);
+    assert.equal(response.message, "Order accepted.");
+  });
+});
+
+test("quoted rejection keeps the owner's exact inline reason", async () => {
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "reject, no chicken left"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              quotedOrder: { id: "order-104", orderNumber: "ORD-104", status: "pending" }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Done, rejected." }),
+        executeTool: async (name, args) => {
+          toolCalls.push({ name, args });
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.deepEqual(toolCalls, [
+      {
+        name: "reject_order",
+        args: { orderId: "order-104", reason: "no chicken left" }
+      }
+    ]);
+  });
+});
+
+test("reject without a reason creates an exact reason request and never mutates", async () => {
+  await runWithRoutingHarness(async () => {
+    const mutations = [];
+    const reasonRequests = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Reject ORD-104"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Done, rejected." }),
+        requestRejectionReason: async (input) => {
+          reasonRequests.push(input);
+          return {
+            handled: true,
+            success: true,
+            message: "What's the reason for rejecting ORD-104?",
+            data: { pendingActionId: "reason-action-104" }
+          };
+        },
+        executeTool: async (...args) => mutations.push(args)
+      })
+    );
+
+    assert.equal(mutations.length, 0);
+    assert.equal(reasonRequests[0].orderReference, "ORD-104");
+    assert.match(response.message, /reason.*ORD-104/i);
+  });
+});
+
+test("awaiting rejection reason cancellation bypasses AI and never rejects", async () => {
+  for (const message of ["cancel", "never mind"]) {
+    await runWithRoutingHarness(async () => {
+      const events = [];
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: ownerPhone,
+          message
+        },
+        makeOrderSafetyDependencies({
+          buildStaffState: async () =>
+            makeStaffState({
+              recentReferences: {
+                orderSelection: {
+                  pendingActionId: "reason-action-104",
+                  decision: "reject",
+                  awaitingReason: true,
+                  candidates: [
+                    {
+                      id: "order-104",
+                      orderNumber: "ORD-104",
+                      status: "pending",
+                      position: 1
+                    }
+                  ]
+                }
+              }
+            }),
+          runOrchestrator: async () => {
+            events.push("ai");
+            return makeAgentResult({
+              executedTools: [{ name: "reject_order", success: true }]
+            });
+          },
+          handleSavedSelection: async () => {
+            events.push("cancel-selection");
+            return {
+              handled: true,
+              success: true,
+              message: "Okay, I cancelled that order rejection."
+            };
+          },
+          executeTool: async () => {
+            events.push("reject_order");
+            return { success: true, message: "Order rejected." };
+          }
+        })
+      );
+
+      assert.deepEqual(events, ["cancel-selection"]);
+      assert.equal(response.source, "legacy_owner");
+      assert.match(response.message, /cancelled/i);
+    });
+  }
+});
+
+test("awaiting rejection reason blocks a no-tool false rejection claim", async () => {
+  await runWithRoutingHarness(async () => {
+    const unchangedOrder = { id: "order-104", status: "pending" };
+    let pendingSelectionStatus = "pending";
+    let deterministicMutations = 0;
+    let reconciliationCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Done — ORD-104 has been rejected.",
+            executedTools: []
+          }),
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          unchangedOrder.status = "rejected";
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.match(response.message, /haven't confirmed/i);
+    assert.doesNotMatch(response.message, /has been rejected|done.*rejected/i);
+    assert.equal(unchangedOrder.status, "pending");
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(deterministicMutations, 0);
+    assert.equal(reconciliationCalls, 0);
+  });
+});
+
+test("awaiting rejection reason keeps the selection pending after a pre-execution mismatch", async () => {
+  await runWithRoutingHarness(async () => {
+    const unchangedWrongOrder = { id: "order-105", status: "pending" };
+    let pendingSelectionStatus = "pending";
+    let deterministicMutations = 0;
+    let reconciliationCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            success: false,
+            message: "The requested order does not match the active order selection.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: false,
+                code: "ORDER_REFERENCE_MISMATCH",
+                message: "The requested order does not match the active order selection."
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          unchangedWrongOrder.status = "rejected";
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(unchangedWrongOrder.status, "pending");
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(deterministicMutations, 0);
+    assert.equal(reconciliationCalls, 0);
+    assert.match(response.message, /haven't confirmed/i);
+  });
+});
+
+test("awaiting rejection reason keeps the selection pending after a conflicting confirm attempt", async () => {
+  await runWithRoutingHarness(async () => {
+    const selectedOrder = { id: "order-104", status: "pending" };
+    let pendingSelectionStatus = "pending";
+    let deterministicMutations = 0;
+    let reconciliationCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: selectedOrder.id,
+                    orderNumber: "ORD-104",
+                    status: selectedOrder.status,
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            success: false,
+            message:
+              "Only rejecting one of the selected orders is allowed while the rejection reason is pending.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: false,
+                code: "ORDER_WORKFLOW_CONFLICT",
+                message:
+                  "Only rejecting one of the selected orders is allowed while the rejection reason is pending."
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          selectedOrder.status = "accepted";
+          return { success: true, message: "Order confirmed." };
+        }
+      })
+    );
+
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.equal(selectedOrder.status, "pending");
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(deterministicMutations, 0);
+    assert.equal(reconciliationCalls, 0);
+    assert.match(response.message, /haven't confirmed/i);
+  });
+});
+
+test("awaiting rejection reason conversational text cannot trigger deterministic rejection", async () => {
+  await runWithRoutingHarness(async () => {
+    const mutations = [];
+    let savedSelectionCalls = 0;
+    let reconciliationCalls = 0;
+    let pendingSelectionStatus = "pending";
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "hold on let me check"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Okay, let me know when you have checked." }),
+        handleSavedSelection: async () => {
+          savedSelectionCalls += 1;
+          return { handled: false, success: false, message: "" };
+        },
+        reconcileAwaitingSelection: async () => {
+          reconciliationCalls += 1;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async (...args) => mutations.push(args)
+      })
+    );
+
+    assert.equal(mutations.length, 0);
+    assert.equal(savedSelectionCalls, 0);
+    assert.equal(reconciliationCalls, 0);
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("AI can reject the selected order with the owner's actual supplied reason", async () => {
+  await runWithRoutingHarness(async () => {
+    let deterministicMutations = 0;
+    let pendingSelectionStatus = "pending";
+    let reconciliationInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "Chicken is finished"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-104",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "ORD-104 was rejected because chicken is finished.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "rejected"
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async (input) => {
+          reconciliationInput = input;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        },
+        executeTool: async () => {
+          deterministicMutations += 1;
+          return { success: true, message: "Order rejected." };
+        }
+      })
+    );
+
+    assert.equal(deterministicMutations, 0);
+    assert.equal(pendingSelectionStatus, "completed");
+    assert.deepEqual(reconciliationInput.expectedOrderIds, ["order-104"]);
+    assert.deepEqual(reconciliationInput.successfulOrderIds, ["order-104"]);
+    assert.deepEqual(response.data.orders, [{ id: "order-104" }]);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("awaiting rejection reason completes after both exact selected orders are rejected", async () => {
+  await runWithRoutingHarness(async () => {
+    let pendingSelectionStatus = "pending";
+    let reconciliationInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "We're out of chicken."
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-both",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  },
+                  {
+                    id: "order-105",
+                    orderNumber: "ORD-105",
+                    status: "pending",
+                    position: 2
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Both orders were rejected.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "rejected"
+              },
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-105",
+                resultOrderNumber: "ORD-105",
+                resultOrderStatus: "rejected"
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async (input) => {
+          reconciliationInput = input;
+          pendingSelectionStatus = "completed";
+          return { completed: true, remainingOrderIds: [], updated: true };
+        }
+      })
+    );
+
+    assert.equal(pendingSelectionStatus, "completed");
+    assert.deepEqual(reconciliationInput.expectedOrderIds, [
+      "order-104",
+      "order-105"
+    ]);
+    assert.deepEqual(reconciliationInput.successfulOrderIds, [
+      "order-104",
+      "order-105"
+    ]);
+    assert.deepEqual(response.data.orders, [
+      { id: "order-104" },
+      { id: "order-105" }
+    ]);
+    assert.equal(response.data.orderEvent, "rejected");
+    assert.equal(response.data.notifyCustomer, true);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("awaiting rejection reason keeps the remaining exact order after partial AI mutation", async () => {
+  await runWithRoutingHarness(async () => {
+    let pendingSelectionStatus = "pending";
+    let pendingOrderIds = ["order-104", "order-105"];
+    let reconciliationInput;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "We're out of chicken."
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "reason-action-both",
+                decision: "reject",
+                awaitingReason: true,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  },
+                  {
+                    id: "order-105",
+                    orderNumber: "ORD-105",
+                    status: "pending",
+                    position: 2
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({
+            message: "Done — both orders were rejected.",
+            executedTools: [
+              {
+                name: "reject_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "rejected"
+              }
+            ]
+          }),
+        reconcileAwaitingSelection: async (input) => {
+          reconciliationInput = input;
+          pendingOrderIds = ["order-105"];
+          return {
+            completed: false,
+            remainingOrderIds: ["order-105"],
+            updated: true
+          };
+        }
+      })
+    );
+
+    assert.equal(pendingSelectionStatus, "pending");
+    assert.deepEqual(pendingOrderIds, ["order-105"]);
+    assert.deepEqual(reconciliationInput.successfulOrderIds, ["order-104"]);
+    assert.equal(response.success, false);
+    assert.equal(response.source, "legacy_owner");
+    assert.deepEqual(response.data.orders, [{ id: "order-104" }]);
+    assert.match(response.message, /ORD-105 is still pending/i);
+    assert.doesNotMatch(response.message, /both orders (?:were|are) rejected/i);
+  });
+});
+
+test("one AI mutation cannot consume a two-order saved selection", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "all"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [
+                { id: "order-104", orderNumber: "ORD-104", status: "pending" },
+                { id: "order-105", orderNumber: "ORD-105", status: "pending" }
+              ],
+              recentActive: []
+            },
+            recentReferences: {
+              orderSelection: {
+                pendingActionId: "selection-action",
+                decision: "accept",
+                awaitingReason: false,
+                candidates: [
+                  {
+                    id: "order-104",
+                    orderNumber: "ORD-104",
+                    status: "pending",
+                    position: 1
+                  },
+                  {
+                    id: "order-105",
+                    orderNumber: "ORD-105",
+                    status: "pending",
+                    position: 2
+                  }
+                ]
+              }
+            }
+          }),
+        runOrchestrator: async () => {
+          events.push("ai-one-order");
+          return makeAgentResult({
+            message: "ORD-104 was accepted.",
+            executedTools: [
+              {
+                name: "confirm_order",
+                success: true,
+                resultOrderId: "order-104",
+                resultOrderNumber: "ORD-104",
+                resultOrderStatus: "accepted"
+              }
+            ]
+          });
+        },
+        handleSavedSelection: async () => {
+          events.push("saved-selection-all");
+          return {
+            handled: true,
+            success: true,
+            message: "2 orders accepted.",
+            data: { orders: [{ id: "order-104" }, { id: "order-105" }] }
+          };
+        }
+      })
+    );
+
+    assert.deepEqual(events, ["ai-one-order", "saved-selection-all"]);
+    assert.equal(response.source, "legacy_owner");
+    assert.match(response.message, /2 orders accepted/i);
+  });
+});
+
+test("ambiguous reject does not default to the newest pending order", async () => {
+  await runWithRoutingHarness(async () => {
+    const mutations = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "reject it"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: ["104", "105", "106"].map((number) => ({
+                id: `order-${number}`,
+                orderNumber: `ORD-${number}`,
+                status: "pending"
+              })),
+              recentActive: []
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Done, rejected." }),
+        handleUnquotedDecision: async () => ({
+          handled: true,
+          success: true,
+          message: "Which order should I reject?",
+          data: { pendingActionId: "selection-action" }
+        }),
+        executeTool: async (...args) => mutations.push(args)
+      })
+    );
+
+    assert.equal(mutations.length, 0);
+    assert.match(response.message, /Which order/i);
+  });
+});
+
+test("one actionable pending order can safely satisfy accept it", async () => {
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: managerPhone,
+        message: "accept it"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [
+                { id: "order-104", orderNumber: "ORD-104", status: "pending" }
+              ],
+              recentActive: []
+            }
+          }),
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "Done, accepted." }),
+        executeTool: async (name, args) => {
+          toolCalls.push({ name, args });
+          return { success: true, message: "Order accepted." };
+        }
+      })
+    );
+
+    assert.deepEqual(toolCalls, [
+      { name: "confirm_order", args: { orderId: "order-104" } }
+    ]);
+  });
+});
+
+test("completion fallback uses one active order but clarifies multiple active orders", async () => {
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "done"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [],
+              recentActive: [
+                { id: "order-104", orderNumber: "ORD-104", status: "preparing" }
+              ]
+            }
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        executeTool: async (name, args) => {
+          toolCalls.push({ name, args });
+          return { success: true, message: "Order status updated to completed." };
+        }
+      })
+    );
+
+    assert.deepEqual(toolCalls, [
+      {
+        name: "update_order_status",
+        args: { orderId: "order-104", status: "completed" }
+      }
+    ]);
+  });
+
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "done"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            orders: {
+              freshPending: [],
+              recentActive: [
+                { id: "order-104", orderNumber: "ORD-104", status: "preparing" },
+                { id: "order-105", orderNumber: "ORD-105", status: "ready" }
+              ]
+            }
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        executeTool: async (...args) => toolCalls.push(args)
+      })
+    );
+
+    assert.equal(toolCalls.length, 0);
+    assert.match(response.message, /Which order/i);
+  });
+});
+
+test("a no-tool ready claim falls back to the scoped status tool", async () => {
+  await runWithRoutingHarness(async () => {
+    const toolCalls = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: managerPhone,
+        message: "mark ORD-104 ready"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "ORD-104 is ready." }),
+        executeTool: async (name, args) => {
+          toolCalls.push({ name, args });
+          return { success: true, message: "Order status updated to ready." };
+        }
+      })
+    );
+
+    assert.deepEqual(toolCalls, [
+      {
+        name: "update_order_status",
+        args: { orderId: "ORD-104", status: "ready" }
+      }
+    ]);
+    assert.equal(response.source, "legacy_owner");
+  });
+});
+
+test("read-only order questions do not trigger the mutation safety fallback", async () => {
+  await runWithRoutingHarness(async () => {
+    let legacyCalls = 0;
+    for (const message of ["what happened to ORD-104?", "why was this rejected?"]) {
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: ownerPhone,
+          message
+        },
+        makeOrderSafetyDependencies({
+          buildStaffState: buildEmptyStaffState,
+          runOrchestrator: async () => makeAgentResult({ message: "Here is the status." }),
+          executeTool: async () => {
+            legacyCalls += 1;
+            return { success: true, message: "mutated" };
+          }
+        })
+      );
+      assert.equal(response.source, "openrouter_agent");
+    }
+    assert.equal(legacyCalls, 0);
   });
 });
 

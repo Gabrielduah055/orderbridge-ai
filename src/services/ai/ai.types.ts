@@ -1,6 +1,10 @@
 import type { IOrderDocument } from "../../models/order.model";
 import type { IRestaurantDocument } from "../../models/Restaurant";
-import type { ResolvedSender, ToolResult } from "../../types/agent.types";
+import type {
+  ResolvedSender,
+  ToolExecutionContext,
+  ToolResult
+} from "../../types/agent.types";
 import type { StaffOperationalState } from "./staffOperationalState.service";
 
 export type AiProviderName = "hermes" | "openrouter";
@@ -65,12 +69,16 @@ export interface ExecutedAgentTool {
   message: string;
   requiresConfirmation?: boolean;
   pendingActionId?: string;
+  resultOrderId?: string;
+  resultOrderNumber?: string;
+  resultOrderStatus?: string;
 }
 
 export interface AgentOrchestratorInput {
   restaurant: IRestaurantDocument;
   sender: ResolvedSender;
   message: string;
+  quotedMessageId?: string;
   staffState?: StaffOperationalState;
 }
 
@@ -96,5 +104,6 @@ export interface AgentOrchestratorResult {
 
 export type AgentToolExecutor = (
   toolName: string,
-  rawArgs: unknown
+  rawArgs: unknown,
+  context: ToolExecutionContext
 ) => Promise<ToolResult>;

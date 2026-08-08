@@ -19,7 +19,11 @@ import type {
   AiUsage,
   ExecutedAgentTool
 } from "./ai.types";
-import type { SaveAgentMessageInput, ToolResult } from "../../types/agent.types";
+import type {
+  SaveAgentMessageInput,
+  ToolExecutionContext,
+  ToolResult
+} from "../../types/agent.types";
 import type { IOrderDocument } from "../../models/order.model";
 
 const safeFallbackMessage =
@@ -31,7 +35,8 @@ const recoverableToolCodes = new Set([
   "ORDER_ITEM_QUANTITY_REQUIRED",
   "ORDER_ITEM_CLARIFICATION_NO_MATCH",
   "ORDER_DRAFT_INCOMPLETE",
-  "CUSTOMER_NAME_REQUIRED"
+  "CUSTOMER_NAME_REQUIRED",
+  "ORDER_REJECTION_REASON_REQUIRED"
 ]);
 
 const classifyOrchestratorError = (error: unknown): string => {
@@ -81,6 +86,99 @@ const stripTrustedModelArguments = (
   );
 };
 
+const orderMutationToolNames = new Set([
+  "cancel_order",
+  "confirm_order",
+  "reject_order",
+  "update_order_status"
+]);
+
+const getRequestedOrderReferences = (
+  args: Record<string, unknown>
+): string[] => {
+  return [args.orderId, args.orderReference]
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+};
+
+const referencesMatchAllowedValues = (
+  requestedReferences: string[],
+  allowedReferences: Array<string | undefined>
+): boolean => {
+  const allowed = new Set(
+    allowedReferences
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  return (
+    requestedReferences.length > 0 &&
+    allowed.size > 0 &&
+    requestedReferences.every((reference) => allowed.has(reference))
+  );
+};
+
+const getTrustedOrderReferenceGuardResult = (
+  input: AgentOrchestratorInput,
+  toolName: string,
+  args: Record<string, unknown>
+): ToolResult | null => {
+  if (
+    (input.sender.role !== "owner" && input.sender.role !== "manager") ||
+    !orderMutationToolNames.has(toolName)
+  ) {
+    return null;
+  }
+
+  const requestedReferences = getRequestedOrderReferences(args);
+  const selection = input.staffState?.recentReferences.orderSelection;
+
+  if (selection?.decision === "reject" && selection.awaitingReason) {
+    if (toolName !== "reject_order") {
+      return {
+        success: false,
+        code: "ORDER_WORKFLOW_CONFLICT",
+        message:
+          "Only rejecting one of the selected orders is allowed while the rejection reason is pending."
+      };
+    }
+
+    const allowedOrderIds = selection.candidates.map((candidate) => candidate.id);
+
+    if (!referencesMatchAllowedValues(requestedReferences, allowedOrderIds)) {
+      return {
+        success: false,
+        code: "ORDER_REFERENCE_MISMATCH",
+        message: "The requested order does not match the active order selection."
+      };
+    }
+  }
+
+  const explicitCurrentReference = input.message.match(
+    /\b(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})\b/i
+  )?.[1];
+  const quotedOrder = input.staffState?.recentReferences.quotedOrder;
+
+  if (input.quotedMessageId && !explicitCurrentReference && quotedOrder) {
+    if (
+      !referencesMatchAllowedValues(requestedReferences, [
+        quotedOrder.id,
+        quotedOrder.orderNumber
+      ])
+    ) {
+      return {
+        success: false,
+        code: "ORDER_REFERENCE_MISMATCH",
+        message: "The requested order does not match the quoted order."
+      };
+    }
+  }
+
+  return null;
+};
+
 const toConversationMessage = (message: {
   role: string;
   content: string;
@@ -104,6 +202,29 @@ const buildToolResultForModel = (toolName: string, result: ToolResult) => ({
   requiresConfirmation: result.requiresConfirmation,
   pendingActionId: result.pendingActionId
 });
+
+const getExecutedOrderMetadata = (data: unknown) => {
+  if (!data || typeof data !== "object") {
+    return {};
+  }
+
+  const order = (data as Record<string, unknown>).order;
+  if (!order || typeof order !== "object") {
+    return {};
+  }
+
+  const source = order as Record<string, unknown>;
+  const rawId = source.id ?? source._id;
+
+  return {
+    resultOrderId:
+      rawId === undefined || rawId === null ? undefined : String(rawId),
+    resultOrderNumber:
+      typeof source.orderNumber === "string" ? source.orderNumber : undefined,
+    resultOrderStatus:
+      typeof source.status === "string" ? source.status : undefined
+  };
+};
 
 const removeImageUrlsForModel = (value: unknown): unknown => {
   if (Array.isArray(value)) {
@@ -319,15 +440,14 @@ export const runAgentOrchestrator = async (
   let usage: AiUsage | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
-  const executeTool =
-    dependencies.executeTool ??
-    ((toolName, rawArgs) =>
-      executeAgentTool(toolName, rawArgs, {
-        restaurantId,
-        restaurant: input.restaurant,
-        sender: input.sender,
-        originalMessage: normalizedInputMessage
-      }));
+  const executeTool = dependencies.executeTool ?? executeAgentTool;
+  const toolExecutionContext: ToolExecutionContext = {
+    restaurantId,
+    restaurant: input.restaurant,
+    sender: input.sender,
+    originalMessage: normalizedInputMessage,
+    quotedMessageId: input.quotedMessageId
+  };
 
   try {
     for (let round = 0; round < maxToolRounds; round += 1) {
@@ -396,6 +516,11 @@ export const runAgentOrchestrator = async (
       for (const toolCall of response.toolCalls) {
         const toolName = toolCall.name;
         const safeArguments = stripTrustedModelArguments(toolCall.arguments);
+        const trustedReferenceGuardResult = getTrustedOrderReferenceGuardResult(
+          input,
+          toolName,
+          safeArguments
+        );
         const result = toolCall.invalidArguments
           ? {
               success: false,
@@ -404,7 +529,12 @@ export const runAgentOrchestrator = async (
                 "The tool arguments were malformed. Please retry the tool call with valid JSON arguments."
             }
           : permittedToolNames.has(toolName)
-            ? await executeTool(toolName, safeArguments)
+            ? trustedReferenceGuardResult ??
+              (await executeTool(
+                toolName,
+                safeArguments,
+                toolExecutionContext
+              ))
             : {
                 success: false,
                 code: "TOOL_FORBIDDEN",
@@ -417,7 +547,8 @@ export const runAgentOrchestrator = async (
           code: result.code,
           message: result.message,
           requiresConfirmation: result.requiresConfirmation,
-          pendingActionId: result.pendingActionId
+          pendingActionId: result.pendingActionId,
+          ...getExecutedOrderMetadata(result.data)
         });
         importantData = getImportantData(importantData, result, toolName);
 

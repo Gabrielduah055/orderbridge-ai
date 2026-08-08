@@ -92,6 +92,8 @@ export interface StaffOrderView {
 export interface StaffOrderSelectionReference {
   pendingActionId: string;
   decision: "accept" | "reject";
+  awaitingReason: boolean;
+  rejectionReason?: string;
   candidates: Array<StaffOrderView & { position: number }>;
 }
 
@@ -384,6 +386,11 @@ export const buildStaffOperationalState = async (
           selectionAction.data?.decision === "reject"
             ? ("reject" as const)
             : ("accept" as const),
+        awaitingReason: selectionAction.data?.awaitingReason === true,
+        rejectionReason:
+          selectionAction.data?.decision === "reject"
+            ? safeString(selectionAction.data?.reason, 500)
+            : undefined,
         candidates: selectionOrderIds.flatMap((orderId, index) => {
           const order = selectionOrderMap.get(orderId);
           return order
