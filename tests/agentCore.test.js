@@ -1061,6 +1061,50 @@ const runNoToolStaffResponse = async (message, responseText) =>
     }
   );
 
+const makePendingCampaignStaffState = (overrides = {}) => ({
+  pendingActions: [],
+  imageWorkflow: null,
+  orders: { freshPending: [], recentActive: [] },
+  recentReferences: {
+    campaign: {
+      id: "64b000000000000000000c01",
+      campaignVersion: 2,
+      pendingActionId: "64b000000000000000000c02",
+      status: "pending_approval"
+    }
+  },
+  permissions: [
+    "approve_campaign",
+    "update_campaign_draft",
+    "confirm_pending_image_assignment",
+    "confirm_order"
+  ],
+  ...overrides
+});
+
+const runSingleToolStaffResponse = async ({
+  message,
+  staffState,
+  toolName,
+  args,
+  finalText
+}) =>
+  runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message,
+      staffState
+    },
+    {
+      provider: makeSingleToolProvider(toolName, args, finalText),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => ({ success: true, message: finalText })
+    }
+  );
+
 test("no-tool campaign creation and cancellation claims are not trusted", async () => {
   const created = await runNoToolStaffResponse(
     "Create a campaign for inactive customers tomorrow.",
@@ -1144,6 +1188,168 @@ test("a trusted pending campaign reference protects no-tool natural follow-up ed
 
   assert.equal(result.success, false);
   assert.match(result.message, /couldn't confirm.*updated/i);
+});
+
+test("pending campaign does not override a successful image confirmation", async () => {
+  const result = await runSingleToolStaffResponse({
+    message: "confirm",
+    staffState: makePendingCampaignStaffState({
+      imageWorkflow: {
+        active: true,
+        type: "menu_item_image",
+        stage: "awaiting_confirmation",
+        imageUploaded: true,
+        itemId: "64b000000000000000000d01",
+        itemName: "Jollof Rice",
+        pendingActionId: "64b000000000000000000d02"
+      }
+    }),
+    toolName: "confirm_pending_image_assignment",
+    args: {},
+    finalText: "Image assignment confirmed."
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.message, "Image assignment confirmed.");
+  assert.equal(result.executedTools[0].name, "confirm_pending_image_assignment");
+});
+
+test("pending campaign does not override a successful quoted-order confirmation", async () => {
+  const orderId = "64b000000000000000000104";
+  const result = await runSingleToolStaffResponse({
+    message: "confirm",
+    staffState: makePendingCampaignStaffState({
+      recentReferences: {
+        campaign: {
+          id: "64b000000000000000000c01",
+          campaignVersion: 2,
+          pendingActionId: "64b000000000000000000c02",
+          status: "pending_approval"
+        },
+        quotedOrder: {
+          id: orderId,
+          orderNumber: "ORD-104",
+          status: "pending"
+        }
+      }
+    }),
+    toolName: "confirm_order",
+    args: { orderId },
+    finalText: "Order ORD-104 confirmed."
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.message, "Order ORD-104 confirmed.");
+  assert.equal(result.executedTools[0].name, "confirm_order");
+});
+
+test("pending campaign alone still protects a generic no-tool approval claim", async () => {
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "confirm",
+      staffState: makePendingCampaignStaffState()
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({
+          text: "Campaign approved.",
+          toolCalls: []
+        })
+      },
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.match(result.message, /haven't approved/i);
+});
+
+test("explicit campaign edit still requires the campaign tool", async () => {
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "change the campaign to 6pm",
+      staffState: makePendingCampaignStaffState()
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({
+          text: "Done, the campaign was updated.",
+          toolCalls: []
+        })
+      },
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.match(result.message, /couldn't confirm.*updated/i);
+});
+
+test("explicit campaign approval remains protected alongside an image workflow", async () => {
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "approve the campaign",
+      staffState: makePendingCampaignStaffState({
+        imageWorkflow: {
+          active: true,
+          type: "menu_item_image",
+          stage: "awaiting_confirmation",
+          imageUploaded: true,
+          pendingActionId: "64b000000000000000000d02"
+        }
+      })
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({
+          text: "Done, the campaign was approved.",
+          toolCalls: []
+        })
+      },
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.match(result.message, /haven't approved/i);
+});
+
+test("reminder schedule changes require reschedule rather than create", async () => {
+  const result = await runSingleToolStaffResponse({
+    message: "Change my reminder schedule to 9am",
+    staffState: makePendingCampaignStaffState({
+      recentReferences: {},
+      permissions: ["reschedule_staff_reminder"]
+    }),
+    toolName: "reschedule_staff_reminder",
+    args: {
+      reminderId: "64b000000000000000000e11",
+      scheduledAt: "2026-08-09T09:00"
+    },
+    finalText: "Reminder rescheduled."
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.message, "Reminder rescheduled.");
+  assert.equal(result.executedTools[0].name, "reschedule_staff_reminder");
 });
 
 test("OpenRouter blocks a rejection outside the trusted awaiting-reason selection before execution", async () => {

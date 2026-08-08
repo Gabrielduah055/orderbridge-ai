@@ -160,11 +160,125 @@ test("owner reminder uses backend sender, restaurant credentials, local timezone
     assert.equal(enqueued.metadata.recipientPhone, ownerPhone);
     assert.equal(enqueued.metadata.recipientRole, "owner");
     assert.equal(enqueued.metadata.apiKey, undefined);
-    assert.match(enqueued.idempotencyKey, /inbound-owner-1$/);
+    assert.match(
+      enqueued.idempotencyKey,
+      /^staff-reminder:.*:inbound-owner-1:[a-f0-9]{64}$/
+    );
     assert.equal(reminder.text, "Check stock");
   } finally {
     wasenderQueue.enqueueWasenderMessage = originalEnqueue;
   }
+});
+
+const captureReminderCreations = async (inputs) => {
+  const originalEnqueue = wasenderQueue.enqueueWasenderMessage;
+  const queuedByKey = new Map();
+  const attemptedKeys = [];
+
+  try {
+    wasenderQueue.enqueueWasenderMessage = async (input) => {
+      attemptedKeys.push(input.idempotencyKey);
+      const existing = queuedByKey.get(input.idempotencyKey);
+
+      if (existing) {
+        return existing;
+      }
+
+      const reminder = makeReminder({
+        _id: `reminder-${queuedByKey.size + 1}`,
+        nextAttemptAt: input.nextAttemptAt,
+        to: input.to,
+        text: input.text,
+        metadata: input.metadata,
+        idempotencyKey: input.idempotencyKey
+      });
+      queuedByKey.set(input.idempotencyKey, reminder);
+      return reminder;
+    };
+
+    await withRestaurant(makeRestaurant(), async () => {
+      for (const input of inputs) {
+        await createStaffReminder(
+          {
+            restaurantId,
+            senderPhone: ownerPhone,
+            ...input
+          },
+          now
+        );
+      }
+    });
+
+    return { attemptedKeys, queuedMessages: [...queuedByKey.values()] };
+  } finally {
+    wasenderQueue.enqueueWasenderMessage = originalEnqueue;
+  }
+};
+
+test("same request and reminder payload deduplicate to one outbound message", async () => {
+  const input = {
+    requestId: "inbound-owner-duplicate",
+    text: "Call supplier",
+    scheduledAt: "2026-08-09T08:00"
+  };
+  const captured = await captureReminderCreations([input, input]);
+
+  assert.equal(captured.queuedMessages.length, 1);
+  assert.equal(captured.attemptedKeys[0], captured.attemptedKeys[1]);
+});
+
+test("same request creates separate reminders for different text and times", async () => {
+  const captured = await captureReminderCreations([
+    {
+      requestId: "inbound-owner-multiple",
+      text: "Call supplier",
+      scheduledAt: "2026-08-09T08:00"
+    },
+    {
+      requestId: "inbound-owner-multiple",
+      text: "Check stock",
+      scheduledAt: "2026-08-09T10:00"
+    }
+  ]);
+
+  assert.equal(captured.queuedMessages.length, 2);
+  assert.notEqual(captured.attemptedKeys[0], captured.attemptedKeys[1]);
+});
+
+test("same request and text at different times creates separate reminders", async () => {
+  const captured = await captureReminderCreations([
+    {
+      requestId: "inbound-owner-different-times",
+      text: "Call supplier",
+      scheduledAt: "2026-08-09T08:00"
+    },
+    {
+      requestId: "inbound-owner-different-times",
+      text: "Call supplier",
+      scheduledAt: "2026-08-09T10:00"
+    }
+  ]);
+
+  assert.equal(captured.queuedMessages.length, 2);
+  assert.notEqual(captured.attemptedKeys[0], captured.attemptedKeys[1]);
+});
+
+test("same request and time with different text creates separate reminders", async () => {
+  const captured = await captureReminderCreations([
+    {
+      requestId: "inbound-owner-different-text",
+      text: "Call supplier",
+      scheduledAt: "2026-08-09T08:00"
+    },
+    {
+      requestId: "inbound-owner-different-text",
+      text: "Check stock",
+      scheduledAt: "2026-08-09T08:00"
+    }
+  ]);
+
+  assert.equal(captured.queuedMessages.length, 2);
+  assert.notEqual(captured.attemptedKeys[0], captured.attemptedKeys[1]);
 });
 
 test("manager reminder is scoped to that exact verified manager", async () => {

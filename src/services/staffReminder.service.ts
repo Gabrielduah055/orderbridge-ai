@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Types } from "mongoose";
 import { z } from "zod";
 import {
@@ -176,6 +177,21 @@ const getScopedReminder = async (
   return reminder;
 };
 
+const getReminderIdempotencyFingerprint = (
+  text: string,
+  scheduledFor: Date
+): string => {
+  const normalizedText = text
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  return createHash("sha256")
+    .update(`${normalizedText}\n${scheduledFor.toISOString()}`)
+    .digest("hex");
+};
+
 export const createStaffReminder = async (
   input: z.infer<typeof createStaffReminderSchema> & {
     restaurantId: string;
@@ -205,7 +221,13 @@ export const createStaffReminder = async (
     );
   }
 
-  const idempotencySuffix = input.requestId?.trim() || new Types.ObjectId();
+  const requestId = input.requestId?.trim();
+  const idempotencySuffix = requestId
+    ? `${requestId}:${getReminderIdempotencyFingerprint(
+        parsed.text,
+        scheduledFor
+      )}`
+    : `generated:${new Types.ObjectId()}`;
   const message = await enqueueWasenderMessage({
     restaurantId: input.restaurantId,
     sessionId: staff.restaurant.wasenderSessionId,

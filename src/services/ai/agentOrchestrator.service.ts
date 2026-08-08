@@ -366,7 +366,7 @@ const mergeUsage = (current: AiUsage | undefined, next: AiUsage | undefined): Ai
 };
 
 const looksLikeSuccessClaim = (message: string): boolean => {
-  return /\b(done|completed|confirmed|placed|created|scheduled|rescheduled|updated|cancelled|sent|delivered|successfully|has been|is now|set up)\b/i.test(
+  return /\b(done|completed|confirmed|approved|placed|created|scheduled|rescheduled|updated|cancell?ed|sent|delivered|successfully|has been|is now|set up)\b/i.test(
     message
   );
 };
@@ -382,13 +382,27 @@ const getRequiredCampaignOrReminderTool = (
 ): RequiredOperationalTool | null => {
   const message = input.message.toLowerCase();
   const mentionsCampaign = /\bcampaigns?\b/.test(message);
-  const hasTrustedCampaignReference = Boolean(
-    input.staffState?.recentReferences.campaign
+  const trustedCampaignReference =
+    input.staffState?.recentReferences.campaign;
+  const hasCompetingCampaignContext = Boolean(
+    input.staffState?.imageWorkflow ||
+      input.staffState?.recentReferences.quotedOrder ||
+      input.staffState?.recentReferences.orderSelection ||
+      /\bORD-[A-Za-z0-9-]+\b/i.test(input.message) ||
+      /\b[a-f0-9]{24}\b/i.test(input.message) ||
+      input.staffState?.pendingActions.some(
+        (action) =>
+          action.requiresConfirmation &&
+          action.actionId !== trustedCampaignReference?.pendingActionId
+      )
+  );
+  const hasUnambiguousCampaignFollowUp = Boolean(
+    trustedCampaignReference && !hasCompetingCampaignContext
   );
   const mentionsReminder = /\breminders?\b/.test(message);
 
   if (
-    (mentionsCampaign || hasTrustedCampaignReference) &&
+    (mentionsCampaign || hasUnambiguousCampaignFollowUp) &&
     /\b(cancel|discard|delete|stop)\b/.test(message) &&
     (mentionsCampaign || /\b(it|that|this)\b/.test(message))
   ) {
@@ -401,7 +415,7 @@ const getRequiredCampaignOrReminderTool = (
   }
 
   if (
-    (mentionsCampaign || hasTrustedCampaignReference) &&
+    (mentionsCampaign || hasUnambiguousCampaignFollowUp) &&
     /\b(approve|confirm|send it|go ahead)\b/.test(message)
   ) {
     return {
@@ -413,7 +427,7 @@ const getRequiredCampaignOrReminderTool = (
   }
 
   if (
-    (mentionsCampaign || hasTrustedCampaignReference) &&
+    (mentionsCampaign || hasUnambiguousCampaignFollowUp) &&
     (/\b(change|edit|update|shorten|rewrite|reschedule|move)\b/.test(
       message
     ) || /\bmake\b.*\b(shorter|longer|less|more)\b/.test(message))
@@ -437,18 +451,6 @@ const getRequiredCampaignOrReminderTool = (
   }
 
   if (
-    (/\bremind me\b/.test(message) ||
-      (mentionsReminder && /\b(create|set|schedule|add)\b/.test(message))) &&
-    !/\b(cancel|delete|remove)\b/.test(message)
-  ) {
-    return {
-      toolName: "create_staff_reminder",
-      safeMessage:
-        "I couldn't confirm that the reminder was scheduled. Please try again."
-    };
-  }
-
-  if (
     mentionsReminder &&
     /\b(cancel|delete|remove)\b/.test(message)
   ) {
@@ -467,6 +469,17 @@ const getRequiredCampaignOrReminderTool = (
       toolName: "reschedule_staff_reminder",
       safeMessage:
         "I couldn't confirm that the reminder was rescheduled. It remains unchanged."
+    };
+  }
+
+  if (
+    /\bremind me\b/.test(message) ||
+    (mentionsReminder && /\b(create|set|schedule|add)\b/.test(message))
+  ) {
+    return {
+      toolName: "create_staff_reminder",
+      safeMessage:
+        "I couldn't confirm that the reminder was scheduled. Please try again."
     };
   }
 
