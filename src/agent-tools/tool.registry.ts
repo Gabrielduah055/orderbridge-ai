@@ -77,6 +77,8 @@ import {
 } from "../models/orderFeedback.model";
 import {
   listCustomerFeedback,
+  orderCheckInOutcomes,
+  respondToOrderCheckIn,
   resolveCustomerFeedback
 } from "../services/orderFeedback.service";
 import { toolPermissions, type ToolName } from "./tool.permissions";
@@ -209,6 +211,13 @@ const updateOrderDraftSchema = z
     customerName: z.string().trim().min(1).optional(),
     orderType: z.enum(["pickup", "delivery"]).optional(),
     deliveryAddress: z.string().trim().min(1).optional()
+  })
+  .strict();
+const respondToOrderCheckInSchema = z
+  .object({
+    outcome: z.enum(orderCheckInOutcomes),
+    orderReference: z.string().trim().min(1).max(80).optional(),
+    feedbackText: z.string().trim().min(1).max(500).optional()
   })
   .strict();
 const addMenuItemsSchema = z
@@ -1100,6 +1109,71 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Latest order retrieved successfully.",
         data: safeOrderView(order)
+      };
+    }
+  },
+  respond_to_order_check_in: {
+    definition: {
+      name: "respond_to_order_check_in",
+      description:
+        "Customer-only. Record a clear response to an active accepted-order check-in. Do not use for new orders, menu requests, or unrelated conversation.",
+      parameters: {
+        outcome:
+          "One of received_satisfied, received_complaint, or not_received.",
+        orderReference:
+          "Order number when the customer identifies it or more than one active check-in exists.",
+        feedbackText:
+          "The customer's own feedback or complaint wording, when provided."
+      }
+    },
+    roles: toolPermissions.respond_to_order_check_in,
+    schema: respondToOrderCheckInSchema,
+    handler: async (args, context) => {
+      const feedbackText = args.feedbackText ?? context.originalMessage;
+      const result = await respondToOrderCheckIn({
+        restaurantId: context.restaurantId,
+        customerPhone: context.sender.normalizedPhone,
+        customerName: context.sender.name,
+        outcome: args.outcome,
+        orderReference: args.orderReference,
+        feedbackText,
+        inboundEventId: context.requestId
+      });
+
+      if (!result.handled || !result.message) {
+        return {
+          success: false,
+          code: "ORDER_CHECK_IN_NOT_FOUND",
+          message: "There is no active order check-in for this customer."
+        };
+      }
+
+      if (!result.success) {
+        return {
+          success: false,
+          code: result.ambiguousOrderNumbers
+            ? "ORDER_CHECK_IN_AMBIGUOUS"
+            : "ORDER_CHECK_IN_NOT_MATCHED",
+          message: result.message,
+          data: result.ambiguousOrderNumbers
+            ? { orderNumbers: result.ambiguousOrderNumbers }
+            : undefined
+        };
+      }
+
+      return {
+        success: true,
+        message: result.message,
+        data: {
+          outcome: args.outcome,
+          orderNumber: result.order?.orderNumber,
+          status: result.order?.status,
+          completionSource: result.order?.completionSource,
+          completionConfirmedByCustomer:
+            result.order?.completionConfirmedByCustomer,
+          feedbackType: result.feedback?.type,
+          requiresOwnerAttention: result.feedback?.requiresOwnerAttention
+        }
       };
     }
   },
@@ -2139,6 +2213,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         context.sender.normalizedPhone,
         args.customerName
       );
+
+      if (draft.currentStep === "idle") {
+        draft.currentStep = "choosing_items";
+        await draft.save();
+      }
 
       return {
         success: true,

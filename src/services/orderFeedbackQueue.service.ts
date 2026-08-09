@@ -7,7 +7,8 @@ import { feedbackCompletionEligibleStatuses } from "./orderCompletion.service";
 import type { WasenderSendResult } from "./wasender.service";
 
 export const ORDER_FEEDBACK_FOLLOW_UP_VERSION = 1;
-export const DEFAULT_ORDER_FEEDBACK_DELAY_MINUTES = 120;
+export const DEFAULT_PICKUP_CHECK_IN_DELAY_MINUTES = 45;
+export const DEFAULT_DELIVERY_CHECK_IN_DELAY_MINUTES = 75;
 export const DEFAULT_ORDER_FEEDBACK_REMINDER_HOURS = 12;
 export const DEFAULT_ORDER_AUTO_COMPLETE_HOURS = 24;
 
@@ -56,11 +57,29 @@ const parsePositiveNumber = (
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
-export const getOrderFeedbackDelayMinutes = (): number =>
-  parsePositiveNumber(
+export const getOrderCheckInDelayMinutes = (
+  restaurant: Pick<
+    IRestaurantDocument,
+    "pickupCheckInDelayMinutes" | "deliveryCheckInDelayMinutes"
+  >,
+  orderType: IOrderDocument["orderType"]
+): number => {
+  const configured =
+    orderType === "pickup"
+      ? restaurant.pickupCheckInDelayMinutes
+      : restaurant.deliveryCheckInDelayMinutes;
+
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+
+  return parsePositiveNumber(
     process.env.ORDER_FEEDBACK_DELAY_MINUTES,
-    DEFAULT_ORDER_FEEDBACK_DELAY_MINUTES
+    orderType === "pickup"
+      ? DEFAULT_PICKUP_CHECK_IN_DELAY_MINUTES
+      : DEFAULT_DELIVERY_CHECK_IN_DELAY_MINUTES
   );
+};
 
 export const getOrderFeedbackReminderHours = (): number =>
   parsePositiveNumber(
@@ -74,33 +93,64 @@ export const getOrderAutoCompleteHours = (): number =>
     DEFAULT_ORDER_AUTO_COMPLETE_HOURS
   );
 
+export const getOrderFeedbackReminderDelayMs = (): number => {
+  const configuredMinutes = Number(process.env.ORDER_FEEDBACK_REMINDER_MINUTES);
+
+  return Number.isFinite(configuredMinutes) && configuredMinutes > 0
+    ? configuredMinutes * 60_000
+    : getOrderFeedbackReminderHours() * 60 * 60_000;
+};
+
+export const getOrderAutoCompleteDelayMs = (): number => {
+  const configuredMinutes = Number(process.env.ORDER_AUTO_COMPLETE_MINUTES);
+
+  return Number.isFinite(configuredMinutes) && configuredMinutes > 0
+    ? configuredMinutes * 60_000
+    : getOrderAutoCompleteHours() * 60 * 60_000;
+};
+
 export const buildOrderFeedbackRequestMessage = (
   restaurant: Pick<IRestaurantDocument, "name">,
-  order: Pick<IOrderDocument, "customerName" | "orderNumber" | "_id">
+  order: Pick<IOrderDocument, "customerName" | "orderNumber" | "orderType" | "_id">
 ): string => {
   const customer = order.customerName?.trim();
-  const greeting = customer ? `Hi ${customer},` : "Hi,";
+  const greeting = customer ? `Hi ${customer} 👋` : "Hi there 👋";
   const orderNumber = order.orderNumber ?? String(order._id);
+  const choices =
+    order.orderType === "pickup"
+      ? [
+          "1. I picked it up and everything is fine",
+          "2. I received it, but I have a complaint",
+          "3. I haven't received/picked it up yet"
+        ]
+      : [
+          "1. Received and satisfied",
+          "2. Received, but I have a complaint",
+          "3. I have not received it"
+        ];
 
   return [
-    `${greeting} we hope you received order ${orderNumber} from ${restaurant.name}.`,
+    greeting,
     "",
-    "Reply:",
-    "1. Received and satisfied",
-    "2. Received, but I have a complaint",
-    "3. I have not received it",
+    `Just checking on order ${orderNumber} from ${restaurant.name}.`,
     "",
-    "You can also type your review or suggestion."
+    ...choices,
+    "",
+    "You can also type your feedback."
   ].join("\n");
 };
 
 export const buildOrderFeedbackReminderMessage = (
   restaurant: Pick<IRestaurantDocument, "name">,
-  order: Pick<IOrderDocument, "orderNumber" | "_id">
+  order: Pick<IOrderDocument, "orderNumber" | "orderType" | "_id">
 ): string => {
   const orderNumber = order.orderNumber ?? String(order._id);
+  const pendingText =
+    order.orderType === "pickup"
+      ? "3 if you have not received or picked it up yet"
+      : "3 if you have not received it";
 
-  return `Just checking on order ${orderNumber} from ${restaurant.name}. Reply 1 if received, 2 for a complaint, or 3 if it has not arrived.`;
+  return `One quick check-in on order ${orderNumber} from ${restaurant.name}: reply 1 if everything is fine, 2 for a complaint, or ${pendingText}.`;
 };
 
 export const buildOrderFeedbackQueueMetadata = (
@@ -166,6 +216,10 @@ export const scheduleOrderFeedbackFollowUp = async (
     return { scheduled: false, reason: `order_${order.status}` };
   }
 
+  if (restaurant.orderCheckInEnabled === false) {
+    return { scheduled: false, reason: "order_check_in_disabled" };
+  }
+
   if (!order.customerConfirmedNotificationSentAt && !order.receiptSentAt) {
     return { scheduled: false, reason: "acceptance_message_not_sent" };
   }
@@ -197,9 +251,14 @@ export const scheduleOrderFeedbackFollowUp = async (
     orderId,
     followUpVersion
   );
+  const acceptanceAnchor =
+    order.customerConfirmedNotificationSentAt ?? order.receiptSentAt!;
   const scheduledAt =
     order.feedbackFollowUpScheduledAt ??
-    new Date(now.getTime() + getOrderFeedbackDelayMinutes() * 60_000);
+    new Date(
+      acceptanceAnchor.getTime() +
+        getOrderCheckInDelayMinutes(restaurant, order.orderType) * 60_000
+    );
   const queued = await dependencies.enqueueMessage({
     restaurantId,
     sessionId: restaurant.wasenderSessionId,
@@ -303,6 +362,10 @@ export const getQueuedOrderFeedbackStaleReason = async (
 
   if (!restaurant) {
     return "restaurant_inactive_or_missing";
+  }
+
+  if (restaurant.orderCheckInEnabled === false) {
+    return "order_check_in_disabled";
   }
 
   if (restaurant.wasenderSessionId !== message.sessionId) {

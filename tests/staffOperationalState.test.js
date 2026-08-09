@@ -621,7 +621,8 @@ test("staff operational state reaches a delimited data-only prompt section", asy
       buildRestaurantContext: async () => promptContext(owner, state.permissions),
       findDraft: async () => null,
       findClarification: async () => null,
-      loadCustomerMemory: async () => null
+      loadCustomerMemory: async () => null,
+      loadActiveCheckIns: async () => []
     },
     state
   );
@@ -679,7 +680,8 @@ test("customer prompt remains unchanged and never receives staff state", async (
       buildRestaurantContext: async () => promptContext(customer, ["get_menu"]),
       findDraft: async () => null,
       findClarification: async () => null,
-      loadCustomerMemory: async () => null
+      loadCustomerMemory: async () => null,
+      loadActiveCheckIns: async () => []
     },
     accidentalStaffState
   );

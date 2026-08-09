@@ -832,21 +832,26 @@ export const submitOrderDraft = async (
 };
 
 export const buildStateAwareFollowUpMessage = (
-  step: ICustomerSessionDocument["currentStep"]
+  step: ICustomerSessionDocument["currentStep"],
+  cartItemCount = 0
 ): string | null => {
   switch (step) {
+    case "choosing_items":
+      return cartItemCount > 0
+        ? "Still there? You can add another item or continue with your order."
+        : "Still there? Tell me what you'd like to order whenever you're ready.";
     case "collecting_quantity":
-      return "Are you still there? I just need the number of portions you would like.";
+      return "Still there? I just need the quantity you'd like.";
     case "choosing_order_type":
-      return "Are you still there? Should I prepare the order for pickup or delivery?";
+      return "Still there? Would you like pickup or delivery?";
     case "selecting_item_from_category":
       return "Are you still there? Please choose one of the options I listed.";
     case "collecting_address":
-      return "Are you still there? Please send the delivery location when you are ready.";
+      return "Still there? Please send the delivery location when you're ready.";
     case "collecting_name":
-      return "Are you still there? I just need the name for the order.";
+      return "Still there? I just need the name for the order.";
     case "confirming_order":
-      return "Your order is ready to be submitted. Would you like me to send it to the restaurant?";
+      return "Your order is ready to submit whenever you're ready.";
     default:
       return null;
   }

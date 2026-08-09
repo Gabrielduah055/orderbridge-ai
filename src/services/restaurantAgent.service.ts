@@ -33,7 +33,10 @@ import {
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
-import { handleOrderFeedbackCustomerResponse } from "./orderFeedback.service";
+import {
+  handleOrderFeedbackCustomerResponse,
+  type HandleOrderFeedbackResponseResult
+} from "./orderFeedback.service";
 import type {
   RestaurantAgentMessageInput,
   RestaurantAgentResponse,
@@ -44,6 +47,8 @@ import {
   buildStaffOperationalState,
   createEmptyStaffOperationalState
 } from "./ai/staffOperationalState.service";
+import { findActiveDraft } from "./orderDraft.service";
+import type { CustomerSessionStep } from "../models/customerSession.model";
 
 const temporaryHermesErrorMessage =
   "I'm having trouble reaching the restaurant assistant right now. Please try again in a few minutes.";
@@ -57,7 +62,8 @@ const customerMutationToolNames = new Set([
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "respond_to_order_check_in"
 ]);
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
@@ -102,6 +108,24 @@ export const isExplicitCustomerClarificationResetMessage = (
 
   return explicitCustomerClarificationResetMessages.has(normalized);
 };
+
+export const isExactOrderCheckInReply = (message: string): boolean =>
+  /^[123][.!]?$/.test(normalizeText(message));
+
+const competingCustomerOrderSteps = new Set<CustomerSessionStep>([
+  "choosing_items",
+  "selecting_item_from_category",
+  "collecting_quantity",
+  "choosing_order_type",
+  "collecting_address",
+  "collecting_name",
+  "awaiting_delivery_fee",
+  "confirming_order"
+]);
+
+export const hasCompetingCustomerOrderWorkflow = (
+  draft: { currentStep: CustomerSessionStep } | null
+): boolean => Boolean(draft && competingCustomerOrderSteps.has(draft.currentStep));
 
 export const parseSpecificMenuItemViewRequest = (message: string): string | null => {
   const normalized = normalizeText(message);
@@ -249,6 +273,8 @@ export interface RestaurantAgentRoutingDependencies {
   executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
   cancelPendingAction?: typeof cancelPendingToolAction;
   cancelCustomerClarifications?: typeof cancelPendingOrderItemClarifications;
+  handleCustomerFeedback?: typeof handleOrderFeedbackCustomerResponse;
+  findCustomerDraft?: typeof findActiveDraft;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -836,6 +862,9 @@ export const handleRestaurantAgentMessage = async (
     dependencies.handleLegacyCustomerMessage ?? handleLegacyCustomerMessage;
   const cancelCustomerClarifications =
     dependencies.cancelCustomerClarifications ?? cancelPendingOrderItemClarifications;
+  const handleCustomerFeedback =
+    dependencies.handleCustomerFeedback ?? handleOrderFeedbackCustomerResponse;
+  const findCustomerDraft = dependencies.findCustomerDraft ?? findActiveDraft;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -916,13 +945,38 @@ export const handleRestaurantAgentMessage = async (
       };
     }
 
-    const feedbackResult = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone: sender.normalizedPhone,
-      customerName: sender.name,
-      message,
-      inboundEventId: input.inboundEventId
-    });
+    const exactCheckInReply = isExactOrderCheckInReply(message);
+    let competingOrderWorkflow = false;
+
+    if (customerOpenRouterEnabled && exactCheckInReply) {
+      try {
+        const activeDraft = await findCustomerDraft(
+          restaurantId,
+          sender.normalizedPhone
+        );
+        competingOrderWorkflow = hasCompetingCustomerOrderWorkflow(activeDraft);
+      } catch (error) {
+        // If trusted draft state cannot be loaded, do not risk mutating an old
+        // feedback workflow through the deterministic numbered shortcut.
+        competingOrderWorkflow = true;
+        console.error("[customerAgent] active draft check failed", {
+          restaurantId,
+          errorType: error instanceof Error ? error.name : "UnknownError"
+        });
+      }
+    }
+
+    const feedbackResult: HandleOrderFeedbackResponseResult =
+      !customerOpenRouterEnabled ||
+      (exactCheckInReply && !competingOrderWorkflow)
+        ? await handleCustomerFeedback({
+            restaurantId,
+            customerPhone: sender.normalizedPhone,
+            customerName: sender.name,
+            message,
+            inboundEventId: input.inboundEventId
+          })
+        : { handled: false, success: false };
 
     if (feedbackResult.handled && feedbackResult.message) {
       await saveAgentConversationMessage({

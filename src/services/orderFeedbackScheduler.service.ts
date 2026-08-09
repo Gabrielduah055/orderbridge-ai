@@ -8,8 +8,8 @@ import {
 import {
   buildOrderFeedbackQueueMetadata,
   buildOrderFeedbackReminderMessage,
-  getOrderAutoCompleteHours,
-  getOrderFeedbackReminderHours,
+  getOrderAutoCompleteDelayMs,
+  getOrderFeedbackReminderDelayMs,
   getOrderFeedbackReminderIdempotencyKey,
   getQueuedOrderFeedbackStaleReason,
   scheduleOrderFeedbackFollowUp,
@@ -32,6 +32,9 @@ type FeedbackRestaurant = Pick<
   | "status"
   | "wasenderSessionId"
   | "wasenderApiToken"
+  | "orderCheckInEnabled"
+  | "pickupCheckInDelayMinutes"
+  | "deliveryCheckInDelayMinutes"
 >;
 
 export interface OrderFeedbackSchedulerDependencies {
@@ -71,6 +74,7 @@ export interface OrderFeedbackSchedulerPassResult {
 const loadActiveRestaurants = async (): Promise<FeedbackRestaurant[]> => {
   return Restaurant.find({
     status: { $in: ["trial", "active"] },
+    orderCheckInEnabled: { $ne: false },
     wasenderSessionId: { $exists: true, $ne: "" },
     wasenderApiToken: { $exists: true, $ne: "" }
   })
@@ -112,7 +116,7 @@ export const findOrderFeedbackReminderCandidates = async (
   limit = ORDER_FEEDBACK_BATCH_SIZE
 ): Promise<IOrderDocument[]> => {
   const cutoff = new Date(
-    now.getTime() - getOrderFeedbackReminderHours() * 60 * 60_000
+    now.getTime() - getOrderFeedbackReminderDelayMs()
   );
 
   return Order.find({
@@ -133,7 +137,7 @@ export const findOrderFeedbackAutoCompletionCandidates = async (
   limit = ORDER_FEEDBACK_BATCH_SIZE
 ): Promise<IOrderDocument[]> => {
   const cutoff = new Date(
-    now.getTime() - getOrderAutoCompleteHours() * 60 * 60_000
+    now.getTime() - getOrderAutoCompleteDelayMs()
   );
 
   return Order.find({
@@ -216,7 +220,7 @@ export const queueOrderFeedbackReminder = async (
 
   const dueAt = new Date(
     order.feedbackRequestSentAt.getTime() +
-      getOrderFeedbackReminderHours() * 60 * 60_000
+      getOrderFeedbackReminderDelayMs()
   );
 
   if (dueAt > now) {

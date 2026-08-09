@@ -88,7 +88,7 @@ export const createRestaurantSchema = z
     assistantTone: z.enum(assistantTones).default("friendly"),
     assistantPersonalitySummary: optionalTextSchema,
     followUpEnabled: z.boolean().default(true),
-    followUpDelayMinutes: z.number().int().min(0).default(5),
+    followUpDelayMinutes: z.number().int().min(0).default(3),
     timezone: timezoneSchema.default("Africa/Accra"),
     ownerDailySummaryEnabled: z.boolean().default(false),
     ownerDailySummaryTime: ownerSummaryTimeSchema.default("08:00"),
@@ -96,7 +96,10 @@ export const createRestaurantSchema = z
     ownerWeeklySummaryDay: z.enum(ownerSummaryWeekdays).default("monday"),
     ownerWeeklySummaryTime: ownerSummaryTimeSchema.default("08:00"),
     ownerPendingActionReminderEnabled: z.boolean().default(false),
-    ownerPendingActionReminderDelayMinutes: z.number().int().min(1).default(3)
+    ownerPendingActionReminderDelayMinutes: z.number().int().min(1).default(3),
+    orderCheckInEnabled: z.boolean().default(true),
+    pickupCheckInDelayMinutes: z.number().int().min(1).default(45),
+    deliveryCheckInDelayMinutes: z.number().int().min(1).default(75)
   })
   .strict();
 

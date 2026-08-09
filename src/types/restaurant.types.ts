@@ -82,6 +82,9 @@ export interface RestaurantInput {
   ownerWeeklySummaryTime?: string;
   ownerPendingActionReminderEnabled?: boolean;
   ownerPendingActionReminderDelayMinutes?: number;
+  orderCheckInEnabled?: boolean;
+  pickupCheckInDelayMinutes?: number;
+  deliveryCheckInDelayMinutes?: number;
 }
 
 export interface RestaurantManagerContactInput {

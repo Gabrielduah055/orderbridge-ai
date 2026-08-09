@@ -48,6 +48,24 @@ export interface HandleOrderFeedbackResponseResult {
   ambiguousOrderNumbers?: string[];
 }
 
+export const orderCheckInOutcomes = [
+  "received_satisfied",
+  "received_complaint",
+  "not_received"
+] as const;
+
+export type OrderCheckInOutcome = (typeof orderCheckInOutcomes)[number];
+
+export interface RespondToOrderCheckInInput {
+  restaurantId: string;
+  customerPhone: string;
+  customerName?: string;
+  outcome: OrderCheckInOutcome;
+  orderReference?: string;
+  feedbackText?: string;
+  inboundEventId?: string;
+}
+
 export interface ListCustomerFeedbackInput {
   type?: OrderFeedbackType;
   requiresAttention?: boolean;
@@ -327,19 +345,22 @@ export const buildOwnerFeedbackNotification = (
   >
 ): string => {
   const customer = feedback.customerName || feedback.customerPhone;
-  const typeLabel = feedback.type.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
-  const attentionLine = feedback.requiresOwnerAttention
-    ? ["", "This needs your attention."]
-    : [];
+  if (feedback.type === "delivery_not_received") {
+    return [
+      "⚠️ ORDER NOT RECEIVED",
+      "",
+      `${customer} says order ${feedback.orderNumber} has not been received.`,
+      "",
+      "Please check this order."
+    ].join("\n");
+  }
 
   return [
-    `Customer feedback — Order ${feedback.orderNumber}`,
+    "⚠️ CUSTOMER COMPLAINT",
     "",
-    `Customer: ${customer}`,
-    `Type: ${typeLabel}`,
-    `Message: ${feedback.message}`,
-    ...(feedback.sentiment ? [`Sentiment: ${feedback.sentiment}`] : []),
-    ...attentionLine
+    `${customer} has a complaint about ${feedback.orderNumber}.`,
+    "",
+    feedback.message
   ].join("\n");
 };
 
@@ -460,7 +481,10 @@ export const createOrderFeedback = async (
     }
   }
 
-  if (created || !feedback.ownerNotifiedAt) {
+  if (
+    feedback.requiresOwnerAttention &&
+    (created || !feedback.ownerNotifiedAt)
+  ) {
     await notifyOwnerOfOrderFeedback(feedback);
   }
 
@@ -490,6 +514,33 @@ export const findActiveFeedbackOrders = async (
       }
     ]
   }).sort({ feedbackRequestSentAt: -1, createdAt: -1 });
+};
+
+export interface ActiveOrderCheckInView {
+  orderNumber: string;
+  orderType: IOrderDocument["orderType"];
+  status: IOrderDocument["status"];
+  checkInStatus: IOrderDocument["feedbackFollowUpStatus"];
+  awaitingComplaint: boolean;
+  receiptClarificationPending: boolean;
+}
+
+export const loadActiveOrderCheckInState = async (
+  restaurantId: string,
+  customerPhone: string
+): Promise<ActiveOrderCheckInView[]> => {
+  const orders = await findActiveFeedbackOrders(restaurantId, customerPhone);
+
+  return orders.map((order) => ({
+    orderNumber: getOrderReference(order),
+    orderType: order.orderType,
+    status: order.status,
+    checkInStatus: order.feedbackFollowUpStatus,
+    awaitingComplaint: Boolean(order.feedbackAwaitingComplaint),
+    receiptClarificationPending: Boolean(
+      order.feedbackReceiptClarificationPending
+    )
+  }));
 };
 
 const selectFeedbackOrder = (
@@ -957,6 +1008,28 @@ export const handleOrderFeedbackCustomerResponse = async (
     order,
     feedback
   };
+};
+
+export const respondToOrderCheckIn = async (
+  input: RespondToOrderCheckInInput
+): Promise<HandleOrderFeedbackResponseResult> => {
+  const option =
+    input.outcome === "received_satisfied"
+      ? "1"
+      : input.outcome === "received_complaint"
+        ? "2"
+        : "3";
+  const message = [input.orderReference, option, input.feedbackText]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join(" ");
+
+  return handleOrderFeedbackCustomerResponse({
+    restaurantId: input.restaurantId,
+    customerPhone: input.customerPhone,
+    customerName: input.customerName,
+    message,
+    inboundEventId: input.inboundEventId
+  });
 };
 
 export const listCustomerFeedback = async (

@@ -74,7 +74,7 @@ test("backfill preserves explicit false values and configured times", async () =
     followUpEnabled: false,
     ownerDailySummaryEnabled: false,
     ownerWeeklySummaryEnabled: false,
-    postDeliveryFollowUpEnabled: false,
+    orderCheckInEnabled: false,
     ownerDailySummaryTime: "17:30",
     ownerWeeklySummaryTime: "19:45"
   };
@@ -85,7 +85,7 @@ test("backfill preserves explicit false values and configured times", async () =
   assert.equal(restaurant.followUpEnabled, false);
   assert.equal(restaurant.ownerDailySummaryEnabled, false);
   assert.equal(restaurant.ownerWeeklySummaryEnabled, false);
-  assert.equal(restaurant.postDeliveryFollowUpEnabled, false);
+  assert.equal(restaurant.orderCheckInEnabled, false);
   assert.equal(restaurant.ownerDailySummaryTime, "17:30");
   assert.equal(restaurant.ownerWeeklySummaryTime, "19:45");
   assert.equal(

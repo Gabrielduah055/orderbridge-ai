@@ -6,6 +6,7 @@ const { Order } = require("../dist/models/order.model");
 const {
   handleRestaurantAgentMessage,
   isExplicitCustomerClarificationResetMessage,
+  isExactOrderCheckInReply,
   shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
 const {
@@ -241,6 +242,151 @@ test("an explicit menu restart may clear stale clarification before the customer
 
     assert.deepEqual(cancellations, [{ restaurantId, senderPhone: customerPhone }]);
     assert.equal(orchestratorCalls, 1);
+  });
+});
+
+test("only exact numbered check-in replies use the deterministic pre-AI boundary", () => {
+  assert.equal(isExactOrderCheckInReply("1"), true);
+  assert.equal(isExactOrderCheckInReply("3."), true);
+  assert.equal(isExactOrderCheckInReply("I want 2 fried rice"), false);
+  assert.equal(isExactOrderCheckInReply("I received it and it was nice"), false);
+});
+
+test("a pending check-in cannot hijack an unrelated new customer order", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let feedbackCalls = 0;
+    const orchestratorMessages = [];
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "I want 2 fried rice"
+      },
+      {
+        handleCustomerFeedback: async () => {
+          feedbackCalls += 1;
+          return { handled: true, success: true, message: "wrong path" };
+        },
+        runOrchestrator: async (input) => {
+          orchestratorMessages.push(input.message);
+          return makeAgentResult({
+            executedTools: [
+              { name: "add_order_item_by_name", success: true }
+            ]
+          });
+        }
+      }
+    );
+
+    assert.equal(feedbackCalls, 0);
+    assert.deepEqual(orchestratorMessages, ["I want 2 fried rice"]);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+for (const scenario of [
+  { step: "collecting_quantity", message: "2" },
+  { step: "selecting_item_from_category", message: "1" },
+  { step: "choosing_items", message: "2" }
+]) {
+  test(`an exact ${scenario.message} reaches customer AI while the draft is ${scenario.step}`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      let feedbackCalls = 0;
+      const orchestratorMessages = [];
+
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message: scenario.message
+        },
+        {
+          findCustomerDraft: async () => ({ currentStep: scenario.step }),
+          handleCustomerFeedback: async () => {
+            feedbackCalls += 1;
+            return { handled: true, success: true, message: "wrong old-order mutation" };
+          },
+          runOrchestrator: async (input) => {
+            orchestratorMessages.push(input.message);
+            return makeAgentResult();
+          }
+        }
+      );
+
+      assert.equal(feedbackCalls, 0);
+      assert.deepEqual(orchestratorMessages, [scenario.message]);
+      assert.equal(response.source, "openrouter_agent");
+    });
+  });
+}
+
+test("an exact numbered response remains safely handled before customer AI", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let feedbackCalls = 0;
+    let orchestratorCalls = 0;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "1"
+      },
+      {
+        findCustomerDraft: async () => null,
+        handleCustomerFeedback: async () => {
+          feedbackCalls += 1;
+          return {
+            handled: true,
+            success: true,
+            message: "Thanks for confirming. Your order is now marked complete."
+          };
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult();
+        }
+      }
+    );
+
+    assert.equal(feedbackCalls, 1);
+    assert.equal(orchestratorCalls, 0);
+    assert.match(response.message, /marked complete/i);
+  });
+});
+
+test("exact not-received response remains deterministic without an active draft", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let feedbackCalls = 0;
+    let orchestratorCalls = 0;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "3"
+      },
+      {
+        findCustomerDraft: async () => null,
+        handleCustomerFeedback: async ({ message }) => {
+          feedbackCalls += 1;
+          assert.equal(message, "3");
+          return {
+            handled: true,
+            success: true,
+            message: "I've alerted the restaurant. This order remains open."
+          };
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult();
+        }
+      }
+    );
+
+    assert.equal(feedbackCalls, 1);
+    assert.equal(orchestratorCalls, 0);
+    assert.match(response.message, /remains open/i);
   });
 });
 
@@ -587,7 +733,9 @@ test("customer eval suite is bounded, decision-only, and accepts correct mocked 
       if (scenario.expectNoTool) {
         return {
           text: scenario.expectedTextPattern
-            ? "Which item would you like to see?"
+            ? scenario.name.includes("check-ins")
+              ? "Which order do you mean: ORD-100 or ORD-101?"
+              : "Which item would you like to see?"
             : "Happy to help.",
           toolCalls: []
         };
@@ -671,7 +819,17 @@ test("production customer prompt receives the active trusted clarification", asy
           }
         ]
       }),
-      loadCustomerMemory: async () => null
+      loadCustomerMemory: async () => null,
+      loadActiveCheckIns: async () => [
+        {
+          orderNumber: "ORD-100",
+          orderType: "delivery",
+          status: "accepted",
+          checkInStatus: "requested",
+          awaitingComplaint: false,
+          receiptClarificationPending: false
+        }
+      ]
     }
   );
 
@@ -679,4 +837,6 @@ test("production customer prompt receives the active trusted clarification", asy
   assert.match(prompt, /"originalText":"add chicken"/);
   assert.match(prompt, /Chicken Salad/);
   assert.match(prompt, /Chicken Jollof/);
+  assert.match(prompt, /"activeOrderCheckIns"/);
+  assert.match(prompt, /ORD-100/);
 });

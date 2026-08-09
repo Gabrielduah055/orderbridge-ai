@@ -51,7 +51,12 @@ export interface IRestaurant {
   ownerWeeklySummaryTime: string;
   ownerPendingActionReminderEnabled: boolean;
   ownerPendingActionReminderDelayMinutes: number;
+  orderCheckInEnabled: boolean;
+  pickupCheckInDelayMinutes: number;
+  deliveryCheckInDelayMinutes: number;
+  /** @deprecated Retained only for persisted-record compatibility. */
   postDeliveryFollowUpEnabled: boolean;
+  /** @deprecated Retained only for persisted-record compatibility. */
   postDeliveryFollowUpDelayMinutes: number;
 }
 
@@ -309,6 +314,20 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
       default: 3,
       min: 1
     },
+    orderCheckInEnabled: {
+      type: Boolean,
+      default: true
+    },
+    pickupCheckInDelayMinutes: {
+      type: Number,
+      default: 45,
+      min: 1
+    },
+    deliveryCheckInDelayMinutes: {
+      type: Number,
+      default: 75,
+      min: 1
+    },
     postDeliveryFollowUpEnabled: {
       type: Boolean,
       default: true
@@ -327,5 +346,6 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
 restaurantSchema.index({ status: 1, ownerDailySummaryEnabled: 1 });
 restaurantSchema.index({ status: 1, ownerWeeklySummaryEnabled: 1 });
 restaurantSchema.index({ status: 1, ownerPendingActionReminderEnabled: 1 });
+restaurantSchema.index({ status: 1, orderCheckInEnabled: 1 });
 
 export const Restaurant = model<IRestaurantDocument>("Restaurant", restaurantSchema);
