@@ -248,18 +248,24 @@ const removeImageUrlsForModel = (value: unknown): unknown => {
   const source = value as Record<string, unknown>;
   const sanitized: Record<string, unknown> = {};
   let hasImage = false;
+  let containsImageField = false;
 
   for (const [key, entryValue] of Object.entries(source)) {
     if (key === "imageUrl") {
+      containsImageField = true;
       hasImage = typeof entryValue === "string" && Boolean(entryValue.trim());
+      continue;
+    }
+
+    if (key === "mediaItemId") {
       continue;
     }
 
     sanitized[key] = removeImageUrlsForModel(entryValue);
   }
 
-  if (hasImage) {
-    sanitized.hasImage = true;
+  if (containsImageField) {
+    sanitized.hasImage = hasImage;
   }
 
   return sanitized;
@@ -268,7 +274,8 @@ const removeImageUrlsForModel = (value: unknown): unknown => {
 const getImportantData = (
   currentData: AgentOrchestratorResult["data"],
   result: ToolResult,
-  toolName: string
+  toolName: string,
+  toolArguments: Record<string, unknown>
 ): AgentOrchestratorResult["data"] => {
   const nextData = { ...(currentData ?? {}) };
 
@@ -280,12 +287,19 @@ const getImportantData = (
 
       if (
         toolName === "search_menu_items" &&
+        toolArguments.includeImage === true &&
         typeof item.imageUrl === "string" &&
         item.imageUrl.trim() &&
         typeof item.name === "string" &&
         item.name.trim()
       ) {
         nextData.menuItemImage = {
+          menuItemId:
+            item.mediaItemId === undefined || item.mediaItemId === null
+              ? item.id === undefined || item.id === null
+                ? undefined
+                : String(item.id)
+              : String(item.mediaItemId),
           imageUrl: item.imageUrl,
           caption: item.name,
           source: "search_menu_items_tool"
@@ -319,6 +333,32 @@ const getImportantData = (
 
   return Object.keys(nextData).length > 0 ? nextData : undefined;
 };
+
+const isClearCustomerMenuMediaRequest = (input: AgentOrchestratorInput): boolean => {
+  if (input.sender.role !== "customer") {
+    return false;
+  }
+
+  const message = input.message.toLowerCase();
+
+  if (/\b(order|cart|delivery status|order status)\b/.test(message)) {
+    return false;
+  }
+
+  return (
+    /\b(pic|pics|photo|photos|image|images|picture|pictures)\b/.test(message) ||
+    /\bwhat does\b.+\blook like\b/.test(message) ||
+    /^(?:please\s+)?(?:show me|can i see|let me see)\b/.test(message)
+  );
+};
+
+const isUngroundedImageUnavailabilityClaim = (message: string): boolean =>
+  /\b(?:cannot|can't|unable to|do not|don't)\b.{0,60}\b(?:access|send|show|have)\b.{0,30}\b(?:pic|photo|image|picture)s?\b/i.test(
+    message
+  ) ||
+  /\b(?:no|not any|isn't an?|is not an?)\b.{0,30}\b(?:saved\s+)?(?:pic|photo|image|picture)s?\b/i.test(
+    message
+  );
 
 const sanitizeMenuItemImageResponse = (
   message: string,
@@ -604,6 +644,7 @@ export const runAgentOrchestrator = async (
   let importantData: AgentOrchestratorResult["data"];
   let responseId: string | undefined;
   let usage: AiUsage | undefined;
+  let customerMediaGroundingRetryUsed = false;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -631,6 +672,42 @@ export const runAgentOrchestrator = async (
 
         if (!rawFinalMessage) {
           throw new Error("Agent provider returned an empty final response.");
+        }
+
+        const hasMenuLookup = executedTools.some(
+          (tool) => tool.name === "search_menu_items"
+        );
+
+        if (
+          isClearCustomerMenuMediaRequest(input) &&
+          !hasMenuLookup &&
+          isUngroundedImageUnavailabilityClaim(rawFinalMessage)
+        ) {
+          if (!customerMediaGroundingRetryUsed) {
+            customerMediaGroundingRetryUsed = true;
+            messages.push({
+              role: "system",
+              content:
+                "Safety correction: do not claim menu images are inaccessible or unavailable without a grounded search_menu_items lookup. If one item is clearly referenced, call search_menu_items with includeImage=true. If the reference is ambiguous, ask which item the customer means."
+            });
+            continue;
+          }
+
+          console.info("[customerAgent] clarification returned", {
+            restaurantId,
+            reason: "ungrounded_menu_image_claim"
+          });
+
+          return {
+            success: true,
+            message: "Sure — which menu item would you like to see?",
+            data: importantData,
+            provider: provider.name,
+            model: provider.model,
+            responseId,
+            executedTools,
+            usage
+          };
         }
 
         const finalMessage = sanitizeMenuItemImageResponse(rawFinalMessage, importantData);
@@ -736,7 +813,12 @@ export const runAgentOrchestrator = async (
           pendingActionId: result.pendingActionId,
           ...getExecutedOrderMetadata(result.data)
         });
-        importantData = getImportantData(importantData, result, toolName);
+        importantData = getImportantData(
+          importantData,
+          result,
+          toolName,
+          safeArguments
+        );
 
         await saveMessage({
           restaurantId,

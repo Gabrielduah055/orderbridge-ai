@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import * as agentCustomerService from "../services/agentCustomer.service";
+import { handleCustomerCompatibilityMessage } from "../services/customerAgentCompatibility.service";
 
 export const handleCustomerMessage = async (
   req: Request,
@@ -7,7 +7,7 @@ export const handleCustomerMessage = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const response = await agentCustomerService.handleCustomerMessage(req.body);
+    const response = await handleCustomerCompatibilityMessage(req.body);
 
     res.status(response.success ? 200 : 400).json(response);
   } catch (error) {

@@ -11,7 +11,7 @@ import {
 } from "../agent-tools/tool.executor";
 import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
-import { handleCustomerMessage } from "./agentCustomer.service";
+import { handleLegacyCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import {
@@ -49,6 +49,16 @@ const temporaryHermesErrorMessage =
   "I'm having trouble reaching the restaurant assistant right now. Please try again in a few minutes.";
 const temporaryAgentErrorMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
+const customerMutationToolNames = new Set([
+  "start_order",
+  "add_order_item_by_name",
+  "remove_order_item_by_name",
+  "update_order_item_quantity",
+  "update_order_draft",
+  "confirm_order_draft",
+  "cancel_order_draft",
+  "cancel_order"
+]);
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
 
@@ -204,6 +214,7 @@ export const shouldUseAiFirstStaffTextRouting = (
 
 export interface RestaurantAgentRoutingDependencies {
   runOrchestrator?: typeof runAgentOrchestrator;
+  handleLegacyCustomerMessage?: typeof handleLegacyCustomerMessage;
   buildStaffState?: typeof buildStaffOperationalState;
   handlePendingImageReply?: typeof handlePendingMenuItemImageReply;
   rememberImageRequest?: typeof rememberMenuItemImageRequest;
@@ -731,10 +742,15 @@ const handleSpecificMenuItemViewRequest = async (
 
 const handleLocalCustomerRequest = async (
   input: RestaurantAgentMessageInput,
-  sender: ReturnType<typeof resolveSenderIdentity>
+  sender: ReturnType<typeof resolveSenderIdentity>,
+  legacyHandler: typeof handleLegacyCustomerMessage = handleLegacyCustomerMessage
 ): Promise<RestaurantAgentResponse> => {
   const restaurantId = String(input.restaurant._id);
-  const result = await handleCustomerMessage({
+  console.warn("[customerAgent] legacy fallback used", {
+    restaurantId,
+    senderRole: sender.role
+  });
+  const result = await legacyHandler({
     restaurantId,
     customerPhone: sender.normalizedPhone,
     customerName: sender.name,
@@ -784,7 +800,11 @@ export const handleRestaurantAgentMessage = async (
   dependencies: RestaurantAgentRoutingDependencies = {}
 ): Promise<RestaurantAgentResponse> => {
   const restaurantId = String(input.restaurant._id);
-  const sender = resolveSenderIdentity(input.restaurant, input.senderPhone);
+  const resolvedSender = resolveSenderIdentity(input.restaurant, input.senderPhone);
+  const sender =
+    resolvedSender.role === "customer" && input.customerName?.trim()
+      ? { ...resolvedSender, name: input.customerName.trim() }
+      : resolvedSender;
   const message = normalizeText(input.message);
   const aiProviderName = getAiProviderName();
   const openRouterConfig = getOpenRouterConfig();
@@ -793,6 +813,8 @@ export const handleRestaurantAgentMessage = async (
     openRouterConfig.customerAgentEnabled
   );
   const runOrchestrator = dependencies.runOrchestrator ?? runAgentOrchestrator;
+  const legacyCustomerHandler =
+    dependencies.handleLegacyCustomerMessage ?? handleLegacyCustomerMessage;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -1266,7 +1288,8 @@ export const handleRestaurantAgentMessage = async (
 
   const parsedSpecificItemName = parseSpecificMenuItemViewRequest(message);
   const specificItemName =
-    sender.role === "customer" || hasExplicitImageViewCue(message)
+    (sender.role === "customer" && !customerOpenRouterEnabled) ||
+    (sender.role !== "customer" && hasExplicitImageViewCue(message))
       ? parsedSpecificItemName
       : null;
 
@@ -1294,6 +1317,10 @@ export const handleRestaurantAgentMessage = async (
 
   if (sender.role === "customer") {
     if (customerOpenRouterEnabled) {
+      console.info("[customerAgent] ai-first turn started", {
+        restaurantId,
+        senderRole: sender.role
+      });
       // ── Stale-clarification guard ──────────────────────────────────────────
       // If the customer sends a greeting or asks for the menu, they have clearly
       // started a new conversation.  Cancel any pending clarification that was
@@ -1310,13 +1337,34 @@ export const handleRestaurantAgentMessage = async (
         });
       }
 
-      const agentResult = await runAgentOrchestrator({
+      const agentResult = await runOrchestrator({
         restaurant: input.restaurant,
         sender,
         message,
         requestId: input.inboundEventId,
         quotedMessageId: input.quotedMessageId
       });
+
+      console.info("[customerAgent] AI tools executed", {
+        restaurantId,
+        tools: agentResult.executedTools.map((tool) => tool.name)
+      });
+
+      if (agentResult.data?.menuItemImage) {
+        const menuItemImage = agentResult.data.menuItemImage as Record<string, unknown>;
+        console.info("[customerAgent] trusted menu image prepared", {
+          restaurantId,
+          menuItemId:
+            typeof menuItemImage.menuItemId === "string"
+              ? menuItemImage.menuItemId
+              : undefined,
+          hasImage: true
+        });
+      }
+
+      const successfulCustomerMutation = agentResult.executedTools.some(
+        (tool) => tool.success && customerMutationToolNames.has(tool.name)
+      );
 
       // Now that the orchestrator has run and built its context from the uncontaminated
       // history window, persist the user message followed by the assistant response.
@@ -1328,6 +1376,19 @@ export const handleRestaurantAgentMessage = async (
         content: message,
         metadata: { source: "openrouter_agent" }
       });
+
+      if (
+        !agentResult.success &&
+        openRouterConfig.customerLegacyFallback &&
+        !successfulCustomerMutation
+      ) {
+        console.warn("[customerAgent] AI failed; explicit legacy fallback allowed", {
+          restaurantId,
+          senderRole: sender.role
+        });
+
+        return handleLocalCustomerRequest(input, sender, legacyCustomerHandler);
+      }
 
       await saveAgentConversationMessage({
         restaurantId,
@@ -1360,13 +1421,13 @@ export const handleRestaurantAgentMessage = async (
         totalTokens: agentResult.usage?.totalTokens
       });
 
-      if (!agentResult.success && openRouterConfig.customerLegacyFallback) {
-        console.warn("Customer OpenRouter agent failed; using explicit legacy fallback", {
+      if (!agentResult.success && successfulCustomerMutation) {
+        console.warn("[customerAgent] legacy fallback suppressed after mutation", {
           restaurantId,
-          senderRole: sender.role
+          tools: agentResult.executedTools
+            .filter((tool) => tool.success)
+            .map((tool) => tool.name)
         });
-
-        return handleLocalCustomerRequest(input, sender);
       }
 
       return {
@@ -1378,7 +1439,7 @@ export const handleRestaurantAgentMessage = async (
       };
     }
 
-    return handleLocalCustomerRequest(input, sender);
+    return handleLocalCustomerRequest(input, sender, legacyCustomerHandler);
   }
 
   const executionContext = {

@@ -404,7 +404,12 @@ const buildResponse = (
   };
 };
 
-export const handleCustomerMessage = async (
+/**
+ * Emergency rollback implementation for the pre-OpenRouter customer parser.
+ * Normal WhatsApp and HTTP customer turns must enter through
+ * handleRestaurantAgentMessage instead.
+ */
+export const handleLegacyCustomerMessage = async (
   input: CustomerMessageInput
 ): Promise<CustomerAgentResponse> => {
   const restaurant = await getRestaurantOrThrow(input.restaurantId);

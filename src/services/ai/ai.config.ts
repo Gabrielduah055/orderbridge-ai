@@ -16,6 +16,9 @@ const parsePositiveNumber = (value: string | undefined, fallback: number): numbe
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const isExplicitlyFalse = (value: string | undefined): boolean =>
+  cleanEnvValue(value)?.toLowerCase() === "false";
+
 const getProviderName = (): AiProviderName => {
   const provider = cleanEnvValue(process.env.AI_PROVIDER)?.toLowerCase() ?? "hermes";
 
@@ -40,7 +43,12 @@ export const getOpenRouterConfig = () => ({
   ),
   siteUrl: cleanEnvValue(process.env.OPENROUTER_SITE_URL),
   appName: cleanEnvValue(process.env.OPENROUTER_APP_NAME) ?? "OrderBridgeAI",
-  customerAgentEnabled: process.env.OPENROUTER_CUSTOMER_AGENT_ENABLED === "true",
+  // OpenRouter is AI-first for customers by default. This compatibility flag is
+  // intentionally opt-out so a missing deployment variable cannot silently
+  // restore the legacy natural-language parser.
+  customerAgentEnabled: !isExplicitlyFalse(
+    process.env.OPENROUTER_CUSTOMER_AGENT_ENABLED
+  ),
   customerLegacyFallback: process.env.OPENROUTER_CUSTOMER_LEGACY_FALLBACK === "true",
   baseUrl:
     cleanEnvValue(process.env.OPENROUTER_BASE_URL)?.replace(/\/$/, "") ??

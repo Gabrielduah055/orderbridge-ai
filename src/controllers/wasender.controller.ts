@@ -176,14 +176,29 @@ type ImageMessageSender = (
   options?: { apiKey?: string }
 ) => Promise<WasenderSendResult>;
 
+interface MenuItemImageDeliveryLogContext {
+  restaurantId?: string;
+  customerPhone?: string;
+  menuItemId?: string;
+  menuItemName?: string;
+}
+
 export const sendMenuItemImage = async (
   sessionId: string,
   to: string,
   imageUrl: string,
   caption: string,
   apiKey?: string,
-  imageSender: ImageMessageSender = sendImageMessage
+  imageSender: ImageMessageSender = sendImageMessage,
+  logContext: MenuItemImageDeliveryLogContext = {}
 ): Promise<boolean> => {
+  console.info("[customerAgent] image delivery attempted", {
+    restaurantId: logContext.restaurantId,
+    customerPhone: logContext.customerPhone,
+    menuItemId: logContext.menuItemId,
+    menuItemName: logContext.menuItemName
+  });
+
   try {
     const result = await imageSender(sessionId, to, imageUrl, caption, { apiKey });
 
@@ -191,13 +206,19 @@ export const sendMenuItemImage = async (
       return true;
     }
 
-    console.warn("Menu item image send failed", {
+    console.warn("[customerAgent] menu image delivery failed", {
+      ...logContext,
       status: result.status,
-      error: getSafeErrorMessage(result.error, "WaSender rejected the image message")
+      error: redactUrls(
+        getSafeErrorMessage(result.error, "WaSender rejected the image message")
+      )
     });
   } catch (error) {
-    console.warn("Menu item image send failed", {
-      error: getSafeErrorMessage(error, "WaSender image request failed")
+    console.warn("[customerAgent] menu image delivery failed", {
+      ...logContext,
+      error: redactUrls(
+        getSafeErrorMessage(error, "WaSender image request failed")
+      )
     });
   }
 
@@ -235,6 +256,8 @@ export const getTrustedMenuItemImageDelivery = (
   }
 
   return {
+    menuItemId:
+      typeof delivery.menuItemId === "string" ? delivery.menuItemId : undefined,
     imageUrl: delivery.imageUrl,
     caption: delivery.caption,
     source
@@ -643,7 +666,15 @@ const processNormalizedWebhook = async (
           webhook.from,
           menuItemImage.imageUrl,
           menuItemImage.caption,
-          restaurant.wasenderApiToken
+          restaurant.wasenderApiToken,
+          sendImageMessage,
+          {
+            restaurantId: String(restaurant._id),
+            customerPhone:
+              sender.role === "customer" ? sender.normalizedPhone : undefined,
+            menuItemId: menuItemImage.menuItemId,
+            menuItemName: menuItemImage.caption
+          }
         );
 
         if (!imageSent) {
