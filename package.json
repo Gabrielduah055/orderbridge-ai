@@ -9,6 +9,7 @@
     "audit:menu-images": "node dist/scripts/auditMenuItemImages.js",
     "backfill:restaurant-config": "node dist/scripts/backfillRestaurantSchedulerConfig.js",
     "set:restaurant-wasender-token": "node dist/scripts/setRestaurantWasenderToken.js",
+    "eval:staff": "tsc && node dist/evals/runStaffAgentEval.js",
     "start": "node dist/server.js",
     "test": "tsc && node --test tests/*.test.js"
   },
