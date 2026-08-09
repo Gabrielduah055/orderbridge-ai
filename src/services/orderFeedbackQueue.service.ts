@@ -364,6 +364,10 @@ export const getQueuedOrderFeedbackStaleReason = async (
     return "restaurant_inactive_or_missing";
   }
 
+  if (restaurant.orderCheckInEnabled === false) {
+    return "order_check_in_disabled";
+  }
+
   if (restaurant.wasenderSessionId !== message.sessionId) {
     return "restaurant_wasender_session_changed";
   }

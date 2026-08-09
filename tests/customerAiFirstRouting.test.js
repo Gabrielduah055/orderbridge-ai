@@ -285,6 +285,42 @@ test("a pending check-in cannot hijack an unrelated new customer order", async (
   });
 });
 
+for (const scenario of [
+  { step: "collecting_quantity", message: "2" },
+  { step: "selecting_item_from_category", message: "1" },
+  { step: "choosing_items", message: "2" }
+]) {
+  test(`an exact ${scenario.message} reaches customer AI while the draft is ${scenario.step}`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      let feedbackCalls = 0;
+      const orchestratorMessages = [];
+
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message: scenario.message
+        },
+        {
+          findCustomerDraft: async () => ({ currentStep: scenario.step }),
+          handleCustomerFeedback: async () => {
+            feedbackCalls += 1;
+            return { handled: true, success: true, message: "wrong old-order mutation" };
+          },
+          runOrchestrator: async (input) => {
+            orchestratorMessages.push(input.message);
+            return makeAgentResult();
+          }
+        }
+      );
+
+      assert.equal(feedbackCalls, 0);
+      assert.deepEqual(orchestratorMessages, [scenario.message]);
+      assert.equal(response.source, "openrouter_agent");
+    });
+  });
+}
+
 test("an exact numbered response remains safely handled before customer AI", async () => {
   await withCustomerRoutingHarness(async () => {
     let feedbackCalls = 0;
@@ -297,6 +333,7 @@ test("an exact numbered response remains safely handled before customer AI", asy
         message: "1"
       },
       {
+        findCustomerDraft: async () => null,
         handleCustomerFeedback: async () => {
           feedbackCalls += 1;
           return {
@@ -315,6 +352,41 @@ test("an exact numbered response remains safely handled before customer AI", asy
     assert.equal(feedbackCalls, 1);
     assert.equal(orchestratorCalls, 0);
     assert.match(response.message, /marked complete/i);
+  });
+});
+
+test("exact not-received response remains deterministic without an active draft", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let feedbackCalls = 0;
+    let orchestratorCalls = 0;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "3"
+      },
+      {
+        findCustomerDraft: async () => null,
+        handleCustomerFeedback: async ({ message }) => {
+          feedbackCalls += 1;
+          assert.equal(message, "3");
+          return {
+            handled: true,
+            success: true,
+            message: "I've alerted the restaurant. This order remains open."
+          };
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult();
+        }
+      }
+    );
+
+    assert.equal(feedbackCalls, 1);
+    assert.equal(orchestratorCalls, 0);
+    assert.match(response.message, /remains open/i);
   });
 });
 

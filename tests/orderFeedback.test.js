@@ -467,6 +467,43 @@ test("stale validation is tenant-scoped and does not consult marketing opt-out s
   }
 });
 
+test("disabling restaurant check-ins cancels queued requests and reminders", async () => {
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalOrderFindOne = Order.findOne;
+  const originalFeedbackExists = OrderFeedback.exists;
+
+  try {
+    Restaurant.findOne = () =>
+      query(makeRestaurant({ orderCheckInEnabled: false }));
+    Order.findOne = () =>
+      query(
+        makeOrder({
+          feedbackFollowUpStatus: "scheduled",
+          feedbackRequestSentAt: undefined
+        })
+      );
+    OrderFeedback.exists = async () => null;
+
+    for (const kind of [
+      "order_feedback_request",
+      "order_feedback_reminder"
+    ]) {
+      const reason = await getQueuedOrderFeedbackStaleReason({
+        restaurantId,
+        sessionId: "wasender-session-1",
+        to: customerPhone,
+        metadata: buildOrderFeedbackQueueMetadata(makeOrder(), kind, 1)
+      });
+
+      assert.equal(reason, "order_check_in_disabled");
+    }
+  } finally {
+    Restaurant.findOne = originalRestaurantFindOne;
+    Order.findOne = originalOrderFindOne;
+    OrderFeedback.exists = originalFeedbackExists;
+  }
+});
+
 test("completed and issue-reported orders cancel stale feedback requests", async () => {
   const originalRestaurantFindOne = Restaurant.findOne;
   const originalOrderFindOne = Order.findOne;
