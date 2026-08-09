@@ -6,6 +6,7 @@ import { buildAgentSystemPrompt } from "../services/ai/agentPrompt.service";
 import { getAgentToolDefinitionsForRole } from "../services/ai/agentToolDefinitions.service";
 import { getOpenRouterConfig } from "../services/ai/ai.config";
 import { OpenRouterProvider } from "../services/ai/providers/openRouter.provider";
+import { createEmptyStaffOperationalState } from "../services/ai/staffOperationalState.service";
 import {
   formatStaffAgentEvaluation,
   runStaffAgentEvaluation
@@ -62,6 +63,33 @@ const buildSyntheticRestaurantContext = async (
   permissions
 });
 
+const buildSyntheticSender = (
+  role: "owner" | "manager"
+): ResolvedSender => ({
+  name: role === "owner" ? "Eval Owner" : "Eval Manager",
+  phone: role === "owner" ? "+233500000001" : "+233500000002",
+  normalizedPhone: role === "owner" ? "+233500000001" : "+233500000002",
+  role,
+  verified: true
+});
+
+export const buildLiveStaffEvalSystemPrompt = async (
+  scenario: (typeof staffAgentScenarios)[number]
+): Promise<string> => {
+  const sender = buildSyntheticSender(scenario.role);
+  const permissions = getAllowedToolNamesForRole(scenario.role);
+  const staffState =
+    scenario.staffState ?? createEmptyStaffOperationalState(scenario.role);
+
+  return buildAgentSystemPrompt(
+    restaurant,
+    sender,
+    permissions,
+    { buildRestaurantContext: buildSyntheticRestaurantContext },
+    staffState
+  );
+};
+
 const run = async (): Promise<void> => {
   const config = getOpenRouterConfig();
 
@@ -72,22 +100,7 @@ const run = async (): Promise<void> => {
 
   const provider = new OpenRouterProvider();
   const result = await runStaffAgentEvaluation(staffAgentScenarios, async (scenario) => {
-    const sender: ResolvedSender = {
-      name: scenario.role === "owner" ? "Eval Owner" : "Eval Manager",
-      phone: scenario.role === "owner" ? "+233500000001" : "+233500000002",
-      normalizedPhone:
-        scenario.role === "owner" ? "+233500000001" : "+233500000002",
-      role: scenario.role,
-      verified: true
-    };
-    const permissions = getAllowedToolNamesForRole(scenario.role);
-    const systemPrompt = await buildAgentSystemPrompt(
-      restaurant,
-      sender,
-      permissions,
-      { buildRestaurantContext: buildSyntheticRestaurantContext },
-      scenario.staffState
-    );
+    const systemPrompt = await buildLiveStaffEvalSystemPrompt(scenario);
 
     return provider.complete({
       messages: [
@@ -106,8 +119,10 @@ const run = async (): Promise<void> => {
   }
 };
 
-void run().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : "Unknown live evaluation error";
-  console.error(`LIVE STAFF EVAL FAILED — ${message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  void run().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "Unknown live evaluation error";
+    console.error(`LIVE STAFF EVAL FAILED — ${message}`);
+    process.exitCode = 1;
+  });
+}

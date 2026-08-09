@@ -14,6 +14,9 @@ const {
 const {
   handleOwnerMessage
 } = require("../dist/services/agentOwner.service");
+const {
+  buildLiveStaffEvalSystemPrompt
+} = require("../dist/evals/runStaffAgentEval");
 
 const restaurantId = "64b000000000000000000777";
 const ownerPhone = "+233500000001";
@@ -119,6 +122,25 @@ test("live staff decisions use production role-filtered tool definitions", () =>
   assert.equal(managerTools.has("update_menu_price"), false);
   assert.equal(ownerTools.has("get_business_report"), true);
   assert.equal(managerTools.has("get_business_report"), true);
+});
+
+test("ordinary live eval scenarios receive normal production staff-state context", async () => {
+  const ordinaryScenario = staffAgentScenarios.find(
+    (scenario) => scenario.name === "Greeting"
+  );
+
+  assert.ok(ordinaryScenario);
+  assert.equal(ordinaryScenario.staffState, undefined);
+
+  const prompt = await buildLiveStaffEvalSystemPrompt(ordinaryScenario);
+
+  assert.match(prompt, /CURRENT STAFF OPERATIONAL STATE/);
+  assert.match(prompt, /<staff_state>/);
+  assert.match(prompt, /"pendingActions":\[\]/);
+  assert.match(prompt, /"imageWorkflow":null/);
+  assert.match(prompt, /"recentReferences":\{\}/);
+  assert.match(prompt, /"permissions":\[/);
+  assert.match(prompt, /<\/staff_state>/);
 });
 
 test("failed backend mutation cannot be represented as successful eval evidence", () => {
