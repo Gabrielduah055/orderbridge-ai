@@ -26,6 +26,7 @@ const {
   applyOrderFeedbackProviderResult,
   buildOrderFeedbackQueueMetadata,
   buildOrderFeedbackRequestMessage,
+  getOrderCheckInDelayMinutes,
   getQueuedOrderFeedbackStaleReason,
   scheduleOrderFeedbackFollowUp
 } = require("../dist/services/orderFeedbackQueue.service");
@@ -124,6 +125,7 @@ test("feedback request text identifies the restaurant and order without marketin
   assert.match(message, /Golden Spoon/);
   assert.match(message, /ORD-123/);
   assert.match(message, /1\. Received and satisfied/);
+  assert.doesNotMatch(message, /hope you received|proof of delivery/i);
   assert.equal(/offer|promotion|subscribe|marketing/i.test(message), false);
 });
 
@@ -710,6 +712,8 @@ const withFeedbackResponseHarness = async (orders, run) => {
   let completionTransitions = 0;
   let outboundNotifications = 0;
   const currentById = new Map(orders.map((order) => [String(order._id), order]));
+  const feedbackByInboundEvent = new Map();
+  const outboundByIdempotencyKey = new Map();
 
   try {
     Order.find = () => query(orders);
@@ -735,21 +739,41 @@ const withFeedbackResponseHarness = async (orders, run) => {
       if (current && update.$set) Object.assign(current, update.$set);
       return { modifiedCount: 1 };
     };
-    OutboundMessage.findOne = () => query(null);
+    OutboundMessage.findOne = (filter) =>
+      query(outboundByIdempotencyKey.get(filter.idempotencyKey) ?? null);
     OutboundMessage.create = async (input) => {
+      const existing = outboundByIdempotencyKey.get(input.idempotencyKey);
+      if (existing) return existing;
       outboundNotifications += 1;
-      return { _id: `outbound-${outboundNotifications}`, ...input };
+      const created = { _id: `outbound-${outboundNotifications}`, ...input };
+      outboundByIdempotencyKey.set(input.idempotencyKey, created);
+      return created;
     };
     OutboundMessage.updateMany = async () => ({ modifiedCount: 1 });
     Restaurant.findOne = () => query(makeRestaurant());
     OrderFeedback.create = async (input) => {
+      if (
+        input.inboundEventId &&
+        feedbackByInboundEvent.has(input.inboundEventId)
+      ) {
+        const duplicateError = new Error("duplicate feedback event");
+        duplicateError.code = 11000;
+        throw duplicateError;
+      }
       feedbackCreates += 1;
-      return makeFeedback({
+      const created = makeFeedback({
         _id: `64b000000000000000000f${30 + feedbackCreates}`,
         ...input
       });
+      if (input.inboundEventId) {
+        feedbackByInboundEvent.set(input.inboundEventId, created);
+      }
+      return created;
     };
-    OrderFeedback.findOne = () => Promise.resolve(null);
+    OrderFeedback.findOne = (filter) =>
+      Promise.resolve(
+        feedbackByInboundEvent.get(filter.inboundEventId) ?? null
+      );
 
     return await run({
       get feedbackCreates() {
@@ -833,6 +857,24 @@ test("response 3 never completes and creates an urgent non-delivery record", asy
   });
 });
 
+test("duplicate complaint webhook does not duplicate feedback or owner alert", async () => {
+  await withFeedbackResponseHarness([makeOrder()], async (harness) => {
+    const input = {
+      restaurantId,
+      customerPhone,
+      message: "2 The chicken was cold.",
+      inboundEventId: "event-duplicate-complaint"
+    };
+
+    await handleOrderFeedbackCustomerResponse(input);
+    await handleOrderFeedbackCustomerResponse(input);
+
+    assert.equal(harness.feedbackCreates, 1);
+    assert.equal(harness.outboundNotifications, 1);
+    assert.equal(harness.completionTransitions, 1);
+  });
+});
+
 test("natural positive feedback completes and is stored as a review", async () => {
   await withFeedbackResponseHarness([makeOrder()], async (harness) => {
     const result = await handleOrderFeedbackCustomerResponse({
@@ -846,6 +888,65 @@ test("natural positive feedback completes and is stored as a review", async () =
     assert.equal(result.feedback.type, "review");
     assert.equal(result.feedback.sentiment, "positive");
     assert.equal(harness.completionTransitions, 1);
+    assert.equal(harness.outboundNotifications, 0);
+  });
+});
+
+test("customer check-in tool delegates a natural complaint to the trusted feedback workflow", async () => {
+  await withFeedbackResponseHarness([makeOrder()], async (harness) => {
+    const result = await executeAgentTool(
+      "respond_to_order_check_in",
+      {
+        outcome: "received_complaint",
+        feedbackText: "I got it but the chicken was cold"
+      },
+      {
+        restaurantId,
+        restaurant: makeRestaurant(),
+        sender: {
+          role: "customer",
+          phone: customerPhone,
+          normalizedPhone: customerPhone,
+          verified: false
+        },
+        originalMessage: "I got it but the chicken was cold",
+        requestId: "event-tool-complaint"
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.outcome, "received_complaint");
+    assert.equal(result.data.status, "completed");
+    assert.equal(result.data.feedbackType, "complaint");
+    assert.equal(harness.completionTransitions, 1);
+    assert.equal(harness.outboundNotifications, 1);
+  });
+});
+
+test("customer check-in tool never completes a not-received order", async () => {
+  await withFeedbackResponseHarness([makeOrder()], async (harness) => {
+    const result = await executeAgentTool(
+      "respond_to_order_check_in",
+      { outcome: "not_received" },
+      {
+        restaurantId,
+        restaurant: makeRestaurant(),
+        sender: {
+          role: "customer",
+          phone: customerPhone,
+          normalizedPhone: customerPhone,
+          verified: false
+        },
+        originalMessage: "I still haven't received it",
+        requestId: "event-tool-not-received"
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.outcome, "not_received");
+    assert.equal(result.data.feedbackType, "delivery_not_received");
+    assert.equal(harness.completionTransitions, 0);
+    assert.equal(harness.outboundNotifications, 1);
   });
 });
 
@@ -1056,10 +1157,9 @@ test("owner notification provider success and failure are recorded separately", 
 test("owner feedback notification clearly distinguishes urgent complaints", () => {
   const message = buildOwnerFeedbackNotification(makeFeedback());
 
-  assert.match(message, /Order ORD-123/);
+  assert.match(message, /ORD-123/);
   assert.match(message, /Mavis/);
-  assert.match(message, /Complaint/);
-  assert.match(message, /needs your attention/i);
+  assert.match(message, /CUSTOMER COMPLAINT/);
 });
 
 test("feedback permissions allow only owner and manager access", () => {
@@ -1067,6 +1167,8 @@ test("feedback permissions allow only owner and manager access", () => {
   assert.equal(isToolAllowedForRole("list_customer_feedback", "manager"), true);
   assert.equal(isToolAllowedForRole("list_customer_feedback", "customer"), false);
   assert.equal(isToolAllowedForRole("resolve_customer_feedback", "customer"), false);
+  assert.equal(isToolAllowedForRole("respond_to_order_check_in", "customer"), true);
+  assert.equal(isToolAllowedForRole("respond_to_order_check_in", "owner"), false);
 });
 
 test("feedback list query is tenant-scoped and capped at 20", async () => {

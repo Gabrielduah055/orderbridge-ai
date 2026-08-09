@@ -4,6 +4,7 @@ import { buildDraftView, findActiveDraft } from "../orderDraft.service";
 import type { IRestaurantDocument } from "../../models/Restaurant";
 import type { ResolvedSender } from "../../types/agent.types";
 import { loadCustomerMemorySummary } from "../customerMemory.service";
+import { loadActiveOrderCheckInState } from "../orderFeedback.service";
 import type { StaffOperationalState } from "./staffOperationalState.service";
 
 export interface AgentSystemPromptDependencies {
@@ -11,6 +12,7 @@ export interface AgentSystemPromptDependencies {
   findDraft?: typeof findActiveDraft;
   findClarification?: typeof findActiveOrderItemClarification;
   loadCustomerMemory?: typeof loadCustomerMemorySummary;
+  loadActiveCheckIns?: typeof loadActiveOrderCheckInState;
 }
 
 export const buildAgentSystemPrompt = async (
@@ -27,6 +29,8 @@ export const buildAgentSystemPrompt = async (
     dependencies.findClarification ?? findActiveOrderItemClarification;
   const loadCustomerMemory =
     dependencies.loadCustomerMemory ?? loadCustomerMemorySummary;
+  const loadActiveCheckIns =
+    dependencies.loadActiveCheckIns ?? loadActiveOrderCheckInState;
   const restaurantId = String(restaurant._id);
   const isCustomer = sender.role === "customer";
   const customerMemoryPromise = isCustomer
@@ -43,7 +47,27 @@ export const buildAgentSystemPrompt = async (
         }
       )
     : Promise.resolve(null);
-  const [context, activeDraft, activeClarification, customerMemory] =
+  const activeCheckInsPromise = isCustomer
+    ? loadActiveCheckIns(restaurantId, sender.normalizedPhone).catch(
+        (error: unknown) => {
+          console.error("Active order check-in lookup failed", {
+            restaurantId,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Unknown active check-in error"
+          });
+          return [];
+        }
+      )
+    : Promise.resolve([]);
+  const [
+    context,
+    activeDraft,
+    activeClarification,
+    customerMemory,
+    activeOrderCheckIns
+  ] =
     await Promise.all([
       buildRestaurantContext(restaurant, sender, permissions),
       isCustomer
@@ -55,7 +79,8 @@ export const buildAgentSystemPrompt = async (
             senderPhone: sender.normalizedPhone
           })
         : Promise.resolve(null),
-      customerMemoryPromise
+      customerMemoryPromise,
+      activeCheckInsPromise
     ]);
   const safeContext = {
     restaurant: {
@@ -77,6 +102,7 @@ export const buildAgentSystemPrompt = async (
         ? {
             memory: customerMemory,
             activeDraft: activeDraft ? buildDraftView(activeDraft, restaurant) : null,
+            activeOrderCheckIns,
             activeClarification: activeClarification
               ? {
                   intent: activeClarification.intent,
@@ -107,6 +133,10 @@ export const buildAgentSystemPrompt = async (
           "Ask only for missing information and preserve details already provided in the active draft.",
           "Ask one natural question at a time, or at most two closely related questions.",
           "Customer confirmation submits the order to the restaurant; it does not mean the restaurant has accepted it.",
+          "customerState.activeOrderCheckIns contains trusted pending check-ins for accepted orders. Use respond_to_order_check_in only when the current customer message clearly answers one of those check-ins.",
+          "A new order, menu request, order-status question, or unrelated conversation must never be treated as a check-in response merely because a check-in is pending.",
+          "For a clear natural check-in response, call respond_to_order_check_in with received_satisfied, received_complaint, or not_received and preserve the customer's own complaint/feedback wording in feedbackText.",
+          "If multiple active check-ins exist, use an explicitly stated order number. If the customer did not identify one, ask which order and do not guess.",
           "After confirm_order_draft succeeds, explain that the order is awaiting restaurant confirmation.",
           "Never claim an order is confirmed or accepted until a backend order result reports status accepted or confirmed.",
           "Never invent a receipt, receipt URL, or confirmed status.",

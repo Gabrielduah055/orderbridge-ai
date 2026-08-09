@@ -124,6 +124,10 @@ test("outdated follow-ups are cancelled after a reply or draft-step change", asy
     {
       conversationVersion: 4,
       currentStep: "choosing_order_type"
+    },
+    {
+      conversationVersion: 4,
+      currentStep: "idle"
     }
   ];
 

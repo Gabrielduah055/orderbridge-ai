@@ -5,14 +5,15 @@ import { getSafeErrorMessage } from "../utils/error.util";
 export const restaurantSchedulerConfigDefaults = {
   timezone: "Africa/Accra",
   followUpEnabled: true,
-  followUpDelayMinutes: 5,
+  followUpDelayMinutes: 3,
   ownerDailySummaryEnabled: true,
   ownerDailySummaryTime: "08:00",
   ownerWeeklySummaryEnabled: true,
   ownerWeeklySummaryDay: "monday",
   ownerWeeklySummaryTime: "08:00",
-  postDeliveryFollowUpEnabled: true,
-  postDeliveryFollowUpDelayMinutes: 45
+  orderCheckInEnabled: true,
+  pickupCheckInDelayMinutes: 45,
+  deliveryCheckInDelayMinutes: 75
 } as const;
 
 export type RestaurantSchedulerConfigField =

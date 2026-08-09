@@ -546,13 +546,29 @@ test("missing customer name gets structured draft error code", () => {
 
 test("state-aware follow-ups use active order step", () => {
   assert.equal(
+    buildStateAwareFollowUpMessage("choosing_items"),
+    "Still there? Tell me what you'd like to order whenever you're ready."
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage("choosing_items", 2),
+    "Still there? You can add another item or continue with your order."
+  );
+  assert.equal(
     buildStateAwareFollowUpMessage("collecting_quantity"),
-    "Are you still there? I just need the number of portions you would like."
+    "Still there? I just need the quantity you'd like."
   );
   assert.equal(
     buildStateAwareFollowUpMessage("collecting_name"),
-    "Are you still there? I just need the name for the order."
+    "Still there? I just need the name for the order."
   );
+  for (const step of [
+    "choosing_order_type",
+    "selecting_item_from_category",
+    "collecting_address",
+    "confirming_order"
+  ]) {
+    assert.equal(typeof buildStateAwareFollowUpMessage(step), "string", step);
+  }
   assert.equal(buildStateAwareFollowUpMessage("idle"), null);
 });
 
@@ -2590,6 +2606,7 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(customerTools.includes("confirm_order_draft"), true);
   assert.equal(customerTools.includes("cancel_order_draft"), true);
   assert.equal(customerTools.includes("get_latest_customer_order"), true);
+  assert.equal(customerTools.includes("respond_to_order_check_in"), true);
   assert.equal(customerTools.includes("get_customer_recommendations"), true);
   assert.equal(customerTools.includes("update_menu_price"), false);
   assert.equal(customerTools.includes("confirm_order"), false);
@@ -3199,7 +3216,8 @@ test("customer prompt receives memory for the exact restaurant and phone", async
           frequentItems: ["Jollof Rice (3 completed orders)"],
           preferredOrderType: "delivery"
         };
-      }
+      },
+      loadActiveCheckIns: async () => []
     }
   );
 
@@ -3253,7 +3271,8 @@ test("owner prompts never load or include customer memory", async () => {
         return {
           name: "Wrong customer"
         };
-      }
+      },
+      loadActiveCheckIns: async () => []
     }
   );
 
@@ -3309,7 +3328,8 @@ test("customer memory lookup failure does not block the ordering prompt", async 
         findClarification: async () => null,
         loadCustomerMemory: async () => {
           throw new Error("Temporary profile read failure");
-        }
+        },
+        loadActiveCheckIns: async () => []
       }
     );
 

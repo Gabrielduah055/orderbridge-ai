@@ -113,7 +113,8 @@ export const buildLiveCustomerEvalSystemPrompt = async (
         frequentItems: ["Jollof Rice"],
         preferredOrderType: "pickup",
         marketingConsent: "granted"
-      })
+      }),
+      loadActiveCheckIns: async () => scenario.activeOrderCheckIns ?? []
     }
   );
 

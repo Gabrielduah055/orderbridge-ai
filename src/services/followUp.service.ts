@@ -13,6 +13,7 @@ let schedulerBusy = false;
 let schedulerPassLogged = false;
 
 const activeSteps: string[] = [
+  "choosing_items",
   "collecting_quantity",
   "choosing_order_type",
   "selecting_item_from_category",
@@ -75,7 +76,7 @@ export const runFollowUpPass = async (): Promise<FollowUpSchedulerPassResult> =>
       currentStep: { $in: activeSteps },
       expiresAt: { $gt: now }
     }).select(
-      "_id restaurantId customerPhone currentStep conversationVersion lastFollowUpKey lastFollowUpAt expiresAt"
+      "_id restaurantId customerPhone cartItems currentStep conversationVersion lastFollowUpKey lastFollowUpAt expiresAt"
     );
 
     for (const session of sessions) {
@@ -104,7 +105,10 @@ export const runFollowUpPass = async (): Promise<FollowUpSchedulerPassResult> =>
           continue;
         }
 
-        const message = buildStateAwareFollowUpMessage(session.currentStep);
+        const message = buildStateAwareFollowUpMessage(
+          session.currentStep,
+          session.cartItems.length
+        );
 
         if (!message) {
           continue;

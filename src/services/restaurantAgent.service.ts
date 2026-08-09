@@ -33,7 +33,10 @@ import {
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
-import { handleOrderFeedbackCustomerResponse } from "./orderFeedback.service";
+import {
+  handleOrderFeedbackCustomerResponse,
+  type HandleOrderFeedbackResponseResult
+} from "./orderFeedback.service";
 import type {
   RestaurantAgentMessageInput,
   RestaurantAgentResponse,
@@ -57,7 +60,8 @@ const customerMutationToolNames = new Set([
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "respond_to_order_check_in"
 ]);
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
@@ -102,6 +106,9 @@ export const isExplicitCustomerClarificationResetMessage = (
 
   return explicitCustomerClarificationResetMessages.has(normalized);
 };
+
+export const isExactOrderCheckInReply = (message: string): boolean =>
+  /^[123][.!]?$/.test(normalizeText(message));
 
 export const parseSpecificMenuItemViewRequest = (message: string): string | null => {
   const normalized = normalizeText(message);
@@ -249,6 +256,7 @@ export interface RestaurantAgentRoutingDependencies {
   executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
   cancelPendingAction?: typeof cancelPendingToolAction;
   cancelCustomerClarifications?: typeof cancelPendingOrderItemClarifications;
+  handleCustomerFeedback?: typeof handleOrderFeedbackCustomerResponse;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -836,6 +844,8 @@ export const handleRestaurantAgentMessage = async (
     dependencies.handleLegacyCustomerMessage ?? handleLegacyCustomerMessage;
   const cancelCustomerClarifications =
     dependencies.cancelCustomerClarifications ?? cancelPendingOrderItemClarifications;
+  const handleCustomerFeedback =
+    dependencies.handleCustomerFeedback ?? handleOrderFeedbackCustomerResponse;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -916,13 +926,16 @@ export const handleRestaurantAgentMessage = async (
       };
     }
 
-    const feedbackResult = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone: sender.normalizedPhone,
-      customerName: sender.name,
-      message,
-      inboundEventId: input.inboundEventId
-    });
+    const feedbackResult: HandleOrderFeedbackResponseResult =
+      !customerOpenRouterEnabled || isExactOrderCheckInReply(message)
+        ? await handleCustomerFeedback({
+            restaurantId,
+            customerPhone: sender.normalizedPhone,
+            customerName: sender.name,
+            message,
+            inboundEventId: input.inboundEventId
+          })
+        : { handled: false, success: false };
 
     if (feedbackResult.handled && feedbackResult.message) {
       await saveAgentConversationMessage({

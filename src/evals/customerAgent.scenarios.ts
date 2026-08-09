@@ -1,4 +1,8 @@
 import type { AiMessage } from "../services/ai/ai.types";
+import type {
+  FeedbackFollowUpStatus,
+  OrderStatus
+} from "../models/order.model";
 
 export interface SyntheticCustomerDraft {
   customerName?: string;
@@ -43,6 +47,14 @@ export interface CustomerAgentEvalScenario {
       available: boolean;
     }>;
   };
+  activeOrderCheckIns?: Array<{
+    orderNumber: string;
+    orderType: "pickup" | "delivery";
+    status: OrderStatus;
+    checkInStatus: FeedbackFollowUpStatus;
+    awaitingComplaint: boolean;
+    receiptClarificationPending: boolean;
+  }>;
 }
 
 const customerMutations = [
@@ -292,6 +304,96 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     expectedTool: "add_order_item_by_name",
     expectedArguments: { itemName: "Chicken Salad" },
     forbiddenArguments: ["quantity"]
+  },
+  {
+    name: "Pending check-in does not hijack new order",
+    message: "I want 2 fried rice",
+    activeOrderCheckIns: [
+      {
+        orderNumber: "ORD-100",
+        orderType: "delivery",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      }
+    ],
+    expectedTool: "add_order_item_by_name",
+    expectedArguments: { itemName: "fried rice", quantity: 2 },
+    forbiddenTools: ["respond_to_order_check_in"]
+  },
+  {
+    name: "Natural satisfied check-in response",
+    message: "yh I got it, food was nice",
+    activeOrderCheckIns: [
+      {
+        orderNumber: "ORD-100",
+        orderType: "delivery",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      }
+    ],
+    expectedTool: "respond_to_order_check_in",
+    expectedArguments: { outcome: "received_satisfied" }
+  },
+  {
+    name: "Natural complaint check-in response",
+    message: "I got it but the chicken was cold",
+    activeOrderCheckIns: [
+      {
+        orderNumber: "ORD-100",
+        orderType: "pickup",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      }
+    ],
+    expectedTool: "respond_to_order_check_in",
+    expectedArguments: { outcome: "received_complaint" }
+  },
+  {
+    name: "Natural not-received check-in response",
+    message: "I still haven't received it",
+    activeOrderCheckIns: [
+      {
+        orderNumber: "ORD-100",
+        orderType: "delivery",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      }
+    ],
+    expectedTool: "respond_to_order_check_in",
+    expectedArguments: { outcome: "not_received" }
+  },
+  {
+    name: "Multiple active check-ins require order clarification",
+    message: "I got it and it was fine",
+    activeOrderCheckIns: [
+      {
+        orderNumber: "ORD-100",
+        orderType: "delivery",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      },
+      {
+        orderNumber: "ORD-101",
+        orderType: "pickup",
+        status: "accepted",
+        checkInStatus: "requested",
+        awaitingComplaint: false,
+        receiptClarificationPending: false
+      }
+    ],
+    expectNoTool: true,
+    forbiddenTools: ["respond_to_order_check_in"],
+    expectedTextPattern: /which order|order number|ORD-100|ORD-101/i
   },
   {
     name: "Marketing STOP boundary",
