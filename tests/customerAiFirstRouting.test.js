@@ -5,6 +5,7 @@ const { AgentConversationMessage } = require("../dist/models/agentConversation.m
 const { Order } = require("../dist/models/order.model");
 const {
   handleRestaurantAgentMessage,
+  isExplicitCustomerClarificationResetMessage,
   shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
 const {
@@ -17,11 +18,13 @@ const {
   runAgentOrchestrator
 } = require("../dist/services/ai/agentOrchestrator.service");
 const {
+  buildAgentSystemPrompt
+} = require("../dist/services/ai/agentPrompt.service");
+const {
   getAgentToolDefinitionsForRole
 } = require("../dist/services/ai/agentToolDefinitions.service");
 const {
-  sendMenuItemImage,
-  buildMenuItemImageFallbackMessage,
+  enqueueTrustedMenuItemImageReply,
   getTrustedMenuItemImageDelivery
 } = require("../dist/controllers/wasender.controller");
 const {
@@ -186,6 +189,60 @@ for (const message of [
     });
   });
 }
+
+for (const message of ["the second dish", "I mean the Chicken Salad"]) {
+  test(`${JSON.stringify(message)} preserves clarification state for the customer AI`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      let cancellationCalls = 0;
+      let orchestratorCalls = 0;
+
+      await handleRestaurantAgentMessage(
+        { restaurant: makeRestaurant(), senderPhone: customerPhone, message },
+        {
+          cancelCustomerClarifications: async () => {
+            cancellationCalls += 1;
+          },
+          runOrchestrator: async () => {
+            orchestratorCalls += 1;
+            return makeAgentResult();
+          }
+        }
+      );
+
+      assert.equal(cancellationCalls, 0);
+      assert.equal(orchestratorCalls, 1);
+    });
+  });
+}
+
+test("an explicit menu restart may clear stale clarification before the customer AI turn", async () => {
+  await withCustomerRoutingHarness(async () => {
+    const cancellations = [];
+    let orchestratorCalls = 0;
+
+    await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "show me the menu"
+      },
+      {
+        cancelCustomerClarifications: async (input) => {
+          cancellations.push(input);
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult({
+            executedTools: [{ name: "get_menu", success: true }]
+          });
+        }
+      }
+    );
+
+    assert.deepEqual(cancellations, [{ restaurantId, senderPhone: customerPhone }]);
+    assert.equal(orchestratorCalls, 1);
+  });
+});
 
 test("explicit legacy fallback runs only after an AI failure", async () => {
   await withCustomerRoutingHarness(
@@ -439,41 +496,45 @@ test("grounded no-image result exposes hasImage false but never an image URL", a
   assert.doesNotMatch(toolContent, /https?:\/\//i);
 });
 
-test("trusted backend image payload sends the actual WhatsApp image", async () => {
+test("trusted backend image payload queues one media message with a safe reply caption", async () => {
   const calls = [];
-  const sent = await sendMenuItemImage(
-    "session",
-    customerPhone,
-    imageUrl,
-    "Chicken Salad",
-    "restaurant-token",
-    async (...args) => {
-      calls.push(args);
-      return { success: true, status: 200 };
+  await enqueueTrustedMenuItemImageReply(
+    {
+      restaurantId,
+      sessionId: "session",
+      to: customerPhone,
+      delivery: {
+        menuItemId: "menu-chicken",
+        imageUrl,
+        caption: "Chicken Salad",
+        source: "search_menu_items_tool"
+      },
+      agentMessage: `Here it is: ${imageUrl}`,
+      eventId: "webhook-message-1",
+      apiKey: "restaurant-token"
     },
-    { restaurantId, customerPhone, menuItemId: "menu-chicken", menuItemName: "Chicken Salad" }
+    async (input) => {
+      calls.push(input);
+      return input;
+    }
   );
 
-  assert.equal(sent, true);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][2], imageUrl);
-  assert.equal(calls[0][3], "Chicken Salad");
+  assert.equal(calls[0].type, "image");
+  assert.equal(calls[0].imageUrl, imageUrl);
+  assert.equal(calls[0].caption, "Here is Chicken Salad.");
+  assert.doesNotMatch(calls[0].caption, /https?:\/\//i);
+  assert.equal(
+    calls[0].idempotencyKey,
+    `send_restaurant_agent_image:webhook-message-1:${customerPhone}`
+  );
 });
 
-test("WaSender image failure returns the existing safe text fallback without a URL", async () => {
-  const sent = await sendMenuItemImage(
-    "session",
-    customerPhone,
-    imageUrl,
-    "Chicken Salad",
-    undefined,
-    async () => ({ success: false, status: 503, error: "provider unavailable" })
-  );
-  const fallback = buildMenuItemImageFallbackMessage("Here is Chicken Salad.");
-
-  assert.equal(sent, false);
-  assert.match(fallback, /couldn't send the image right now/i);
-  assert.doesNotMatch(fallback, /https?:\/\//i);
+test("explicit clarification resets are intentionally narrow", () => {
+  assert.equal(isExplicitCustomerClarificationResetMessage("start over"), true);
+  assert.equal(isExplicitCustomerClarificationResetMessage("Please show me the menu!"), true);
+  assert.equal(isExplicitCustomerClarificationResetMessage("the second dish"), false);
+  assert.equal(isExplicitCustomerClarificationResetMessage("I mean the Chicken Salad"), false);
 });
 
 test("only an explicitly trusted media payload is accepted for outbound delivery", () => {
@@ -578,4 +639,44 @@ test("live customer eval prompt uses production customer state hierarchy", async
   assert.match(prompt, /Assorted Fried Rice/);
   assert.match(prompt, /Active draft and clarification records are more authoritative/);
   assert.match(prompt, /Customer memory.*must never override/i);
+});
+
+test("production customer prompt receives the active trusted clarification", async () => {
+  const prompt = await buildAgentSystemPrompt(
+    makeRestaurant(),
+    { role: "customer", normalizedPhone: customerPhone, verified: false },
+    ["search_menu_items"],
+    {
+      buildRestaurantContext: async () => ({
+        restaurant: { name: "Golden Grill", cuisine: "Local", status: "active" },
+        sender: { role: "customer", verified: false },
+        settings: {},
+        summary: {},
+        permissions: ["search_menu_items"]
+      }),
+      findDraft: async () => null,
+      findClarification: async () => ({
+        intent: "add_item",
+        originalText: "add chicken",
+        candidates: [
+          {
+            menuItemId: "64b000000000000000000111",
+            name: "Chicken Salad",
+            available: true
+          },
+          {
+            menuItemId: "64b000000000000000000112",
+            name: "Chicken Jollof",
+            available: true
+          }
+        ]
+      }),
+      loadCustomerMemory: async () => null
+    }
+  );
+
+  assert.match(prompt, /"activeClarification"/);
+  assert.match(prompt, /"originalText":"add chicken"/);
+  assert.match(prompt, /Chicken Salad/);
+  assert.match(prompt, /Chicken Jollof/);
 });

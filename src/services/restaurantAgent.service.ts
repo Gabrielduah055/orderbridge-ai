@@ -85,6 +85,24 @@ const isMenuRequest = (message: string): boolean => {
   );
 };
 
+const explicitCustomerClarificationResetMessages = new Set([
+  "start over",
+  "restart",
+  "send me the menu",
+  "show me the menu"
+]);
+
+export const isExplicitCustomerClarificationResetMessage = (
+  message: string
+): boolean => {
+  const normalized = normalizeText(message)
+    .toLowerCase()
+    .replace(/[.!?]+$/, "")
+    .replace(/^please\s+/, "");
+
+  return explicitCustomerClarificationResetMessages.has(normalized);
+};
+
 export const parseSpecificMenuItemViewRequest = (message: string): string | null => {
   const normalized = normalizeText(message);
   const patterns = [
@@ -230,6 +248,7 @@ export interface RestaurantAgentRoutingDependencies {
   findPendingActions?: typeof findPendingToolActions;
   executeConfirmedAction?: typeof executeConfirmedPendingToolAction;
   cancelPendingAction?: typeof cancelPendingToolAction;
+  cancelCustomerClarifications?: typeof cancelPendingOrderItemClarifications;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -815,6 +834,8 @@ export const handleRestaurantAgentMessage = async (
   const runOrchestrator = dependencies.runOrchestrator ?? runAgentOrchestrator;
   const legacyCustomerHandler =
     dependencies.handleLegacyCustomerMessage ?? handleLegacyCustomerMessage;
+  const cancelCustomerClarifications =
+    dependencies.cancelCustomerClarifications ?? cancelPendingOrderItemClarifications;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -1322,16 +1343,10 @@ export const handleRestaurantAgentMessage = async (
         senderRole: sender.role
       });
       // ── Stale-clarification guard ──────────────────────────────────────────
-      // If the customer sends a greeting or asks for the menu, they have clearly
-      // started a new conversation.  Cancel any pending clarification that was
-      // left over from the previous session so the AI starts with a clean slate
-      // and does not keep asking them to choose between items they no longer
-      // care about.  For all other messages the AI receives the active
-      // clarification in its system-prompt context and can reason about it.
-      const isGreeting = /^(hi|hello|hey|good\s+(morning|afternoon|evening)|start)\b/i.test(message);
-
-      if (isGreeting || isMenuRequest(message)) {
-        await cancelPendingOrderItemClarifications({
+      // Only explicit fresh-start commands clear a pending clarification. Generic
+      // food/menu language stays available to the AI as trusted turn context.
+      if (isExplicitCustomerClarificationResetMessage(message)) {
+        await cancelCustomerClarifications({
           restaurantId,
           senderPhone: sender.normalizedPhone
         });
