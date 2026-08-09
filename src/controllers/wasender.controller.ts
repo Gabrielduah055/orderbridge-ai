@@ -2,9 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import {
   decryptWasenderMedia,
   sendTextMessage,
-  sendImageMessage,
   validateWasenderMenuItemImageMetadata,
-  type WasenderSendResult
 } from "../services/wasender.service";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
@@ -168,52 +166,6 @@ const getErrorDetails = (error: unknown): Record<string, unknown> => {
   return details;
 };
 
-type ImageMessageSender = (
-  sessionId: string,
-  to: string,
-  imageUrl: string,
-  caption?: string,
-  options?: { apiKey?: string }
-) => Promise<WasenderSendResult>;
-
-export const sendMenuItemImage = async (
-  sessionId: string,
-  to: string,
-  imageUrl: string,
-  caption: string,
-  apiKey?: string,
-  imageSender: ImageMessageSender = sendImageMessage
-): Promise<boolean> => {
-  try {
-    const result = await imageSender(sessionId, to, imageUrl, caption, { apiKey });
-
-    if (result.success) {
-      return true;
-    }
-
-    console.warn("Menu item image send failed", {
-      status: result.status,
-      error: getSafeErrorMessage(result.error, "WaSender rejected the image message")
-    });
-  } catch (error) {
-    console.warn("Menu item image send failed", {
-      error: getSafeErrorMessage(error, "WaSender image request failed")
-    });
-  }
-
-  return false;
-};
-
-export const sendCustomerMenuItemImage = async (
-  sessionId: string,
-  to: string,
-  imageUrl: string,
-  apiKey?: string,
-  imageSender: ImageMessageSender = sendImageMessage
-): Promise<boolean> => {
-  return sendMenuItemImage(sessionId, to, imageUrl, "", apiKey, imageSender);
-};
-
 export const getTrustedMenuItemImageDelivery = (
   data: RestaurantAgentResponse["data"]
 ): MenuItemImageDelivery | undefined => {
@@ -235,6 +187,8 @@ export const getTrustedMenuItemImageDelivery = (
   }
 
   return {
+    menuItemId:
+      typeof delivery.menuItemId === "string" ? delivery.menuItemId : undefined,
     imageUrl: delivery.imageUrl,
     caption: delivery.caption,
     source
@@ -269,6 +223,59 @@ export const buildCustomerImageFallbackMessage = (
   _imageUrl: string
 ): string => {
   return buildMenuItemImageFallbackMessage(agentMessage);
+};
+
+export interface EnqueueTrustedMenuItemImageReplyInput {
+  restaurantId: string;
+  sessionId: string;
+  to: string;
+  delivery: MenuItemImageDelivery;
+  agentMessage: string;
+  eventId?: string;
+  apiKey?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export const enqueueTrustedMenuItemImageReply = async (
+  input: EnqueueTrustedMenuItemImageReplyInput,
+  enqueueMessage: typeof enqueueWasenderMessage = enqueueWasenderMessage
+): Promise<void> => {
+  const recipient = normalizePhone(input.to) || input.to;
+  const caption = buildMenuItemImageReplyMessage(
+    input.agentMessage,
+    input.delivery.caption
+  );
+
+  await enqueueMessage({
+    restaurantId: input.restaurantId,
+    sessionId: input.sessionId,
+    to: recipient,
+    type: "image",
+    imageUrl: input.delivery.imageUrl,
+    caption,
+    apiKey: input.apiKey,
+    idempotencyKey: input.eventId
+      ? `send_restaurant_agent_image:${input.eventId}:${recipient}`
+      : undefined,
+    metadata: {
+      ...input.metadata,
+      kind: "menu_item_image_delivery",
+      restaurantId: input.restaurantId,
+      customerPhone: recipient,
+      menuItemId: input.delivery.menuItemId,
+      menuItemName: input.delivery.caption,
+      responsePurpose: "menu_item_image",
+      recipientType: "webhook_sender",
+      usesRestaurantApiToken: Boolean(input.apiKey?.trim())
+    }
+  });
+
+  console.info("[customerAgent] trusted menu image queued", {
+    restaurantId: input.restaurantId,
+    customerPhone: recipient,
+    menuItemId: input.delivery.menuItemId,
+    menuItemName: input.delivery.caption
+  });
 };
 
 const latestResponsePurpose = (message: string): string => {
@@ -633,24 +640,6 @@ const processNormalizedWebhook = async (
       const menuItemImage = getTrustedMenuItemImageDelivery(agentResponse.data);
       let replyMessage = agentResponse.message;
 
-      if (menuItemImage) {
-        replyMessage = buildMenuItemImageReplyMessage(
-          agentResponse.message,
-          menuItemImage.caption
-        );
-        const imageSent = await sendMenuItemImage(
-          restaurant.wasenderSessionId,
-          webhook.from,
-          menuItemImage.imageUrl,
-          menuItemImage.caption,
-          restaurant.wasenderApiToken
-        );
-
-        if (!imageSent) {
-          replyMessage = buildMenuItemImageFallbackMessage(replyMessage);
-        }
-      }
-
       if (sender.role === "customer") {
         const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
 
@@ -664,24 +653,43 @@ const processNormalizedWebhook = async (
         }
       }
 
-      await sendAgentReplyDirectly(
-        restaurant.wasenderSessionId,
-        webhook.from,
-        replyMessage,
-        {
-          action: "send_restaurant_agent_reply",
+      if (menuItemImage) {
+        await enqueueTrustedMenuItemImageReply({
           restaurantId: String(restaurant._id),
+          sessionId: restaurant.wasenderSessionId,
+          to: webhook.from,
+          delivery: menuItemImage,
+          agentMessage: agentResponse.message,
           eventId,
-          source: agentResponse.source,
-          senderRole: agentResponse.sender?.role,
-          ...conversationMetadata,
-          responsePurpose:
-            agentResponse.sender?.role === "customer"
-              ? latestResponsePurpose(replyMessage)
-              : "owner_agent_reply"
-        },
-        restaurant.wasenderApiToken
-      );
+          apiKey: restaurant.wasenderApiToken,
+          metadata: {
+            action: "send_restaurant_agent_image",
+            eventId,
+            source: agentResponse.source,
+            senderRole: agentResponse.sender?.role,
+            ...conversationMetadata
+          }
+        });
+      } else {
+        await sendAgentReplyDirectly(
+          restaurant.wasenderSessionId,
+          webhook.from,
+          replyMessage,
+          {
+            action: "send_restaurant_agent_reply",
+            restaurantId: String(restaurant._id),
+            eventId,
+            source: agentResponse.source,
+            senderRole: agentResponse.sender?.role,
+            ...conversationMetadata,
+            responsePurpose:
+              agentResponse.sender?.role === "customer"
+                ? latestResponsePurpose(replyMessage)
+                : "owner_agent_reply"
+          },
+          restaurant.wasenderApiToken
+        );
+      }
       await sendCustomerOrderSideEffects(restaurant, agentResponse);
 
       webhookEvent.status = "processed";

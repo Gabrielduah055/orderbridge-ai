@@ -41,7 +41,7 @@ OPENROUTER_MODEL=google/gemini-3.1-flash-lite
 OPENROUTER_TIMEOUT_MS=45000
 OPENROUTER_MAX_TOOL_ROUNDS=6
 OPENROUTER_MAX_OUTPUT_TOKENS=800
-OPENROUTER_CUSTOMER_AGENT_ENABLED=false
+OPENROUTER_CUSTOMER_AGENT_ENABLED=true
 OPENROUTER_CUSTOMER_LEGACY_FALLBACK=false
 OPENROUTER_SITE_URL=
 OPENROUTER_APP_NAME=OrderBridgeAI
@@ -56,9 +56,9 @@ The backend reads Firebase service account values from environment variables. `F
 
 ## Restaurant Agent
 
-Owner and manager WhatsApp messages can use OpenRouter by setting `AI_PROVIDER=openrouter`. Customer WhatsApp messages can also use OpenRouter when `OPENROUTER_CUSTOMER_AGENT_ENABLED=true`. The backend sends the selected model only role-filtered tool definitions, then executes any requested tool locally through the existing `executeAgentTool` flow. MongoDB-backed services remain the source of truth for menu items, prices, availability, drafts, orders, revenue, and mutations.
+Owner, manager, and customer WhatsApp messages use OpenRouter when `AI_PROVIDER=openrouter`. `OPENROUTER_CUSTOMER_AGENT_ENABLED` defaults to enabled and is retained only as an emergency customer rollback when explicitly set to `false`. The backend sends the selected model only role-filtered tool definitions, then executes any requested tool locally through the existing `executeAgentTool` flow. MongoDB-backed services remain the source of truth for menu items, prices, availability, drafts, orders, revenue, and mutations.
 
-Hermes is still available for rollback with `AI_PROVIDER=hermes`. To keep customers on the legacy deterministic ordering flow while testing owner/manager OpenRouter, leave `OPENROUTER_CUSTOMER_AGENT_ENABLED=false`. If customer OpenRouter is enabled and fails, the backend returns a safe failure response unless `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` is explicitly configured.
+Hermes is still available for rollback with `AI_PROVIDER=hermes`. To explicitly keep customers on the legacy deterministic ordering flow while staff use OpenRouter, set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false`. If customer OpenRouter fails, the backend returns a safe failure response unless `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` is explicitly configured. Legacy fallback is never invoked after a successful AI-side customer mutation.
 
 Customer OpenRouter tools are limited to customer-safe operations: reading the restaurant profile, menu, delivery information, the customer's own order details/latest order, and managing that customer's own order draft. Customers cannot update prices, change availability, read revenue, or access another customer's order.
 

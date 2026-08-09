@@ -54,12 +54,14 @@ export interface RestaurantAgentContext {
 export interface RestaurantAgentMessageInput {
   restaurant: IRestaurantDocument;
   senderPhone: string;
+  customerName?: string;
   message: string;
   quotedMessageId?: string;
   inboundEventId?: string;
 }
 
 export interface MenuItemImageDelivery {
+  menuItemId?: string;
   imageUrl: string;
   caption: string;
   source: "menu_item_record" | "search_menu_items_tool";

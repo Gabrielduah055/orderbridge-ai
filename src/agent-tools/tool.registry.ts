@@ -236,24 +236,35 @@ const menuItemView = (
   item: IMenuItemDocument,
   categoryNameById: Map<string, string>,
   includeInternal: boolean
-) => ({
-  id: includeInternal ? String(item._id) : undefined,
-  name: item.name,
-  description: item.description,
-  price: item.price,
-  category: categoryNameById.get(String(item.categoryId)),
-  available: item.isAvailable,
-  imageUrl: item.imageUrl,
-  ...(includeInternal
-    ? {
-        categoryId: String(item.categoryId),
-        tags: item.tags,
-        allergens: item.allergens,
-        isPopular: item.isPopular,
-        isPromoItem: item.isPromoItem
-      }
-    : {})
-});
+) => {
+  const view = {
+    id: includeInternal ? String(item._id) : undefined,
+    name: item.name,
+    description: item.description,
+    price: item.price,
+    category: categoryNameById.get(String(item.categoryId)),
+    available: item.isAvailable,
+    imageUrl: item.imageUrl,
+    ...(includeInternal
+      ? {
+          categoryId: String(item.categoryId),
+          tags: item.tags,
+          allergens: item.allergens,
+          isPopular: item.isPopular,
+          isPromoItem: item.isPromoItem
+        }
+      : {})
+  };
+
+  // Used only to prepare trusted outbound media/log metadata. Non-enumerable so
+  // it is never serialized into the model's tool result or an HTTP response.
+  Object.defineProperty(view, "mediaItemId", {
+    value: String(item._id),
+    enumerable: false
+  });
+
+  return view;
+};
 
 const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   id: String(order._id),
@@ -701,7 +712,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       parameters: {
         query: "Search text.",
         category: "Optional category name.",
-        availableOnly: "Optional boolean."
+        availableOnly: "Optional boolean.",
+        includeImage:
+          "Set true only when the customer or staff member explicitly asks to see the item image. The backend keeps the image URL private and delivers media separately."
       }
     },
     roles: toolPermissions.search_menu_items,
@@ -709,7 +722,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       .object({
         query: z.string().trim().min(1),
         category: z.string().trim().min(1).optional(),
-        availableOnly: z.boolean().optional()
+        availableOnly: z.boolean().optional(),
+        includeImage: z.boolean().optional()
       })
       .strict(),
     handler: async (args, context) => {

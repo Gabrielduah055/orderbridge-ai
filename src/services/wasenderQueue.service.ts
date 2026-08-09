@@ -15,12 +15,14 @@ import {
 import {
   extractWasenderProviderMessageId,
   sendDocumentMessage,
+  sendImageMessage,
   sendTextMessage,
   type WasenderSendResult
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
 import { normalizeGhanaPhone } from "../utils/phone.util";
+import { redactUrls } from "../utils/error.util";
 import {
   applyOrderFeedbackProviderResult,
   getQueuedOrderFeedbackStaleReason,
@@ -34,6 +36,7 @@ export interface EnqueueWasenderMessageInput {
   type: OutboundMessageType;
   text?: string;
   documentUrl?: string;
+  imageUrl?: string;
   caption?: string;
   apiKey?: string;
   idempotencyKey?: string;
@@ -856,6 +859,7 @@ export const enqueueWasenderMessage = async (
       type: input.type,
       text: input.text,
       documentUrl: input.documentUrl,
+      imageUrl: input.imageUrl,
       caption: input.caption,
       apiKey: input.apiKey,
       status: "pending",
@@ -884,8 +888,15 @@ export const enqueueWasenderMessage = async (
   }
 };
 
-const sendQueuedMessage = async (
-  message: IOutboundMessageDocument
+export interface SendQueuedWasenderMessageDependencies {
+  sendText?: typeof sendTextMessage;
+  sendDocument?: typeof sendDocumentMessage;
+  sendImage?: typeof sendImageMessage;
+}
+
+export const sendQueuedWasenderMessage = async (
+  message: IOutboundMessageDocument,
+  dependencies: SendQueuedWasenderMessageDependencies = {}
 ): Promise<WasenderSendResult> => {
   if (message.type === "document") {
     if (!message.documentUrl) {
@@ -895,7 +906,7 @@ const sendQueuedMessage = async (
       };
     }
 
-    return sendDocumentMessage(
+    return (dependencies.sendDocument ?? sendDocumentMessage)(
       message.sessionId,
       message.to,
       message.documentUrl,
@@ -904,13 +915,31 @@ const sendQueuedMessage = async (
     );
   }
 
-  return sendTextMessage(message.sessionId, message.to, message.text ?? "", {
+  if (message.type === "image") {
+    if (!message.imageUrl) {
+      return {
+        success: false,
+        error: "Queued image message is missing imageUrl"
+      };
+    }
+
+    return (dependencies.sendImage ?? sendImageMessage)(
+      message.sessionId,
+      message.to,
+      message.imageUrl,
+      message.caption,
+      { apiKey: message.apiKey }
+    );
+  }
+
+  return (dependencies.sendText ?? sendTextMessage)(message.sessionId, message.to, message.text ?? "", {
     apiKey: message.apiKey
   });
 };
 
 export interface ProcessQueuedWasenderMessageDependencies {
   sendMessage?: (message: IOutboundMessageDocument) => Promise<WasenderSendResult>;
+  enqueueMessage?: typeof enqueueWasenderMessage;
 }
 
 export const processNextQueuedWasenderMessage = async (
@@ -922,7 +951,7 @@ export const processNextQueuedWasenderMessage = async (
     nextAttemptAt: { $lte: now }
   })
     .sort({ nextAttemptAt: 1, createdAt: 1 })
-    .select("+apiKey");
+    .select("+apiKey +imageUrl");
 
   if (!candidate) {
     return false;
@@ -963,7 +992,7 @@ export const processNextQueuedWasenderMessage = async (
     {
       new: true
     }
-  ).select("+apiKey");
+  ).select("+apiKey +imageUrl");
 
   if (!locked) {
     return true;
@@ -1086,7 +1115,17 @@ export const processNextQueuedWasenderMessage = async (
     }
   }
 
-  const result = await (dependencies.sendMessage ?? sendQueuedMessage)(locked);
+  if (locked.type === "image") {
+    console.info("[customerAgent] image delivery attempted", {
+      restaurantId: locked.restaurantId ? String(locked.restaurantId) : undefined,
+      customerPhone: locked.to,
+      menuItemId: locked.metadata?.menuItemId,
+      menuItemName: locked.metadata?.menuItemName,
+      attempt: locked.attempts
+    });
+  }
+
+  const result = await (dependencies.sendMessage ?? sendQueuedWasenderMessage)(locked);
   await updateOrderSideEffectAfterSend(locked, result);
   await applyOrderFeedbackProviderResult(locked, result);
 
@@ -1118,6 +1157,37 @@ export const processNextQueuedWasenderMessage = async (
     result,
     locked.status === "failed"
   );
+
+  if (locked.type === "image") {
+    console.warn("[customerAgent] menu image delivery failed", {
+      restaurantId: locked.restaurantId ? String(locked.restaurantId) : undefined,
+      customerPhone: locked.to,
+      menuItemId: locked.metadata?.menuItemId,
+      menuItemName: locked.metadata?.menuItemName,
+      status: result.status,
+      error: redactUrls(getErrorMessage(result)),
+      retryScheduled: locked.status === "pending"
+    });
+
+    if (locked.status === "failed" && locked.metadata?.kind === "menu_item_image_delivery") {
+      const queueMessageId = String(locked._id);
+      await (dependencies.enqueueMessage ?? enqueueWasenderMessage)({
+        restaurantId: locked.restaurantId ? String(locked.restaurantId) : undefined,
+        sessionId: locked.sessionId,
+        to: locked.to,
+        type: "text",
+        text: "I couldn't send the image right now. Please try again.",
+        apiKey: locked.apiKey,
+        idempotencyKey: `${locked.idempotencyKey ?? queueMessageId}:safe-image-fallback`,
+        metadata: {
+          ...locked.metadata,
+          kind: "menu_item_image_failure",
+          failedImageQueueMessageId: queueMessageId,
+          responsePurpose: "menu_item_image_failure"
+        }
+      });
+    }
+  }
   return true;
 };
 

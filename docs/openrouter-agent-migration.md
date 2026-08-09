@@ -6,7 +6,7 @@ Wasender receives a text webhook, resolves the restaurant from the WhatsApp sess
 
 ## Current Customer Message Flow
 
-Customer messages can now use either the existing deterministic customer flow or the OpenRouter agent orchestrator. `OPENROUTER_CUSTOMER_AGENT_ENABLED=true` routes customers through OpenRouter with customer-safe tools; `false` keeps the legacy flow. `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` enables explicit legacy fallback if the customer OpenRouter path fails.
+Customer messages use the OpenRouter agent orchestrator whenever `AI_PROVIDER=openrouter`. `OPENROUTER_CUSTOMER_AGENT_ENABLED` defaults to enabled; explicit `false` is an emergency rollback to the legacy flow. `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` enables explicit legacy fallback if the customer OpenRouter path fails before any successful mutation.
 
 ## Current Hermes Flow
 
@@ -50,7 +50,7 @@ Incoming WhatsApp message -> trusted backend context -> recent history plus acti
 
 ## Migration And Rollback
 
-Use `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to enable the OpenRouter agent. Set `OPENROUTER_CUSTOMER_AGENT_ENABLED=true` to migrate customer conversations. Set `AI_PROVIDER=hermes` to return owner/manager conversations to the legacy Hermes path. Set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false` to keep customer conversations on the legacy parser.
+Use `AI_PROVIDER=openrouter` with `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to enable the OpenRouter agent for staff and customers. Set `AI_PROVIDER=hermes` to return owner/manager conversations to the legacy Hermes path. Set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false` only for an explicit emergency customer rollback.
 
 ## Phase 6 Order Decisions
 

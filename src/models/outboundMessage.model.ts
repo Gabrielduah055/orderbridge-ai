@@ -1,6 +1,6 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 
-export const outboundMessageTypes = ["text", "document"] as const;
+export const outboundMessageTypes = ["text", "document", "image"] as const;
 export const outboundMessageStatuses = ["pending", "sending", "sent", "failed", "cancelled"] as const;
 
 export type OutboundMessageType = (typeof outboundMessageTypes)[number];
@@ -13,6 +13,7 @@ export interface IOutboundMessage {
   type: OutboundMessageType;
   text?: string;
   documentUrl?: string;
+  imageUrl?: string;
   caption?: string;
   apiKey?: string;
   status: OutboundMessageStatus;
@@ -63,6 +64,11 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
     documentUrl: {
       type: String,
       trim: true
+    },
+    imageUrl: {
+      type: String,
+      trim: true,
+      select: false
     },
     caption: {
       type: String
