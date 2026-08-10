@@ -9,6 +9,7 @@ import {
   type OrderFeedbackType
 } from "../models/orderFeedback.model";
 import { Order, type IOrderDocument } from "../models/order.model";
+import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
@@ -37,6 +38,7 @@ export interface HandleOrderFeedbackResponseInput {
   customerName?: string;
   message: string;
   inboundEventId?: string;
+  trustedOrderId?: string;
 }
 
 export interface HandleOrderFeedbackResponseResult {
@@ -119,7 +121,7 @@ export const classifyDeterministicOrderFeedback = (
   const rating = extractRating(message);
   const nonDelivery =
     /\b(?:have|has|had)?\s*not\s+(?:received|got|gotten)\b/.test(normalized) ||
-    /\b(?:haven't|hasn't|didn't)\s+(?:receive|get|arrive)\b/.test(normalized) ||
+    /\b(?:haven't|hasn't|didn't)\s+(?:received?|get|got|gotten|arrived?)\b/.test(normalized) ||
     /\b(?:order|food|delivery)\s+(?:has\s+not|hasn't|never)\s+arrived\b/.test(normalized) ||
     /\bnot\s+(?:yet\s+)?arrived\b/.test(normalized) ||
     /\bstill\s+waiting\b/.test(normalized);
@@ -245,6 +247,33 @@ export const classifyDeterministicOrderFeedback = (
   return null;
 };
 
+export const isExplicitNaturalOrderFeedback = (rawMessage: string): boolean => {
+  const message = normalizeText(rawMessage);
+
+  if (!message || /^[123][.!]?$/.test(message)) {
+    return false;
+  }
+
+  if (
+    /^(?:i\s+)?(?:want|need|would\s+like)\s+to\s+complain[.!]?$/i.test(
+      message
+    ) ||
+    /^complaint[.!]?$/i.test(message)
+  ) {
+    return true;
+  }
+
+  const classification = classifyDeterministicOrderFeedback(message);
+
+  if (!classification || classification.receiptStatus === "unclear") {
+    return false;
+  }
+
+  return /\b(?:received|arrived|got\s+it|picked\s+it\s+up|picked\s+up|previous\s+order|last\s+order|still\s+waiting|enjoyed|complaint|food\s+was|meal\s+was|order\s+was)\b|\b(?:haven't|hasn't|didn't)\s+(?:received?|get|got|gotten|arrived?)\b/i.test(
+    message
+  );
+};
+
 const parseAiJson = (text: string): unknown => {
   const trimmed = text.trim();
   const withoutFence = trimmed
@@ -347,7 +376,7 @@ export const buildOwnerFeedbackNotification = (
   const customer = feedback.customerName || feedback.customerPhone;
   if (feedback.type === "delivery_not_received") {
     return [
-      "⚠️ ORDER NOT RECEIVED",
+      "🚨 ORDER NOT RECEIVED",
       "",
       `${customer} says order ${feedback.orderNumber} has not been received.`,
       "",
@@ -355,12 +384,35 @@ export const buildOwnerFeedbackNotification = (
     ].join("\n");
   }
 
+  if (feedback.type === "review") {
+    return [
+      "⭐ CUSTOMER REVIEW",
+      "",
+      customer,
+      `Order ${feedback.orderNumber}`,
+      "",
+      `“${feedback.message}”`
+    ].join("\n");
+  }
+
+  if (feedback.type === "suggestion") {
+    return [
+      "💡 CUSTOMER SUGGESTION",
+      "",
+      customer,
+      `Order ${feedback.orderNumber}`,
+      "",
+      `“${feedback.message}”`
+    ].join("\n");
+  }
+
   return [
     "⚠️ CUSTOMER COMPLAINT",
     "",
-    `${customer} has a complaint about ${feedback.orderNumber}.`,
+    customer,
+    `Order ${feedback.orderNumber}`,
     "",
-    feedback.message
+    `“${feedback.message}”`
   ].join("\n");
 };
 
@@ -482,7 +534,7 @@ export const createOrderFeedback = async (
   }
 
   if (
-    feedback.requiresOwnerAttention &&
+    meaningfulOwnerFeedbackTypes.has(feedback.type) &&
     (created || !feedback.ownerNotifiedAt)
   ) {
     await notifyOwnerOfOrderFeedback(feedback);
@@ -516,6 +568,14 @@ export const findActiveFeedbackOrders = async (
   }).sort({ feedbackRequestSentAt: -1, createdAt: -1 });
 };
 
+const meaningfulOwnerFeedbackTypes = new Set<OrderFeedbackType>([
+  "review",
+  "complaint",
+  "suggestion",
+  "delivery_not_received",
+  "mixed"
+]);
+
 export interface ActiveOrderCheckInView {
   orderNumber: string;
   orderType: IOrderDocument["orderType"];
@@ -543,13 +603,59 @@ export const loadActiveOrderCheckInState = async (
   }));
 };
 
+export const resolveQuotedOrderFeedbackOrderId = async (
+  restaurantId: string,
+  customerPhone: string,
+  quotedMessageId?: string
+): Promise<string | null> => {
+  const providerMessageId = quotedMessageId?.trim();
+
+  if (!Types.ObjectId.isValid(restaurantId) || !providerMessageId) {
+    return null;
+  }
+
+  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const queuedMessage = await OutboundMessage.findOne({
+    restaurantId,
+    to: normalizedPhone,
+    status: "sent",
+    providerMessageId,
+    "metadata.kind": {
+      $in: ["order_feedback_request", "order_feedback_reminder"]
+    },
+    "metadata.customerPhone": normalizedPhone
+  })
+    .sort({ sentAt: -1 })
+    .select("metadata");
+  const orderId =
+    queuedMessage?.metadata &&
+    typeof queuedMessage.metadata.orderId === "string"
+      ? queuedMessage.metadata.orderId
+      : "";
+
+  return Types.ObjectId.isValid(orderId) ? orderId : null;
+};
+
 const selectFeedbackOrder = (
   orders: IOrderDocument[],
-  message: string
+  message: string,
+  trustedOrderId?: string
 ):
   | { order: IOrderDocument }
   | { ambiguity: string[] }
   | { unmatchedReference: string } => {
+  if (trustedOrderId) {
+    const trustedOrder = orders.find(
+      (order) => String(order._id) === trustedOrderId
+    );
+
+    if (trustedOrder) {
+      return { order: trustedOrder };
+    }
+
+    return { unmatchedReference: trustedOrderId };
+  }
+
   const quotedOrderNumber = extractOrderNumber(message);
 
   if (quotedOrderNumber) {
@@ -850,7 +956,7 @@ const handleReceiptClarification = async (
   return {
     handled: true,
     success: true,
-    message: `Just to confirm ${getOrderReference(order)}: did you receive the order? Reply 1 for yes or 3 for no.`,
+    message: `Just to confirm ${getOrderReference(order)}: did you receive the order, or are you still waiting for it?`,
     order
   };
 };
@@ -873,7 +979,11 @@ export const handleOrderFeedbackCustomerResponse = async (
     return { handled: false, success: false };
   }
 
-  const selected = selectFeedbackOrder(orders, message);
+  const selected = selectFeedbackOrder(
+    orders,
+    message,
+    input.trustedOrderId
+  );
 
   if ("unmatchedReference" in selected) {
     return {
@@ -929,7 +1039,7 @@ export const handleOrderFeedbackCustomerResponse = async (
     return {
       handled: true,
       success: true,
-      message: `I’m sorry something went wrong. Did you receive ${getOrderReference(order)}? Reply 1 for yes or 3 for no, and you can add the complaint.`,
+      message: `I’m sorry something went wrong. Did you receive ${getOrderReference(order)}? Tell me whether it arrived, then add the complaint.`,
       order
     };
   }
@@ -942,7 +1052,7 @@ export const handleOrderFeedbackCustomerResponse = async (
     return {
       handled: true,
       success: true,
-      message: `Thanks. To make sure I handle ${getOrderReference(order)} correctly, did you receive the order? Reply 1 for yes or 3 for no.`,
+      message: `Thanks. To make sure I handle ${getOrderReference(order)} correctly, did you receive the order, or are you still waiting for it?`,
       order
     };
   }
@@ -1004,7 +1114,7 @@ export const handleOrderFeedbackCustomerResponse = async (
   return {
     handled: true,
     success: true,
-    message: `Thanks for the feedback. One quick check for ${getOrderReference(order)}: did you receive the order? Reply 1 for yes or 3 for no.`,
+    message: `Thanks for the feedback. One quick check for ${getOrderReference(order)}: did you receive the order, or are you still waiting for it?`,
     order,
     feedback
   };

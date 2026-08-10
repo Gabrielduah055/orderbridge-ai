@@ -884,32 +884,132 @@ export const submitOrderDraft = async (
   };
 };
 
-export const buildStateAwareFollowUpMessage = (
-  step: ICustomerSessionDocument["currentStep"],
-  cartItemCount = 0
+export type CustomerDraftFollowUpState = Pick<
+  ICustomerSessionDocument,
+  | "currentStep"
+  | "cartItems"
+  | "pendingMenuItemId"
+  | "pendingMenuItemName"
+  | "pendingCategoryId"
+  | "pendingCategoryName"
+  | "orderType"
+  | "deliveryFee"
+  | "customerName"
+>;
+
+export interface CustomerDraftFollowUpContext {
+  clarificationCandidateNames?: readonly string[];
+  knownCustomerName?: string;
+}
+
+const formatFollowUpItemSummary = (
+  session: CustomerDraftFollowUpState
 ): string | null => {
-  switch (step) {
+  if (session.cartItems.length === 0) {
+    return null;
+  }
+
+  if (session.cartItems.length === 1) {
+    const item = session.cartItems[0];
+    return `${item.quantity} ${getCartItemDisplayName(item)}`;
+  }
+
+  return session.cartItems
+    .map((item) => `${item.quantity} ${getCartItemDisplayName(item)}`)
+    .join(", ");
+};
+
+const joinClarificationNames = (names: readonly string[]): string => {
+  if (names.length <= 1) {
+    return names[0] ?? "the option you wanted";
+  }
+
+  return `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`;
+};
+
+export const buildStateAwareFollowUpMessage = (
+  session: CustomerDraftFollowUpState,
+  context: CustomerDraftFollowUpContext = {}
+): string | null => {
+  switch (session.currentStep) {
     case "choosing_items":
-      return cartItemCount > 0
+      return session.cartItems.length > 0
         ? "Still there? You can add another item or continue with your order."
         : "Still there? Tell me what you'd like to order whenever you're ready.";
     case "collecting_quantity":
-      return "Still there? I just need the quantity you'd like.";
-    case "choosing_order_type":
-      return "Still there? Would you like pickup or delivery?";
-    case "selecting_item_from_category":
-      return "Are you still there? Please choose one of the options I listed.";
+      return session.pendingMenuItemName?.trim()
+        ? `Still there? How many portions of ${session.pendingMenuItemName.trim()} would you like?`
+        : "Still there? How many portions would you like?";
+    case "choosing_order_type": {
+      const itemSummary = formatFollowUpItemSummary(session);
+      return itemSummary
+        ? `Still there? Would you like your ${itemSummary} for pickup or delivery?`
+        : "Still there? Would you like pickup or delivery?";
+    }
+    case "selecting_item_from_category": {
+      const candidateNames = (context.clarificationCandidateNames ?? [])
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .slice(0, 4);
+
+      if (candidateNames.length > 0) {
+        return `Still there? Which item did you want — ${joinClarificationNames(candidateNames)}?`;
+      }
+
+      return session.pendingCategoryName?.trim()
+        ? `Still there? Which ${session.pendingCategoryName.trim()} option would you like?`
+        : "Still there? Which item option would you like?";
+    }
     case "collecting_address":
-      return "Still there? Please send the delivery location when you're ready.";
+      return "Still there? Please send the delivery location for your order.";
     case "collecting_name":
-      return "Still there? I just need the name for the order.";
-    case "confirming_order":
-      return "Your order is ready to submit whenever you're ready.";
+      return context.knownCustomerName?.trim()
+        ? `Still there? I can use ${context.knownCustomerName.trim()} for this order. Shall I continue?`
+        : "Still there? What name should I use for the order?";
+    case "confirming_order": {
+      const itemSummary = formatFollowUpItemSummary(session);
+      const orderType = session.orderType ?? "current";
+      const subtotal = session.cartItems.reduce(
+        (total, item) => total + item.totalPrice,
+        0
+      );
+      const total =
+        typeof session.deliveryFee === "number"
+          ? subtotal + session.deliveryFee
+          : subtotal;
+      const hasTrustedTotal =
+        session.orderType === "pickup" ||
+        typeof session.deliveryFee === "number";
+      const trustedSummary = itemSummary
+        ? `${orderType} order for ${itemSummary}${
+            hasTrustedTotal ? ` at GHS ${total.toFixed(2)}` : ""
+          }`
+        : `${orderType} order`;
+
+      return `Still there? Shall I submit your ${trustedSummary}?`;
+    }
     default:
       return null;
   }
 };
 
+export const buildDraftFollowUpContextKey = (
+  session: CustomerDraftFollowUpState
+): string => {
+  const cartKey = session.cartItems
+    .map((item) => `${String(item.menuItemId)}:${item.quantity}`)
+    .join(",");
+
+  return [
+    session.currentStep,
+    session.pendingMenuItemId ? String(session.pendingMenuItemId) : "",
+    session.pendingCategoryId ? String(session.pendingCategoryId) : "",
+    cartKey,
+    session.orderType ?? "",
+    typeof session.deliveryFee === "number" ? session.deliveryFee : ""
+  ].join("|");
+};
+
 export const buildFollowUpKey = (session: ICustomerSessionDocument): string => {
-  return `${session.currentStep}:${session.conversationVersion ?? 0}`;
+  return `${session.currentStep}:${session.conversationVersion ?? 0}:${buildDraftFollowUpContextKey(session)}`;
 };

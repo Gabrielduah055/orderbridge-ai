@@ -325,6 +325,10 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
   {
     name: "Natural satisfied check-in response",
     message: "yh I got it, food was nice",
+    activeDraft: draft({
+      cartItems: chickenDraft.cartItems,
+      currentStep: "choosing_order_type"
+    }),
     activeOrderCheckIns: [
       {
         orderNumber: "ORD-100",
@@ -341,6 +345,10 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
   {
     name: "Natural complaint check-in response",
     message: "I got it but the chicken was cold",
+    activeDraft: draft({
+      cartItems: chickenDraft.cartItems,
+      currentStep: "choosing_order_type"
+    }),
     activeOrderCheckIns: [
       {
         orderNumber: "ORD-100",
@@ -357,6 +365,10 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
   {
     name: "Natural not-received check-in response",
     message: "I still haven't received it",
+    activeDraft: draft({
+      cartItems: chickenDraft.cartItems,
+      currentStep: "choosing_order_type"
+    }),
     activeOrderCheckIns: [
       {
         orderNumber: "ORD-100",

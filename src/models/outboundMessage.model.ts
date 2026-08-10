@@ -25,6 +25,7 @@ export interface IOutboundMessage {
   lastError?: string;
   lastStatus?: number;
   providerData?: unknown;
+  providerMessageId?: string;
   idempotencyKey?: string;
   metadata?: Record<string, unknown>;
 }
@@ -116,6 +117,11 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
     providerData: {
       type: Schema.Types.Mixed
     },
+    providerMessageId: {
+      type: String,
+      trim: true,
+      index: true
+    },
     idempotencyKey: {
       type: String,
       trim: true,
@@ -133,6 +139,7 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
 
 outboundMessageSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
 outboundMessageSchema.index({ sessionId: 1, sentAt: -1 });
+outboundMessageSchema.index({ restaurantId: 1, providerMessageId: 1 });
 
 export const OutboundMessage = model<IOutboundMessageDocument>(
   "OutboundMessage",

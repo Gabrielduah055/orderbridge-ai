@@ -355,6 +355,162 @@ test("an exact numbered response remains safely handled before customer AI", asy
   });
 });
 
+test("a bare quantity-like number with an active draft and check-in mutates neither workflow", async () => {
+  await withCustomerRoutingHarness(async () => {
+    const draft = {
+      currentStep: "collecting_quantity",
+      pendingMenuItemName: "Special Noodles",
+      cartItems: []
+    };
+    let feedbackCalls = 0;
+    let orchestratorCalls = 0;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "1"
+      },
+      {
+        findCustomerDraft: async () => draft,
+        loadCustomerCheckIns: async () => [
+          {
+            orderNumber: "ORD-123",
+            orderType: "delivery",
+            status: "accepted",
+            checkInStatus: "requested",
+            awaitingComplaint: false,
+            receiptClarificationPending: false
+          }
+        ],
+        handleCustomerFeedback: async () => {
+          feedbackCalls += 1;
+          return { handled: true, success: true, message: "wrong mutation" };
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult();
+        }
+      }
+    );
+
+    assert.equal(feedbackCalls, 0);
+    assert.equal(orchestratorCalls, 0);
+    assert.equal(response.data.workflowClarificationRequired, true);
+    assert.match(response.message, /quantity.*Special Noodles/i);
+    assert.match(response.message, /ORD-123/);
+    assert.equal(draft.cartItems.length, 0);
+  });
+});
+
+test("a quoted numbered reply can safely select the old feedback workflow", async () => {
+  await withCustomerRoutingHarness(async () => {
+    const draft = {
+      currentStep: "collecting_quantity",
+      pendingMenuItemName: "Special Noodles",
+      cartItems: []
+    };
+    let feedbackInput;
+    let orchestratorCalls = 0;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "1",
+        quotedMessageId: "provider-feedback-message-1"
+      },
+      {
+        findCustomerDraft: async () => draft,
+        loadCustomerCheckIns: async () => [
+          {
+            orderNumber: "ORD-123",
+            orderType: "delivery",
+            status: "accepted",
+            checkInStatus: "requested",
+            awaitingComplaint: false,
+            receiptClarificationPending: false
+          }
+        ],
+        resolveQuotedCustomerFeedback: async () =>
+          "64b000000000000000000123",
+        handleCustomerFeedback: async (input) => {
+          feedbackInput = input;
+          return {
+            handled: true,
+            success: true,
+            message: "Thanks for confirming the earlier order."
+          };
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult();
+        }
+      }
+    );
+
+    assert.equal(response.success, true);
+    assert.equal(
+      feedbackInput.trustedOrderId,
+      "64b000000000000000000123"
+    );
+    assert.equal(orchestratorCalls, 0);
+    assert.equal(draft.cartItems.length, 0);
+    assert.equal(draft.currentStep, "collecting_quantity");
+  });
+});
+
+for (const feedbackMessage of [
+  "I have received my previous order. I really enjoyed the meal.",
+  "I received the previous order but the food was cold.",
+  "I still haven't received my previous order."
+]) {
+  test(`explicit natural feedback ${JSON.stringify(feedbackMessage)} leaves a concurrent draft unchanged`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      const draft = {
+        currentStep: "choosing_order_type",
+        cartItems: [
+          {
+            name: "Special Noodles",
+            quantity: 1
+          }
+        ]
+      };
+      const before = structuredClone(draft);
+      let feedbackCalls = 0;
+      let orchestratorCalls = 0;
+
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message: feedbackMessage
+        },
+        {
+          findCustomerDraft: async () => draft,
+          handleCustomerFeedback: async () => {
+            feedbackCalls += 1;
+            return {
+              handled: true,
+              success: true,
+              message: "Thanks for the feedback. We shared it with the restaurant."
+            };
+          },
+          runOrchestrator: async () => {
+            orchestratorCalls += 1;
+            return makeAgentResult();
+          }
+        }
+      );
+
+      assert.equal(response.success, true);
+      assert.equal(feedbackCalls, 1);
+      assert.equal(orchestratorCalls, 0);
+      assert.deepEqual(draft, before);
+    });
+  });
+}
+
 test("exact not-received response remains deterministic without an active draft", async () => {
   await withCustomerRoutingHarness(async () => {
     let feedbackCalls = 0;
@@ -520,6 +676,48 @@ const runImageOrchestrator = async ({ responses, history = [], executeTool }) =>
 
   return { result, providerRequests, savedMessages };
 };
+
+test("one customer turn cannot mutate both feedback and the active order", async () => {
+  const executedBackendTools = [];
+  const { result } = await runImageOrchestrator({
+    responses: [
+      {
+        text: null,
+        toolCalls: [
+          {
+            id: "feedback-mutation",
+            name: "respond_to_order_check_in",
+            arguments: { outcome: "received_satisfied" }
+          },
+          {
+            id: "draft-mutation",
+            name: "update_order_draft",
+            arguments: { orderType: "pickup" }
+          }
+        ]
+      },
+      {
+        text: "Please clarify which workflow you mean.",
+        toolCalls: []
+      }
+    ],
+    executeTool: async (toolName) => {
+      executedBackendTools.push(toolName);
+      return {
+        success: true,
+        message: "Mutation completed."
+      };
+    }
+  });
+
+  assert.deepEqual(executedBackendTools, ["respond_to_order_check_in"]);
+  assert.equal(result.executedTools[0].success, true);
+  assert.equal(result.executedTools[1].success, false);
+  assert.equal(
+    result.executedTools[1].code,
+    "CUSTOMER_WORKFLOW_CONFLICT"
+  );
+});
 
 test("contextual image lookup keeps URL outside model text and prepares trusted media", async () => {
   const { result, savedMessages } = await runImageOrchestrator({
@@ -839,4 +1037,7 @@ test("production customer prompt receives the active trusted clarification", asy
   assert.match(prompt, /Chicken Jollof/);
   assert.match(prompt, /"activeOrderCheckIns"/);
   assert.match(prompt, /ORD-100/);
+  assert.match(prompt, /separate workflows/i);
+  assert.match(prompt, /never guess.*1, 2, 3, yes, or ok/i);
+  assert.match(prompt, /never mutate both/i);
 });

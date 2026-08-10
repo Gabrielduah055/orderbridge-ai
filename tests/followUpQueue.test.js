@@ -7,6 +7,9 @@ const {
   buildCustomerFollowUpQueueMetadata
 } = require("../dist/services/followUp.service");
 const {
+  buildDraftFollowUpContextKey
+} = require("../dist/services/orderDraft.service");
+const {
   processNextQueuedWasenderMessage
 } = require("../dist/services/wasenderQueue.service");
 
@@ -30,6 +33,14 @@ const processReminder = async ({ metadata, session }) => {
   let sendCount = 0;
   let sessionFilter;
 
+  const scopedSession = session
+    ? {
+        _id: "customer-session-1",
+        cartItems: [],
+        orderType: null,
+        ...session
+      }
+    : null;
   const candidate = {
     _id: "queue-message-1",
     sessionId: "wasender-session-1",
@@ -57,7 +68,7 @@ const processReminder = async ({ metadata, session }) => {
     OutboundMessage.findOneAndUpdate = () => resolvedQuery(locked);
     CustomerSession.findOne = (filter) => {
       sessionFilter = filter;
-      return resolvedQuery(session);
+      return resolvedQuery(scopedSession);
     };
 
     const processed = await processNextQueuedWasenderMessage({
@@ -86,14 +97,19 @@ const processReminder = async ({ metadata, session }) => {
 };
 
 test("follow-up queue metadata captures the restaurant-scoped draft snapshot", () => {
+  const draftSnapshot = {
+    _id: "customer-session-1",
+    restaurantId,
+    customerPhone,
+    conversationVersion: 4,
+    currentStep: "collecting_quantity",
+    cartItems: [],
+    orderType: null,
+    pendingMenuItemId: "64b000000000000000000901",
+    pendingMenuItemName: "Special Noodles"
+  };
   const metadata = buildCustomerFollowUpQueueMetadata(
-    {
-      _id: "customer-session-1",
-      restaurantId,
-      customerPhone,
-      conversationVersion: 4,
-      currentStep: "collecting_quantity"
-    },
+    draftSnapshot,
     "collecting_quantity:4"
   );
 
@@ -104,6 +120,7 @@ test("follow-up queue metadata captures the restaurant-scoped draft snapshot", (
     customerPhone,
     conversationVersion: 4,
     expectedDraftStep: "collecting_quantity",
+    expectedDraftContextKey: buildDraftFollowUpContextKey(draftSnapshot),
     followUpKey: "collecting_quantity:4"
   });
 });
@@ -111,6 +128,7 @@ test("follow-up queue metadata captures the restaurant-scoped draft snapshot", (
 test("outdated follow-ups are cancelled after a reply or draft-step change", async () => {
   const metadata = {
     kind: "customer_follow_up",
+    sessionId: "customer-session-1",
     restaurantId,
     customerPhone,
     conversationVersion: 4,
@@ -149,6 +167,7 @@ test("a follow-up is cancelled when its scoped customer session no longer exists
   const result = await processReminder({
     metadata: {
       kind: "customer_follow_up",
+      sessionId: "customer-session-1",
       restaurantId,
       customerPhone,
       conversationVersion: 4,
@@ -167,10 +186,42 @@ test("a follow-up is cancelled when its scoped customer session no longer exists
   });
 });
 
+test("a follow-up is cancelled when its trusted unresolved draft context changes", async () => {
+  const originalSnapshot = {
+    currentStep: "collecting_quantity",
+    cartItems: [],
+    orderType: null,
+    pendingMenuItemId: "64b000000000000000000901"
+  };
+  const result = await processReminder({
+    metadata: {
+      kind: "customer_follow_up",
+      sessionId: "customer-session-1",
+      restaurantId,
+      customerPhone,
+      conversationVersion: 4,
+      expectedDraftStep: "collecting_quantity",
+      expectedDraftContextKey:
+        buildDraftFollowUpContextKey(originalSnapshot)
+    },
+    session: {
+      conversationVersion: 4,
+      currentStep: "collecting_quantity",
+      cartItems: [],
+      orderType: null,
+      pendingMenuItemId: "64b000000000000000000902"
+    }
+  });
+
+  assert.equal(result.locked.status, "cancelled");
+  assert.equal(result.sendCount, 0);
+});
+
 test("a current follow-up is still sent", async () => {
   const result = await processReminder({
     metadata: {
       kind: "customer_follow_up",
+      sessionId: "customer-session-1",
       restaurantId,
       customerPhone,
       conversationVersion: 4,
@@ -186,6 +237,7 @@ test("a current follow-up is still sent", async () => {
   assert.equal(result.sendCount, 1);
   assert.equal(result.locked.status, "sent");
   assert.equal(result.locked.sentAt instanceof Date, true);
+  assert.equal(result.locked.providerMessageId, "provider-message-1");
   assert.equal(result.savedCount, 1);
   assert.deepEqual(result.sessionFilter, {
     restaurantId,

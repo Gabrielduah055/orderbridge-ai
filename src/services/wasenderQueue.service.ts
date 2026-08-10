@@ -8,6 +8,10 @@ import { CustomerProfile } from "../models/customerProfile.model";
 import { MenuItem } from "../models/MenuItem";
 import { CustomerSession, type ICustomerSessionDocument } from "../models/customerSession.model";
 import {
+  buildDraftFollowUpContextKey,
+  type CustomerDraftFollowUpState
+} from "./orderDraft.service";
+import {
   OutboundMessage,
   type IOutboundMessageDocument,
   type OutboundMessageType
@@ -77,7 +81,10 @@ export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>)
 
 export const isQueuedConversationalMessageStale = (
   metadata: Record<string, unknown> | undefined,
-  session: Pick<ICustomerSessionDocument, "conversationVersion" | "currentStep"> | null
+  session: (Pick<
+    ICustomerSessionDocument,
+    "_id" | "conversationVersion"
+  > & CustomerDraftFollowUpState) | null
 ): boolean => {
   if (!metadata || isTransactionalQueuedMessage(metadata)) {
     return false;
@@ -91,15 +98,35 @@ export const isQueuedConversationalMessageStale = (
     return metadata.kind === "customer_follow_up";
   }
 
+  const kind = typeof metadata.kind === "string" ? metadata.kind : "";
   const expectedVersion = Number(metadata.conversationVersion);
   const expectedStep = typeof metadata.expectedDraftStep === "string" ? metadata.expectedDraftStep : undefined;
+
+  if (kind === "customer_follow_up") {
+    const expectedSessionId =
+      typeof metadata.sessionId === "string" ? metadata.sessionId : "";
+    const expectedContextKey =
+      typeof metadata.expectedDraftContextKey === "string"
+        ? metadata.expectedDraftContextKey
+        : "";
+
+    if (!expectedSessionId || String(session._id) !== expectedSessionId) {
+      return true;
+    }
+
+    if (
+      expectedContextKey &&
+      buildDraftFollowUpContextKey(session) !== expectedContextKey
+    ) {
+      return true;
+    }
+  }
 
   if (Number.isFinite(expectedVersion) && session.conversationVersion > expectedVersion) {
     return true;
   }
 
   if (expectedStep && session.currentStep !== expectedStep) {
-    const kind = typeof metadata.kind === "string" ? metadata.kind : "";
     const purpose = typeof metadata.responsePurpose === "string" ? metadata.responsePurpose : "";
 
     if (kind === "customer_follow_up") {
@@ -1095,7 +1122,7 @@ export const processNextQueuedWasenderMessage = async (
     const session =
       restaurantId && customerPhone
         ? await CustomerSession.findOne({ restaurantId, customerPhone }).select(
-            "conversationVersion currentStep"
+            "_id conversationVersion currentStep cartItems pendingMenuItemId pendingCategoryId orderType deliveryFee"
           )
         : null;
 
@@ -1134,6 +1161,7 @@ export const processNextQueuedWasenderMessage = async (
     locked.sentAt = new Date();
     locked.lastStatus = result.status;
     locked.providerData = result.data;
+    locked.providerMessageId = extractWasenderProviderMessageId(result.data);
     locked.lastError = undefined;
     await locked.save();
     await updateCampaignRecipientAfterAttempt(locked, result, false);
