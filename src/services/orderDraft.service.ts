@@ -777,6 +777,27 @@ export interface SubmitOrderDraftDependencies {
   rememberCustomerName?: typeof rememberConfirmedCustomerName;
 }
 
+const rememberSubmittedCustomerNameBestEffort = async (
+  restaurantId: string,
+  orderId: unknown,
+  customerPhone: string,
+  customerName: string,
+  rememberCustomerName: typeof rememberConfirmedCustomerName
+): Promise<void> => {
+  try {
+    await rememberCustomerName(
+      restaurantId,
+      customerPhone,
+      customerName
+    );
+  } catch {
+    console.error("Customer name persistence failed", {
+      restaurantId,
+      orderId: String(orderId)
+    });
+  }
+};
+
 export const submitOrderDraft = async (
   restaurant: IRestaurantDocument,
   customerPhone: string,
@@ -800,10 +821,12 @@ export const submitOrderDraft = async (
         existingOrder.customerName?.trim() || draft.customerName?.trim();
 
       if (submittedCustomerName) {
-        await rememberCustomerName(
+        await rememberSubmittedCustomerNameBestEffort(
           restaurantId,
+          existingOrder._id,
           existingOrder.customerPhone,
-          submittedCustomerName
+          submittedCustomerName,
+          rememberCustomerName
         );
       }
 
@@ -846,10 +869,12 @@ export const submitOrderDraft = async (
   draft.convertedOrderId = order._id;
   draft.convertedAt = new Date();
   await draft.save();
-  await rememberCustomerName(
+  await rememberSubmittedCustomerNameBestEffort(
     restaurantId,
+    order._id,
     order.customerPhone,
-    order.customerName?.trim() || submittedCustomerName
+    order.customerName?.trim() || submittedCustomerName,
+    rememberCustomerName
   );
 
   return {
