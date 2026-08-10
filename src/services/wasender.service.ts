@@ -1,12 +1,29 @@
 import crypto from "crypto";
 import { getSafeErrorMessage } from "../utils/error.util";
+import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export type WasenderMessageType = "text" | "image" | "document" | "unknown";
+export type WasenderAddressingMode = "pn" | "lid";
+export type WasenderSenderPhoneSource =
+  | "cleanedParticipantPn"
+  | "cleanedSenderPn"
+  | "senderPn"
+  | "participant"
+  | "remoteJid"
+  | "senderPhone";
 
 export interface NormalizedWasenderWebhook {
   event?: string;
   sessionId: string;
   from: string;
+  senderPhone?: string;
+  senderPhoneSource?: WasenderSenderPhoneSource;
+  senderLid?: string;
+  senderAddress: string;
+  addressingMode?: WasenderAddressingMode;
+  hasCleanedParticipantPn: boolean;
+  hasCleanedSenderPn: boolean;
+  hasSenderPn: boolean;
   message: string;
   messageType: WasenderMessageType;
   mediaUrl?: string;
@@ -27,6 +44,10 @@ export interface WasenderSendResult {
 
 export interface WasenderSendOptions {
   apiKey?: string;
+}
+
+export interface WasenderLidResolutionResult extends WasenderSendResult {
+  phone?: string;
 }
 
 const defaultWasenderApiUrl = "https://www.wasenderapi.com";
@@ -174,16 +195,64 @@ const getPrimaryMessagePayload = (payload: Record<string, unknown>): unknown => 
   return messages;
 };
 
+export const normalizeWhatsappLid = (value?: string): string => {
+  if (!value) {
+    return "";
+  }
+
+  const address = value.replace(/^whatsapp:/i, "").trim().toLowerCase();
+
+  return /^[a-z0-9._-]+@lid$/i.test(address) ? address : "";
+};
+
 const cleanWhatsappAddress = (value?: string): string => {
   if (!value) {
     return "";
   }
 
-  return value
+  const lid = normalizeWhatsappLid(value);
+
+  if (lid) {
+    return lid;
+  }
+
+  const address = value
+    .replace(/^whatsapp:/i, "")
     .replace(/@s\.whatsapp\.net$/i, "")
     .replace(/@c\.us$/i, "")
-    .replace(/^whatsapp:/i, "")
     .trim();
+
+  return address.includes("@") ? "" : address;
+};
+
+const normalizeWhatsappPhoneAddress = (value?: string): string => {
+  if (!value || normalizeWhatsappLid(value)) {
+    return "";
+  }
+
+  const address = value.replace(/^whatsapp:/i, "").trim();
+
+  if (address.includes("@") && !/@(?:s\.whatsapp\.net|c\.us)$/i.test(address)) {
+    return "";
+  }
+
+  return normalizeGhanaPhone(address);
+};
+
+const firstWhatsappPhone = (
+  sources: unknown[],
+  candidates: Array<{ path: string; source: WasenderSenderPhoneSource }>
+): { phone?: string; source?: WasenderSenderPhoneSource } => {
+  for (const candidate of candidates) {
+    const value = firstStringFromSources(sources, [candidate.path]);
+    const phone = normalizeWhatsappPhoneAddress(value);
+
+    if (phone) {
+      return { phone, source: candidate.source };
+    }
+  }
+
+  return {};
 };
 
 const detectMessageType = (payload: unknown, messageText?: string): WasenderMessageType => {
@@ -278,11 +347,16 @@ const postToWasender = async (
       ? path.replace(/^\/api/, "")
       : path;
   const url = `${config.apiUrl}${normalizedPath}`;
+  const recipientAddressingMode = normalizeWhatsappLid(
+    typeof body.to === "string" ? body.to : undefined
+  )
+    ? "lid"
+    : "pn";
 
   try {
     console.info("Wasender API send attempt", {
       path: normalizedPath,
-      to: body.to,
+      recipientAddressingMode,
       usesRestaurantApiToken: Boolean(options.apiKey?.trim()),
       hasText: typeof body.text === "string" && body.text.length > 0,
       hasDocumentUrl: typeof body.documentUrl === "string" && body.documentUrl.length > 0
@@ -318,7 +392,7 @@ const postToWasender = async (
       console.error("Wasender API send failed", {
         status: response.status,
         error: providerError,
-        to: body.to
+        recipientAddressingMode
       });
 
       return {
@@ -331,7 +405,7 @@ const postToWasender = async (
 
     console.info("Wasender API send accepted", {
       status: response.status,
-      to: body.to
+      recipientAddressingMode
     });
 
     return {
@@ -361,6 +435,90 @@ const isHttpUrl = (value: string): boolean => {
     return parsed.protocol === "https:" || parsed.protocol === "http:";
   } catch {
     return false;
+  }
+};
+
+export const resolveWasenderPhoneFromLid = async (
+  lid: string,
+  options: WasenderSendOptions = {}
+): Promise<WasenderLidResolutionResult> => {
+  const normalizedLid = normalizeWhatsappLid(lid);
+
+  if (!normalizedLid) {
+    return {
+      success: false,
+      error: "Invalid WhatsApp LID"
+    };
+  }
+
+  const config = getWasenderConfig(options);
+
+  if (!config) {
+    return {
+      success: false,
+      error: "Wasender API is not configured"
+    };
+  }
+
+  const path = normalizeWasenderPath(
+    config.apiUrl,
+    `/api/pn-from-lid/${encodeURIComponent(normalizedLid)}`
+  );
+
+  try {
+    const response = await fetch(`${config.apiUrl}${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        Accept: "application/json"
+      }
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    const data = contentType.includes("application/json")
+      ? ((await response.json()) as unknown)
+      : await response.text();
+    const explicitFailure =
+      data &&
+      typeof data === "object" &&
+      "success" in data &&
+      (data as { success?: unknown }).success === false;
+
+    if (!response.ok || explicitFailure) {
+      return {
+        success: false,
+        status: response.status,
+        data,
+        error: getSafeErrorMessage(
+          data,
+          `Wasender LID resolution failed with status ${response.status}`
+        )
+      };
+    }
+
+    const phone = normalizeWhatsappPhoneAddress(
+      firstString(data, ["data.pn", "pn"])
+    );
+
+    if (!phone) {
+      return {
+        success: false,
+        status: response.status,
+        data,
+        error: "Wasender LID resolution returned no valid phone number"
+      };
+    }
+
+    return {
+      success: true,
+      status: response.status,
+      data,
+      phone
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: getSafeErrorMessage(error, "Wasender LID resolution request failed")
+    };
   }
 };
 
@@ -538,13 +696,91 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
       "session.id",
       "data.session.id"
     ]) ?? "";
+  const senderSources = [messagePayload, rawPayload];
+  const cleanedParticipantPn = firstStringFromSources(senderSources, [
+    "key.cleanedParticipantPn",
+    "data.messages.key.cleanedParticipantPn"
+  ]);
+  const cleanedSenderPn = firstStringFromSources(senderSources, [
+    "key.cleanedSenderPn",
+    "data.messages.key.cleanedSenderPn"
+  ]);
+  const senderPn = firstStringFromSources(senderSources, [
+    "key.senderPn",
+    "data.messages.key.senderPn"
+  ]);
+  const phoneIdentity = firstWhatsappPhone(senderSources, [
+    { path: "key.cleanedParticipantPn", source: "cleanedParticipantPn" },
+    { path: "data.messages.key.cleanedParticipantPn", source: "cleanedParticipantPn" },
+    { path: "key.cleanedSenderPn", source: "cleanedSenderPn" },
+    { path: "data.messages.key.cleanedSenderPn", source: "cleanedSenderPn" },
+    { path: "key.senderPn", source: "senderPn" },
+    { path: "data.messages.key.senderPn", source: "senderPn" },
+    { path: "key.participant", source: "participant" },
+    { path: "data.messages.key.participant", source: "participant" },
+    { path: "senderPhone", source: "senderPhone" },
+    { path: "fromNumber", source: "senderPhone" },
+    { path: "data.senderPhone", source: "senderPhone" },
+    { path: "key.remoteJid", source: "remoteJid" },
+    { path: "data.messages.key.remoteJid", source: "remoteJid" },
+    { path: "from", source: "senderPhone" },
+    { path: "sender", source: "senderPhone" },
+    { path: "data.from", source: "senderPhone" },
+    { path: "data.sender", source: "senderPhone" },
+    { path: "message.from", source: "senderPhone" }
+  ]);
+  const rawRemoteAddress = firstStringFromSources(senderSources, [
+    "key.participant",
+    "data.messages.key.participant",
+    "key.remoteJid",
+    "data.messages.key.remoteJid",
+    "from",
+    "sender",
+    "data.from",
+    "data.sender",
+    "message.from"
+  ]);
+  const explicitSenderLid = firstStringFromSources(senderSources, [
+    "key.senderLid",
+    "data.messages.key.senderLid",
+    "senderLid",
+    "data.senderLid"
+  ]);
+  const senderLid =
+    normalizeWhatsappLid(explicitSenderLid) ||
+    normalizeWhatsappLid(rawRemoteAddress) ||
+    undefined;
+  const explicitAddressingMode = firstStringFromSources(senderSources, [
+    "key.addressingMode",
+    "data.messages.key.addressingMode",
+    "addressingMode",
+    "data.addressingMode"
+  ])?.toLowerCase();
+  const addressingMode: WasenderAddressingMode | undefined =
+    explicitAddressingMode === "lid" || explicitAddressingMode === "pn"
+      ? explicitAddressingMode
+      : normalizeWhatsappLid(rawRemoteAddress)
+        ? "lid"
+        : phoneIdentity.phone
+          ? "pn"
+          : undefined;
+  const senderAddress =
+    rawRemoteAddress?.replace(/^whatsapp:/i, "").trim() ??
+    senderLid ??
+    phoneIdentity.phone ??
+    "";
   const from = cleanWhatsappAddress(
-    firstStringFromSources([messagePayload, rawPayload], [
+    firstStringFromSources(senderSources, [
       "key.cleanedParticipantPn",
+      "data.messages.key.cleanedParticipantPn",
       "key.cleanedSenderPn",
+      "data.messages.key.cleanedSenderPn",
       "key.senderPn",
+      "data.messages.key.senderPn",
       "key.participant",
+      "data.messages.key.participant",
       "key.remoteJid",
+      "data.messages.key.remoteJid",
       "from",
       "sender",
       "senderPhone",
@@ -552,8 +788,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
       "data.from",
       "data.sender",
       "data.senderPhone",
-      "message.from",
-      "key.remoteJid"
+      "message.from"
     ])
   );
   const receiver = cleanWhatsappAddress(
@@ -610,6 +845,14 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     event,
     sessionId,
     from,
+    senderPhone: phoneIdentity.phone,
+    senderPhoneSource: phoneIdentity.source,
+    senderLid,
+    senderAddress,
+    addressingMode,
+    hasCleanedParticipantPn: Boolean(cleanedParticipantPn),
+    hasCleanedSenderPn: Boolean(cleanedSenderPn),
+    hasSenderPn: Boolean(senderPn),
     message: message ?? "",
     messageType: detectMessageType(messagePayload ?? rawPayload, message),
     mediaUrl,

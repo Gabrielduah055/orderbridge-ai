@@ -28,7 +28,8 @@ export const resolveSenderIdentity = (
   }
 
   const managerContact = restaurant.managerContacts.find(
-    (manager) => normalizePhone(manager.phone) === normalizedPhone
+    (manager) =>
+      Boolean(normalizedPhone) && normalizePhone(manager.phone) === normalizedPhone
   );
 
   if (managerContact) {
@@ -41,7 +42,10 @@ export const resolveSenderIdentity = (
     };
   }
 
-  if (restaurant.managerPhones.map(normalizePhone).includes(normalizedPhone)) {
+  if (
+    normalizedPhone &&
+    restaurant.managerPhones.map(normalizePhone).includes(normalizedPhone)
+  ) {
     return {
       phone: senderPhone,
       normalizedPhone,
