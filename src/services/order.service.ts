@@ -124,10 +124,40 @@ const allowedStaffOrderTransitions: Record<StaffOrderProgressStatus, readonly St
   completed: []
 };
 
-export const normalizeRestaurantRejectionReason = (reason?: string): string => {
-  const normalized = reason?.trim().replace(/\s+/g, " ") ?? "";
+const rejectionReasonPlaceholders = new Set([
+  "restaurant is unable to fulfill this order at this time",
+  "restaurant is unable to fulfil this order at this time",
+  "unable to fulfill this order at this time",
+  "unable to fulfil this order at this time",
+  "no reason provided",
+  "reason not provided",
+  "not specified",
+  "unspecified",
+  "n/a",
+  "none"
+]);
 
-  if (normalized.length < 3 || normalized.length > 500) {
+export const getTrustedRestaurantRejectionReason = (
+  reason?: string
+): string | undefined => {
+  const normalized = reason?.trim().replace(/\s+/g, " ") ?? "";
+  const normalizedKey = normalized.toLowerCase().replace(/[.!]+$/, "");
+
+  if (
+    normalized.length < 3 ||
+    normalized.length > 500 ||
+    rejectionReasonPlaceholders.has(normalizedKey)
+  ) {
+    return undefined;
+  }
+
+  return normalized;
+};
+
+export const normalizeRestaurantRejectionReason = (reason?: string): string => {
+  const normalized = getTrustedRestaurantRejectionReason(reason);
+
+  if (!normalized) {
     throw new BadRequestError(
       "Please provide a meaningful reason for rejecting the order.",
       "ORDER_REJECTION_REASON_REQUIRED"

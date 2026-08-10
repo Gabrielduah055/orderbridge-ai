@@ -1,7 +1,10 @@
 import { type IOrderDocument } from "../models/order.model";
 import { type IRestaurantDocument } from "../models/Restaurant";
 import { generateOrderReceipt } from "./receipt.service";
-import { formatGhanaCedi } from "./order.service";
+import {
+  formatGhanaCedi,
+  getTrustedRestaurantRejectionReason
+} from "./order.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
 export type SideEffectStepStatus = "success" | "queued" | "failed" | "skipped" | "not_attempted";
@@ -114,10 +117,12 @@ export const buildCustomerOrderRejectedMessage = (
   restaurant: IRestaurantDocument,
   order: IOrderDocument
 ): string => {
-  const reason = order.restaurantRejectionReason?.trim();
+  const reason = getTrustedRestaurantRejectionReason(
+    order.restaurantRejectionReason
+  );
 
   return reason
-    ? `${restaurant.name} could not accept order ${getOrderReference(order)} at this time. The restaurant gave this reason: ${reason}.`
+    ? `${restaurant.name} could not accept order ${getOrderReference(order)}.\n\nReason:\n${reason}`
     : `${restaurant.name} could not accept order ${getOrderReference(order)}.`;
 };
 

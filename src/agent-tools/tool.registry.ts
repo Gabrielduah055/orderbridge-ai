@@ -291,7 +291,12 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   ownerNotifiedAt: order.ownerNotifiedAt,
   restaurantConfirmedAt: order.restaurantConfirmedAt,
   restaurantRejectedAt: order.restaurantRejectedAt,
-  restaurantRejectionReason: includeCustomer ? order.restaurantRejectionReason : undefined,
+  restaurantRejectionReason:
+    order.status === "rejected"
+      ? orderService.getTrustedRestaurantRejectionReason(
+          order.restaurantRejectionReason
+        )
+      : undefined,
   receiptUrl: includeCustomer ? order.receiptUrl : undefined,
   receiptGeneratedAt: order.receiptGeneratedAt,
   receiptSentAt: order.receiptSentAt,
@@ -540,6 +545,87 @@ const findOrderForRestaurant = async (
   }
 
   return order;
+};
+
+const extractTrustedInlineRejectionReason = (
+  message?: string
+): string | undefined => {
+  const normalized = message?.trim().replace(/\s+/g, " ");
+
+  if (!normalized) {
+    return undefined;
+  }
+
+  const patterns = [
+    /^(?:reject|decline|cancel)(?:\s+order)?\s+(?:ORD-[A-Za-z0-9-]+|[a-f0-9]{24})(?:(?:\s+because\s+)|(?:\s*[,;:\-\u2014]\s*))(.+)$/i,
+    /^(?:reject|decline|cancel)(?:\s+order)?\s+(?:ORD-[A-Za-z0-9-]+|[a-f0-9]{24})\s+(.+)$/i,
+    /^(?:reject|decline)(?:\s+(?:it|this|that|this order|that order|the order))?(?:(?:\s+because\s+)|(?:\s*[,;:\-\u2014]\s*))(.+)$/i,
+    /^(?:can'?t|cannot)\s+fulfil(?:l)?(?:\s+(?:it|this|that|this order|that order|the order))?(?:(?:\s+because\s+)|(?:\s*[,;:\-\u2014]\s*))(.+)$/i
+  ];
+
+  for (const pattern of patterns) {
+    const candidate = pattern.exec(normalized)?.[1];
+    const trustedReason =
+      orderService.getTrustedRestaurantRejectionReason(candidate);
+
+    if (trustedReason) {
+      return trustedReason;
+    }
+  }
+
+  return undefined;
+};
+
+const getTrustedStaffRejectionReason = (
+  context: ToolExecutionContext,
+  order: IOrderDocument
+): string | undefined => {
+  const inlineReason = extractTrustedInlineRejectionReason(
+    context.originalMessage
+  );
+
+  if (inlineReason) {
+    return inlineReason;
+  }
+
+  const selection = context.trustedStaffOrderSelection;
+  const selectionMatchesOrder = selection?.candidates.some(
+    (candidate) =>
+      candidate.id.toLowerCase() === String(order._id).toLowerCase() ||
+      candidate.orderNumber?.toLowerCase() === order.orderNumber?.toLowerCase()
+  );
+
+  if (
+    selection?.decision !== "reject" ||
+    !selectionMatchesOrder
+  ) {
+    return undefined;
+  }
+
+  const savedReason = orderService.getTrustedRestaurantRejectionReason(
+    selection.rejectionReason
+  );
+
+  if (savedReason) {
+    return savedReason;
+  }
+
+  if (!selection.awaitingReason) {
+    return undefined;
+  }
+
+  const currentStaffText = context.originalMessage?.trim().replace(/\s+/g, " ");
+
+  if (
+    !currentStaffText ||
+    /^(?:yes|yeah|yep|yh|ok|okay|no|cancel|stop|never mind|nevermind)[.!]*$/i.test(
+      currentStaffText
+    )
+  ) {
+    return undefined;
+  }
+
+  return orderService.getTrustedRestaurantRejectionReason(currentStaffText);
 };
 
 const completeMatchingOwnerOrderSelection = async (
@@ -2076,7 +2162,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         "Owner/manager only. Reject a pending customer-submitted order when the restaurant cannot fulfil it.",
       parameters: {
         orderReference: "Order number or order ID.",
-        reason: "Required reason supplied by the owner/manager to share with the customer."
+        reason:
+          "Required owner/manager reason from the current message or trusted pending rejection state. The backend stores the grounded staff text, not model-authored wording."
       }
     },
     roles: toolPermissions.reject_order,
@@ -2088,9 +2175,20 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return order;
       }
 
+      const trustedReason = getTrustedStaffRejectionReason(context, order);
+
+      if (!trustedReason) {
+        return {
+          success: false,
+          code: "ORDER_REJECTION_REASON_REQUIRED",
+          message:
+            "Please provide a meaningful staff-supplied reason for rejecting the order."
+        };
+      }
+
       const result = await orderService.rejectRestaurantOrder(
         String(order._id),
-        args.reason,
+        trustedReason,
         context.restaurantId
       );
       await completeMatchingOwnerOrderSelection(
