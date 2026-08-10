@@ -641,7 +641,8 @@ export const runAgentOrchestrator = async (
     input.sender,
     Array.from(permittedToolNames),
     {},
-    input.staffState
+    input.staffState,
+    input.trustedCustomerReplyContext
   );
   const history = await getHistory(restaurantId, input.sender.normalizedPhone, 14);
   const messages: AiMessage[] = [
@@ -811,7 +812,17 @@ export const runAgentOrchestrator = async (
             ? getCustomerWorkflowMutation(toolName)
             : null;
         const workflowConflictResult: ToolResult | null =
-          completedCustomerWorkflowMutation &&
+          input.trustedCustomerReplyContext &&
+          requestedCustomerWorkflow &&
+          requestedCustomerWorkflow !==
+            input.trustedCustomerReplyContext.workflow
+            ? {
+                success: false,
+                code: "CUSTOMER_WORKFLOW_CONFLICT",
+                message:
+                  "The trusted quoted reply belongs to the customer's active order. Do not mutate an earlier order check-in from this message."
+              }
+            : completedCustomerWorkflowMutation &&
           requestedCustomerWorkflow &&
           completedCustomerWorkflowMutation !== requestedCustomerWorkflow
             ? {

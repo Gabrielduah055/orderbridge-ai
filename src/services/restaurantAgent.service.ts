@@ -14,6 +14,7 @@ import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
 import { handleLegacyCustomerMessage } from "./agentCustomer.service";
 import { isHermesAgentConfigured, sendHermesAgentMessage } from "./hermesAgent.service";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
+import { OutboundMessage } from "../models/outboundMessage.model";
 import {
   handleSavedOwnerSelectionReply,
   handleUnquotedOwnerOrderDecision,
@@ -46,7 +47,10 @@ import type {
   RestaurantAgentResponse,
   SenderRole
 } from "../types/agent.types";
-import type { AgentOrchestratorResult } from "./ai/ai.types";
+import type {
+  AgentOrchestratorResult,
+  TrustedCustomerReplyContext
+} from "./ai/ai.types";
 import {
   buildStaffOperationalState,
   createEmptyStaffOperationalState
@@ -117,7 +121,9 @@ export const isExactOrderCheckInReply = (message: string): boolean =>
   /^[123][.!]?$/.test(normalizeText(message));
 
 export const isAmbiguousCustomerWorkflowReply = (message: string): boolean =>
-  /^(?:[123][.!]?|yes|ok|okay)$/i.test(normalizeText(message));
+  /^(?:[123][.!]?|yes|yh|yea|yeah|yep|yup|ok|okay|sure|alright|no|nope|nah)$/i.test(
+    normalizeText(message)
+  );
 
 const competingCustomerOrderSteps = new Set<CustomerSessionStep>([
   "choosing_items",
@@ -133,6 +139,55 @@ const competingCustomerOrderSteps = new Set<CustomerSessionStep>([
 export const hasCompetingCustomerOrderWorkflow = (
   draft: { currentStep: CustomerSessionStep } | null
 ): boolean => Boolean(draft && competingCustomerOrderSteps.has(draft.currentStep));
+
+const activeOrderQuestionPurposeByStep: Partial<
+  Record<CustomerSessionStep, string>
+> = {
+  collecting_quantity: "quantity_clarification",
+  choosing_order_type: "order_type_question",
+  collecting_address: "address_question",
+  collecting_name: "name_question"
+};
+
+export const resolveQuotedActiveOrderReplyContext = async (
+  restaurantId: string,
+  customerPhone: string,
+  quotedMessageId: string | undefined,
+  draft: Awaited<ReturnType<typeof findActiveDraft>>
+): Promise<TrustedCustomerReplyContext | null> => {
+  const providerMessageId = quotedMessageId?.trim();
+  const responsePurpose = draft
+    ? activeOrderQuestionPurposeByStep[draft.currentStep]
+    : undefined;
+
+  if (!providerMessageId || !draft || !responsePurpose) {
+    return null;
+  }
+
+  const draftId = String(draft._id);
+  const outbound = await OutboundMessage.findOne({
+    restaurantId,
+    to: customerPhone,
+    status: "sent",
+    providerMessageId,
+    "metadata.kind": "customer_agent_question",
+    "metadata.customerPhone": customerPhone,
+    "metadata.draftId": draftId,
+    "metadata.expectedDraftStep": draft.currentStep,
+    "metadata.responsePurpose": responsePurpose
+  })
+    .sort({ sentAt: -1 })
+    .select("_id");
+
+  return outbound
+    ? {
+        workflow: "active_order",
+        draftId,
+        expectedDraftStep: draft.currentStep,
+        responsePurpose
+      }
+    : null;
+};
 
 const buildCompetingCustomerWorkflowClarification = (
   message: string,
@@ -303,6 +358,7 @@ export interface RestaurantAgentRoutingDependencies {
   findCustomerDraft?: typeof findActiveDraft;
   loadCustomerCheckIns?: typeof loadActiveOrderCheckInState;
   resolveQuotedCustomerFeedback?: typeof resolveQuotedOrderFeedbackOrderId;
+  resolveQuotedCustomerActiveOrder?: typeof resolveQuotedActiveOrderReplyContext;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -898,6 +954,9 @@ export const handleRestaurantAgentMessage = async (
   const resolveQuotedCustomerFeedback =
     dependencies.resolveQuotedCustomerFeedback ??
     resolveQuotedOrderFeedbackOrderId;
+  const resolveQuotedCustomerActiveOrder =
+    dependencies.resolveQuotedCustomerActiveOrder ??
+    resolveQuotedActiveOrderReplyContext;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -934,6 +993,8 @@ export const handleRestaurantAgentMessage = async (
     senderRole: sender.role,
     verified: sender.verified
   });
+
+  let trustedCustomerReplyContext: TrustedCustomerReplyContext | undefined;
 
   if (sender.role === "customer") {
     const preferenceResult =
@@ -1025,11 +1086,33 @@ export const handleRestaurantAgentMessage = async (
     }
 
     if (
+      input.quotedMessageId &&
+      ambiguousShortReply &&
+      competingOrderWorkflow
+    ) {
+      try {
+        trustedCustomerReplyContext =
+          (await resolveQuotedCustomerActiveOrder(
+            restaurantId,
+            sender.normalizedPhone,
+            input.quotedMessageId,
+            activeDraft
+          )) ?? undefined;
+      } catch (error) {
+        console.error("[customerAgent] quoted active-order lookup failed", {
+          restaurantId,
+          errorType: error instanceof Error ? error.name : "UnknownError"
+        });
+      }
+    }
+
+    if (
       ambiguousShortReply &&
       (workflowStateLoadFailed ||
         (competingOrderWorkflow &&
           hasActiveFeedbackWorkflow &&
-          !trustedQuotedOrderId))
+          !trustedQuotedOrderId &&
+          !trustedCustomerReplyContext))
     ) {
       const clarificationMessage = workflowStateLoadFailed
         ? "I can’t safely tell which customer workflow that reply belongs to. Please say whether it is for your current order or an earlier order check-in."
@@ -1524,7 +1607,8 @@ export const handleRestaurantAgentMessage = async (
         sender,
         message,
         requestId: input.inboundEventId,
-        quotedMessageId: input.quotedMessageId
+        quotedMessageId: input.quotedMessageId,
+        trustedCustomerReplyContext
       });
 
       console.info("[customerAgent] AI tools executed", {

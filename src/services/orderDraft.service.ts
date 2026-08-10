@@ -621,6 +621,38 @@ export const getMissingDraftFields = (session: ICustomerSessionDocument): string
   return missing;
 };
 
+export const synchronizeDraftCurrentStep = (
+  session: ICustomerSessionDocument
+): ICustomerSessionDocument["currentStep"] => {
+  if (session.pendingMenuItemId) {
+    session.currentStep = "collecting_quantity";
+    return session.currentStep;
+  }
+
+  if (session.pendingCategoryId) {
+    session.currentStep = "selecting_item_from_category";
+    return session.currentStep;
+  }
+
+  const missingFields = getMissingDraftFields(session);
+
+  if (missingFields.includes("items")) {
+    session.currentStep = "choosing_items";
+  } else if (missingFields.includes("orderType")) {
+    session.currentStep = "choosing_order_type";
+  } else if (missingFields.includes("deliveryAddress")) {
+    session.currentStep = "collecting_address";
+  } else if (missingFields.includes("deliveryFee")) {
+    session.currentStep = "awaiting_delivery_fee";
+  } else if (missingFields.includes("customerName")) {
+    session.currentStep = "collecting_name";
+  } else {
+    session.currentStep = "confirming_order";
+  }
+
+  return session.currentStep;
+};
+
 export const findMenuItemMatchInCategory = async (
   restaurantId: string,
   categoryId: string,

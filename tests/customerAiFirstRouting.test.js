@@ -3,10 +3,13 @@ const test = require("node:test");
 
 const { AgentConversationMessage } = require("../dist/models/agentConversation.model");
 const { Order } = require("../dist/models/order.model");
+const { OutboundMessage } = require("../dist/models/outboundMessage.model");
 const {
   handleRestaurantAgentMessage,
+  isAmbiguousCustomerWorkflowReply,
   isExplicitCustomerClarificationResetMessage,
   isExactOrderCheckInReply,
+  resolveQuotedActiveOrderReplyContext,
   shouldUseOpenRouterCustomerAgent
 } = require("../dist/services/restaurantAgent.service");
 const {
@@ -26,7 +29,8 @@ const {
 } = require("../dist/services/ai/agentToolDefinitions.service");
 const {
   enqueueTrustedMenuItemImageReply,
-  getTrustedMenuItemImageDelivery
+  getTrustedMenuItemImageDelivery,
+  sendAgentReplyDirectly
 } = require("../dist/controllers/wasender.controller");
 const {
   customerAgentScenarios
@@ -252,6 +256,12 @@ test("only exact numbered check-in replies use the deterministic pre-AI boundary
   assert.equal(isExactOrderCheckInReply("I received it and it was nice"), false);
 });
 
+for (const message of ["yh", "yeah", "no", "sure"]) {
+  test(`${JSON.stringify(message)} is an explicit ambiguous workflow-safety reply`, () => {
+    assert.equal(isAmbiguousCustomerWorkflowReply(message), true);
+  });
+}
+
 test("a pending check-in cannot hijack an unrelated new customer order", async () => {
   await withCustomerRoutingHarness(async () => {
     let feedbackCalls = 0;
@@ -403,6 +413,56 @@ test("a bare quantity-like number with an active draft and check-in mutates neit
   });
 });
 
+for (const message of ["yh", "yeah", "no", "sure"]) {
+  test(`${JSON.stringify(message)} with an active draft and check-in mutates neither workflow`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      let feedbackCalls = 0;
+      let orchestratorCalls = 0;
+
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message
+        },
+        {
+          findCustomerDraft: async () => ({
+            _id: "64b000000000000000000889",
+            currentStep: "choosing_order_type",
+            cartItems: [
+              { name: "Special Noodles", quantity: 2 }
+            ]
+          }),
+          loadCustomerCheckIns: async () => [
+            {
+              orderNumber: "ORD-123",
+              orderType: "delivery",
+              status: "accepted",
+              checkInStatus: "requested",
+              awaitingComplaint: false,
+              receiptClarificationPending: false
+            }
+          ],
+          handleCustomerFeedback: async () => {
+            feedbackCalls += 1;
+            return { handled: true, success: true, message: "wrong mutation" };
+          },
+          runOrchestrator: async () => {
+            orchestratorCalls += 1;
+            return makeAgentResult();
+          }
+        }
+      );
+
+      assert.equal(feedbackCalls, 0);
+      assert.equal(orchestratorCalls, 0);
+      assert.equal(response.data.workflowClarificationRequired, true);
+      assert.match(response.message, /current order/i);
+      assert.match(response.message, /ORD-123/);
+    });
+  });
+}
+
 test("a quoted numbered reply can safely select the old feedback workflow", async () => {
   await withCustomerRoutingHarness(async () => {
     const draft = {
@@ -434,6 +494,7 @@ test("a quoted numbered reply can safely select the old feedback workflow", asyn
         ],
         resolveQuotedCustomerFeedback: async () =>
           "64b000000000000000000123",
+        resolveQuotedCustomerActiveOrder: async () => null,
         handleCustomerFeedback: async (input) => {
           feedbackInput = input;
           return {
@@ -458,6 +519,163 @@ test("a quoted numbered reply can safely select the old feedback workflow", asyn
     assert.equal(draft.cartItems.length, 0);
     assert.equal(draft.currentStep, "collecting_quantity");
   });
+});
+
+test("a trusted quoted quantity question routes a bare number only to the active draft", async () => {
+  await withCustomerRoutingHarness(async () => {
+    const draft = {
+      _id: "64b000000000000000000889",
+      currentStep: "collecting_quantity",
+      pendingMenuItemName: "Special Noodles",
+      cartItems: []
+    };
+    let feedbackCalls = 0;
+    let orchestratorInput;
+
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "1",
+        quotedMessageId: "provider-quantity-question-1"
+      },
+      {
+        findCustomerDraft: async () => draft,
+        loadCustomerCheckIns: async () => [
+          {
+            orderNumber: "ORD-123",
+            orderType: "delivery",
+            status: "accepted",
+            checkInStatus: "requested",
+            awaitingComplaint: false,
+            receiptClarificationPending: false
+          }
+        ],
+        resolveQuotedCustomerFeedback: async () => null,
+        resolveQuotedCustomerActiveOrder: async () => ({
+          workflow: "active_order",
+          draftId: String(draft._id),
+          expectedDraftStep: "collecting_quantity",
+          responsePurpose: "quantity_clarification"
+        }),
+        handleCustomerFeedback: async () => {
+          feedbackCalls += 1;
+          return { handled: true, success: true, message: "wrong mutation" };
+        },
+        runOrchestrator: async (input) => {
+          orchestratorInput = input;
+          return makeAgentResult({
+            executedTools: [
+              { name: "add_order_item_by_name", success: true }
+            ]
+          });
+        }
+      }
+    );
+
+    assert.equal(response.success, true);
+    assert.equal(feedbackCalls, 0);
+    assert.equal(
+      orchestratorInput.trustedCustomerReplyContext.workflow,
+      "active_order"
+    );
+    assert.equal(
+      orchestratorInput.trustedCustomerReplyContext.expectedDraftStep,
+      "collecting_quantity"
+    );
+  });
+});
+
+test("direct active-order questions persist scoped provider quote context", async () => {
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const originalCreate = OutboundMessage.create;
+  const originalFindOne = OutboundMessage.findOne;
+  const created = [];
+  let lookupFilter;
+
+  process.env.WASENDER_API_URL = "https://wasender.example";
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => "application/json" },
+    json: async () => ({
+      success: true,
+      data: { id: "provider-quantity-question-1" }
+    })
+  });
+  OutboundMessage.create = async (input) => {
+    created.push(input);
+    return input;
+  };
+
+  try {
+    await sendAgentReplyDirectly(
+      "golden-session",
+      customerPhone,
+      "How many portions of Special Noodles would you like?",
+      {
+        action: "send_restaurant_agent_reply",
+        restaurantId,
+        eventId: "inbound-quantity-1",
+        senderRole: "customer",
+        customerPhone,
+        draftId: "64b000000000000000000889",
+        conversationVersion: 4,
+        expectedDraftStep: "collecting_quantity",
+        responsePurpose: "quantity_clarification"
+      },
+      "restaurant-token"
+    );
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].status, "sent");
+    assert.equal(
+      created[0].providerMessageId,
+      "provider-quantity-question-1"
+    );
+    assert.equal(created[0].metadata.kind, "customer_agent_question");
+    assert.equal(created[0].metadata.expectedDraftStep, "collecting_quantity");
+
+    OutboundMessage.findOne = (filter) => {
+      lookupFilter = filter;
+      return {
+        sort() {
+          return this;
+        },
+        select() {
+          return Promise.resolve({ _id: "outbound-question-1" });
+        }
+      };
+    };
+    const context = await resolveQuotedActiveOrderReplyContext(
+      restaurantId,
+      customerPhone,
+      "provider-quantity-question-1",
+      {
+        _id: "64b000000000000000000889",
+        currentStep: "collecting_quantity"
+      }
+    );
+
+    assert.equal(context.workflow, "active_order");
+    assert.equal(lookupFilter.restaurantId, restaurantId);
+    assert.equal(lookupFilter.to, customerPhone);
+    assert.equal(
+      lookupFilter["metadata.draftId"],
+      "64b000000000000000000889"
+    );
+    assert.equal(
+      lookupFilter["metadata.expectedDraftStep"],
+      "collecting_quantity"
+    );
+  } finally {
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
+    OutboundMessage.create = originalCreate;
+    OutboundMessage.findOne = originalFindOne;
+  }
 });
 
 for (const feedbackMessage of [
@@ -641,7 +859,12 @@ test("customer HTTP compatibility service validates scope then routes through th
   assert.equal(response.source, "openrouter_agent");
 });
 
-const runImageOrchestrator = async ({ responses, history = [], executeTool }) => {
+const runImageOrchestrator = async ({
+  responses,
+  history = [],
+  executeTool,
+  inputOverrides = {}
+}) => {
   let index = 0;
   const providerRequests = [];
   const savedMessages = [];
@@ -663,7 +886,8 @@ const runImageOrchestrator = async ({ responses, history = [], executeTool }) =>
         role: "customer",
         verified: false
       },
-      message: "any pic of it?"
+      message: "any pic of it?",
+      ...inputOverrides
     },
     {
       provider,
@@ -716,6 +940,60 @@ test("one customer turn cannot mutate both feedback and the active order", async
   assert.equal(
     result.executedTools[1].code,
     "CUSTOMER_WORKFLOW_CONFLICT"
+  );
+});
+
+test("trusted active-order quote context blocks feedback mutation", async () => {
+  const executedBackendTools = [];
+  const { result } = await runImageOrchestrator({
+    inputOverrides: {
+      message: "1",
+      quotedMessageId: "provider-quantity-question-1",
+      trustedCustomerReplyContext: {
+        workflow: "active_order",
+        draftId: "64b000000000000000000889",
+        expectedDraftStep: "collecting_quantity",
+        responsePurpose: "quantity_clarification"
+      }
+    },
+    responses: [
+      {
+        toolCalls: [
+          {
+            id: "wrong-feedback-mutation",
+            name: "respond_to_order_check_in",
+            arguments: { outcome: "received_satisfied" }
+          },
+          {
+            id: "trusted-quantity-mutation",
+            name: "add_order_item_by_name",
+            arguments: { itemName: "Special Noodles", quantity: 1 }
+          }
+        ]
+      },
+      {
+        text: "Would you like pickup or delivery?",
+        toolCalls: []
+      }
+    ],
+    executeTool: async (toolName) => {
+      executedBackendTools.push(toolName);
+      return { success: true, message: "active order updated" };
+    }
+  });
+
+  assert.deepEqual(executedBackendTools, ["add_order_item_by_name"]);
+  assert.equal(
+    result.executedTools.find(
+      ({ name }) => name === "respond_to_order_check_in"
+    ).code,
+    "CUSTOMER_WORKFLOW_CONFLICT"
+  );
+  assert.equal(
+    result.executedTools.find(
+      ({ name }) => name === "add_order_item_by_name"
+    ).success,
+    true
   );
 });
 
@@ -1038,6 +1316,8 @@ test("production customer prompt receives the active trusted clarification", asy
   assert.match(prompt, /"activeOrderCheckIns"/);
   assert.match(prompt, /ORD-100/);
   assert.match(prompt, /separate workflows/i);
-  assert.match(prompt, /never guess.*1, 2, 3, yes, or ok/i);
+  assert.match(prompt, /never guess.*1, 2, 3, yes, yh, yeah, sure, no, or ok/i);
+  assert.match(prompt, /trustedReplyContext/);
+  assert.match(prompt, /backend-verified quote context overrides/i);
   assert.match(prompt, /never mutate both/i);
 });
