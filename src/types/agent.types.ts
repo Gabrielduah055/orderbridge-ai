@@ -109,6 +109,15 @@ export interface ToolExecutionContext {
   originalMessage?: string;
   quotedMessageId?: string;
   confirmed?: boolean;
+  trustedStaffOrderSelection?: {
+    decision: "accept" | "reject";
+    awaitingReason: boolean;
+    rejectionReason?: string;
+    candidates: Array<{
+      id: string;
+      orderNumber?: string;
+    }>;
+  };
 }
 
 export interface ToolResult<T = unknown> {

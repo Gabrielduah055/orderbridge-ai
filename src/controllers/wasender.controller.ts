@@ -193,26 +193,24 @@ export const getTrustedMenuItemImageDelivery = (
     menuItemId:
       typeof delivery.menuItemId === "string" ? delivery.menuItemId : undefined,
     imageUrl: delivery.imageUrl,
-    caption: delivery.caption,
+    caption: typeof delivery.caption === "string" ? delivery.caption : "",
     source
   };
 };
 
+export const buildTrustedMenuImageCaption = (
+  delivery: Pick<MenuItemImageDelivery, "caption">
+): string => {
+  const itemName = delivery.caption.trim();
+
+  return itemName || "Menu item image";
+};
+
 export const buildMenuItemImageReplyMessage = (
-  agentMessage: string,
+  _agentMessage: string,
   caption: string
 ): string => {
-  if (/https?:\/\/\S+/i.test(agentMessage)) {
-    return `Here is ${caption}.`;
-  }
-
-  const withoutUrls = agentMessage
-    .replace(/https?:\/\/\S+/gi, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/ {2,}/g, " ")
-    .trim();
-
-  return withoutUrls || `Here is ${caption}.`;
+  return buildTrustedMenuImageCaption({ caption });
 };
 
 export const buildMenuItemImageFallbackMessage = (
@@ -245,10 +243,7 @@ export const enqueueTrustedMenuItemImageReply = async (
   enqueueMessage: typeof enqueueWasenderMessage = enqueueWasenderMessage
 ): Promise<void> => {
   const recipient = normalizePhone(input.to) || input.to;
-  const caption = buildMenuItemImageReplyMessage(
-    input.agentMessage,
-    input.delivery.caption
-  );
+  const caption = buildTrustedMenuImageCaption(input.delivery);
 
   await enqueueMessage({
     restaurantId: input.restaurantId,

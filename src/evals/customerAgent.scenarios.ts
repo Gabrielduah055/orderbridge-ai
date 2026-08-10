@@ -144,6 +144,18 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     expectedArguments: { query: "Chicken Salad", includeImage: true }
   },
   {
+    name: "Contextual image live wording",
+    message: "Lemme see.",
+    history: [
+      {
+        role: "assistant",
+        content: "Currently, the only menu item with an image is the Chicken Salad."
+      }
+    ],
+    expectedTool: "search_menu_items",
+    expectedArguments: { query: "Chicken Salad", includeImage: true }
+  },
+  {
     name: "Ambiguous image",
     message: "can I see it?",
     history: [
@@ -223,6 +235,12 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     name: "Order status",
     message: "where's my order?",
     expectedOneOfTools: ["get_latest_customer_order", "get_order_details"]
+  },
+  {
+    name: "Rejected order reason follow-up",
+    message: "Why was ORD-123 rejected?",
+    expectedTool: "get_order_details",
+    expectedArguments: { orderReference: "ORD-123" }
   },
   {
     name: "Show my order is not menu media",

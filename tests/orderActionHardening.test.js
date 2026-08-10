@@ -36,6 +36,14 @@ const owner = {
   verified: true
 };
 
+const customer = {
+  name: "Ama",
+  phone: "+233241111111",
+  normalizedPhone: "+233241111111",
+  role: "customer",
+  verified: false
+};
+
 const context = {
   restaurantId,
   restaurant,
@@ -50,6 +58,7 @@ const makeOrder = (overrides = {}) => ({
   customerName: "Ama",
   customerPhone: "+233241111111",
   status: "pending",
+  items: [],
   customerConfirmedAt: new Date(),
   createdAt: new Date(),
   feedbackFollowUpStatus: "not_scheduled",
@@ -109,13 +118,150 @@ test("backend rejection validation runs before order lookup", async () => {
   };
 
   try {
-    await assert.rejects(
-      () => orderService.rejectRestaurantOrder(orderId, undefined, restaurantId),
-      (error) => error.code === "ORDER_REJECTION_REASON_REQUIRED"
-    );
+    for (const reason of [undefined, "", " "]) {
+      await assert.rejects(
+        () => orderService.rejectRestaurantOrder(orderId, reason, restaurantId),
+        (error) => error.code === "ORDER_REJECTION_REASON_REQUIRED"
+      );
+    }
     assert.equal(lookups, 0);
   } finally {
     Order.findOne = originalFindOne;
+  }
+});
+
+test("backend rejects known generated/default rejection placeholders", async () => {
+  const originalFindOne = Order.findOne;
+  let lookups = 0;
+  Order.findOne = async () => {
+    lookups += 1;
+    return makeOrder();
+  };
+
+  try {
+    for (const reason of [
+      "Restaurant is unable to fulfill this order at this time.",
+      "Restaurant is unable to fulfil this order at this time.",
+      "No reason provided",
+      "N/A"
+    ]) {
+      await assert.rejects(
+        () => orderService.rejectRestaurantOrder(orderId, reason, restaurantId),
+        (error) => error.code === "ORDER_REJECTION_REASON_REQUIRED"
+      );
+    }
+    assert.equal(lookups, 0);
+  } finally {
+    Order.findOne = originalFindOne;
+  }
+});
+
+test("reject_order refuses an AI-invented reason when staff supplied none", async () => {
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+  let mutations = 0;
+  Order.findOne = async () => makeOrder();
+  Order.findOneAndUpdate = async () => {
+    mutations += 1;
+    return null;
+  };
+
+  try {
+    const result = await executeAgentTool(
+      "reject_order",
+      {
+        orderId,
+        reason: "Restaurant is unable to fulfill this order at this time."
+      },
+      { ...context, originalMessage: "Reject ORD-104" }
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.code, "ORDER_REJECTION_REASON_REQUIRED");
+    assert.equal(mutations, 0);
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("reject_order stores exact inline staff text instead of model-authored text", async () => {
+  const originalFindOne = Order.findOne;
+  const originalRejectOrder = orderService.rejectRestaurantOrder;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  let storedReason;
+  Order.findOne = async () => makeOrder();
+  orderService.rejectRestaurantOrder = async (_orderId, reason) => {
+    storedReason = reason;
+    return {
+      order: makeOrder({
+        status: "rejected",
+        restaurantRejectionReason: reason
+      }),
+      idempotent: false
+    };
+  };
+  PendingAgentAction.updateMany = async () => ({ modifiedCount: 0 });
+
+  try {
+    const result = await executeAgentTool(
+      "reject_order",
+      { orderId, reason: "The restaurant cannot fulfil the order." },
+      {
+        ...context,
+        originalMessage:
+          "Reject ORD-104 because we've run out of Chicken Salad."
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(storedReason, "we've run out of Chicken Salad.");
+  } finally {
+    Order.findOne = originalFindOne;
+    orderService.rejectRestaurantOrder = originalRejectOrder;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
+  }
+});
+
+test("pending rejection binds the next staff reason to the exact selected order", async () => {
+  const originalFindOne = Order.findOne;
+  const originalRejectOrder = orderService.rejectRestaurantOrder;
+  const originalPendingUpdateMany = PendingAgentAction.updateMany;
+  let storedReason;
+  Order.findOne = async () => makeOrder();
+  orderService.rejectRestaurantOrder = async (_orderId, reason) => {
+    storedReason = reason;
+    return {
+      order: makeOrder({
+        status: "rejected",
+        restaurantRejectionReason: reason
+      }),
+      idempotent: false
+    };
+  };
+  PendingAgentAction.updateMany = async () => ({ modifiedCount: 1 });
+
+  try {
+    const result = await executeAgentTool(
+      "reject_order",
+      { orderId, reason: "A model-authored substitute" },
+      {
+        ...context,
+        originalMessage: "We've run out of Chicken Salad.",
+        trustedStaffOrderSelection: {
+          decision: "reject",
+          awaitingReason: true,
+          candidates: [{ id: orderId, orderNumber: "ORD-104" }]
+        }
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(storedReason, "We've run out of Chicken Salad.");
+  } finally {
+    Order.findOne = originalFindOne;
+    orderService.rejectRestaurantOrder = originalRejectOrder;
+    PendingAgentAction.updateMany = originalPendingUpdateMany;
   }
 });
 
@@ -594,6 +740,101 @@ test("cross-restaurant order lookup fails without leaking the other tenant", asy
   }
 });
 
+test("customer order reads expose a trusted reason only for the customer's rejected order", async () => {
+  const originalFindOne = Order.findOne;
+  const rejectedOrder = makeOrder({
+    status: "rejected",
+    restaurantRejectedAt: new Date(),
+    restaurantRejectionReason: "We've run out of Chicken Salad."
+  });
+
+  try {
+    Order.findOne = (filter) => {
+      if (filter.customerPhone) {
+        assert.equal(filter.customerPhone, customer.normalizedPhone);
+        return {
+          sort: async () => rejectedOrder
+        };
+      }
+
+      return Promise.resolve(rejectedOrder);
+    };
+
+    const details = await toolRegistry.get_order_details.handler(
+      { orderReference: "ORD-104" },
+      { ...context, sender: customer, originalMessage: "Why was ORD-104 rejected?" }
+    );
+    const latest = await toolRegistry.get_latest_customer_order.handler(
+      {},
+      { ...context, sender: customer, originalMessage: "Why was my order rejected?" }
+    );
+
+    assert.equal(details.success, true);
+    assert.equal(
+      details.data.restaurantRejectionReason,
+      "We've run out of Chicken Salad."
+    );
+    assert.equal(
+      latest.data.restaurantRejectionReason,
+      "We've run out of Chicken Salad."
+    );
+  } finally {
+    Order.findOne = originalFindOne;
+  }
+});
+
+test("customer cannot read another customer's rejection reason", async () => {
+  const originalFindOne = Order.findOne;
+  Order.findOne = async () =>
+    makeOrder({
+      customerPhone: "+233241111112",
+      status: "rejected",
+      restaurantRejectedAt: new Date(),
+      restaurantRejectionReason: "Kitchen equipment failed."
+    });
+
+  try {
+    const result = await toolRegistry.get_order_details.handler(
+      { orderReference: "ORD-104" },
+      { ...context, sender: customer, originalMessage: "Why was ORD-104 rejected?" }
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.code, "ORDER_FORBIDDEN");
+    assert.equal(result.data, undefined);
+  } finally {
+    Order.findOne = originalFindOne;
+  }
+});
+
+test("old rejected orders do not expose a missing or generated placeholder reason", async () => {
+  const originalFindOne = Order.findOne;
+
+  try {
+    for (const restaurantRejectionReason of [
+      undefined,
+      "Restaurant is unable to fulfill this order at this time."
+    ]) {
+      Order.findOne = async () =>
+        makeOrder({
+          status: "rejected",
+          restaurantRejectedAt: new Date(),
+          restaurantRejectionReason
+        });
+
+      const result = await toolRegistry.get_order_details.handler(
+        { orderReference: "ORD-104" },
+        { ...context, sender: customer, originalMessage: "Why was ORD-104 rejected?" }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.data.restaurantRejectionReason, undefined);
+    }
+  } finally {
+    Order.findOne = originalFindOne;
+  }
+});
+
 test("backend rejects a tool order that differs from the explicit current reference", async () => {
   const originalFindOne = Order.findOne;
   const originalFindOneAndUpdate = Order.findOneAndUpdate;
@@ -681,7 +922,39 @@ test("staff prompt forbids invented rejection reasons and false order success", 
     staffState
   );
 
-  assert.match(prompt, /never invent or substitute a reason/i);
+  assert.match(prompt, /never invent, substitute, or use a generic\/default reason/i);
   assert.match(prompt, /never claim an order was accepted, rejected, or completed/i);
   assert.match(prompt, /quotedOrder/i);
+});
+
+test("customer prompt uses saved rejection reasons and forbids inventing missing ones", async () => {
+  const permissions = ["get_order_details", "get_latest_customer_order"];
+  const prompt = await buildAgentSystemPrompt(
+    restaurant,
+    customer,
+    permissions,
+    {
+      buildRestaurantContext: async () => ({
+        restaurant: { id: restaurantId, name: restaurant.name, status: "active" },
+        sender: {
+          name: customer.name,
+          phone: customer.normalizedPhone,
+          role: customer.role,
+          verified: customer.verified
+        },
+        people: {},
+        settings: {},
+        summary: {},
+        permissions
+      }),
+      findDraft: async () => null,
+      findClarification: async () => null,
+      loadCustomerMemory: async () => null,
+      loadActiveCheckIns: async () => []
+    }
+  );
+
+  assert.match(prompt, /restaurantRejectionReason/);
+  assert.match(prompt, /never invent a reason/i);
+  assert.match(prompt, /no specific reason is saved/i);
 });

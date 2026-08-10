@@ -365,26 +365,28 @@ const isClearCustomerMenuMediaRequest = (input: AgentOrchestratorInput): boolean
     return false;
   }
 
-  const message = input.message.toLowerCase();
+  const message = normalizeText(input.message).toLowerCase();
 
   if (/\b(order|cart|delivery status|order status)\b/.test(message)) {
     return false;
   }
 
   return (
-    /\b(pic|pics|photo|photos|image|images|picture|pictures)\b/.test(message) ||
     /\bwhat does\b.+\blook like\b/.test(message) ||
-    /^(?:please\s+)?(?:show me|can i see|let me see)\b/.test(message)
+    /^(?:please\s+)?(?:lemme see|let me see|show me|show it|show me that|can i see(?: it)?)\b/.test(
+      message
+    ) ||
+    /^(?:please\s+)?send\s+(?:it|(?:the\s+)?(?:pic|photo|image|picture))\b/.test(
+      message
+    ) ||
+    /\bany\s+(?:pic|photo|image|picture)\s+of\s+.+/.test(message)
   );
 };
 
-const isUngroundedImageUnavailabilityClaim = (message: string): boolean =>
-  /\b(?:cannot|can't|unable to|do not|don't)\b.{0,60}\b(?:access|send|show|have)\b.{0,30}\b(?:pic|photo|image|picture)s?\b/i.test(
+const isMenuMediaClarification = (message: string): boolean =>
+  /\b(?:which|what)\s+(?:menu\s+)?(?:item|one|dish|meal|image|picture|photo)\b/i.test(
     message
-  ) ||
-  /\b(?:no|not any|isn't an?|is not an?)\b.{0,30}\b(?:saved\s+)?(?:pic|photo|image|picture)s?\b/i.test(
-    message
-  );
+  ) || /\bwhich one\b/i.test(message);
 
 const sanitizeMenuItemImageResponse = (
   message: string,
@@ -672,6 +674,7 @@ export const runAgentOrchestrator = async (
   let responseId: string | undefined;
   let usage: AiUsage | undefined;
   let customerMediaGroundingRetryUsed = false;
+  let customerMenuMediaLookupPerformed = false;
   let completedCustomerWorkflowMutation: CustomerWorkflowMutation | null = null;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
@@ -682,7 +685,9 @@ export const runAgentOrchestrator = async (
     sender: input.sender,
     requestId: input.requestId,
     originalMessage: normalizedInputMessage,
-    quotedMessageId: input.quotedMessageId
+    quotedMessageId: input.quotedMessageId,
+    trustedStaffOrderSelection:
+      input.staffState?.recentReferences.orderSelection
   };
 
   try {
@@ -702,14 +707,10 @@ export const runAgentOrchestrator = async (
           throw new Error("Agent provider returned an empty final response.");
         }
 
-        const hasMenuLookup = executedTools.some(
-          (tool) => tool.name === "search_menu_items"
-        );
-
         if (
           isClearCustomerMenuMediaRequest(input) &&
-          !hasMenuLookup &&
-          isUngroundedImageUnavailabilityClaim(rawFinalMessage)
+          !customerMenuMediaLookupPerformed &&
+          !isMenuMediaClarification(rawFinalMessage)
         ) {
           if (!customerMediaGroundingRetryUsed) {
             customerMediaGroundingRetryUsed = true;
@@ -857,6 +858,18 @@ export const runAgentOrchestrator = async (
                 code: "TOOL_FORBIDDEN",
                 message: "That tool is not available for the current sender role."
               };
+
+        if (
+          input.sender.role === "customer" &&
+          toolName === "search_menu_items" &&
+          safeArguments.includeImage === true &&
+          !toolCall.invalidArguments &&
+          permittedToolNames.has(toolName) &&
+          !workflowConflictResult &&
+          !trustedReferenceGuardResult
+        ) {
+          customerMenuMediaLookupPerformed = true;
+        }
 
         if (result.success && requestedCustomerWorkflow) {
           completedCustomerWorkflowMutation = requestedCustomerWorkflow;

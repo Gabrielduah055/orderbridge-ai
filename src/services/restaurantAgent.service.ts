@@ -1713,7 +1713,9 @@ export const handleRestaurantAgentMessage = async (
     restaurant: input.restaurant,
     sender,
     originalMessage: message,
-    quotedMessageId: input.quotedMessageId
+    quotedMessageId: input.quotedMessageId,
+    trustedStaffOrderSelection:
+      staffOperationalState?.recentReferences.orderSelection
   };
   const legacyStaffSource =
     aiProviderName === "openrouter" ? "legacy_owner" : "hermes_tools";

@@ -2591,7 +2591,15 @@ test("customer decision messages do not invent receipt on rejection", () => {
   );
   assert.equal(
     buildCustomerOrderRejectedMessage(restaurantRecord, order),
-    "Golden Grill could not accept order ORD-123 at this time. The restaurant gave this reason: Chicken is unavailable."
+    "Golden Grill could not accept order ORD-123.\n\nReason:\nChicken is unavailable"
+  );
+  assert.equal(
+    buildCustomerOrderRejectedMessage(restaurantRecord, {
+      ...order,
+      restaurantRejectionReason:
+        "Restaurant is unable to fulfill this order at this time."
+    }),
+    "Golden Grill could not accept order ORD-123."
   );
 });
 

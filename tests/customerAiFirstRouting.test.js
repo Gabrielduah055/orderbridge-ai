@@ -1038,22 +1038,209 @@ test("contextual image lookup keeps URL outside model text and prepares trusted 
   assert.match(toolContent, /"hasImage":true/);
 });
 
-test("ambiguous contextual image reference clarifies without choosing a random item", async () => {
+test("image inventory questions use menu metadata without forcing media delivery", async (t) => {
+  for (const message of [
+    "Wat menu item image do u have",
+    "What menu item images do you have?",
+    "Do you have any pictures?",
+    "Which meals have photos?"
+  ]) {
+    await t.test(message, async () => {
+      let receivedTool;
+      const { result, providerRequests, savedMessages } = await runImageOrchestrator({
+        inputOverrides: { message },
+        responses: [
+          {
+            toolCalls: [
+              {
+                id: "image-inventory-menu",
+                name: "get_menu",
+                arguments: {}
+              }
+            ]
+          },
+          {
+            text: "Currently, the only menu item with an image is Chicken Salad.",
+            toolCalls: []
+          }
+        ],
+        executeTool: async (toolName) => {
+          receivedTool = toolName;
+          return {
+            success: true,
+            message: "Menu loaded.",
+            data: [{ id: "menu-chicken", name: "Chicken Salad", imageUrl }]
+          };
+        }
+      });
+
+      assert.equal(receivedTool, "get_menu");
+      assert.equal(providerRequests.length, 2);
+      assert.match(result.message, /only menu item with an image is Chicken Salad/i);
+      assert.equal(result.data?.menuItemImage, undefined);
+      const toolContent = savedMessages.find(({ direction }) => direction === "tool").content;
+      assert.match(toolContent, /"hasImage":true/);
+      assert.doesNotMatch(toolContent, /cloudinary|https?:\/\//i);
+    });
+  }
+});
+
+test("explicit image request performs an includeImage lookup and prepares trusted media", async () => {
+  let receivedArguments;
+  const { result, savedMessages } = await runImageOrchestrator({
+    inputOverrides: { message: "Show me the Chicken Salad image." },
+    responses: [
+      {
+        toolCalls: [
+          {
+            id: "explicit-image-search",
+            name: "search_menu_items",
+            arguments: { query: "Chicken Salad", includeImage: true }
+          }
+        ]
+      },
+      { text: "Here is Chicken Salad.", toolCalls: [] }
+    ],
+    executeTool: async (_toolName, args) => {
+      receivedArguments = args;
+      return {
+        success: true,
+        message: "Menu search completed.",
+        data: [{ id: "menu-chicken", name: "Chicken Salad", imageUrl }]
+      };
+    }
+  });
+
+  assert.deepEqual(receivedArguments, {
+    query: "Chicken Salad",
+    includeImage: true
+  });
+  assert.equal(result.data.menuItemImage.imageUrl, imageUrl);
+  const toolContent = savedMessages.find(({ direction }) => direction === "tool").content;
+  assert.doesNotMatch(toolContent, /cloudinary|https?:\/\//i);
+});
+
+test("live Lemme see follow-up resolves and queues the sole recent image item", async () => {
+  let receivedArguments;
   const { result } = await runImageOrchestrator({
+    inputOverrides: { message: "Lemme see." },
     history: [
-      { role: "assistant", content: "We have Jollof, Fried Rice, and Chicken Salad." }
+      {
+        role: "assistant",
+        content: "Currently, the only menu item with an image is the Chicken Salad."
+      }
     ],
     responses: [
-      { text: "Which item would you like to see?", toolCalls: [] }
+      {
+        toolCalls: [
+          {
+            id: "live-context-image-search",
+            name: "search_menu_items",
+            arguments: { query: "Chicken Salad", includeImage: true }
+          }
+        ]
+      },
+      { text: "Here is Chicken Salad.", toolCalls: [] }
+    ],
+    executeTool: async (_toolName, args) => {
+      receivedArguments = args;
+      return {
+        success: true,
+        message: "Menu search completed.",
+        data: [{ id: "menu-chicken", name: "Chicken Salad", imageUrl }]
+      };
+    }
+  });
+
+  assert.deepEqual(receivedArguments, {
+    query: "Chicken Salad",
+    includeImage: true
+  });
+  assert.equal(result.data.menuItemImage.caption, "Chicken Salad");
+
+  const queued = [];
+  await enqueueTrustedMenuItemImageReply(
+    {
+      restaurantId,
+      sessionId: "session",
+      to: customerPhone,
+      delivery: result.data.menuItemImage,
+      agentMessage: '{"action":"dalle_image_display"}'
+    },
+    async (input) => {
+      queued.push(input);
+      return input;
+    }
+  );
+
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].type, "image");
+  assert.equal(queued[0].imageUrl, imageUrl);
+  assert.equal(queued[0].caption, "Chicken Salad");
+  assert.doesNotMatch(queued[0].caption, /\{|action|dalle_image_display|https?:\/\//i);
+});
+
+test("ambiguous contextual image reference clarifies without choosing a random item", async () => {
+  const { result } = await runImageOrchestrator({
+    inputOverrides: { message: "Lemme see." },
+    history: [
+      {
+        role: "assistant",
+        content: "Chicken Salad and Beef Salad both have saved images."
+      }
+    ],
+    responses: [
+      {
+        text: "Which one would you like to see, Chicken Salad or Beef Salad?",
+        toolCalls: []
+      }
     ],
     executeTool: async () => {
       throw new Error("ambiguous image request must not execute a tool");
     }
   });
 
-  assert.match(result.message, /which item/i);
+  assert.match(result.message, /which (?:item|one)/i);
   assert.deepEqual(result.executedTools, []);
   assert.equal(result.data, undefined);
+});
+
+test("clear image request retries a model that claims delivery without a lookup", async () => {
+  let toolCalls = 0;
+  const { result, providerRequests } = await runImageOrchestrator({
+    inputOverrides: { message: "Lemme see." },
+    history: [
+      {
+        role: "assistant",
+        content: "The only menu item with an image is Chicken Salad."
+      }
+    ],
+    responses: [
+      { text: "Sure, here it is.", toolCalls: [] },
+      {
+        toolCalls: [
+          {
+            id: "grounded-image-search",
+            name: "search_menu_items",
+            arguments: { query: "Chicken Salad", includeImage: true }
+          }
+        ]
+      },
+      { text: "Here is Chicken Salad.", toolCalls: [] }
+    ],
+    executeTool: async () => {
+      toolCalls += 1;
+      return {
+        success: true,
+        message: "Menu search completed.",
+        data: [{ id: "menu-chicken", name: "Chicken Salad", imageUrl }]
+      };
+    }
+  });
+
+  assert.equal(providerRequests.length, 3);
+  assert.equal(toolCalls, 1);
+  assert.equal(result.data.menuItemImage.caption, "Chicken Salad");
 });
 
 test("false image-access claim is retried through the trusted menu lookup", async () => {
@@ -1131,7 +1318,10 @@ test("trusted backend image payload queues one media message with a safe reply c
         caption: "Chicken Salad",
         source: "search_menu_items_tool"
       },
-      agentMessage: `Here it is: ${imageUrl}`,
+      agentMessage: JSON.stringify({
+        action: "dalle_image_display",
+        action_input: JSON.stringify({ item_name: "Chicken Salad", imageUrl })
+      }),
       eventId: "webhook-message-1",
       apiKey: "restaurant-token"
     },
@@ -1144,12 +1334,37 @@ test("trusted backend image payload queues one media message with a safe reply c
   assert.equal(calls.length, 1);
   assert.equal(calls[0].type, "image");
   assert.equal(calls[0].imageUrl, imageUrl);
-  assert.equal(calls[0].caption, "Here is Chicken Salad.");
+  assert.equal(calls[0].caption, "Chicken Salad");
   assert.doesNotMatch(calls[0].caption, /https?:\/\//i);
+  assert.doesNotMatch(calls[0].caption, /\{|"action"|dalle_image_display/i);
   assert.equal(
     calls[0].idempotencyKey,
     `send_restaurant_agent_image:webhook-message-1:${customerPhone}`
   );
+});
+
+test("trusted image caption falls back safely when the item name is unavailable", async () => {
+  const calls = [];
+  await enqueueTrustedMenuItemImageReply(
+    {
+      restaurantId,
+      sessionId: "session",
+      to: customerPhone,
+      delivery: {
+        imageUrl,
+        caption: "   ",
+        source: "search_menu_items_tool"
+      },
+      agentMessage: '{"action":"dalle_image_display"}'
+    },
+    async (input) => {
+      calls.push(input);
+      return input;
+    }
+  );
+
+  assert.equal(calls[0].caption, "Menu item image");
+  assert.doesNotMatch(calls[0].caption, /action|\{|https?:\/\//i);
 });
 
 test("explicit clarification resets are intentionally narrow", () => {
