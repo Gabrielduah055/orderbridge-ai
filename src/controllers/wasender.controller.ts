@@ -541,19 +541,11 @@ const processNormalizedWebhook = async (
     });
 
     if (!customerIdentity.customerPhone) {
-      await sendAgentReplyDirectly(
-        restaurant.wasenderSessionId,
-        customerIdentity.recipientAddress,
-        "I can't verify your WhatsApp phone number right now. Please try again shortly.",
-        {
-          action: "send_unresolved_whatsapp_identity_reply",
-          restaurantId: String(restaurant._id),
-          eventId,
-          responsePurpose: "unresolved_whatsapp_identity",
-          addressingMode: customerIdentity.addressingMode
-        },
-        restaurant.wasenderApiToken
-      );
+      console.warn("WhatsApp sender identity has no documented outbound recipient", {
+        restaurantId: String(restaurant._id),
+        addressingMode: customerIdentity.addressingMode,
+        resolutionSource: customerIdentity.resolutionSource
+      });
       webhookEvent.status = "processed";
       webhookEvent.processedAt = new Date();
       await webhookEvent.save();
@@ -561,7 +553,8 @@ const processNormalizedWebhook = async (
     }
 
     const canonicalCustomerPhone = customerIdentity.customerPhone;
-    const replyAddress = customerIdentity.recipientAddress;
+    const replyAddress =
+      customerIdentity.recipientAddress ?? canonicalCustomerPhone;
     const sender = resolveSenderIdentity(restaurant, canonicalCustomerPhone);
     const processWebhookTurn = async (): Promise<void> => {
       let conversationMetadata: Record<string, unknown> = {};

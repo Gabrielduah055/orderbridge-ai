@@ -16,7 +16,7 @@ export type WasenderIdentityResolutionSource =
 export interface ResolvedWasenderCustomerIdentity {
   customerPhone?: string;
   lid?: string;
-  recipientAddress: string;
+  recipientAddress?: string;
   addressingMode: "pn" | "lid";
   resolutionSource: WasenderIdentityResolutionSource;
 }
@@ -134,18 +134,6 @@ export const rememberWasenderCustomerIdentity = async (
   }
 };
 
-const getRecipientAddress = (
-  webhook: NormalizedWasenderWebhook,
-  phone: string | undefined,
-  lid: string | undefined
-): string => {
-  if (webhook.addressingMode === "lid" && lid) {
-    return lid;
-  }
-
-  return phone ?? lid ?? webhook.senderAddress;
-};
-
 export const resolveWasenderCustomerIdentity = async (
   restaurantId: string,
   webhook: NormalizedWasenderWebhook,
@@ -169,7 +157,7 @@ export const resolveWasenderCustomerIdentity = async (
     return {
       customerPhone: phone,
       lid: lid || undefined,
-      recipientAddress: getRecipientAddress(webhook, phone, lid || undefined),
+      recipientAddress: phone,
       addressingMode: webhook.addressingMode === "lid" && lid ? "lid" : "pn",
       resolutionSource: "phone_field"
     };
@@ -188,7 +176,7 @@ export const resolveWasenderCustomerIdentity = async (
     return {
       customerPhone: storedPhone,
       lid,
-      recipientAddress: getRecipientAddress(webhook, storedPhone, lid),
+      recipientAddress: storedPhone,
       addressingMode: "lid",
       resolutionSource: "stored_mapping"
     };
@@ -205,7 +193,7 @@ export const resolveWasenderCustomerIdentity = async (
       return {
         customerPhone: resolvedPhone,
         lid,
-        recipientAddress: getRecipientAddress(webhook, resolvedPhone, lid),
+        recipientAddress: resolvedPhone,
         addressingMode: "lid",
         resolutionSource: "provider_lookup"
       };
@@ -216,7 +204,6 @@ export const resolveWasenderCustomerIdentity = async (
 
   return {
     lid,
-    recipientAddress: lid,
     addressingMode: "lid",
     resolutionSource: "lid_only"
   };

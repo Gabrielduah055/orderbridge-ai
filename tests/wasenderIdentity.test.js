@@ -91,7 +91,7 @@ test("LID plus cleaned sender phone uses the phone and remembers the LID mapping
   assert.equal(webhook.from, customerPhoneDigits);
   assert.equal(webhook.senderLid, lid);
   assert.equal(identity.customerPhone, customerPhone);
-  assert.equal(identity.recipientAddress, lid);
+  assert.equal(identity.recipientAddress, customerPhone);
   assert.equal(identity.resolutionSource, "phone_field");
   assert.deepEqual(remembered, [[restaurantId, lid, customerPhone]]);
 });
@@ -120,6 +120,7 @@ test("LID plus senderPn uses the trusted sender phone and remembers the mapping"
 
   assert.equal(webhook.senderPhoneSource, "senderPn");
   assert.equal(identity.customerPhone, customerPhone);
+  assert.equal(identity.recipientAddress, customerPhone);
   assert.deepEqual(remembered, [restaurantId, lid, customerPhone]);
 });
 
@@ -146,7 +147,7 @@ test("LID-only webhook resolves through an existing restaurant-scoped mapping", 
   );
 
   assert.equal(identity.customerPhone, customerPhone);
-  assert.equal(identity.recipientAddress, lid);
+  assert.equal(identity.recipientAddress, customerPhone);
   assert.equal(identity.resolutionSource, "stored_mapping");
   assert.equal(lookupCalled, false);
 });
@@ -196,6 +197,7 @@ test("LID-only webhook can use the documented WaSender PN lookup and persist it"
     );
 
     assert.equal(identity.customerPhone, customerPhone);
+    assert.equal(identity.recipientAddress, customerPhone);
     assert.equal(identity.resolutionSource, "provider_lookup");
     assert.deepEqual(remembered, [[restaurantId, lid, customerPhone]]);
   } finally {
@@ -228,7 +230,7 @@ test("failed LID lookup remains LID-only without fabricating a customer phone", 
   );
 
   assert.equal(identity.customerPhone, undefined);
-  assert.equal(identity.recipientAddress, lid);
+  assert.equal(identity.recipientAddress, undefined);
   assert.equal(identity.resolutionSource, "lid_only");
   assert.deepEqual(remembered, [[restaurantId, lid]]);
   assert.equal(normalizeGhanaPhone(lid), "");
@@ -400,13 +402,26 @@ test("an unresolved LID never receives owner or manager permissions", () => {
   assert.equal(sender.normalizedPhone, "");
 });
 
-test("an immediate reply to a LID-addressed webhook preserves the trusted LID recipient", async () => {
+test("LID inbound resolves to a phone before the agent reply is sent", async () => {
   const originalFetch = global.fetch;
   const originalApiUrl = process.env.WASENDER_API_URL;
   const requests = [];
   process.env.WASENDER_API_URL = "https://wasender.example";
   global.fetch = async (url, options) => {
     requests.push({ url, options });
+
+    if (url.includes("/api/pn-from-lid/")) {
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          success: true,
+          data: { pn: `${customerPhoneDigits}@s.whatsapp.net` }
+        })
+      };
+    }
+
     return {
       ok: true,
       status: 200,
@@ -416,17 +431,36 @@ test("an immediate reply to a LID-addressed webhook preserves the trusted LID re
   };
 
   try {
+    const webhook = normalizeIncomingWebhook(
+      makePayload({ remoteJid: lid, senderLid: lid, addressingMode: "lid" })
+    );
+    const identity = await resolveWasenderCustomerIdentity(
+      restaurantId,
+      webhook,
+      "restaurant-token",
+      {
+        findByLid: async () => null,
+        remember: async (_seenRestaurantId, seenLid, phone) => ({
+          lid: seenLid,
+          phone
+        })
+      }
+    );
+
+    assert.equal(identity.customerPhone, customerPhone);
+    assert.equal(identity.recipientAddress, customerPhone);
+
     await sendAgentReplyDirectly(
       "session-1",
-      lid,
+      identity.recipientAddress,
       "Hello",
       { restaurantId, eventId: "message-1", action: "reply" },
       "restaurant-token"
     );
 
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, "https://wasender.example/api/send-message");
-    assert.equal(JSON.parse(requests[0].options.body).to, lid);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].url, "https://wasender.example/api/send-message");
+    assert.equal(JSON.parse(requests[1].options.body).to, customerPhone);
   } finally {
     global.fetch = originalFetch;
     if (originalApiUrl === undefined) {
