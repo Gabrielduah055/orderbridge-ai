@@ -4,7 +4,15 @@ const path = require("node:path");
 const test = require("node:test");
 
 const { executeAgentTool } = require("../dist/agent-tools/tool.executor");
+const {
+  runAgentOrchestrator
+} = require("../dist/services/ai/agentOrchestrator.service");
 const { CustomerSession } = require("../dist/models/customerSession.model");
+const { MenuCategory } = require("../dist/models/MenuCategory");
+const { MenuItem } = require("../dist/models/MenuItem");
+const {
+  AgentClarification
+} = require("../dist/models/agentClarification.model");
 const { Order } = require("../dist/models/order.model");
 const { OutboundMessage } = require("../dist/models/outboundMessage.model");
 const { Restaurant } = require("../dist/models/Restaurant");
@@ -147,6 +155,213 @@ test("start_order preserves a more specific trusted draft step", async () => {
     assert.equal(draft.currentStep, "collecting_quantity");
   } finally {
     CustomerSession.findOne = originalFindOne;
+  }
+});
+
+test("real quantity tool flow advances to order type and schedules the matching follow-up", async () => {
+  const originals = {
+    sessionFindOne: CustomerSession.findOne,
+    sessionFind: CustomerSession.find,
+    categoryFind: MenuCategory.find,
+    itemFind: MenuItem.find,
+    clarificationFindOne: AgentClarification.findOne,
+    clarificationUpdateMany: AgentClarification.updateMany,
+    restaurantFind: Restaurant.find,
+    outboundFindOne: OutboundMessage.findOne,
+    outboundCreate: OutboundMessage.create
+  };
+  const categoryId = "64b000000000000000000d31";
+  const menuItemId = "64b000000000000000000d32";
+  const queued = [];
+  const session = {
+    _id: "64b000000000000000000d21",
+    restaurantId,
+    customerPhone,
+    cartItems: [],
+    pendingMenuItemId: menuItemId,
+    pendingMenuItemName: "Special Noodles",
+    currentStep: "collecting_quantity",
+    orderType: null,
+    deliveryFeeResolved: false,
+    conversationVersion: 4,
+    expiresAt: new Date(Date.now() + 60 * 60_000),
+    async save() {
+      return this;
+    }
+  };
+  const restaurant = makeRestaurant({ followUpDelayMinutes: 3 });
+  const providerResponses = [
+    {
+      toolCalls: [
+        {
+          id: "add-special-noodles",
+          name: "add_order_item_by_name",
+          arguments: { itemName: "Special Noodles", quantity: 2 }
+        }
+      ]
+    },
+    {
+      text: "Would you like your 2 Special Noodles for pickup or delivery?",
+      toolCalls: []
+    }
+  ];
+  let providerCall = 0;
+
+  try {
+    CustomerSession.findOne = async () => session;
+    MenuCategory.find = async () => [
+      { _id: categoryId, name: "Noodles", isActive: true }
+    ];
+    MenuItem.find = async () => [
+      {
+        _id: menuItemId,
+        restaurantId,
+        categoryId,
+        name: "Special Noodles",
+        price: 65,
+        isAvailable: true
+      }
+    ];
+    AgentClarification.findOne = () => query(null);
+    AgentClarification.updateMany = async () => ({ modifiedCount: 0 });
+
+    const agentResult = await runAgentOrchestrator(
+      {
+        restaurant,
+        sender: {
+          role: "customer",
+          phone: customerPhone,
+          normalizedPhone: customerPhone,
+          verified: false
+        },
+        message: "2"
+      },
+      {
+        provider: {
+          name: "openrouter",
+          model: "test-model",
+          complete: async () => providerResponses[providerCall++]
+        },
+        getHistory: async () => [],
+        saveMessage: async () => undefined,
+        buildSystemPrompt: async () => "customer order prompt"
+      }
+    );
+
+    assert.equal(agentResult.success, true);
+    assert.match(agentResult.message, /pickup or delivery/i);
+    assert.equal(session.cartItems.length, 1);
+    assert.equal(session.cartItems[0].quantity, 2);
+    assert.equal(session.currentStep, "choosing_order_type");
+
+    session.expiresAt = new Date(Date.now() + 2 * 60 * 60_000 - 4 * 60_000);
+    Restaurant.find = () => query([restaurant]);
+    CustomerSession.find = () => query([session]);
+    OutboundMessage.findOne = () => query(null);
+    OutboundMessage.create = async (input) => {
+      queued.push(input);
+      return { _id: "follow-up-1", ...input };
+    };
+
+    const followUpResult = await runFollowUpPass();
+
+    assert.equal(followUpResult.messagesQueued, 1);
+    assert.equal(queued.length, 1);
+    assert.match(queued[0].text, /2 Special Noodles/i);
+    assert.match(queued[0].text, /pickup or delivery/i);
+    assert.doesNotMatch(queued[0].text, /add another item or continue/i);
+    assert.equal(
+      queued[0].metadata.expectedDraftStep,
+      "choosing_order_type"
+    );
+  } finally {
+    CustomerSession.findOne = originals.sessionFindOne;
+    CustomerSession.find = originals.sessionFind;
+    MenuCategory.find = originals.categoryFind;
+    MenuItem.find = originals.itemFind;
+    AgentClarification.findOne = originals.clarificationFindOne;
+    AgentClarification.updateMany = originals.clarificationUpdateMany;
+    Restaurant.find = originals.restaurantFind;
+    OutboundMessage.findOne = originals.outboundFindOne;
+    OutboundMessage.create = originals.outboundCreate;
+  }
+});
+
+test("another item can be added after the draft advances to choosing_order_type", async () => {
+  const originals = {
+    sessionFindOne: CustomerSession.findOne,
+    categoryFind: MenuCategory.find,
+    itemFind: MenuItem.find,
+    clarificationFindOne: AgentClarification.findOne,
+    clarificationUpdateMany: AgentClarification.updateMany
+  };
+  const categoryId = "64b000000000000000000d31";
+  const session = {
+    _id: "64b000000000000000000d21",
+    restaurantId,
+    customerPhone,
+    cartItems: [
+      {
+        menuItemId: "64b000000000000000000d32",
+        name: "Special Noodles",
+        quantity: 2,
+        unitPrice: 65,
+        totalPrice: 130
+      }
+    ],
+    currentStep: "choosing_order_type",
+    orderType: null,
+    deliveryFeeResolved: false,
+    conversationVersion: 4,
+    expiresAt: new Date(Date.now() + 60 * 60_000),
+    async save() {
+      return this;
+    }
+  };
+
+  try {
+    CustomerSession.findOne = async () => session;
+    MenuCategory.find = async () => [
+      { _id: categoryId, name: "Sides", isActive: true }
+    ];
+    MenuItem.find = async () => [
+      {
+        _id: "64b000000000000000000d33",
+        restaurantId,
+        categoryId,
+        name: "Spring Rolls",
+        price: 25,
+        isAvailable: true
+      }
+    ];
+    AgentClarification.findOne = () => query(null);
+    AgentClarification.updateMany = async () => ({ modifiedCount: 0 });
+
+    const result = await executeAgentTool(
+      "add_order_item_by_name",
+      { itemName: "Spring Rolls", quantity: 1 },
+      {
+        restaurantId,
+        restaurant: makeRestaurant(),
+        sender: {
+          role: "customer",
+          phone: customerPhone,
+          normalizedPhone: customerPhone,
+          verified: false
+        },
+        originalMessage: "add 1 Spring Rolls too"
+      }
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(session.cartItems.length, 2);
+    assert.equal(session.currentStep, "choosing_order_type");
+  } finally {
+    CustomerSession.findOne = originals.sessionFindOne;
+    MenuCategory.find = originals.categoryFind;
+    MenuItem.find = originals.itemFind;
+    AgentClarification.findOne = originals.clarificationFindOne;
+    AgentClarification.updateMany = originals.clarificationUpdateMany;
   }
 });
 

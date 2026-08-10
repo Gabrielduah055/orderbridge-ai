@@ -36,7 +36,8 @@ const recoverableToolCodes = new Set([
   "ORDER_ITEM_CLARIFICATION_NO_MATCH",
   "ORDER_DRAFT_INCOMPLETE",
   "CUSTOMER_NAME_REQUIRED",
-  "ORDER_REJECTION_REASON_REQUIRED"
+  "ORDER_REJECTION_REASON_REQUIRED",
+  "CUSTOMER_WORKFLOW_CONFLICT"
 ]);
 
 const classifyOrchestratorError = (error: unknown): string => {
@@ -102,6 +103,31 @@ const orderMutationToolNames = new Set([
   "reject_order",
   "update_order_status"
 ]);
+
+const customerOrderWorkflowMutationTools = new Set([
+  "start_order",
+  "add_order_item_by_name",
+  "remove_order_item_by_name",
+  "update_order_item_quantity",
+  "update_order_draft",
+  "confirm_order_draft",
+  "cancel_order_draft",
+  "cancel_order"
+]);
+
+type CustomerWorkflowMutation = "active_order" | "order_feedback";
+
+const getCustomerWorkflowMutation = (
+  toolName: string
+): CustomerWorkflowMutation | null => {
+  if (customerOrderWorkflowMutationTools.has(toolName)) {
+    return "active_order";
+  }
+
+  return toolName === "respond_to_order_check_in"
+    ? "order_feedback"
+    : null;
+};
 
 const getRequestedOrderReferences = (
   args: Record<string, unknown>
@@ -615,7 +641,8 @@ export const runAgentOrchestrator = async (
     input.sender,
     Array.from(permittedToolNames),
     {},
-    input.staffState
+    input.staffState,
+    input.trustedCustomerReplyContext
   );
   const history = await getHistory(restaurantId, input.sender.normalizedPhone, 14);
   const messages: AiMessage[] = [
@@ -645,6 +672,7 @@ export const runAgentOrchestrator = async (
   let responseId: string | undefined;
   let usage: AiUsage | undefined;
   let customerMediaGroundingRetryUsed = false;
+  let completedCustomerWorkflowMutation: CustomerWorkflowMutation | null = null;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -779,6 +807,31 @@ export const runAgentOrchestrator = async (
       for (const toolCall of response.toolCalls) {
         const toolName = toolCall.name;
         const safeArguments = stripTrustedModelArguments(toolCall.arguments);
+        const requestedCustomerWorkflow =
+          input.sender.role === "customer"
+            ? getCustomerWorkflowMutation(toolName)
+            : null;
+        const workflowConflictResult: ToolResult | null =
+          input.trustedCustomerReplyContext &&
+          requestedCustomerWorkflow &&
+          requestedCustomerWorkflow !==
+            input.trustedCustomerReplyContext.workflow
+            ? {
+                success: false,
+                code: "CUSTOMER_WORKFLOW_CONFLICT",
+                message:
+                  "The trusted quoted reply belongs to the customer's active order. Do not mutate an earlier order check-in from this message."
+              }
+            : completedCustomerWorkflowMutation &&
+          requestedCustomerWorkflow &&
+          completedCustomerWorkflowMutation !== requestedCustomerWorkflow
+            ? {
+                success: false,
+                code: "CUSTOMER_WORKFLOW_CONFLICT",
+                message:
+                  "That message could refer to two active customer workflows. Ask whether the customer means the current order or the earlier order check-in before changing anything else."
+              }
+            : null;
         const trustedReferenceGuardResult = getTrustedOrderReferenceGuardResult(
           input,
           toolName,
@@ -792,7 +845,8 @@ export const runAgentOrchestrator = async (
                 "The tool arguments were malformed. Please retry the tool call with valid JSON arguments."
             }
           : permittedToolNames.has(toolName)
-            ? trustedReferenceGuardResult ??
+            ? workflowConflictResult ??
+              trustedReferenceGuardResult ??
               (await executeTool(
                 toolName,
                 safeArguments,
@@ -803,6 +857,10 @@ export const runAgentOrchestrator = async (
                 code: "TOOL_FORBIDDEN",
                 message: "That tool is not available for the current sender role."
               };
+
+        if (result.success && requestedCustomerWorkflow) {
+          completedCustomerWorkflowMutation = requestedCustomerWorkflow;
+        }
 
         executedTools.push({
           name: toolName,

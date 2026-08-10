@@ -7,6 +7,7 @@ import {
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
+import { OutboundMessage } from "../models/outboundMessage.model";
 import { findActiveDraft, recordInboundCustomerTurn } from "../services/orderDraft.service";
 import { handleRestaurantAgentMessage } from "../services/restaurantAgent.service";
 import {
@@ -15,6 +16,7 @@ import {
   notifyOwnerOfSubmittedOrder
 } from "../services/orderSideEffects.service";
 import {
+  extractWasenderProviderMessageId,
   normalizeIncomingWebhook,
   type NormalizedWasenderWebhook,
 } from "../services/wasender.service";
@@ -282,10 +284,6 @@ export const enqueueTrustedMenuItemImageReply = async (
 };
 
 const latestResponsePurpose = (message: string): string => {
-  if (/welcome|hello|hi\b/i.test(message)) {
-    return "greeting";
-  }
-
   if (/how many|number of portions|1, 2, or more/i.test(message)) {
     return "quantity_clarification";
   }
@@ -300,6 +298,10 @@ const latestResponsePurpose = (message: string): string => {
 
   if (/may I have your name|name please/i.test(message)) {
     return "name_question";
+  }
+
+  if (/welcome|hello|hi\b/i.test(message)) {
+    return "greeting";
   }
 
   return "conversation";
@@ -332,6 +334,82 @@ const enqueueTextMessageOrThrow = async (
   });
 };
 
+const trustedActiveOrderQuestionPurposes = new Set([
+  "quantity_clarification",
+  "order_type_question",
+  "address_question",
+  "name_question"
+]);
+
+const rememberDirectCustomerAgentQuestion = async (
+  sessionId: string,
+  recipient: string,
+  message: string,
+  context: Record<string, unknown>,
+  result: Awaited<ReturnType<typeof sendTextMessage>>
+): Promise<void> => {
+  const restaurantId =
+    typeof context.restaurantId === "string" ? context.restaurantId : "";
+  const customerPhone =
+    typeof context.customerPhone === "string" ? context.customerPhone : "";
+  const draftId = typeof context.draftId === "string" ? context.draftId : "";
+  const expectedDraftStep =
+    typeof context.expectedDraftStep === "string"
+      ? context.expectedDraftStep
+      : "";
+  const responsePurpose =
+    typeof context.responsePurpose === "string" ? context.responsePurpose : "";
+  const providerMessageId = extractWasenderProviderMessageId(result.data);
+  const eventId = typeof context.eventId === "string" ? context.eventId : "";
+  const action = typeof context.action === "string" ? context.action : "";
+
+  if (
+    context.senderRole !== "customer" ||
+    !restaurantId ||
+    !customerPhone ||
+    !draftId ||
+    !expectedDraftStep ||
+    !providerMessageId ||
+    !eventId ||
+    !action ||
+    !trustedActiveOrderQuestionPurposes.has(responsePurpose)
+  ) {
+    return;
+  }
+
+  const sentAt = new Date();
+
+  try {
+    await OutboundMessage.create({
+      restaurantId,
+      sessionId,
+      to: recipient,
+      type: "text",
+      text: message,
+      status: "sent",
+      attempts: 1,
+      maxAttempts: 1,
+      nextAttemptAt: sentAt,
+      sentAt,
+      lastAttemptAt: sentAt,
+      lastStatus: result.status,
+      providerMessageId,
+      idempotencyKey: `${action}:${eventId}:${recipient}`,
+      metadata: {
+        ...context,
+        kind: "customer_agent_question",
+        recipientType: "webhook_sender",
+        directDelivery: true
+      }
+    });
+  } catch (error) {
+    console.warn("[agentReply] Direct reply context persistence failed", {
+      restaurantId,
+      errorType: error instanceof Error ? error.name : "UnknownError"
+    });
+  }
+};
+
 // Option A: Send the AI reply directly — no queue, no wait, instant delivery.
 // If Wasender rejects it (e.g. rate limit), we silently fall back to the queue
 // so the customer still gets the message, just slightly delayed.
@@ -348,6 +426,13 @@ export const sendAgentReplyDirectly = async (
     const result = await sendTextMessage(sessionId, recipient, message, { apiKey });
 
     if (result.success) {
+      await rememberDirectCustomerAgentQuestion(
+        sessionId,
+        recipient,
+        message,
+        context,
+        result
+      );
       return; // delivered instantly ✅
     }
 

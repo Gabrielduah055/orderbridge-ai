@@ -65,6 +65,7 @@ import {
   resetDraftState,
   parseExplicitQuantity,
   resolveTrustedQuantity,
+  synchronizeDraftCurrentStep,
   submitOrderDraft
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
@@ -2304,7 +2305,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           addItemToDraft(draft, item, quantity);
           clearPendingMenuItem(draft);
           clearPendingCategory(draft);
-          draft.currentStep = "choosing_items";
+          synchronizeDraftCurrentStep(draft);
           await draft.save();
 
           return {
@@ -2374,7 +2375,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           addItemToDraft(draft, categoryMatch.item, explicitQuantity);
           clearPendingMenuItem(draft);
           clearPendingCategory(draft);
-          draft.currentStep = "choosing_items";
+          synchronizeDraftCurrentStep(draft);
           await cancelPendingOrderItemClarifications({
             restaurantId: context.restaurantId,
             senderPhone: context.sender.normalizedPhone
@@ -2502,7 +2503,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const displayName = getMenuItemDisplayName(match.item, getMenuItemCategoryName(match.item));
       addItemToDraft(draft, match.item, quantity);
       clearPendingMenuItem(draft);
-      draft.currentStep = "choosing_items";
+      synchronizeDraftCurrentStep(draft);
       await cancelPendingOrderItemClarifications({
         restaurantId: context.restaurantId,
         senderPhone: context.sender.normalizedPhone
@@ -2531,6 +2532,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
       const message = removeItemFromDraft(draft, args.itemName, args.quantity);
       clearPendingMenuItem(draft);
+      synchronizeDraftCurrentStep(draft);
       await draft.save();
 
       return {
@@ -2604,6 +2606,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       cartItem.totalPrice = cartItem.unitPrice * args.newQuantity;
 
       clearConvertedDraftState(draft);
+      synchronizeDraftCurrentStep(draft);
       await draft.save();
 
       return {
@@ -2672,15 +2675,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         draft.deliveryFeeSource = fee.source;
         draft.deliveryFeeResolved = fee.resolved;
 
-        if (!fee.resolved) {
-          draft.currentStep =
-            fee.source === "manual_confirmation"
-              ? draft.customerName?.trim()
-                ? "confirming_order"
-                : "collecting_name"
-              : "awaiting_delivery_fee";
-        }
       }
+
+      synchronizeDraftCurrentStep(draft);
 
       await draft.save();
 

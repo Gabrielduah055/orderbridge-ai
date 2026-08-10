@@ -6,6 +6,7 @@ import type { ResolvedSender } from "../../types/agent.types";
 import { loadCustomerMemorySummary } from "../customerMemory.service";
 import { loadActiveOrderCheckInState } from "../orderFeedback.service";
 import type { StaffOperationalState } from "./staffOperationalState.service";
+import type { TrustedCustomerReplyContext } from "./ai.types";
 
 export interface AgentSystemPromptDependencies {
   buildRestaurantContext?: typeof buildRestaurantAgentContext;
@@ -20,7 +21,8 @@ export const buildAgentSystemPrompt = async (
   sender: ResolvedSender,
   permissions: string[],
   dependencies: AgentSystemPromptDependencies = {},
-  staffState?: StaffOperationalState
+  staffState?: StaffOperationalState,
+  trustedCustomerReplyContext?: TrustedCustomerReplyContext
 ): Promise<string> => {
   const buildRestaurantContext =
     dependencies.buildRestaurantContext ?? buildRestaurantAgentContext;
@@ -103,6 +105,7 @@ export const buildAgentSystemPrompt = async (
             memory: customerMemory,
             activeDraft: activeDraft ? buildDraftView(activeDraft, restaurant) : null,
             activeOrderCheckIns,
+            trustedReplyContext: trustedCustomerReplyContext ?? null,
             activeClarification: activeClarification
               ? {
                   intent: activeClarification.intent,
@@ -135,6 +138,11 @@ export const buildAgentSystemPrompt = async (
           "Ask one natural question at a time, or at most two closely related questions.",
           "Customer confirmation submits the order to the restaurant; it does not mean the restaurant has accepted it.",
           "customerState.activeOrderCheckIns contains trusted pending check-ins for accepted orders. Use respond_to_order_check_in only when the current customer message clearly answers one of those check-ins.",
+          "Treat customerState.activeDraft and customerState.activeOrderCheckIns as separate workflows. A customer may have both at once; the existence of one must never silently redirect or mutate the other.",
+          "Explicit wording about receiving, enjoying, missing, or having a problem with an earlier order may address an order check-in even while a new draft is active. Explicit quantity, item-selection, pickup/delivery, address, name, or submit wording addresses the active draft.",
+          "When both workflows are active, never guess the meaning of a short ambiguous reply such as 1, 2, 3, yes, yh, yeah, sure, no, or ok. Ask whether it is for the current order or the earlier order check-in, and call no mutation tool until clarified.",
+          "When customerState.trustedReplyContext explicitly identifies the current quoted reply as active_order, use its exact expectedDraftStep and the trusted active draft to interpret that reply. This narrow backend-verified quote context overrides the short-reply ambiguity rule for that reply only; it never authorizes an order-feedback mutation.",
+          "Within one customer turn, never mutate both the active-order workflow and the order-feedback workflow.",
           "A new order, menu request, order-status question, or unrelated conversation must never be treated as a check-in response merely because a check-in is pending.",
           "For a clear natural check-in response, call respond_to_order_check_in with received_satisfied, received_complaint, or not_received and preserve the customer's own complaint/feedback wording in feedbackText.",
           "If multiple active check-ins exist, use an explicitly stated order number. If the customer did not identify one, ask which order and do not guess.",

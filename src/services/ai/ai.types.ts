@@ -80,7 +80,15 @@ export interface AgentOrchestratorInput {
   message: string;
   requestId?: string;
   quotedMessageId?: string;
+  trustedCustomerReplyContext?: TrustedCustomerReplyContext;
   staffState?: StaffOperationalState;
+}
+
+export interface TrustedCustomerReplyContext {
+  workflow: "active_order";
+  draftId: string;
+  expectedDraftStep: string;
+  responsePurpose: string;
 }
 
 export interface AgentOrchestratorResult {

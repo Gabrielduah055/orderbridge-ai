@@ -116,27 +116,23 @@ export const buildOrderFeedbackRequestMessage = (
   const customer = order.customerName?.trim();
   const greeting = customer ? `Hi ${customer} 👋` : "Hi there 👋";
   const orderNumber = order.orderNumber ?? String(order._id);
-  const choices =
+  const question =
     order.orderType === "pickup"
-      ? [
-          "1. I picked it up and everything is fine",
-          "2. I received it, but I have a complaint",
-          "3. I haven't received/picked it up yet"
-        ]
-      : [
-          "1. Received and satisfied",
-          "2. Received, but I have a complaint",
-          "3. I have not received it"
-        ];
+      ? "Did everything go well with your pickup?"
+      : "How did it go?";
+  const guidance =
+    order.orderType === "pickup"
+      ? "Tell me if you picked it up and everything was fine, had a problem, or haven't picked it up yet."
+      : "Tell me if you received and enjoyed it, had a problem with the order, or haven't received it yet.";
 
   return [
     greeting,
     "",
     `Just checking on order ${orderNumber} from ${restaurant.name}.`,
     "",
-    ...choices,
+    question,
     "",
-    "You can also type your feedback."
+    guidance
   ].join("\n");
 };
 
@@ -145,12 +141,12 @@ export const buildOrderFeedbackReminderMessage = (
   order: Pick<IOrderDocument, "orderNumber" | "orderType" | "_id">
 ): string => {
   const orderNumber = order.orderNumber ?? String(order._id);
-  const pendingText =
+  const reminder =
     order.orderType === "pickup"
-      ? "3 if you have not received or picked it up yet"
-      : "3 if you have not received it";
+      ? "Did your pickup go well? Tell me if everything was fine, there was a problem, or you haven't picked it up yet."
+      : "How did it go? Tell me if you received and enjoyed it, there was a problem, or you're still waiting.";
 
-  return `One quick check-in on order ${orderNumber} from ${restaurant.name}: reply 1 if everything is fine, 2 for a complaint, or ${pendingText}.`;
+  return `One quick check-in on order ${orderNumber} from ${restaurant.name}: ${reminder}`;
 };
 
 export const buildOrderFeedbackQueueMetadata = (

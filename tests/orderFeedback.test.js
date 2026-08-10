@@ -19,12 +19,14 @@ const {
   buildOwnerFeedbackNotification,
   classifyDeterministicOrderFeedback,
   handleOrderFeedbackCustomerResponse,
+  resolveQuotedOrderFeedbackOrderId,
   listCustomerFeedback,
   resolveCustomerFeedback
 } = require("../dist/services/orderFeedback.service");
 const {
   applyOrderFeedbackProviderResult,
   buildOrderFeedbackQueueMetadata,
+  buildOrderFeedbackReminderMessage,
   buildOrderFeedbackRequestMessage,
   getOrderCheckInDelayMinutes,
   getQueuedOrderFeedbackStaleReason,
@@ -124,9 +126,22 @@ test("feedback request text identifies the restaurant and order without marketin
 
   assert.match(message, /Golden Spoon/);
   assert.match(message, /ORD-123/);
-  assert.match(message, /1\. Received and satisfied/);
+  assert.match(message, /received and enjoyed it/i);
+  assert.match(message, /had a problem/i);
+  assert.doesNotMatch(message, /(?:^|\n)\s*[123][.)]/m);
   assert.doesNotMatch(message, /hope you received|proof of delivery/i);
   assert.equal(/offer|promotion|subscribe|marketing/i.test(message), false);
+});
+
+test("feedback reminder uses natural language instead of numbered commands", () => {
+  const message = buildOrderFeedbackReminderMessage(
+    makeRestaurant(),
+    makeOrder({ orderType: "pickup" })
+  );
+
+  assert.match(message, /pickup go well/i);
+  assert.match(message, /problem/i);
+  assert.doesNotMatch(message, /reply\s+[123]|[123]\s+if/i);
 });
 
 test("feedback queue metadata is fully scoped and explicitly transactional", () => {
@@ -142,6 +157,46 @@ test("feedback queue metadata is fully scoped and explicitly transactional", () 
       purpose: "transactional"
     }
   );
+});
+
+test("quoted feedback messages resolve only within the restaurant and customer scope", async () => {
+  const originalFindOne = OutboundMessage.findOne;
+  let filter;
+
+  OutboundMessage.findOne = (capturedFilter) => ({
+    sort() {
+      filter = capturedFilter;
+      return this;
+    },
+    async select() {
+      return {
+        metadata: {
+          orderId
+        }
+      };
+    }
+  });
+
+  try {
+    const resolvedOrderId = await resolveQuotedOrderFeedbackOrderId(
+      restaurantId,
+      customerPhone,
+      "provider-feedback-message-1"
+    );
+
+    assert.equal(resolvedOrderId, orderId);
+    assert.equal(filter.restaurantId, restaurantId);
+    assert.equal(filter.to, customerPhone);
+    assert.equal(filter.status, "sent");
+    assert.equal(filter.providerMessageId, "provider-feedback-message-1");
+    assert.deepEqual(filter["metadata.kind"].$in, [
+      "order_feedback_request",
+      "order_feedback_reminder"
+    ]);
+    assert.equal(filter["metadata.customerPhone"], customerPhone);
+  } finally {
+    OutboundMessage.findOne = originalFindOne;
+  }
 });
 
 test("deterministic classification recognizes positive food feedback as received", () => {
@@ -925,7 +980,8 @@ test("natural positive feedback completes and is stored as a review", async () =
     assert.equal(result.feedback.type, "review");
     assert.equal(result.feedback.sentiment, "positive");
     assert.equal(harness.completionTransitions, 1);
-    assert.equal(harness.outboundNotifications, 0);
+    assert.equal(result.feedback.requiresOwnerAttention, false);
+    assert.equal(harness.outboundNotifications, 1);
   });
 });
 
@@ -1197,6 +1253,22 @@ test("owner feedback notification clearly distinguishes urgent complaints", () =
   assert.match(message, /ORD-123/);
   assert.match(message, /Mavis/);
   assert.match(message, /CUSTOMER COMPLAINT/);
+});
+
+test("positive reviews use a concise owner review notification", () => {
+  const message = buildOwnerFeedbackNotification(
+    makeFeedback({
+      type: "review",
+      message: "I received it and really enjoyed the food.",
+      sentiment: "positive",
+      requiresOwnerAttention: false
+    })
+  );
+
+  assert.match(message, /⭐ CUSTOMER REVIEW/);
+  assert.match(message, /Mavis/);
+  assert.match(message, /Order ORD-123/);
+  assert.match(message, /really enjoyed the food/);
 });
 
 test("feedback permissions allow only owner and manager access", () => {

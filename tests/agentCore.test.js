@@ -545,31 +545,97 @@ test("missing customer name gets structured draft error code", () => {
 });
 
 test("state-aware follow-ups use active order step", () => {
+  const draft = (currentStep, overrides = {}) => ({
+    currentStep,
+    cartItems: [],
+    orderType: null,
+    ...overrides
+  });
+
   assert.equal(
-    buildStateAwareFollowUpMessage("choosing_items"),
+    buildStateAwareFollowUpMessage(draft("choosing_items")),
     "Still there? Tell me what you'd like to order whenever you're ready."
   );
   assert.equal(
-    buildStateAwareFollowUpMessage("choosing_items", 2),
+    buildStateAwareFollowUpMessage(
+      draft("choosing_items", {
+        cartItems: [
+          {
+            menuItemId: "64b000000000000000000301",
+            name: "Special Noodles",
+            quantity: 2,
+            unitPrice: 65,
+            totalPrice: 130
+          }
+        ]
+      })
+    ),
     "Still there? You can add another item or continue with your order."
   );
   assert.equal(
-    buildStateAwareFollowUpMessage("collecting_quantity"),
-    "Still there? I just need the quantity you'd like."
+    buildStateAwareFollowUpMessage(
+      draft("collecting_quantity", {
+        pendingMenuItemName: "Special Noodles"
+      })
+    ),
+    "Still there? How many portions of Special Noodles would you like?"
   );
   assert.equal(
-    buildStateAwareFollowUpMessage("collecting_name"),
-    "Still there? I just need the name for the order."
+    buildStateAwareFollowUpMessage(draft("collecting_name")),
+    "Still there? What name should I use for the order?"
   );
-  for (const step of [
-    "choosing_order_type",
-    "selecting_item_from_category",
-    "collecting_address",
-    "confirming_order"
-  ]) {
-    assert.equal(typeof buildStateAwareFollowUpMessage(step), "string", step);
-  }
-  assert.equal(buildStateAwareFollowUpMessage("idle"), null);
+  assert.equal(
+    buildStateAwareFollowUpMessage(
+      draft("choosing_order_type", {
+        cartItems: [
+          {
+            menuItemId: "64b000000000000000000301",
+            name: "Special Noodles",
+            quantity: 2,
+            unitPrice: 65,
+            totalPrice: 130
+          }
+        ]
+      })
+    ),
+    "Still there? Would you like your 2 Special Noodles for pickup or delivery?"
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage(draft("collecting_address")),
+    "Still there? Please send the delivery location for your order."
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage(
+      draft("selecting_item_from_category"),
+      { clarificationCandidateNames: ["Special Noodles", "Beef Noodles"] }
+    ),
+    "Still there? Which item did you want — Special Noodles or Beef Noodles?"
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage(
+      draft("collecting_name"),
+      { knownCustomerName: "Rebecca Lina Santa Maria" }
+    ),
+    "Still there? I can use Rebecca Lina Santa Maria for this order. Shall I continue?"
+  );
+  assert.equal(
+    buildStateAwareFollowUpMessage(
+      draft("confirming_order", {
+        orderType: "pickup",
+        cartItems: [
+          {
+            menuItemId: "64b000000000000000000301",
+            name: "Special Noodles",
+            quantity: 2,
+            unitPrice: 65,
+            totalPrice: 130
+          }
+        ]
+      })
+    ),
+    "Still there? Shall I submit your pickup order for 2 Special Noodles at GHS 130.00?"
+  );
+  assert.equal(buildStateAwareFollowUpMessage(draft("idle")), null);
 });
 
 test("Wasender queue respects retry_after from account protection", () => {

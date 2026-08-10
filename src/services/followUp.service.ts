@@ -3,7 +3,14 @@ import {
   CustomerSession,
   type ICustomerSessionDocument
 } from "../models/customerSession.model";
-import { buildFollowUpKey, buildStateAwareFollowUpMessage } from "./orderDraft.service";
+import { CustomerProfile } from "../models/customerProfile.model";
+import { findActiveOrderItemClarification } from "./agentClarification.service";
+import {
+  buildDraftFollowUpContextKey,
+  buildFollowUpKey,
+  buildStateAwareFollowUpMessage,
+  type CustomerDraftFollowUpState
+} from "./orderDraft.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 
 const DEFAULT_FOLLOW_UP_DELAY_MINUTES = 3;
@@ -25,8 +32,8 @@ const activeSteps: string[] = [
 export const buildCustomerFollowUpQueueMetadata = (
   session: Pick<
     ICustomerSessionDocument,
-    "_id" | "restaurantId" | "customerPhone" | "conversationVersion" | "currentStep"
-  >,
+    "_id" | "restaurantId" | "customerPhone" | "conversationVersion"
+  > & CustomerDraftFollowUpState,
   followUpKey: string
 ): Record<string, unknown> => ({
   kind: "customer_follow_up",
@@ -35,6 +42,7 @@ export const buildCustomerFollowUpQueueMetadata = (
   customerPhone: session.customerPhone,
   conversationVersion: session.conversationVersion,
   expectedDraftStep: session.currentStep,
+  expectedDraftContextKey: buildDraftFollowUpContextKey(session),
   followUpKey
 });
 
@@ -76,7 +84,7 @@ export const runFollowUpPass = async (): Promise<FollowUpSchedulerPassResult> =>
       currentStep: { $in: activeSteps },
       expiresAt: { $gt: now }
     }).select(
-      "_id restaurantId customerPhone cartItems currentStep conversationVersion lastFollowUpKey lastFollowUpAt expiresAt"
+      "_id restaurantId customerPhone customerName cartItems pendingMenuItemId pendingMenuItemName pendingCategoryId pendingCategoryName currentStep orderType deliveryFee deliveryFeeResolved conversationVersion lastFollowUpKey lastFollowUpAt expiresAt"
     );
 
     for (const session of sessions) {
@@ -105,10 +113,31 @@ export const runFollowUpPass = async (): Promise<FollowUpSchedulerPassResult> =>
           continue;
         }
 
-        const message = buildStateAwareFollowUpMessage(
-          session.currentStep,
-          session.cartItems.length
-        );
+        const [clarification, confirmedProfile] = await Promise.all([
+          session.currentStep === "selecting_item_from_category"
+            ? findActiveOrderItemClarification({
+                restaurantId: String(session.restaurantId),
+                senderPhone: session.customerPhone
+              })
+            : Promise.resolve(null),
+          session.currentStep === "collecting_name" &&
+          !session.customerName?.trim()
+            ? CustomerProfile.findOne({
+                restaurantId: session.restaurantId,
+                customerPhone: session.customerPhone,
+                customerNameSource: "customer_confirmed"
+              }).select("customerName")
+            : Promise.resolve(null)
+        ]);
+        const message = buildStateAwareFollowUpMessage(session, {
+          clarificationCandidateNames: clarification?.candidates.map(
+            (candidate) =>
+              candidate.categoryName
+                ? `${candidate.name} ${candidate.categoryName}`
+                : candidate.name
+          ),
+          knownCustomerName: confirmedProfile?.customerName
+        });
 
         if (!message) {
           continue;
