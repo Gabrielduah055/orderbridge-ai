@@ -1038,6 +1038,53 @@ test("contextual image lookup keeps URL outside model text and prepares trusted 
   assert.match(toolContent, /"hasImage":true/);
 });
 
+test("image inventory questions use menu metadata without forcing media delivery", async (t) => {
+  for (const message of [
+    "Wat menu item image do u have",
+    "What menu item images do you have?",
+    "Do you have any pictures?",
+    "Which meals have photos?"
+  ]) {
+    await t.test(message, async () => {
+      let receivedTool;
+      const { result, providerRequests, savedMessages } = await runImageOrchestrator({
+        inputOverrides: { message },
+        responses: [
+          {
+            toolCalls: [
+              {
+                id: "image-inventory-menu",
+                name: "get_menu",
+                arguments: {}
+              }
+            ]
+          },
+          {
+            text: "Currently, the only menu item with an image is Chicken Salad.",
+            toolCalls: []
+          }
+        ],
+        executeTool: async (toolName) => {
+          receivedTool = toolName;
+          return {
+            success: true,
+            message: "Menu loaded.",
+            data: [{ id: "menu-chicken", name: "Chicken Salad", imageUrl }]
+          };
+        }
+      });
+
+      assert.equal(receivedTool, "get_menu");
+      assert.equal(providerRequests.length, 2);
+      assert.match(result.message, /only menu item with an image is Chicken Salad/i);
+      assert.equal(result.data?.menuItemImage, undefined);
+      const toolContent = savedMessages.find(({ direction }) => direction === "tool").content;
+      assert.match(toolContent, /"hasImage":true/);
+      assert.doesNotMatch(toolContent, /cloudinary|https?:\/\//i);
+    });
+  }
+});
+
 test("explicit image request performs an includeImage lookup and prepares trusted media", async () => {
   let receivedArguments;
   const { result, savedMessages } = await runImageOrchestrator({
@@ -1073,7 +1120,7 @@ test("explicit image request performs an includeImage lookup and prepares truste
   assert.doesNotMatch(toolContent, /cloudinary|https?:\/\//i);
 });
 
-test("live Lemme see follow-up resolves the sole recent image item", async () => {
+test("live Lemme see follow-up resolves and queues the sole recent image item", async () => {
   let receivedArguments;
   const { result } = await runImageOrchestrator({
     inputOverrides: { message: "Lemme see." },
@@ -1110,6 +1157,27 @@ test("live Lemme see follow-up resolves the sole recent image item", async () =>
     includeImage: true
   });
   assert.equal(result.data.menuItemImage.caption, "Chicken Salad");
+
+  const queued = [];
+  await enqueueTrustedMenuItemImageReply(
+    {
+      restaurantId,
+      sessionId: "session",
+      to: customerPhone,
+      delivery: result.data.menuItemImage,
+      agentMessage: '{"action":"dalle_image_display"}'
+    },
+    async (input) => {
+      queued.push(input);
+      return input;
+    }
+  );
+
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].type, "image");
+  assert.equal(queued[0].imageUrl, imageUrl);
+  assert.equal(queued[0].caption, "Chicken Salad");
+  assert.doesNotMatch(queued[0].caption, /\{|action|dalle_image_display|https?:\/\//i);
 });
 
 test("ambiguous contextual image reference clarifies without choosing a random item", async () => {

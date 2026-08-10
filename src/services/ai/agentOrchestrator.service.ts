@@ -372,11 +372,14 @@ const isClearCustomerMenuMediaRequest = (input: AgentOrchestratorInput): boolean
   }
 
   return (
-    /\b(pic|pics|photo|photos|image|images|picture|pictures)\b/.test(message) ||
     /\bwhat does\b.+\blook like\b/.test(message) ||
-    /^(?:please\s+)?(?:lemme see|let me see|show me|show it|show me that|can i see(?: it)?|send it)\b/.test(
+    /^(?:please\s+)?(?:lemme see|let me see|show me|show it|show me that|can i see(?: it)?)\b/.test(
       message
-    )
+    ) ||
+    /^(?:please\s+)?send\s+(?:it|(?:the\s+)?(?:pic|photo|image|picture))\b/.test(
+      message
+    ) ||
+    /\bany\s+(?:pic|photo|image|picture)\s+of\s+.+/.test(message)
   );
 };
 
