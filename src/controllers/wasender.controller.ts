@@ -29,6 +29,7 @@ import type {
 } from "../types/agent.types";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
+import { resolveWasenderCustomerIdentity } from "../services/wasenderIdentity.service";
 import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
 
@@ -229,6 +230,7 @@ export interface EnqueueTrustedMenuItemImageReplyInput {
   restaurantId: string;
   sessionId: string;
   to: string;
+  customerPhone?: string;
   delivery: MenuItemImageDelivery;
   agentMessage: string;
   eventId?: string;
@@ -261,7 +263,7 @@ export const enqueueTrustedMenuItemImageReply = async (
       ...input.metadata,
       kind: "menu_item_image_delivery",
       restaurantId: input.restaurantId,
-      customerPhone: recipient,
+      customerPhone: input.customerPhone ?? recipient,
       menuItemId: input.delivery.menuItemId,
       menuItemName: input.delivery.caption,
       responsePurpose: "menu_item_image",
@@ -272,7 +274,8 @@ export const enqueueTrustedMenuItemImageReply = async (
 
   console.info("[customerAgent] trusted menu image queued", {
     restaurantId: input.restaurantId,
-    customerPhone: recipient,
+    recipientAddressingMode: /@lid$/i.test(recipient) ? "lid" : "pn",
+    hasCanonicalCustomerPhone: Boolean(input.customerPhone),
     menuItemId: input.delivery.menuItemId,
     menuItemName: input.delivery.caption
   });
@@ -332,7 +335,7 @@ const enqueueTextMessageOrThrow = async (
 // Option A: Send the AI reply directly — no queue, no wait, instant delivery.
 // If Wasender rejects it (e.g. rate limit), we silently fall back to the queue
 // so the customer still gets the message, just slightly delayed.
-const sendAgentReplyDirectly = async (
+export const sendAgentReplyDirectly = async (
   sessionId: string,
   to: string,
   message: string,
@@ -518,17 +521,55 @@ const processNormalizedWebhook = async (
     }
 
     if (!webhook.from) {
-      throw new Error("Wasender webhook missing sender phone");
+      throw new Error("Wasender webhook missing sender identity");
     }
 
-    const sender = resolveSenderIdentity(restaurant, webhook.from);
+    const customerIdentity = await resolveWasenderCustomerIdentity(
+      String(restaurant._id),
+      webhook,
+      restaurant.wasenderApiToken
+    );
+
+    console.info("WhatsApp sender identity resolved", {
+      restaurantId: String(restaurant._id),
+      addressingMode: customerIdentity.addressingMode,
+      hasCleanedParticipantPn: webhook.hasCleanedParticipantPn,
+      hasCleanedSenderPn: webhook.hasCleanedSenderPn,
+      hasSenderPn: webhook.hasSenderPn,
+      hasSenderLid: Boolean(webhook.senderLid),
+      resolutionSource: customerIdentity.resolutionSource
+    });
+
+    if (!customerIdentity.customerPhone) {
+      await sendAgentReplyDirectly(
+        restaurant.wasenderSessionId,
+        customerIdentity.recipientAddress,
+        "I can't verify your WhatsApp phone number right now. Please try again shortly.",
+        {
+          action: "send_unresolved_whatsapp_identity_reply",
+          restaurantId: String(restaurant._id),
+          eventId,
+          responsePurpose: "unresolved_whatsapp_identity",
+          addressingMode: customerIdentity.addressingMode
+        },
+        restaurant.wasenderApiToken
+      );
+      webhookEvent.status = "processed";
+      webhookEvent.processedAt = new Date();
+      await webhookEvent.save();
+      return;
+    }
+
+    const canonicalCustomerPhone = customerIdentity.customerPhone;
+    const replyAddress = customerIdentity.recipientAddress;
+    const sender = resolveSenderIdentity(restaurant, canonicalCustomerPhone);
     const processWebhookTurn = async (): Promise<void> => {
       let conversationMetadata: Record<string, unknown> = {};
 
       if (sender.role === "customer") {
         const turnSession = await recordInboundCustomerTurn(
           String(restaurant._id),
-          normalizeGhanaPhone(webhook.from),
+          canonicalCustomerPhone,
           eventId,
           sender.name
         );
@@ -549,7 +590,7 @@ const processNormalizedWebhook = async (
         if (!isCloudinaryConfigured()) {
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
-            webhook.from,
+            replyAddress,
             "Image uploads are not configured yet. Please contact support.",
             { action: "image_upload_error", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
@@ -566,14 +607,14 @@ const processNormalizedWebhook = async (
           const trustedImage = await uploadTrustedDecryptedImageFromUrl(decryptedPublicUrl);
           const workflowResult = await prepareUploadedMenuItemImage({
             restaurantId: String(restaurant._id),
-            senderPhone: normalizeGhanaPhone(webhook.from),
+            senderPhone: canonicalCustomerPhone,
             senderRole: sender.role,
             image: trustedImage
           });
 
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
-            webhook.from,
+            replyAddress,
             workflowResult.message,
             { action: "image_received", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
@@ -591,7 +632,7 @@ const processNormalizedWebhook = async (
           });
           await enqueueTextMessageOrThrow(
             restaurant.wasenderSessionId,
-            webhook.from,
+            replyAddress,
             "Sorry, I couldn't process that image. Please send it again.",
             { action: "image_upload_failed", restaurantId: String(restaurant._id), eventId },
             restaurant.wasenderApiToken
@@ -610,7 +651,7 @@ const processNormalizedWebhook = async (
       if (webhook.messageType !== "text" || !webhook.message.trim()) {
         await enqueueTextMessageOrThrow(
           restaurant.wasenderSessionId,
-          webhook.from,
+          replyAddress,
           "Please send a text message so I can help with your order.",
           {
             action: "send_unsupported_message_type_reply",
@@ -629,7 +670,7 @@ const processNormalizedWebhook = async (
 
       const agentResponse = await handleRestaurantAgentMessage({
         restaurant,
-        senderPhone: webhook.from,
+        senderPhone: canonicalCustomerPhone,
         message: webhook.message,
         quotedMessageId: webhook.quotedMessageId,
         inboundEventId: eventId
@@ -657,7 +698,9 @@ const processNormalizedWebhook = async (
         await enqueueTrustedMenuItemImageReply({
           restaurantId: String(restaurant._id),
           sessionId: restaurant.wasenderSessionId,
-          to: webhook.from,
+          to: replyAddress,
+          customerPhone:
+            sender.role === "customer" ? canonicalCustomerPhone : undefined,
           delivery: menuItemImage,
           agentMessage: agentResponse.message,
           eventId,
@@ -673,7 +716,7 @@ const processNormalizedWebhook = async (
       } else {
         await sendAgentReplyDirectly(
           restaurant.wasenderSessionId,
-          webhook.from,
+          replyAddress,
           replyMessage,
           {
             action: "send_restaurant_agent_reply",
