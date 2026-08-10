@@ -3226,6 +3226,12 @@ test("customer prompt receives memory for the exact restaurant and phone", async
     customerPhone: customer.normalizedPhone
   });
   assert.match(prompt, /"memory":\{"name":"Ama"/);
+  assert.match(prompt, /customerState\.memory\.name/);
+  assert.doesNotMatch(prompt, /customerState\.memory\.customerName/);
+  assert.match(prompt, /use it occasionally and naturally for personalization/);
+  assert.match(prompt, /without asking again/);
+  assert.match(prompt, /Do not mutate a draft merely because the customer greeted you/);
+  assert.match(prompt, /missing from both the active draft and memory/);
   assert.match(prompt, /Jollof Rice \(3 completed orders\)/);
   assert.match(prompt, /personalization only/);
   assert.match(prompt, /Never auto-add frequent or recent items/);
