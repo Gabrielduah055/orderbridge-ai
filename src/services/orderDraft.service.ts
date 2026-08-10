@@ -10,6 +10,7 @@ import { MenuItem, type IMenuItemDocument } from "../models/MenuItem";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
 import { cancelPendingOrderItemClarifications } from "./agentClarification.service";
+import { rememberConfirmedCustomerName } from "./customerProfile.service";
 import { BadRequestError } from "../utils/httpErrors";
 
 const sessionTtlMs = 2 * 60 * 60 * 1000;
@@ -82,6 +83,7 @@ export type MenuItemMatchResult =
 export const getDraftExpiry = (): Date => new Date(Date.now() + sessionTtlMs);
 
 export const resetDraftState = (session: ICustomerSessionDocument): void => {
+  session.customerName = undefined;
   session.cartItems = [];
   session.pendingMenuItemId = undefined;
   session.pendingMenuItemName = undefined;
@@ -770,11 +772,20 @@ export const buildDraftView = (
   };
 };
 
+export interface SubmitOrderDraftDependencies {
+  createOrder?: typeof orderService.createOrder;
+  rememberCustomerName?: typeof rememberConfirmedCustomerName;
+}
+
 export const submitOrderDraft = async (
   restaurant: IRestaurantDocument,
-  customerPhone: string
+  customerPhone: string,
+  dependencies: SubmitOrderDraftDependencies = {}
 ): Promise<{ order: IOrderDocument; idempotent: boolean; draft: ICustomerSessionDocument }> => {
   const restaurantId = String(restaurant._id);
+  const createOrder = dependencies.createOrder ?? orderService.createOrder;
+  const rememberCustomerName =
+    dependencies.rememberCustomerName ?? rememberConfirmedCustomerName;
   const draft = await getOrCreateDraft(restaurantId, customerPhone);
 
   if (draft.convertedOrderId) {
@@ -785,6 +796,17 @@ export const submitOrderDraft = async (
     });
 
     if (existingOrder) {
+      const submittedCustomerName =
+        existingOrder.customerName?.trim() || draft.customerName?.trim();
+
+      if (submittedCustomerName) {
+        await rememberCustomerName(
+          restaurantId,
+          existingOrder.customerPhone,
+          submittedCustomerName
+        );
+      }
+
       return {
         order: existingOrder,
         idempotent: true,
@@ -803,7 +825,8 @@ export const submitOrderDraft = async (
     throw error;
   }
 
-  const order = await orderService.createOrder(restaurantId, {
+  const submittedCustomerName = draft.customerName!;
+  const order = await createOrder(restaurantId, {
     customerName: draft.customerName,
     customerPhone: draft.customerPhone,
     items: draft.cartItems.map((item) => ({
@@ -823,6 +846,11 @@ export const submitOrderDraft = async (
   draft.convertedOrderId = order._id;
   draft.convertedAt = new Date();
   await draft.save();
+  await rememberCustomerName(
+    restaurantId,
+    order.customerPhone,
+    order.customerName?.trim() || submittedCustomerName
+  );
 
   return {
     order,

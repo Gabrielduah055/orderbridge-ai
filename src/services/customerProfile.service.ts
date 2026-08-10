@@ -58,6 +58,14 @@ const normalizeComparableText = (value: string): string => {
   return normalizeDisplayText(value).toLowerCase();
 };
 
+const genericCustomerNames = new Set([
+  "customer",
+  "user",
+  "guest",
+  "unknown",
+  "n/a"
+]);
+
 const getOrderCompletionDate = (
   order: CompletedOrderProfileSource
 ): Date => {
@@ -210,6 +218,76 @@ const ensureCustomerPhone = (customerPhone: string): string => {
   }
 
   return normalizedPhone;
+};
+
+export const rememberConfirmedCustomerName = async (
+  restaurantId: string,
+  customerPhone: string,
+  customerName: string
+): Promise<ICustomerProfileDocument> => {
+  ensureValidRestaurantId(restaurantId);
+  const normalizedPhone = ensureCustomerPhone(customerPhone);
+  const normalizedName = normalizeDisplayText(customerName);
+
+  if (
+    !normalizedName ||
+    genericCustomerNames.has(normalizedName.toLowerCase())
+  ) {
+    throw new BadRequestError("A valid customer name is required");
+  }
+
+  const existingProfile = await CustomerProfile.findOne({
+    restaurantId,
+    customerPhone: normalizedPhone
+  });
+
+  if (existingProfile?.customerNameSource === "customer_confirmed") {
+    return existingProfile;
+  }
+
+  if (existingProfile) {
+    existingProfile.customerName = normalizedName;
+    existingProfile.customerNameSource = "customer_confirmed";
+    return existingProfile.save();
+  }
+
+  try {
+    return await CustomerProfile.create({
+      restaurantId,
+      customerPhone: normalizedPhone,
+      customerName: normalizedName,
+      customerNameSource: "customer_confirmed"
+    });
+  } catch (error) {
+    const isDuplicateKey =
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: number }).code === 11000;
+
+    if (!isDuplicateKey) {
+      throw error;
+    }
+
+    const concurrentlyCreatedProfile = await CustomerProfile.findOne({
+      restaurantId,
+      customerPhone: normalizedPhone
+    });
+
+    if (!concurrentlyCreatedProfile) {
+      throw error;
+    }
+
+    if (
+      concurrentlyCreatedProfile.customerNameSource === "customer_confirmed"
+    ) {
+      return concurrentlyCreatedProfile;
+    }
+
+    concurrentlyCreatedProfile.customerName = normalizedName;
+    concurrentlyCreatedProfile.customerNameSource = "customer_confirmed";
+    return concurrentlyCreatedProfile.save();
+  }
 };
 
 export const getEquivalentCustomerPhones = (customerPhone: string): string[] => {
