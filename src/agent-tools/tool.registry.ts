@@ -982,10 +982,14 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         `Opted out: ${customerMarketing.marketingOptedOutCustomers}`,
         `Awaiting consent response: ${customerMarketing.marketingConsentAwaitingResponseCustomers}`,
         "Consent outreach:",
-        `Invited: ${customerMarketing.marketingConsentInvitedCustomers}`,
+        `Sent: ${customerMarketing.marketingConsentInvitedCustomers}`,
         `Accepted: ${customerMarketing.marketingConsentAcceptedCustomers}`,
         `Declined: ${customerMarketing.marketingConsentDeclinedCustomers}`,
         `No response: ${customerMarketing.marketingConsentAwaitingResponseCustomers}`,
+        `Failed delivery: ${customerMarketing.marketingConsentDeliveryFailedCustomers}`,
+        ...(customerMarketing.marketingConsentQueuedCustomers > 0
+          ? [`Pending delivery: ${customerMarketing.marketingConsentQueuedCustomers}`]
+          : []),
         `Not asked yet: ${customerMarketing.marketingConsentNotAskedCustomers}`
       ].join("\n");
 

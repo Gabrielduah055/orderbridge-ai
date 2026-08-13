@@ -5,6 +5,7 @@ import {
   type ICustomerProfileDocument,
   type IFrequentlyOrderedItem
 } from "../models/customerProfile.model";
+import { OutboundMessage } from "../models/outboundMessage.model";
 import {
   Order,
   type IOrderDocument,
@@ -57,11 +58,13 @@ export interface CustomerProfileStatistics {
   marketingEligibleCustomers: number;
   marketingNotOptedInCustomers: number;
   marketingOptedOutCustomers: number;
+  marketingConsentQueuedCustomers: number;
   marketingConsentInvitedCustomers: number;
   marketingConsentAcceptedCustomers: number;
   marketingConsentDeclinedCustomers: number;
   marketingConsentAwaitingResponseCustomers: number;
   marketingConsentNotAskedCustomers: number;
+  marketingConsentDeliveryFailedCustomers: number;
 }
 
 const normalizeDisplayText = (value: string): string => {
@@ -553,9 +556,12 @@ export const getCustomerProfileStatistics = async (
     returningCustomers,
     marketingEligibleCustomers,
     marketingOptedOutCustomers,
-    marketingConsentInvitedCustomers,
-    marketingConsentAcceptedCustomers,
-    marketingConsentDeclinedCustomers
+    marketingConsentPromptedCustomers,
+    marketingConsentAcceptedPhones,
+    marketingConsentDeclinedPhones,
+    queuedConsentPhones,
+    sentConsentPhones,
+    failedConsentPhones
   ] = await Promise.all([
     CustomerProfile.countDocuments(scope),
     CustomerProfile.countDocuments({
@@ -579,22 +585,51 @@ export const getCustomerProfileStatistics = async (
       ...scope,
       marketingConsentPromptedAt: { $exists: true }
     }),
-    CustomerProfile.countDocuments({
+    CustomerProfile.distinct("customerPhone", {
       ...scope,
       marketingConsentPromptResponse: "opt_in"
     }),
-    CustomerProfile.countDocuments({
+    CustomerProfile.distinct("customerPhone", {
       ...scope,
       marketingConsentPromptResponse: "opt_out"
+    }),
+    OutboundMessage.distinct("to", {
+      restaurantId,
+      status: { $in: ["pending", "sending"] },
+      "metadata.kind": "marketing_consent_request"
+    }),
+    OutboundMessage.distinct("to", {
+      restaurantId,
+      status: "sent",
+      "metadata.kind": "marketing_consent_request"
+    }),
+    OutboundMessage.distinct("to", {
+      restaurantId,
+      status: "failed",
+      "metadata.kind": "marketing_consent_request"
     })
   ]);
+  const normalizeStatisticsPhone = (value: unknown): string =>
+    typeof value === "string" ? normalizeGhanaPhone(value) : "";
+  const toPhoneSet = (values: unknown[]): Set<string> =>
+    new Set(values.map(normalizeStatisticsPhone).filter(Boolean));
+  const sentPhoneSet = toPhoneSet(sentConsentPhones);
+  const acceptedPhoneSet = toPhoneSet(marketingConsentAcceptedPhones);
+  const declinedPhoneSet = toPhoneSet(marketingConsentDeclinedPhones);
+  const failedPhoneSet = toPhoneSet(failedConsentPhones);
+  const queuedPhoneSet = toPhoneSet(queuedConsentPhones);
 
-  const marketingConsentAwaitingResponseCustomers = Math.max(
-    0,
-    marketingConsentInvitedCustomers -
-      marketingConsentAcceptedCustomers -
-      marketingConsentDeclinedCustomers
-  );
+  for (const phone of sentPhoneSet) {
+    failedPhoneSet.delete(phone);
+    queuedPhoneSet.delete(phone);
+  }
+
+  const marketingConsentAwaitingResponseCustomers = Array.from(
+    sentPhoneSet
+  ).filter(
+    (phone) =>
+      !acceptedPhoneSet.has(phone) && !declinedPhoneSet.has(phone)
+  ).length;
 
   return {
     totalCustomers,
@@ -608,13 +643,15 @@ export const getCustomerProfileStatistics = async (
         marketingOptedOutCustomers
     ),
     marketingOptedOutCustomers,
-    marketingConsentInvitedCustomers,
-    marketingConsentAcceptedCustomers,
-    marketingConsentDeclinedCustomers,
+    marketingConsentQueuedCustomers: queuedPhoneSet.size,
+    marketingConsentInvitedCustomers: sentPhoneSet.size,
+    marketingConsentAcceptedCustomers: acceptedPhoneSet.size,
+    marketingConsentDeclinedCustomers: declinedPhoneSet.size,
     marketingConsentAwaitingResponseCustomers,
     marketingConsentNotAskedCustomers: Math.max(
       0,
-      totalCustomers - marketingConsentInvitedCustomers
-    )
+      totalCustomers - marketingConsentPromptedCustomers
+    ),
+    marketingConsentDeliveryFailedCustomers: failedPhoneSet.size
   };
 };

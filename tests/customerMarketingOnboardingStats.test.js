@@ -406,7 +406,10 @@ test("STOP then START preserves the hard opt-out boundary and re-enables future 
 
 test("lifetime customer statistics are exact and restaurant scoped", async () => {
   const originalCountDocuments = CustomerProfile.countDocuments;
+  const originalProfileDistinct = CustomerProfile.distinct;
+  const originalOutboundDistinct = OutboundMessage.distinct;
   const filters = [];
+  const outboundFilters = [];
 
   try {
     CustomerProfile.countDocuments = async (filter) => {
@@ -415,10 +418,25 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       if (filter.orderCount?.$gte === 1) return 6;
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
-      if (filter.marketingConsentPromptResponse === "opt_in") return 5;
-      if (filter.marketingConsentPromptResponse === "opt_out") return 2;
       if (filter.marketingConsentPromptedAt) return 8;
       return 8;
+    };
+    CustomerProfile.distinct = async (_field, filter) => {
+      filters.push(filter);
+      if (filter.marketingConsentPromptResponse === "opt_in") {
+        return [11, 12, 13, 14, 15].map((suffix) => `+2335000000${suffix}`);
+      }
+      return ["+233500000016"];
+    };
+    OutboundMessage.distinct = async (_field, filter) => {
+      outboundFilters.push(filter);
+      if (filter.status === "sent") {
+        return [11, 12, 13, 14, 15, 16, 17].map(
+          (suffix) => `+2335000000${suffix}`
+        );
+      }
+      if (filter.status?.$in) return [];
+      return ["+233500000018"];
     };
 
     const statistics = await getCustomerProfileStatistics(restaurantId);
@@ -430,15 +448,69 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       marketingEligibleCustomers: 5,
       marketingNotOptedInCustomers: 1,
       marketingOptedOutCustomers: 2,
-      marketingConsentInvitedCustomers: 8,
+      marketingConsentQueuedCustomers: 0,
+      marketingConsentInvitedCustomers: 7,
       marketingConsentAcceptedCustomers: 5,
-      marketingConsentDeclinedCustomers: 2,
+      marketingConsentDeclinedCustomers: 1,
       marketingConsentAwaitingResponseCustomers: 1,
-      marketingConsentNotAskedCustomers: 0
+      marketingConsentNotAskedCustomers: 0,
+      marketingConsentDeliveryFailedCustomers: 1
     });
     assert.equal(filters.every((filter) => filter.restaurantId === restaurantId), true);
+    assert.equal(
+      outboundFilters.every(
+        (filter) =>
+          filter.restaurantId === restaurantId &&
+          filter["metadata.kind"] === "marketing_consent_request"
+      ),
+      true
+    );
   } finally {
     CustomerProfile.countDocuments = originalCountDocuments;
+    CustomerProfile.distinct = originalProfileDistinct;
+    OutboundMessage.distinct = originalOutboundDistinct;
+  }
+});
+
+test("consent delivery reporting separates queued, sent, failed, accepted, declined, and no response", async () => {
+  const originals = {
+    profileCountDocuments: CustomerProfile.countDocuments,
+    profileDistinct: CustomerProfile.distinct,
+    outboundDistinct: OutboundMessage.distinct
+  };
+  const sentPhone = "+233500000051";
+  const acceptedPhone = "+233500000052";
+  const declinedPhone = "+233500000053";
+
+  try {
+    CustomerProfile.countDocuments = async (filter) =>
+      filter.marketingConsentPromptedAt ? 6 : 6;
+    CustomerProfile.distinct = async (_field, filter) => {
+      if (filter.marketingConsentPromptResponse === "opt_in") {
+        return [acceptedPhone];
+      }
+      return [declinedPhone];
+    };
+    OutboundMessage.distinct = async (_field, filter) => {
+      if (filter.status === "sent") {
+        return [sentPhone, acceptedPhone, declinedPhone];
+      }
+      if (filter.status?.$in) return ["+233500000054"];
+      return ["+233500000055"];
+    };
+
+    const statistics = await getCustomerProfileStatistics(restaurantId);
+
+    assert.equal(statistics.marketingConsentQueuedCustomers, 1);
+    assert.equal(statistics.marketingConsentInvitedCustomers, 3);
+    assert.equal(statistics.marketingConsentDeliveryFailedCustomers, 1);
+    assert.equal(statistics.marketingConsentAcceptedCustomers, 1);
+    assert.equal(statistics.marketingConsentDeclinedCustomers, 1);
+    assert.equal(statistics.marketingConsentAwaitingResponseCustomers, 1);
+  } finally {
+    CustomerProfile.countDocuments = originals.profileCountDocuments;
+    CustomerProfile.distinct = originals.profileDistinct;
+    OutboundMessage.distinct = originals.outboundDistinct;
   }
 });
 
@@ -446,7 +518,9 @@ test("get_business_summary returns lifetime profile totals even with zero orders
   const originals = {
     orderFind: Order.find,
     itemCountDocuments: MenuItem.countDocuments,
-    profileCountDocuments: CustomerProfile.countDocuments
+    profileCountDocuments: CustomerProfile.countDocuments,
+    profileDistinct: CustomerProfile.distinct,
+    outboundDistinct: OutboundMessage.distinct
   };
 
   try {
@@ -457,11 +531,21 @@ test("get_business_summary returns lifetime profile totals even with zero orders
       if (filter.orderCount?.$gte === 1) return 6;
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
-      if (filter.marketingConsentPromptResponse === "opt_in") return 5;
-      if (filter.marketingConsentPromptResponse === "opt_out") return 2;
       if (filter.marketingConsentPromptedAt) return 8;
       return 8;
     };
+    CustomerProfile.distinct = async (_field, filter) =>
+      filter.marketingConsentPromptResponse === "opt_in"
+        ? [11, 12, 13, 14, 15].map((suffix) => `+2335000000${suffix}`)
+        : ["+233500000016"];
+    OutboundMessage.distinct = async (_field, filter) =>
+      filter.status === "sent"
+        ? [11, 12, 13, 14, 15, 16, 17].map(
+            (suffix) => `+2335000000${suffix}`
+          )
+        : filter.status?.$in
+          ? []
+          : ["+233500000018"];
 
     const result = await toolRegistry.get_business_summary.handler(
       {},
@@ -487,6 +571,9 @@ test("get_business_summary returns lifetime profile totals even with zero orders
     assert.equal(result.data.marketingEligibleCustomers, 5);
     assert.equal(result.data.marketingOptedOutCustomers, 2);
     assert.equal(result.data.marketingNotOptedInCustomers, 1);
+    assert.equal(result.data.marketingConsentInvitedCustomers, 7);
+    assert.equal(result.data.marketingConsentDeliveryFailedCustomers, 1);
+    assert.equal(result.data.marketingConsentAwaitingResponseCustomers, 1);
     assert.match(
       toolRegistry.get_business_summary.definition.description,
       /lifetime CustomerProfile counts/i
@@ -495,6 +582,8 @@ test("get_business_summary returns lifetime profile totals even with zero orders
     Order.find = originals.orderFind;
     MenuItem.countDocuments = originals.itemCountDocuments;
     CustomerProfile.countDocuments = originals.profileCountDocuments;
+    CustomerProfile.distinct = originals.profileDistinct;
+    OutboundMessage.distinct = originals.outboundDistinct;
   }
 });
 

@@ -5,6 +5,7 @@ const { Order, orderStatuses } = require("../dist/models/order.model");
 const { Restaurant } = require("../dist/models/Restaurant");
 const { MenuItem } = require("../dist/models/MenuItem");
 const { CustomerProfile } = require("../dist/models/customerProfile.model");
+const { OutboundMessage } = require("../dist/models/outboundMessage.model");
 const {
   createRestaurantSchema
 } = require("../dist/middleware/validateRequest");
@@ -352,6 +353,8 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
   const originalFind = Order.find;
   const originalCountDocuments = MenuItem.countDocuments;
   const originalCustomerCountDocuments = CustomerProfile.countDocuments;
+  const originalCustomerDistinct = CustomerProfile.distinct;
+  const originalOutboundDistinct = OutboundMessage.distinct;
   const completedItemId = "64b000000000000000000941";
   const periodOrders = [
     makeOrder({
@@ -408,6 +411,14 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
       assert.equal(filter.restaurantId, restaurantId);
       return 0;
     };
+    CustomerProfile.distinct = async (_field, filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return [];
+    };
+    OutboundMessage.distinct = async (_field, filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return [];
+    };
 
     const today = await toolRegistry.get_today_orders.handler({}, context);
     const yesterday = await toolRegistry.get_yesterday_orders.handler(
@@ -442,12 +453,16 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
     Order.find = originalFind;
     MenuItem.countDocuments = originalCountDocuments;
     CustomerProfile.countDocuments = originalCustomerCountDocuments;
+    CustomerProfile.distinct = originalCustomerDistinct;
+    OutboundMessage.distinct = originalOutboundDistinct;
   }
 });
 
 test("get_business_report supports all periods and remains context scoped", async () => {
   const originalFind = Order.find;
   const originalCustomerCountDocuments = CustomerProfile.countDocuments;
+  const originalCustomerDistinct = CustomerProfile.distinct;
+  const originalOutboundDistinct = OutboundMessage.distinct;
   const filters = [];
   const context = {
     restaurantId,
@@ -464,6 +479,8 @@ test("get_business_report supports all periods and remains context scoped", asyn
       return { select: async () => [] };
     };
     CustomerProfile.countDocuments = async () => 0;
+    CustomerProfile.distinct = async () => [];
+    OutboundMessage.distinct = async () => [];
 
     for (const period of [
       "today",
@@ -481,10 +498,14 @@ test("get_business_report supports all periods and remains context scoped", asyn
       assert.match(result.data.formattedReport, /TENANT RESTAURANT/);
       assert.equal(result.data.customerMarketing.totalCustomers, 0);
       assert.match(result.data.formattedReport, /CUSTOMER MARKETING \(CURRENT SNAPSHOT\)/);
+      assert.match(result.data.formattedReport, /Sent: 0/);
+      assert.match(result.data.formattedReport, /Failed delivery: 0/);
     }
   } finally {
     Order.find = originalFind;
     CustomerProfile.countDocuments = originalCustomerCountDocuments;
+    CustomerProfile.distinct = originalCustomerDistinct;
+    OutboundMessage.distinct = originalOutboundDistinct;
   }
 
   assert.equal(filters.length, 8);
