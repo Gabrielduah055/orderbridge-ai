@@ -1074,17 +1074,12 @@ export const handleRestaurantAgentMessage = async (
     };
     let workflowStateLoadFailed = false;
 
-    if (
-      ambiguousShortReply ||
-      genericConsentResponse ||
-      Boolean(consentResponse && input.quotedMessageId)
-    ) {
+    if (ambiguousShortReply || consentResponse) {
       try {
         [activeDraft, activeCheckIns, marketingConsentContext] = await Promise.all([
           findCustomerDraft(restaurantId, sender.normalizedPhone),
           loadCustomerCheckIns(restaurantId, sender.normalizedPhone),
-          consentResponse &&
-          (genericConsentResponse || Boolean(input.quotedMessageId))
+          consentResponse
             ? loadMarketingConsentContext(
                 restaurantId,
                 sender.normalizedPhone,
