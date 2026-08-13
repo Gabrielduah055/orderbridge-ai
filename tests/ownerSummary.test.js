@@ -4,6 +4,7 @@ const test = require("node:test");
 const { Order, orderStatuses } = require("../dist/models/order.model");
 const { Restaurant } = require("../dist/models/Restaurant");
 const { MenuItem } = require("../dist/models/MenuItem");
+const { CustomerProfile } = require("../dist/models/customerProfile.model");
 const {
   createRestaurantSchema
 } = require("../dist/middleware/validateRequest");
@@ -350,6 +351,7 @@ test("owner summary order queries are all scoped by restaurantId", async () => {
 test("today orders and sales tools expose completed-only reporting metrics", async () => {
   const originalFind = Order.find;
   const originalCountDocuments = MenuItem.countDocuments;
+  const originalCustomerCountDocuments = CustomerProfile.countDocuments;
   const completedItemId = "64b000000000000000000941";
   const periodOrders = [
     makeOrder({
@@ -402,6 +404,10 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
       assert.equal(filter.restaurantId, restaurantId);
       return 3;
     };
+    CustomerProfile.countDocuments = async (filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return 0;
+    };
 
     const today = await toolRegistry.get_today_orders.handler({}, context);
     const yesterday = await toolRegistry.get_yesterday_orders.handler(
@@ -435,6 +441,7 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
   } finally {
     Order.find = originalFind;
     MenuItem.countDocuments = originalCountDocuments;
+    CustomerProfile.countDocuments = originalCustomerCountDocuments;
   }
 });
 

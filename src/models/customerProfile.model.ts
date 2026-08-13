@@ -48,6 +48,8 @@ export interface ICustomerProfile {
   marketingConsent?: boolean | null;
   marketingConsentAt?: Date;
   marketingConsentSource?: MarketingPreferenceSource;
+  marketingConsentPromptedAt?: Date;
+  marketingConsentPromptOrderId?: Types.ObjectId;
   isOptedOut: boolean;
   optedOutAt?: Date;
   optedOutSource?: MarketingPreferenceSource;
@@ -184,6 +186,13 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
     marketingConsentSource: {
       type: String,
       enum: marketingPreferenceSources
+    },
+    marketingConsentPromptedAt: {
+      type: Date
+    },
+    marketingConsentPromptOrderId: {
+      type: Schema.Types.ObjectId,
+      ref: "Order"
     },
     isOptedOut: {
       type: Boolean,

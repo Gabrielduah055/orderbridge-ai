@@ -70,7 +70,8 @@ const transactionalKinds = new Set([
   "receipt_delivery",
   "order_feedback_request",
   "order_feedback_reminder",
-  "order_feedback_owner_notification"
+  "order_feedback_owner_notification",
+  "marketing_consent_request"
 ]);
 
 export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>): boolean => {
@@ -400,6 +401,48 @@ export const getQueuedCustomerCampaignStaleReason = async (
     restaurant.wasenderApiToken !== queuedApiKey
   ) {
     return "restaurant_wasender_token_changed";
+  }
+
+  return null;
+};
+
+export const getQueuedMarketingConsentRequestStaleReason = async (
+  metadata: Record<string, unknown> | undefined,
+  queuedCustomerPhone: string
+): Promise<string | null> => {
+  const restaurantId =
+    typeof metadata?.restaurantId === "string"
+      ? metadata.restaurantId
+      : undefined;
+  const customerPhone =
+    typeof metadata?.customerPhone === "string"
+      ? normalizeGhanaPhone(metadata.customerPhone)
+      : normalizeGhanaPhone(queuedCustomerPhone);
+
+  if (!restaurantId || !customerPhone) {
+    return "invalid_consent_request_scope";
+  }
+
+  const profile = await CustomerProfile.findOne({
+    restaurantId,
+    customerPhone
+  }).select("marketingConsent isOptedOut");
+
+  // A missing profile may mean the prompt was queued just before the profile
+  // audit update completed. Do not cancel that narrow enqueue/mark race.
+  if (!profile) {
+    return null;
+  }
+
+  if (profile.isOptedOut === true) {
+    return "customer_opted_out";
+  }
+
+  if (
+    profile.marketingConsent === true ||
+    profile.marketingConsent === false
+  ) {
+    return "marketing_preference_already_resolved";
   }
 
   return null;
@@ -1036,6 +1079,25 @@ export const processNextQueuedWasenderMessage = async (
       locked.lastError = `Stale order feedback message: ${staleReason}`;
       await locked.save();
       console.info("Stale order feedback message cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        orderId: locked.metadata.orderId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (locked.metadata?.kind === "marketing_consent_request") {
+    const staleReason =
+      await getQueuedMarketingConsentRequestStaleReason(
+        locked.metadata,
+        locked.to
+      );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale marketing consent request: ${staleReason}`;
+      await locked.save();
+      console.info("Stale marketing consent request cancelled", {
         restaurantId: locked.metadata.restaurantId,
         orderId: locked.metadata.orderId,
         queueMessageId: String(locked._id),

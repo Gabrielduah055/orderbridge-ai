@@ -125,6 +125,28 @@ export const cancelQueuedCustomerMarketingMessages = async (
   ]);
 };
 
+const cancelQueuedMarketingConsentRequest = async (
+  restaurantId: string,
+  customerPhone: string
+): Promise<void> => {
+  await OutboundMessage.updateMany(
+    {
+      restaurantId,
+      to: customerPhone,
+      status: "pending",
+      "metadata.kind": "marketing_consent_request",
+      "metadata.customerPhone": customerPhone
+    },
+    {
+      $set: {
+        status: "cancelled",
+        lastError:
+          "Customer preference was resolved before consent prompt delivery"
+      }
+    }
+  );
+};
+
 export const setCustomerMarketingPreference = async (
   restaurantId: string,
   customerPhone: string,
@@ -151,6 +173,10 @@ export const setCustomerMarketingPreference = async (
 
   if (alreadyApplied && existing) {
     if (command === "opt_out") {
+      await cancelQueuedMarketingConsentRequest(
+        restaurantId,
+        normalizedPhone
+      );
       await cancelQueuedCustomerMarketingMessages(
         restaurantId,
         normalizedPhone,
@@ -210,6 +236,10 @@ export const setCustomerMarketingPreference = async (
   }
 
   if (command === "opt_out") {
+    await cancelQueuedMarketingConsentRequest(
+      restaurantId,
+      normalizedPhone
+    );
     await cancelQueuedCustomerMarketingMessages(
       restaurantId,
       normalizedPhone,

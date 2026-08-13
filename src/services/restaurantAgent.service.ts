@@ -33,7 +33,14 @@ import {
   shouldHandlePendingMenuItemImageReply,
   rememberMenuItemImageRequest
 } from "./menuItemImageWorkflow.service";
-import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
+import {
+  handleCustomerMarketingPreferenceCommand,
+  setCustomerMarketingPreference
+} from "./customerMarketingPreference.service";
+import {
+  getPendingMarketingConsentContext,
+  parseMarketingConsentResponse
+} from "./customerMarketingOnboarding.service";
 import {
   handleOrderFeedbackCustomerResponse,
   isExplicitNaturalOrderFeedback,
@@ -359,6 +366,8 @@ export interface RestaurantAgentRoutingDependencies {
   loadCustomerCheckIns?: typeof loadActiveOrderCheckInState;
   resolveQuotedCustomerFeedback?: typeof resolveQuotedOrderFeedbackOrderId;
   resolveQuotedCustomerActiveOrder?: typeof resolveQuotedActiveOrderReplyContext;
+  loadMarketingConsentContext?: typeof getPendingMarketingConsentContext;
+  setMarketingPreference?: typeof setCustomerMarketingPreference;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -957,6 +966,11 @@ export const handleRestaurantAgentMessage = async (
   const resolveQuotedCustomerActiveOrder =
     dependencies.resolveQuotedCustomerActiveOrder ??
     resolveQuotedActiveOrderReplyContext;
+  const loadMarketingConsentContext =
+    dependencies.loadMarketingConsentContext ??
+    getPendingMarketingConsentContext;
+  const applyMarketingPreference =
+    dependencies.setMarketingPreference ?? setCustomerMarketingPreference;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -1041,16 +1055,36 @@ export const handleRestaurantAgentMessage = async (
 
     const exactCheckInReply = isExactOrderCheckInReply(message);
     const ambiguousShortReply = isAmbiguousCustomerWorkflowReply(message);
+    const consentResponse = parseMarketingConsentResponse(message);
+    const genericConsentResponse = Boolean(
+      consentResponse && !consentResponse.explicitlyMentionsMarketing
+    );
     const explicitNaturalFeedback = isExplicitNaturalOrderFeedback(message);
     let activeDraft: Awaited<ReturnType<typeof findActiveDraft>> = null;
     let activeCheckIns: ActiveOrderCheckInView[] = [];
+    let marketingConsentContext = {
+      pending: false,
+      quotedRequest: false,
+      genericResponseWindowOpen: false
+    };
     let workflowStateLoadFailed = false;
 
-    if (ambiguousShortReply) {
+    if (ambiguousShortReply || genericConsentResponse) {
       try {
-        [activeDraft, activeCheckIns] = await Promise.all([
+        [activeDraft, activeCheckIns, marketingConsentContext] = await Promise.all([
           findCustomerDraft(restaurantId, sender.normalizedPhone),
-          loadCustomerCheckIns(restaurantId, sender.normalizedPhone)
+          loadCustomerCheckIns(restaurantId, sender.normalizedPhone),
+          genericConsentResponse
+            ? loadMarketingConsentContext(
+                restaurantId,
+                sender.normalizedPhone,
+                input.quotedMessageId
+              )
+            : Promise.resolve({
+                pending: false,
+                quotedRequest: false,
+                genericResponseWindowOpen: false
+              })
         ]);
       } catch (error) {
         workflowStateLoadFailed = true;
@@ -1065,6 +1099,112 @@ export const handleRestaurantAgentMessage = async (
       hasCompetingCustomerOrderWorkflow(activeDraft);
     const hasActiveFeedbackWorkflow = activeCheckIns.length > 0;
     let trustedQuotedOrderId: string | null = null;
+
+    const hasTrustedGenericConsentContext = Boolean(
+      marketingConsentContext.pending &&
+        (marketingConsentContext.quotedRequest ||
+          marketingConsentContext.genericResponseWindowOpen)
+    );
+
+    if (
+      consentResponse &&
+      (consentResponse.explicitlyMentionsMarketing ||
+        hasTrustedGenericConsentContext)
+    ) {
+      const hasCompetingWorkflow =
+        competingOrderWorkflow || hasActiveFeedbackWorkflow;
+      const needsClarification =
+        !consentResponse.explicitlyMentionsMarketing &&
+        !marketingConsentContext.quotedRequest &&
+        (workflowStateLoadFailed || hasCompetingWorkflow);
+
+      if (needsClarification) {
+        const clarificationMessage = `Just to make sure — is that ${consentResponse.command === "opt_in" ? "yes" : "no"} for your current order, or would you like to receive ${input.restaurant.name} offers and discounts?`;
+
+        await saveAgentConversationMessage({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          direction: "user",
+          content: message,
+          metadata: {
+            source: "deterministic_marketing_consent_clarification",
+            inboundEventId: input.inboundEventId
+          }
+        });
+        await saveAgentConversationMessage({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          direction: "assistant",
+          content: clarificationMessage,
+          metadata: {
+            source: "deterministic_marketing_consent_clarification",
+            activeDraftStep: activeDraft?.currentStep,
+            activeFeedbackOrderCount: activeCheckIns.length
+          }
+        });
+
+        return {
+          success: true,
+          message: clarificationMessage,
+          data: {
+            workflowClarificationRequired: true,
+            marketingConsentClarificationRequired: true
+          },
+          source: "legacy_customer",
+          sender
+        };
+      }
+
+      const profile = await applyMarketingPreference(
+        restaurantId,
+        sender.normalizedPhone,
+        consentResponse.command,
+        "customer_message"
+      );
+      const preferenceMessage =
+        consentResponse.command === "opt_in"
+          ? `Done. ${input.restaurant.name} can occasionally send you offers and updates here. Reply STOP anytime to stop them.`
+          : `No problem. You won't receive promotional messages from ${input.restaurant.name}. Your normal order updates and receipts will still work.`;
+
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "user",
+        content: message,
+        metadata: {
+          source: "deterministic_marketing_consent_response",
+          command: consentResponse.command,
+          quotedRequest: marketingConsentContext.quotedRequest
+        }
+      });
+      await saveAgentConversationMessage({
+        restaurantId,
+        senderPhone: sender.normalizedPhone,
+        senderRole: sender.role,
+        direction: "assistant",
+        content: preferenceMessage,
+        metadata: {
+          source: "deterministic_marketing_consent_response",
+          command: consentResponse.command,
+          quotedRequest: marketingConsentContext.quotedRequest
+        }
+      });
+
+      return {
+        success: true,
+        message: preferenceMessage,
+        data: {
+          marketingPreference: consentResponse.command,
+          marketingConsent: profile.marketingConsent,
+          isOptedOut: profile.isOptedOut
+        },
+        source: "legacy_customer",
+        sender
+      };
+    }
 
     if (
       input.quotedMessageId &&

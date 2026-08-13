@@ -22,6 +22,9 @@ import {
   feedbackCompletionEligibleStatuses
 } from "./orderCompletion.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import {
+  queueMarketingConsentRequestAfterSuccessfulOrder
+} from "./customerMarketingOnboarding.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -48,6 +51,11 @@ export interface HandleOrderFeedbackResponseResult {
   order?: IOrderDocument;
   feedback?: IOrderFeedbackDocument;
   ambiguousOrderNumbers?: string[];
+}
+
+export interface OrderFeedbackResponseDependencies {
+  queueMarketingConsentRequest?:
+    typeof queueMarketingConsentRequestAfterSuccessfulOrder;
 }
 
 export const orderCheckInOutcomes = [
@@ -733,6 +741,27 @@ const markFeedbackAnswered = async (
   );
 };
 
+const tryQueueMarketingConsentRequest = async (
+  order: IOrderDocument,
+  dependencies: OrderFeedbackResponseDependencies
+): Promise<void> => {
+  try {
+    await (
+      dependencies.queueMarketingConsentRequest ??
+      queueMarketingConsentRequestAfterSuccessfulOrder
+    )(order);
+  } catch (error) {
+    console.error("Marketing consent request queueing failed", {
+      restaurantId: String(order.restaurantId),
+      orderId: String(order._id),
+      error:
+        error instanceof Error
+          ? error.message
+          : "Unknown marketing consent queueing error"
+    });
+  }
+};
+
 const handleDeliveryNotReceived = async (
   input: HandleOrderFeedbackResponseInput,
   order: IOrderDocument,
@@ -782,7 +811,8 @@ const handleDeliveryNotReceived = async (
 const handleNumberedResponse = async (
   input: HandleOrderFeedbackResponseInput,
   order: IOrderDocument,
-  numbered: { option: 1 | 2 | 3; comment: string }
+  numbered: { option: 1 | 2 | 3; comment: string },
+  dependencies: OrderFeedbackResponseDependencies
 ): Promise<HandleOrderFeedbackResponseResult> => {
   const now = new Date();
   const orderId = String(order._id);
@@ -824,6 +854,10 @@ const handleNumberedResponse = async (
       feedbackAwaitingComplaint: false,
       feedbackReceiptClarificationPending: false
     });
+    await tryQueueMarketingConsentRequest(
+      completed.order,
+      dependencies
+    );
 
     return {
       handled: true,
@@ -962,7 +996,8 @@ const handleReceiptClarification = async (
 };
 
 export const handleOrderFeedbackCustomerResponse = async (
-  input: HandleOrderFeedbackResponseInput
+  input: HandleOrderFeedbackResponseInput,
+  dependencies: OrderFeedbackResponseDependencies = {}
 ): Promise<HandleOrderFeedbackResponseResult> => {
   const message = normalizeText(input.message);
 
@@ -1007,7 +1042,7 @@ export const handleOrderFeedbackCustomerResponse = async (
   const numbered = parseNumberedResponse(message);
 
   if (numbered) {
-    return handleNumberedResponse(input, order, numbered);
+    return handleNumberedResponse(input, order, numbered, dependencies);
   }
 
   if (order.feedbackAwaitingComplaint) {
@@ -1087,6 +1122,16 @@ export const handleOrderFeedbackCustomerResponse = async (
         feedbackReceiptClarificationPending: false
       }
     );
+
+    if (
+      classification.type !== "complaint" &&
+      !classification.requiresOwnerAttention
+    ) {
+      await tryQueueMarketingConsentRequest(
+        completed.order,
+        dependencies
+      );
+    }
 
     return {
       handled: true,

@@ -356,6 +356,12 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     expectedArguments: { period: "this_week", compareWithPrevious: true }
   },
   {
+    name: "Lifetime customer count",
+    role: "owner",
+    message: "How many customers do we have now?",
+    expectedTool: "get_business_summary"
+  },
+  {
     name: "Greeting",
     role: "owner",
     message: "hello boss",
