@@ -5,6 +5,7 @@ const { PendingAgentAction } = require("../dist/models/pendingAgentAction.model"
 const { OrderFeedback } = require("../dist/models/orderFeedback.model");
 const { Order } = require("../dist/models/order.model");
 const { OutboundMessage } = require("../dist/models/outboundMessage.model");
+const { CustomerProfile } = require("../dist/models/customerProfile.model");
 const { Restaurant } = require("../dist/models/Restaurant");
 const {
   executeAgentTool
@@ -797,6 +798,7 @@ const withFeedbackResponseHarness = async (orders, run) => {
     outboundCreate: OutboundMessage.create,
     outboundUpdateMany: OutboundMessage.updateMany,
     restaurantFindOne: Restaurant.findOne,
+    customerProfileFindOne: CustomerProfile.findOne,
     feedbackCreate: OrderFeedback.create,
     feedbackFindOne: OrderFeedback.findOne
   };
@@ -843,6 +845,7 @@ const withFeedbackResponseHarness = async (orders, run) => {
     };
     OutboundMessage.updateMany = async () => ({ modifiedCount: 1 });
     Restaurant.findOne = () => query(makeRestaurant());
+    CustomerProfile.findOne = () => query(null);
     OrderFeedback.create = async (input) => {
       if (
         input.inboundEventId &&
@@ -888,6 +891,7 @@ const withFeedbackResponseHarness = async (orders, run) => {
     OutboundMessage.create = originals.outboundCreate;
     OutboundMessage.updateMany = originals.outboundUpdateMany;
     Restaurant.findOne = originals.restaurantFindOne;
+    CustomerProfile.findOne = originals.customerProfileFindOne;
     OrderFeedback.create = originals.feedbackCreate;
     OrderFeedback.findOne = originals.feedbackFindOne;
   }
@@ -895,12 +899,21 @@ const withFeedbackResponseHarness = async (orders, run) => {
 
 test("response 1 completes the exact active order without creating empty feedback", async () => {
   await withFeedbackResponseHarness([makeOrder()], async (harness) => {
-    const result = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone,
-      message: "1",
-      inboundEventId: "event-response-1"
-    });
+    let consentRequests = 0;
+    const result = await handleOrderFeedbackCustomerResponse(
+      {
+        restaurantId,
+        customerPhone,
+        message: "1",
+        inboundEventId: "event-response-1"
+      },
+      {
+        queueMarketingConsentRequest: async () => {
+          consentRequests += 1;
+          return { queued: true };
+        }
+      }
+    );
 
     assert.equal(result.handled, true);
     assert.equal(result.order.status, "completed");
@@ -908,17 +921,56 @@ test("response 1 completes the exact active order without creating empty feedbac
     assert.equal(result.order.completionConfirmedByCustomer, true);
     assert.equal(harness.feedbackCreates, 0);
     assert.equal(harness.completionTransitions, 1);
+    assert.equal(consentRequests, 1);
+  });
+});
+
+test("consent queue failure never turns successful order completion into a failure", async () => {
+  await withFeedbackResponseHarness([makeOrder()], async (harness) => {
+    const originalError = console.error;
+    console.error = () => {};
+
+    try {
+      const result = await handleOrderFeedbackCustomerResponse(
+        {
+          restaurantId,
+          customerPhone,
+          message: "1",
+          inboundEventId: "event-response-consent-failure"
+        },
+        {
+          queueMarketingConsentRequest: async () => {
+            throw new Error("queue unavailable");
+          }
+        }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.order.status, "completed");
+      assert.equal(harness.completionTransitions, 1);
+    } finally {
+      console.error = originalError;
+    }
   });
 });
 
 test("response 2 completes the order, saves a complaint, and queues owner notification", async () => {
   await withFeedbackResponseHarness([makeOrder()], async (harness) => {
-    const result = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone,
-      message: "2 The delivery was late and the food was cold.",
-      inboundEventId: "event-response-2"
-    });
+    let consentRequests = 0;
+    const result = await handleOrderFeedbackCustomerResponse(
+      {
+        restaurantId,
+        customerPhone,
+        message: "2 The delivery was late and the food was cold.",
+        inboundEventId: "event-response-2"
+      },
+      {
+        queueMarketingConsentRequest: async () => {
+          consentRequests += 1;
+          return { queued: true };
+        }
+      }
+    );
 
     assert.equal(result.order.status, "completed");
     assert.equal(result.order.completionSource, "customer_feedback");
@@ -926,17 +978,27 @@ test("response 2 completes the order, saves a complaint, and queues owner notifi
     assert.equal(result.feedback.requiresOwnerAttention, true);
     assert.equal(harness.feedbackCreates, 1);
     assert.equal(harness.outboundNotifications, 1);
+    assert.equal(consentRequests, 0);
   });
 });
 
 test("response 3 never completes and creates an urgent non-delivery record", async () => {
   await withFeedbackResponseHarness([makeOrder()], async (harness) => {
-    const result = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone,
-      message: "3",
-      inboundEventId: "event-response-3"
-    });
+    let consentRequests = 0;
+    const result = await handleOrderFeedbackCustomerResponse(
+      {
+        restaurantId,
+        customerPhone,
+        message: "3",
+        inboundEventId: "event-response-3"
+      },
+      {
+        queueMarketingConsentRequest: async () => {
+          consentRequests += 1;
+          return { queued: true };
+        }
+      }
+    );
 
     assert.equal(harness.completionTransitions, 0);
     assert.equal(result.feedback.type, "delivery_not_received");
@@ -946,6 +1008,7 @@ test("response 3 never completes and creates an urgent non-delivery record", asy
       "issue_reported"
     );
     assert.equal(harness.outboundNotifications, 1);
+    assert.equal(consentRequests, 0);
   });
 });
 
@@ -969,12 +1032,21 @@ test("duplicate complaint webhook does not duplicate feedback or owner alert", a
 
 test("natural positive feedback completes and is stored as a review", async () => {
   await withFeedbackResponseHarness([makeOrder()], async (harness) => {
-    const result = await handleOrderFeedbackCustomerResponse({
-      restaurantId,
-      customerPhone,
-      message: "The food was very nice.",
-      inboundEventId: "event-natural-positive"
-    });
+    let consentRequests = 0;
+    const result = await handleOrderFeedbackCustomerResponse(
+      {
+        restaurantId,
+        customerPhone,
+        message: "The food was very nice.",
+        inboundEventId: "event-natural-positive"
+      },
+      {
+        queueMarketingConsentRequest: async () => {
+          consentRequests += 1;
+          return { queued: true };
+        }
+      }
+    );
 
     assert.equal(result.order.status, "completed");
     assert.equal(result.feedback.type, "review");
@@ -982,6 +1054,7 @@ test("natural positive feedback completes and is stored as a review", async () =
     assert.equal(harness.completionTransitions, 1);
     assert.equal(result.feedback.requiresOwnerAttention, false);
     assert.equal(harness.outboundNotifications, 1);
+    assert.equal(consentRequests, 1);
   });
 });
 

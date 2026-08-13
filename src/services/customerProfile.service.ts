@@ -50,6 +50,15 @@ export interface ConfirmedCustomerPreferencesInput {
   isOptedOut?: boolean;
 }
 
+export interface CustomerProfileStatistics {
+  totalCustomers: number;
+  customersWithCompletedOrders: number;
+  returningCustomers: number;
+  marketingEligibleCustomers: number;
+  marketingNotOptedInCustomers: number;
+  marketingOptedOutCustomers: number;
+}
+
 const normalizeDisplayText = (value: string): string => {
   return value.trim().replace(/\s+/g, " ");
 };
@@ -526,4 +535,51 @@ export const getCustomerProfile = async (
     restaurantId,
     customerPhone: ensureCustomerPhone(customerPhone)
   });
+};
+
+export const getCustomerProfileStatistics = async (
+  restaurantId: string
+): Promise<CustomerProfileStatistics> => {
+  ensureValidRestaurantId(restaurantId);
+  const scope = { restaurantId };
+  const [
+    totalCustomers,
+    customersWithCompletedOrders,
+    returningCustomers,
+    marketingEligibleCustomers,
+    marketingOptedOutCustomers
+  ] = await Promise.all([
+    CustomerProfile.countDocuments(scope),
+    CustomerProfile.countDocuments({
+      ...scope,
+      orderCount: { $gte: 1 }
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      orderCount: { $gte: 2 }
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      marketingConsent: true,
+      isOptedOut: { $ne: true }
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      isOptedOut: true
+    })
+  ]);
+
+  return {
+    totalCustomers,
+    customersWithCompletedOrders,
+    returningCustomers,
+    marketingEligibleCustomers,
+    marketingNotOptedInCustomers: Math.max(
+      0,
+      totalCustomers -
+        marketingEligibleCustomers -
+        marketingOptedOutCustomers
+    ),
+    marketingOptedOutCustomers
+  };
 };

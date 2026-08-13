@@ -32,6 +32,7 @@ import {
   rescheduleStaffReminderSchema
 } from "../services/staffReminder.service";
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
+import { getCustomerProfileStatistics } from "../services/customerProfile.service";
 import {
   businessReportPeriodTypes,
   getCurrentDailySummaryPeriod,
@@ -1304,7 +1305,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
   get_business_summary: {
     definition: {
       name: "get_business_summary",
-      description: "Return a compact business overview for owner or manager.",
+      description:
+        "Return a compact business overview for owner or manager, including trusted lifetime CustomerProfile counts, returning customers, and marketing audience preference totals. Use this for questions such as how many customers the restaurant has or how many can receive promotions.",
       parameters: {}
     },
     roles: toolPermissions.get_business_summary,
@@ -1321,10 +1323,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         timezone: period.timezone,
         periodType: period.type
       });
-      const unavailableItems = await MenuItem.countDocuments({
-        restaurantId: context.restaurantId,
-        isAvailable: false
-      });
+      const [unavailableItems, customerStatistics] = await Promise.all([
+        MenuItem.countDocuments({
+          restaurantId: context.restaurantId,
+          isAvailable: false
+        }),
+        getCustomerProfileStatistics(context.restaurantId)
+      ]);
 
       return {
         success: true,
@@ -1333,7 +1338,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           todayOrderCount: metrics.totalOrders,
           todayRevenue: metrics.completedRevenue,
           pendingOrders: metrics.countsByStatus.pending,
-          unavailableItems
+          unavailableItems,
+          ...customerStatistics
         }
       };
     }

@@ -327,7 +327,7 @@ const getTargetingDescription = (
 ): string => {
   switch (targeting.type) {
     case "all_eligible_customers":
-      return "All customers with explicit marketing consent";
+      return "All customers";
     case "inactive_customers":
       return `Customers whose last completed order was at least ${targeting.inactiveDays} days ago`;
     case "returning_customers":
@@ -729,21 +729,35 @@ export const buildCustomerCampaignPreviewMessage = (
     "name" | "message" | "scheduledAt" | "timezone"
   >,
   preview: CustomerCampaignAudiencePreview
-): string =>
-  [
-    `Campaign preview: ${campaign.name}`,
+): string => {
+  const audienceLines = [
+    `Campaign Preview: ${campaign.name}`,
     "",
     campaign.message,
     "",
     `Audience: ${preview.targetingDescription}`,
-    `Estimated eligible recipients: ${preview.estimatedEligibleRecipients}`,
-    `Excluded without consent: ${preview.excludedNoConsent}`,
-    `Excluded due to opt-out: ${preview.excludedOptOut}`,
-    `Excluded invalid phones: ${preview.excludedInvalidPhone}`,
-    `Planned send: ${campaign.scheduledAt?.toISOString() ?? "as soon as approved"} (${campaign.timezone})`,
     "",
-    "Reply confirm to approve this campaign, or cancel to discard it."
-  ].join("\n");
+    `Customers in audience: ${preview.targetedProfiles}`,
+    `Can receive promotions: ${preview.estimatedEligibleRecipients}`,
+    `Not opted in yet: ${preview.excludedNoConsent}`,
+    `Opted out: ${preview.excludedOptOut}`
+  ];
+
+  if (preview.excludedInvalidPhone > 0) {
+    audienceLines.push(
+      `Invalid/unreachable phone numbers: ${preview.excludedInvalidPhone}`
+    );
+  }
+
+  audienceLines.push(
+    "",
+    `This campaign will be sent to ${preview.estimatedEligibleRecipients} customers.`,
+    "",
+    "Would you like to confirm or cancel it?"
+  );
+
+  return audienceLines.join("\n");
+};
 
 export const approveCustomerCampaign = async (
   restaurantId: string,
@@ -1056,14 +1070,25 @@ export const listCustomerCampaigns = async (
 export const formatCustomerCampaignMessage = (
   restaurantName: string,
   approvedMessage: string
-): string =>
-  [
-    restaurantName,
-    "",
-    approvedMessage.trim(),
-    "",
-    "Reply STOP to stop promotional messages."
-  ].join("\n");
+): string => {
+  const message = approvedMessage.trim();
+  const alreadyHasStopInstruction =
+    /\b(?:reply|text|send)\s+stop\b/i.test(message) ||
+    /\bopt[\s-]?out\b/i.test(message) ||
+    /\bstop\s+(?:receiving|getting)\s+(?:promotions|promotional\s+messages|offers)\b/i.test(
+      message
+    );
+  const lines = [restaurantName, "", message];
+
+  if (!alreadyHasStopInstruction) {
+    lines.push(
+      "",
+      `Reply STOP to stop receiving promotions from ${restaurantName}.`
+    );
+  }
+
+  return lines.join("\n");
+};
 
 export interface CustomerCampaignAggregate {
   total: number;
