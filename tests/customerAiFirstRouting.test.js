@@ -1550,6 +1550,7 @@ for (const [message, expectedCommand, expectedOptedOut] of [
   test(`pending marketing consent handles ${JSON.stringify(message)} deterministically`, async () => {
     await withCustomerRoutingHarness(async () => {
       const mutations = [];
+      const recordedResponses = [];
       const response = await handleRestaurantAgentMessage(
         {
           restaurant: makeRestaurant(),
@@ -1571,6 +1572,10 @@ for (const [message, expectedCommand, expectedOptedOut] of [
               isOptedOut: expectedOptedOut
             };
           },
+          recordMarketingConsentResponse: async (...args) => {
+            recordedResponses.push(args);
+            return true;
+          },
           runOrchestrator: async () => {
             throw new Error("marketing response must not reach AI");
           }
@@ -1578,6 +1583,12 @@ for (const [message, expectedCommand, expectedOptedOut] of [
       );
 
       assert.equal(mutations.length, 1);
+      assert.equal(recordedResponses.length, 1);
+      assert.deepEqual(recordedResponses[0].slice(0, 3), [
+        restaurantId,
+        customerPhone,
+        expectedCommand
+      ]);
       assert.deepEqual(mutations[0].slice(0, 4), [
         restaurantId,
         customerPhone,
@@ -1593,6 +1604,93 @@ for (const [message, expectedCommand, expectedOptedOut] of [
     });
   });
 }
+
+for (const [message, expectedCommand, expectedConsent, expectedOptedOut] of [
+  ["send me offers", "opt_in", true, false],
+  ["no promotions", "opt_out", false, true]
+]) {
+  test(`immediate explicit consent response ${JSON.stringify(message)} records the invitation outcome`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      const mutations = [];
+      const recordedResponses = [];
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message
+        },
+        {
+          findCustomerDraft: async () => null,
+          loadCustomerCheckIns: async () => [],
+          loadMarketingConsentContext: async () => ({
+            pending: true,
+            quotedRequest: false,
+            genericResponseWindowOpen: true
+          }),
+          setMarketingPreference: async (...args) => {
+            mutations.push(args);
+            return {
+              marketingConsent: expectedConsent,
+              isOptedOut: expectedOptedOut
+            };
+          },
+          recordMarketingConsentResponse: async (...args) => {
+            recordedResponses.push(args);
+            return true;
+          },
+          runOrchestrator: async () => {
+            throw new Error("explicit consent response must not reach AI");
+          }
+        }
+      );
+
+      assert.equal(mutations.length, 1);
+      assert.equal(recordedResponses.length, 1);
+      assert.deepEqual(recordedResponses[0].slice(0, 3), [
+        restaurantId,
+        customerPhone,
+        expectedCommand
+      ]);
+      assert.equal(response.data.marketingConsent, expectedConsent);
+      assert.equal(response.data.isOptedOut, expectedOptedOut);
+    });
+  });
+}
+
+test("a quoted explicit response records the invitation after the generic window closes", async () => {
+  await withCustomerRoutingHarness(async () => {
+    const recordedResponses = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "send me offers",
+        quotedMessageId: "provider-consent-explicit-1"
+      },
+      {
+        findCustomerDraft: async () => null,
+        loadCustomerCheckIns: async () => [],
+        loadMarketingConsentContext: async (_restaurantId, _phone, quotedMessageId) => ({
+          pending: true,
+          quotedRequest: quotedMessageId === "provider-consent-explicit-1",
+          genericResponseWindowOpen: false
+        }),
+        setMarketingPreference: async () => ({
+          marketingConsent: true,
+          isOptedOut: false
+        }),
+        recordMarketingConsentResponse: async (...args) => {
+          recordedResponses.push(args);
+          return true;
+        }
+      }
+    );
+
+    assert.equal(response.data.marketingPreference, "opt_in");
+    assert.equal(recordedResponses.length, 1);
+    assert.equal(recordedResponses[0][2], "opt_in");
+  });
+});
 
 test("bare yes without a pending consent request cannot change marketing preference", async () => {
   await withCustomerRoutingHarness(async () => {
@@ -1666,33 +1764,53 @@ test("an unrelated customer turn closes the unquoted generic consent window", as
   });
 });
 
-test("explicit marketing wording remains actionable after the generic window closes", async () => {
-  await withCustomerRoutingHarness(async () => {
-    let command;
-    const response = await handleRestaurantAgentMessage(
-      {
-        restaurant: makeRestaurant(),
-        senderPhone: customerPhone,
-        message: "subscribe me"
-      },
-      {
-        setMarketingPreference: async (_restaurantId, _phone, nextCommand) => {
-          command = nextCommand;
-          return {
-            marketingConsent: true,
-            isOptedOut: false
-          };
+for (const [message, expectedCommand, expectedConsent, expectedOptedOut] of [
+  ["subscribe me", "opt_in", true, false],
+  ["no promotions", "opt_out", false, true]
+]) {
+  test(`old ignored invitation plus ${JSON.stringify(message)} updates only the current preference`, async () => {
+    await withCustomerRoutingHarness(async () => {
+      let command;
+      let recordedResponses = 0;
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: customerPhone,
+          message
         },
-        runOrchestrator: async () => {
-          throw new Error("explicit marketing wording must not reach AI");
+        {
+          findCustomerDraft: async () => null,
+          loadCustomerCheckIns: async () => [],
+          loadMarketingConsentContext: async () => ({
+            pending: true,
+            quotedRequest: false,
+            genericResponseWindowOpen: false
+          }),
+          setMarketingPreference: async (_restaurantId, _phone, nextCommand) => {
+            command = nextCommand;
+            return {
+              marketingConsent: expectedConsent,
+              isOptedOut: expectedOptedOut
+            };
+          },
+          recordMarketingConsentResponse: async () => {
+            recordedResponses += 1;
+            return true;
+          },
+          runOrchestrator: async () => {
+            throw new Error("explicit marketing wording must not reach AI");
+          }
         }
-      }
-    );
+      );
 
-    assert.equal(command, "opt_in");
-    assert.equal(response.data.marketingPreference, "opt_in");
+      assert.equal(command, expectedCommand);
+      assert.equal(recordedResponses, 0);
+      assert.equal(response.data.marketingPreference, expectedCommand);
+      assert.equal(response.data.marketingConsent, expectedConsent);
+      assert.equal(response.data.isOptedOut, expectedOptedOut);
+    });
   });
-});
+}
 
 test("active order plus pending consent makes an unquoted bare yes clarify without mutation", async () => {
   await withCustomerRoutingHarness(async () => {
@@ -1761,7 +1879,8 @@ test("a quoted trusted consent request safely accepts yes beside an active order
             marketingConsent: true,
             isOptedOut: false
           };
-        }
+        },
+        recordMarketingConsentResponse: async () => true
       }
     );
 

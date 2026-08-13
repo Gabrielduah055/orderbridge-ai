@@ -356,6 +356,12 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     expectedArguments: { period: "this_week", compareWithPrevious: true }
   },
   {
+    name: "Invite customers to marketing consent",
+    role: "owner",
+    message: "Ask my customers if they want to receive promotional messages",
+    expectedTool: "invite_customers_to_marketing"
+  },
+  {
     name: "Lifetime customer count",
     role: "owner",
     message: "How many customers do we have now?",

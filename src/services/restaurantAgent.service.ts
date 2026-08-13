@@ -39,7 +39,8 @@ import {
 } from "./customerMarketingPreference.service";
 import {
   getPendingMarketingConsentContext,
-  parseMarketingConsentResponse
+  parseMarketingConsentResponse,
+  recordMarketingConsentPromptResponse
 } from "./customerMarketingOnboarding.service";
 import {
   handleOrderFeedbackCustomerResponse,
@@ -368,6 +369,7 @@ export interface RestaurantAgentRoutingDependencies {
   resolveQuotedCustomerActiveOrder?: typeof resolveQuotedActiveOrderReplyContext;
   loadMarketingConsentContext?: typeof getPendingMarketingConsentContext;
   setMarketingPreference?: typeof setCustomerMarketingPreference;
+  recordMarketingConsentResponse?: typeof recordMarketingConsentPromptResponse;
 }
 
 export const hasMeaningfulAgentToolActivity = (
@@ -971,6 +973,9 @@ export const handleRestaurantAgentMessage = async (
     getPendingMarketingConsentContext;
   const applyMarketingPreference =
     dependencies.setMarketingPreference ?? setCustomerMarketingPreference;
+  const recordMarketingConsentResponse =
+    dependencies.recordMarketingConsentResponse ??
+    recordMarketingConsentPromptResponse;
   const buildStaffState =
     dependencies.buildStaffState ?? buildStaffOperationalState;
   const handlePendingImageReply =
@@ -1069,12 +1074,12 @@ export const handleRestaurantAgentMessage = async (
     };
     let workflowStateLoadFailed = false;
 
-    if (ambiguousShortReply || genericConsentResponse) {
+    if (ambiguousShortReply || consentResponse) {
       try {
         [activeDraft, activeCheckIns, marketingConsentContext] = await Promise.all([
           findCustomerDraft(restaurantId, sender.normalizedPhone),
           loadCustomerCheckIns(restaurantId, sender.normalizedPhone),
-          genericConsentResponse
+          consentResponse
             ? loadMarketingConsentContext(
                 restaurantId,
                 sender.normalizedPhone,
@@ -1163,6 +1168,20 @@ export const handleRestaurantAgentMessage = async (
         consentResponse.command,
         "customer_message"
       );
+      if (hasTrustedGenericConsentContext) {
+        try {
+          await recordMarketingConsentResponse(
+            restaurantId,
+            sender.normalizedPhone,
+            consentResponse.command
+          );
+        } catch (error) {
+          console.error("[customerAgent] consent response audit failed", {
+            restaurantId,
+            errorType: error instanceof Error ? error.name : "UnknownError"
+          });
+        }
+      }
       const preferenceMessage =
         consentResponse.command === "opt_in"
           ? `Done. ${input.restaurant.name} can occasionally send you offers and updates here. Reply STOP anytime to stop them.`

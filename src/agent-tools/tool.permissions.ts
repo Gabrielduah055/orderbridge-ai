@@ -17,6 +17,7 @@ export const toolPermissions = {
   get_marketing_preference: ["customer"],
   get_order_details: ["owner", "manager", "customer"],
   get_business_summary: ["owner", "manager"],
+  invite_customers_to_marketing: ["owner", "manager"],
   create_campaign_draft: ["owner", "manager"],
   update_campaign_draft: ["owner", "manager"],
   preview_campaign: ["owner", "manager"],

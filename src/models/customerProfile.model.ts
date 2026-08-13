@@ -17,6 +17,19 @@ export const marketingPreferenceSources = [
 export type MarketingPreferenceSource =
   (typeof marketingPreferenceSources)[number];
 
+export const marketingConsentPromptSources = [
+  "post_order",
+  "staff_outreach"
+] as const;
+
+export type MarketingConsentPromptSource =
+  (typeof marketingConsentPromptSources)[number];
+
+export const marketingConsentPromptResponses = ["opt_in", "opt_out"] as const;
+
+export type MarketingConsentPromptResponse =
+  (typeof marketingConsentPromptResponses)[number];
+
 export interface IFrequentlyOrderedItem {
   menuItemId: Types.ObjectId;
   name: string;
@@ -50,6 +63,10 @@ export interface ICustomerProfile {
   marketingConsentSource?: MarketingPreferenceSource;
   marketingConsentPromptedAt?: Date;
   marketingConsentPromptOrderId?: Types.ObjectId;
+  marketingConsentPromptSource?: MarketingConsentPromptSource;
+  marketingConsentPromptedByPhone?: string;
+  marketingConsentPromptResponse?: MarketingConsentPromptResponse;
+  marketingConsentPromptRespondedAt?: Date;
   isOptedOut: boolean;
   optedOutAt?: Date;
   optedOutSource?: MarketingPreferenceSource;
@@ -193,6 +210,21 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
     marketingConsentPromptOrderId: {
       type: Schema.Types.ObjectId,
       ref: "Order"
+    },
+    marketingConsentPromptSource: {
+      type: String,
+      enum: marketingConsentPromptSources
+    },
+    marketingConsentPromptedByPhone: {
+      type: String,
+      trim: true
+    },
+    marketingConsentPromptResponse: {
+      type: String,
+      enum: marketingConsentPromptResponses
+    },
+    marketingConsentPromptRespondedAt: {
+      type: Date
     },
     isOptedOut: {
       type: Boolean,
