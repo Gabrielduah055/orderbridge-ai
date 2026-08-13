@@ -317,6 +317,56 @@ const buildAmbiguousPendingActionMessage = (
   ].join("\n");
 };
 
+type CurrentStaffConfirmation =
+  | { kind: "image"; pendingActionId: string }
+  | { kind: "tool"; pendingActionId: string }
+  | null;
+
+const getCreatedAtTime = (value?: unknown): number => {
+  const date = value instanceof Date ? value : new Date(String(value ?? ""));
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+};
+
+export const resolveCurrentStaffConfirmation = (
+  imageWorkflow: Awaited<
+    ReturnType<typeof buildStaffOperationalState>
+  >["imageWorkflow"],
+  latestToolAction?: { _id?: unknown; createdAt?: unknown } | null
+): CurrentStaffConfirmation => {
+  if (!imageWorkflow && !latestToolAction) {
+    return null;
+  }
+
+  if (!imageWorkflow) {
+    return {
+      kind: "tool",
+      pendingActionId: String(latestToolAction?._id)
+    };
+  }
+
+  if (!latestToolAction) {
+    return {
+      kind: "image",
+      pendingActionId: imageWorkflow.pendingActionId
+    };
+  }
+
+  return getCreatedAtTime(imageWorkflow.createdAt) >
+    getCreatedAtTime(latestToolAction.createdAt)
+    ? {
+        kind: "image",
+        pendingActionId: imageWorkflow.pendingActionId
+      }
+    : {
+        kind: "tool",
+        pendingActionId: String(latestToolAction._id)
+      };
+};
+
+const hasExplicitImageWorkflowLanguage = (message: string): boolean =>
+  Boolean(extractMenuItemNameFromImageRetargetReply(message)) ||
+  /\b(?:image|photo|picture)\b/i.test(message);
+
 export const isPendingActionCancellationMessage = (message: string): boolean => {
   const normalized = normalizeDecisionText(message);
 
@@ -1407,6 +1457,10 @@ export const handleRestaurantAgentMessage = async (
     ReturnType<typeof buildStaffOperationalState>
   > | undefined;
   let staffOrderMutationIntent: StaffOrderMutationIntent | null = null;
+  let currentStaffConfirmation: CurrentStaffConfirmation = null;
+  let latestPendingToolActionForDecision: Awaited<
+    ReturnType<typeof findLatestPendingToolAction>
+  > = null;
 
   if (shouldUseAiFirstStaffTextRouting(sender.role, aiProviderName)) {
     let agentResult: AgentOrchestratorResult | undefined;
@@ -1428,6 +1482,24 @@ export const handleRestaurantAgentMessage = async (
 
     staffImageWorkflow = staffState.imageWorkflow;
     staffOperationalState = staffState;
+    const genericStaffConfirmationMessage =
+      !hasExplicitImageWorkflowLanguage(message) &&
+      (isPendingActionConfirmationMessage(message) ||
+        isPendingActionCancellationMessage(message));
+
+    if (genericStaffConfirmationMessage) {
+      latestPendingToolActionForDecision = await findLatestPendingAction({
+        restaurantId,
+        restaurant: input.restaurant,
+        sender,
+        originalMessage: message,
+        quotedMessageId: input.quotedMessageId
+      });
+      currentStaffConfirmation = resolveCurrentStaffConfirmation(
+        staffImageWorkflow,
+        latestPendingToolActionForDecision
+      );
+    }
 
     const pendingOrderSelection = staffState.recentReferences.orderSelection;
     const pendingSelectionReply = pendingOrderSelection
@@ -1477,6 +1549,14 @@ export const handleRestaurantAgentMessage = async (
 
     staffOrderMutationIntent = getStaffOrderMutationIntent(staffState, message);
 
+    const staffStateForTurn =
+      currentStaffConfirmation?.kind === "tool"
+        ? {
+            ...staffState,
+            imageWorkflow: null
+          }
+        : staffState;
+
     try {
       agentResult = await runOrchestrator({
         restaurant: input.restaurant,
@@ -1484,7 +1564,7 @@ export const handleRestaurantAgentMessage = async (
         message,
         requestId: input.inboundEventId,
         quotedMessageId: input.quotedMessageId,
-        staffState
+        staffState: staffStateForTurn
       });
     } catch {
       staffAgentFallbackReason = "orchestrator_exception";
@@ -1609,7 +1689,9 @@ export const handleRestaurantAgentMessage = async (
         agentResult.executedTools
       );
       const requiredImageWorkflowTool = getRequiredImageWorkflowTool(
-        staffState.imageWorkflow,
+        currentStaffConfirmation?.kind === "tool"
+          ? null
+          : staffState.imageWorkflow,
         message
       );
       const imageWorkflowNeedsFallback = Boolean(
@@ -1632,15 +1714,18 @@ export const handleRestaurantAgentMessage = async (
         (isPendingActionConfirmationMessage(message) ||
           isPendingActionCancellationMessage(message));
       const pendingAction = looksLikePendingDecision
-        ? await findLatestPendingAction({
+        ? latestPendingToolActionForDecision ??
+          (await findLatestPendingAction({
             restaurantId,
             restaurant: input.restaurant,
             sender,
             originalMessage: message,
             quotedMessageId: input.quotedMessageId
-          })
+          }))
         : null;
-      const pendingDecisionNeedsFallback = Boolean(pendingAction);
+      const pendingDecisionNeedsFallback = Boolean(
+        pendingAction && currentStaffConfirmation?.kind !== "image"
+      );
       const handledByAi =
         (!imageWorkflowNeedsFallback &&
           !orderWorkflowNeedsFallback &&
@@ -1880,13 +1965,20 @@ export const handleRestaurantAgentMessage = async (
     aiProviderName === "openrouter" ? "legacy_owner" : "hermes_tools";
 
   if (sender.role === "owner" || sender.role === "manager") {
-    const pendingImageResult = await handlePendingImageReply({
-      restaurantId,
-      senderPhone: sender.normalizedPhone,
-      senderRole: sender.role,
-      message,
-      pendingActionId: staffImageWorkflow?.pendingActionId
-    });
+    const genericDecisionTargetsTool =
+      currentStaffConfirmation?.kind === "tool" &&
+      !hasExplicitImageWorkflowLanguage(message) &&
+      (isPendingActionConfirmationMessage(message) ||
+        isPendingActionCancellationMessage(message));
+    const pendingImageResult = genericDecisionTargetsTool
+      ? { handled: false, success: false, message: "" }
+      : await handlePendingImageReply({
+          restaurantId,
+          senderPhone: sender.normalizedPhone,
+          senderRole: sender.role,
+          message,
+          pendingActionId: staffImageWorkflow?.pendingActionId
+        });
 
     if (pendingImageResult.handled) {
       console.warn("[imageWorkflow] legacy fallback", {
@@ -2246,12 +2338,14 @@ export const handleRestaurantAgentMessage = async (
 
   const pendingAction =
     aiProviderName === "openrouter"
-      ? await findLatestPendingAction(executionContext)
+      ? latestPendingToolActionForDecision ??
+        (await findLatestPendingAction(executionContext))
       : null;
 
   if (
     aiProviderName === "openrouter" &&
     pendingAction &&
+    currentStaffConfirmation?.kind !== "image" &&
     isPendingActionConfirmationMessage(message)
   ) {
     const pendingActions = await findPendingActions(executionContext);
@@ -2367,6 +2461,7 @@ export const handleRestaurantAgentMessage = async (
   if (
     aiProviderName === "openrouter" &&
     pendingAction &&
+    currentStaffConfirmation?.kind !== "image" &&
     isPendingActionCancellationMessage(message)
   ) {
     const result = await cancelPendingAction(executionContext);

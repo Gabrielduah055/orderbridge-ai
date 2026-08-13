@@ -115,10 +115,10 @@ export const executeConfirmedPendingToolAction = async (
     _id: pendingActionId,
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
+    action: "TOOL_CALL",
     ...(expectedToolName
       ? {
-          senderRole: context.sender.role,
-          action: "TOOL_CALL",
           toolName: expectedToolName
         }
       : {}),
@@ -166,6 +166,7 @@ export const cancelPendingToolAction = async (
   const pendingAction = await PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {
@@ -197,6 +198,7 @@ export const findLatestPendingToolAction = async (
   return PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {
@@ -211,6 +213,7 @@ export const findPendingToolActions = async (
   return PendingAgentAction.find({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {

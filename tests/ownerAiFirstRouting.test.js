@@ -45,6 +45,24 @@ const makeStaffState = (overrides = {}) => ({
   ...overrides
 });
 
+const imageWorkflow = (createdAt) => ({
+  active: true,
+  type: "menu_item_image",
+  stage: "awaiting_confirmation",
+  imageUploaded: true,
+  itemName: "Chicken Salad",
+  pendingActionId: "image-action-1",
+  createdAt
+});
+
+const pendingToolAction = (createdAt) => ({
+  _id: "tool-action-1",
+  action: "TOOL_CALL",
+  toolName: "invite_customers_to_marketing",
+  summary: "Send the marketing consent invitation",
+  createdAt
+});
+
 const buildEmptyStaffState = async () => makeStaffState();
 
 const runWithRoutingHarness = async (callback) => {
@@ -170,6 +188,270 @@ test("manager text reaches the orchestrator before deterministic image reply han
 
     assert.deepEqual(events, ["ai", "pendingImageReply"]);
     assert.equal(response.source, "legacy_owner");
+  });
+});
+
+for (const message of ["yes", "yes do that"]) {
+  test(`new consent tool confirmation beats an old image workflow for ${JSON.stringify(message)}`, async () => {
+    await runWithRoutingHarness(async () => {
+      const events = [];
+      let orchestratorState;
+      const toolAction = pendingToolAction("2026-08-14T14:58:00.000Z");
+      const response = await handleRestaurantAgentMessage(
+        {
+          restaurant: makeRestaurant(),
+          senderPhone: ownerPhone,
+          message
+        },
+        {
+          buildStaffState: async () =>
+            makeStaffState({
+              imageWorkflow: imageWorkflow("2026-08-14T14:50:00.000Z")
+            }),
+          runOrchestrator: async (input) => {
+            orchestratorState = input.staffState;
+            return makeAgentResult({ message: "Done." });
+          },
+          findLatestPendingAction: async () => toolAction,
+          findPendingActions: async () => [toolAction],
+          executeConfirmedAction: async (pendingActionId) => {
+            events.push(["tool", pendingActionId]);
+            return {
+              success: true,
+              message: "The consent request has been queued for 8 customers."
+            };
+          },
+          handlePendingImageReply: async () => {
+            events.push(["image"]);
+            return {
+              handled: true,
+              success: false,
+              message: "I canâ€™t find the uploaded image anymore. Please send it again."
+            };
+          },
+          rememberImageRequest: unhandledImageReply,
+          handleSavedSelection: unhandledSelection
+        }
+      );
+
+      assert.deepEqual(events, [["tool", "tool-action-1"]]);
+      assert.equal(orchestratorState.imageWorkflow, null);
+      assert.match(response.message, /consent request has been queued/i);
+      assert.doesNotMatch(response.message, /uploaded image anymore/i);
+    });
+  });
+}
+
+test("generic cancellation targets a newer tool action instead of an old image workflow", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const toolAction = pendingToolAction("2026-08-14T14:58:00.000Z");
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "cancel"
+      },
+      {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: imageWorkflow("2026-08-14T14:50:00.000Z")
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Cancelled." }),
+        findLatestPendingAction: async () => toolAction,
+        cancelPendingAction: async () => {
+          events.push("tool-cancel");
+          return { success: true, message: "Okay, I cancelled that pending action." };
+        },
+        handlePendingImageReply: async () => {
+          events.push("image-cancel");
+          return { handled: true, success: true, message: "Image cancelled." };
+        },
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+
+    assert.deepEqual(events, ["tool-cancel"]);
+    assert.match(response.message, /cancelled that pending action/i);
+  });
+});
+
+test("explicit image cancellation can target the image workflow beside a newer tool action", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "cancel the image"
+      },
+      {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: imageWorkflow("2026-08-14T14:50:00.000Z")
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Cancelled." }),
+        findLatestPendingAction: async () =>
+          pendingToolAction("2026-08-14T14:58:00.000Z"),
+        executeConfirmedAction: async () => {
+          events.push("tool");
+          return { success: true, message: "Tool executed." };
+        },
+        handlePendingImageReply: async () => {
+          events.push("image-cancel");
+          return { handled: true, success: true, message: "Image cancelled." };
+        },
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+
+    assert.deepEqual(events, ["image-cancel"]);
+    assert.equal(response.message, "Image cancelled.");
+  });
+});
+
+test("a newer image confirmation beats an older pending tool for generic yes", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: ownerPhone,
+        message: "yes"
+      },
+      {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: imageWorkflow("2026-08-14T14:58:00.000Z")
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        findLatestPendingAction: async () =>
+          pendingToolAction("2026-08-14T14:50:00.000Z"),
+        executeConfirmedAction: async () => {
+          events.push("tool");
+          return { success: true, message: "Tool executed." };
+        },
+        handlePendingImageReply: async () => {
+          events.push("image");
+          return { handled: true, success: true, message: "Image confirmed." };
+        },
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+
+    assert.deepEqual(events, ["image"]);
+    assert.equal(response.message, "Image confirmed.");
+  });
+});
+
+test("generic confirmation still works with only an image action or only a tool action", async () => {
+  await runWithRoutingHarness(async () => {
+    let imageCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      { restaurant: makeRestaurant(), senderPhone: ownerPhone, message: "yes" },
+      {
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: imageWorkflow("2026-08-14T14:58:00.000Z")
+          }),
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        findLatestPendingAction: async () => null,
+        handlePendingImageReply: async () => {
+          imageCalls += 1;
+          return { handled: true, success: true, message: "Image confirmed." };
+        },
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+    assert.equal(imageCalls, 1);
+    assert.equal(response.message, "Image confirmed.");
+  });
+
+  await runWithRoutingHarness(async () => {
+    let toolCalls = 0;
+    const toolAction = pendingToolAction("2026-08-14T14:58:00.000Z");
+    const response = await handleRestaurantAgentMessage(
+      { restaurant: makeRestaurant(), senderPhone: ownerPhone, message: "yes" },
+      {
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        findLatestPendingAction: async () => toolAction,
+        findPendingActions: async () => [toolAction],
+        executeConfirmedAction: async () => {
+          toolCalls += 1;
+          return { success: true, message: "Tool confirmed." };
+        },
+        handlePendingImageReply: unhandledImageReply,
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+    assert.equal(toolCalls, 1);
+    assert.equal(response.message, "Tool confirmed.");
+  });
+});
+
+test("generic confirmation keeps multiple pending tool actions ambiguous", async () => {
+  await runWithRoutingHarness(async () => {
+    const latest = pendingToolAction("2026-08-14T14:58:00.000Z");
+    const older = {
+      ...pendingToolAction("2026-08-14T14:55:00.000Z"),
+      _id: "tool-action-2",
+      toolName: "update_menu_price",
+      summary: "Change Chicken Salad to GHS 65"
+    };
+    let executions = 0;
+    const response = await handleRestaurantAgentMessage(
+      { restaurant: makeRestaurant(), senderPhone: ownerPhone, message: "yes" },
+      {
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () => makeAgentResult({ message: "Done." }),
+        findLatestPendingAction: async () => latest,
+        findPendingActions: async () => [latest, older],
+        executeConfirmedAction: async () => {
+          executions += 1;
+          return { success: true, message: "Tool confirmed." };
+        },
+        handlePendingImageReply: unhandledImageReply,
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+
+    assert.equal(executions, 0);
+    assert.match(response.message, /more than one action awaiting confirmation/i);
+    assert.match(response.message, /specific order or action/i);
+  });
+});
+
+test("expired pending confirmations cannot receive generic confirmation", async () => {
+  await runWithRoutingHarness(async () => {
+    let executions = 0;
+    const response = await handleRestaurantAgentMessage(
+      { restaurant: makeRestaurant(), senderPhone: ownerPhone, message: "yes" },
+      {
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () =>
+          makeAgentResult({ message: "There is no current action to confirm." }),
+        // The production query excludes expiresAt <= now, so an expired action is
+        // deliberately represented as absent at this routing boundary.
+        findLatestPendingAction: async () => null,
+        executeConfirmedAction: async () => {
+          executions += 1;
+          return { success: true, message: "Tool confirmed." };
+        },
+        handlePendingImageReply: unhandledImageReply,
+        rememberImageRequest: unhandledImageReply,
+        handleSavedSelection: unhandledSelection
+      }
+    );
+
+    assert.equal(executions, 0);
+    assert.equal(response.message, "There is no current action to confirm.");
   });
 });
 

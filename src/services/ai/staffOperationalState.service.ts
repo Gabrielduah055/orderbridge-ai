@@ -78,6 +78,7 @@ export interface StaffImageWorkflowView {
   itemId?: string;
   itemName?: string;
   pendingActionId: string;
+  createdAt?: string;
 }
 
 export interface StaffOrderView {
@@ -234,7 +235,8 @@ const getImageWorkflow = (
     imageUploaded: source.action === "IMAGE_ASSIGNMENT",
     itemId,
     itemName,
-    pendingActionId: safeId(source._id) ?? "unknown"
+    pendingActionId: safeId(source._id) ?? "unknown",
+    createdAt: safeIsoDate(source.createdAt)
   };
 };
 
