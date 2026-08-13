@@ -723,6 +723,32 @@ export const previewCustomerCampaign = async (
   };
 };
 
+const formatCampaignPreviewSendTime = (
+  scheduledAt: Date | undefined,
+  timezone: string
+): string => {
+  if (!scheduledAt) {
+    return "As soon as approved";
+  }
+
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    })
+      .formatToParts(scheduledAt)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  ) as Record<string, string>;
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} (${timezone})`;
+};
+
 export const buildCustomerCampaignPreviewMessage = (
   campaign: Pick<
     ICustomerCampaignDocument,
@@ -750,6 +776,11 @@ export const buildCustomerCampaignPreviewMessage = (
   }
 
   audienceLines.push(
+    "",
+    `Send: ${formatCampaignPreviewSendTime(
+      campaign.scheduledAt,
+      campaign.timezone
+    )}`,
     "",
     `This campaign will be sent to ${preview.estimatedEligibleRecipients} customers.`,
     "",

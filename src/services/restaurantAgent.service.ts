@@ -1056,21 +1056,25 @@ export const handleRestaurantAgentMessage = async (
     const exactCheckInReply = isExactOrderCheckInReply(message);
     const ambiguousShortReply = isAmbiguousCustomerWorkflowReply(message);
     const consentResponse = parseMarketingConsentResponse(message);
+    const genericConsentResponse = Boolean(
+      consentResponse && !consentResponse.explicitlyMentionsMarketing
+    );
     const explicitNaturalFeedback = isExplicitNaturalOrderFeedback(message);
     let activeDraft: Awaited<ReturnType<typeof findActiveDraft>> = null;
     let activeCheckIns: ActiveOrderCheckInView[] = [];
     let marketingConsentContext = {
       pending: false,
-      quotedRequest: false
+      quotedRequest: false,
+      genericResponseWindowOpen: false
     };
     let workflowStateLoadFailed = false;
 
-    if (ambiguousShortReply || consentResponse) {
+    if (ambiguousShortReply || genericConsentResponse) {
       try {
         [activeDraft, activeCheckIns, marketingConsentContext] = await Promise.all([
           findCustomerDraft(restaurantId, sender.normalizedPhone),
           loadCustomerCheckIns(restaurantId, sender.normalizedPhone),
-          consentResponse
+          genericConsentResponse
             ? loadMarketingConsentContext(
                 restaurantId,
                 sender.normalizedPhone,
@@ -1078,7 +1082,8 @@ export const handleRestaurantAgentMessage = async (
               )
             : Promise.resolve({
                 pending: false,
-                quotedRequest: false
+                quotedRequest: false,
+                genericResponseWindowOpen: false
               })
         ]);
       } catch (error) {
@@ -1095,7 +1100,17 @@ export const handleRestaurantAgentMessage = async (
     const hasActiveFeedbackWorkflow = activeCheckIns.length > 0;
     let trustedQuotedOrderId: string | null = null;
 
-    if (consentResponse && marketingConsentContext.pending) {
+    const hasTrustedGenericConsentContext = Boolean(
+      marketingConsentContext.pending &&
+        (marketingConsentContext.quotedRequest ||
+          marketingConsentContext.genericResponseWindowOpen)
+    );
+
+    if (
+      consentResponse &&
+      (consentResponse.explicitlyMentionsMarketing ||
+        hasTrustedGenericConsentContext)
+    ) {
       const hasCompetingWorkflow =
         competingOrderWorkflow || hasActiveFeedbackWorkflow;
       const needsClarification =

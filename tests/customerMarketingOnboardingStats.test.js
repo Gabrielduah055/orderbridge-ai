@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
+const { AgentConversationMessage } = require("../dist/models/agentConversation.model");
 const { CustomerProfile } = require("../dist/models/customerProfile.model");
 const { CustomerCampaignRecipient } = require("../dist/models/customerCampaignRecipient.model");
 const { MenuItem } = require("../dist/models/MenuItem");
@@ -14,6 +15,7 @@ const {
 const {
   buildMarketingConsentRequestMessage,
   getMarketingConsentRequestIdempotencyKey,
+  getPendingMarketingConsentContext,
   isOrderEligibleForMarketingConsentPrompt,
   parseMarketingConsentResponse,
   queueMarketingConsentRequestAfterSuccessfulOrder
@@ -198,6 +200,146 @@ test("consent response parser accepts bounded natural answers only", () => {
   assert.match(buildMarketingConsentRequestMessage("Golden Grill"), /Golden Grill/);
 });
 
+test("an intervening unrelated customer message closes the unquoted consent window", async () => {
+  const originals = {
+    profileFindOne: CustomerProfile.findOne,
+    outboundFindOne: OutboundMessage.findOne,
+    conversationExists: AgentConversationMessage.exists
+  };
+  const sentAt = new Date("2026-08-13T10:00:00.000Z");
+  const outboundFilters = [];
+  let conversationFilter;
+
+  try {
+    CustomerProfile.findOne = () => ({
+      select: async () => ({
+        marketingConsent: null,
+        isOptedOut: false,
+        marketingConsentPromptedAt: sentAt,
+        marketingConsentPromptOrderId: orderId
+      })
+    });
+    OutboundMessage.findOne = (filter) => {
+      outboundFilters.push(filter);
+      return {
+        sort() {
+          return this;
+        },
+        select: async () => ({ _id: "queue-consent-1", sentAt })
+      };
+    };
+    AgentConversationMessage.exists = async (filter) => {
+      conversationFilter = filter;
+      return { _id: "unrelated-customer-message" };
+    };
+
+    const context = await getPendingMarketingConsentContext(
+      restaurantId,
+      customerPhone
+    );
+
+    assert.equal(context.pending, true);
+    assert.equal(context.quotedRequest, false);
+    assert.equal(context.genericResponseWindowOpen, false);
+    assert.equal(outboundFilters[0].restaurantId, restaurantId);
+    assert.equal(outboundFilters[0].to, customerPhone);
+    assert.equal(conversationFilter.restaurantId, restaurantId);
+    assert.equal(conversationFilter.senderPhone, customerPhone);
+    assert.equal(conversationFilter.direction, "user");
+    assert.deepEqual(conversationFilter.createdAt, { $gt: sentAt });
+  } finally {
+    CustomerProfile.findOne = originals.profileFindOne;
+    OutboundMessage.findOne = originals.outboundFindOne;
+    AgentConversationMessage.exists = originals.conversationExists;
+  }
+});
+
+test("a just-sent consent request keeps the immediate unquoted generic window open", async () => {
+  const originals = {
+    profileFindOne: CustomerProfile.findOne,
+    outboundFindOne: OutboundMessage.findOne,
+    conversationExists: AgentConversationMessage.exists
+  };
+  const sentAt = new Date("2026-08-13T10:00:00.000Z");
+
+  try {
+    CustomerProfile.findOne = () => ({
+      select: async () => ({
+        marketingConsent: null,
+        isOptedOut: false,
+        marketingConsentPromptedAt: sentAt,
+        marketingConsentPromptOrderId: orderId
+      })
+    });
+    OutboundMessage.findOne = () => ({
+      sort() {
+        return this;
+      },
+      select: async () => ({ _id: "queue-consent-1", sentAt })
+    });
+    AgentConversationMessage.exists = async () => null;
+
+    const context = await getPendingMarketingConsentContext(
+      restaurantId,
+      customerPhone
+    );
+
+    assert.equal(context.pending, true);
+    assert.equal(context.genericResponseWindowOpen, true);
+  } finally {
+    CustomerProfile.findOne = originals.profileFindOne;
+    OutboundMessage.findOne = originals.outboundFindOne;
+    AgentConversationMessage.exists = originals.conversationExists;
+  }
+});
+
+test("quoted consent reply remains trusted after the generic window closes", async () => {
+  const originals = {
+    profileFindOne: CustomerProfile.findOne,
+    outboundFindOne: OutboundMessage.findOne,
+    conversationExists: AgentConversationMessage.exists
+  };
+  const sentAt = new Date("2026-08-13T10:00:00.000Z");
+
+  try {
+    CustomerProfile.findOne = () => ({
+      select: async () => ({
+        marketingConsent: null,
+        isOptedOut: false,
+        marketingConsentPromptedAt: sentAt,
+        marketingConsentPromptOrderId: orderId
+      })
+    });
+    OutboundMessage.findOne = (filter) => ({
+      sort() {
+        return this;
+      },
+      select: async () => ({
+        _id: filter.providerMessageId
+          ? "quoted-consent-message"
+          : "latest-consent-message",
+        sentAt
+      })
+    });
+    AgentConversationMessage.exists = async () => ({
+      _id: "later-unrelated-message"
+    });
+
+    const context = await getPendingMarketingConsentContext(
+      restaurantId,
+      customerPhone,
+      "provider-consent-1"
+    );
+
+    assert.equal(context.quotedRequest, true);
+    assert.equal(context.genericResponseWindowOpen, false);
+  } finally {
+    CustomerProfile.findOne = originals.profileFindOne;
+    OutboundMessage.findOne = originals.outboundFindOne;
+    AgentConversationMessage.exists = originals.conversationExists;
+  }
+});
+
 test("STOP then START preserves the hard opt-out boundary and re-enables future campaigns", async () => {
   const originals = {
     profileFindOne: CustomerProfile.findOne,
@@ -368,8 +510,32 @@ test("campaign preview uses human-friendly backend audience counts", () => {
   assert.match(message, /Not opted in yet: 1/);
   assert.match(message, /Opted out: 2/);
   assert.match(message, /sent to 5 customers/);
+  assert.match(message, /Send: As soon as approved/);
   assert.doesNotMatch(message, /Estimated eligible|Excluded without consent/);
   assert.doesNotMatch(message, /Invalid\/unreachable/);
+});
+
+test("scheduled campaign preview shows the restaurant-local send time before confirmation", () => {
+  const message = buildCustomerCampaignPreviewMessage(
+    {
+      name: "Lunch Promotion",
+      message: "Lunch is ready.",
+      scheduledAt: new Date("2026-08-14T14:00:00.000Z"),
+      timezone: "Africa/Accra"
+    },
+    {
+      targetingDescription: "All customers",
+      targetedProfiles: 8,
+      estimatedEligibleRecipients: 5,
+      excludedNoConsent: 1,
+      excludedOptOut: 2,
+      excludedInvalidPhone: 0,
+      recipients: []
+    }
+  );
+
+  assert.match(message, /Send: 2026-08-14 14:00 \(Africa\/Accra\)/);
+  assert.match(message, /Would you like to confirm or cancel it\?/);
 });
 
 test("campaign delivery appends one restaurant-specific STOP footer", () => {

@@ -1561,7 +1561,8 @@ for (const [message, expectedCommand, expectedOptedOut] of [
           loadCustomerCheckIns: async () => [],
           loadMarketingConsentContext: async () => ({
             pending: true,
-            quotedRequest: false
+            quotedRequest: false,
+            genericResponseWindowOpen: true
           }),
           setMarketingPreference: async (...args) => {
             mutations.push(args);
@@ -1608,7 +1609,8 @@ test("bare yes without a pending consent request cannot change marketing prefere
         loadCustomerCheckIns: async () => [],
         loadMarketingConsentContext: async () => ({
           pending: false,
-          quotedRequest: false
+          quotedRequest: false,
+          genericResponseWindowOpen: false
         }),
         setMarketingPreference: async () => {
           mutations += 1;
@@ -1624,6 +1626,71 @@ test("bare yes without a pending consent request cannot change marketing prefere
     assert.equal(mutations, 0);
     assert.equal(orchestratorCalls, 1);
     assert.equal(response.message, "AI handled the customer turn.");
+  });
+});
+
+test("an unrelated customer turn closes the unquoted generic consent window", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let mutations = 0;
+    let orchestratorCalls = 0;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "yes"
+      },
+      {
+        findCustomerDraft: async () => null,
+        loadCustomerCheckIns: async () => [],
+        loadMarketingConsentContext: async () => ({
+          pending: true,
+          quotedRequest: false,
+          genericResponseWindowOpen: false
+        }),
+        setMarketingPreference: async () => {
+          mutations += 1;
+          return {};
+        },
+        runOrchestrator: async () => {
+          orchestratorCalls += 1;
+          return makeAgentResult({
+            message: "Yes, Chicken Salad is available."
+          });
+        }
+      }
+    );
+
+    assert.equal(mutations, 0);
+    assert.equal(orchestratorCalls, 1);
+    assert.equal(response.message, "Yes, Chicken Salad is available.");
+  });
+});
+
+test("explicit marketing wording remains actionable after the generic window closes", async () => {
+  await withCustomerRoutingHarness(async () => {
+    let command;
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: customerPhone,
+        message: "subscribe me"
+      },
+      {
+        setMarketingPreference: async (_restaurantId, _phone, nextCommand) => {
+          command = nextCommand;
+          return {
+            marketingConsent: true,
+            isOptedOut: false
+          };
+        },
+        runOrchestrator: async () => {
+          throw new Error("explicit marketing wording must not reach AI");
+        }
+      }
+    );
+
+    assert.equal(command, "opt_in");
+    assert.equal(response.data.marketingPreference, "opt_in");
   });
 });
 
@@ -1645,7 +1712,8 @@ test("active order plus pending consent makes an unquoted bare yes clarify witho
         loadCustomerCheckIns: async () => [],
         loadMarketingConsentContext: async () => ({
           pending: true,
-          quotedRequest: false
+          quotedRequest: false,
+          genericResponseWindowOpen: true
         }),
         setMarketingPreference: async () => {
           mutations += 1;
@@ -1684,7 +1752,8 @@ test("a quoted trusted consent request safely accepts yes beside an active order
         loadCustomerCheckIns: async () => [],
         loadMarketingConsentContext: async (_restaurantId, _phone, quotedMessageId) => ({
           pending: true,
-          quotedRequest: quotedMessageId === "provider-consent-1"
+          quotedRequest: quotedMessageId === "provider-consent-1",
+          genericResponseWindowOpen: false
         }),
         setMarketingPreference: async () => {
           mutations += 1;

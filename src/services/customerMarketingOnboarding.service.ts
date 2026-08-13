@@ -1,4 +1,5 @@
 import { Types } from "mongoose";
+import { AgentConversationMessage } from "../models/agentConversation.model";
 import { CustomerProfile } from "../models/customerProfile.model";
 import type { IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
@@ -20,6 +21,7 @@ export interface ParsedMarketingConsentResponse {
 export interface PendingMarketingConsentContext {
   pending: boolean;
   quotedRequest: boolean;
+  genericResponseWindowOpen: boolean;
   promptedAt?: Date;
   promptOrderId?: string;
 }
@@ -77,8 +79,9 @@ const genericOptInResponses = new Set([
 const explicitOptInResponses = new Set([
   "send me offers",
   "send me promotions",
-  "keep me updated"
+  "subscribe me"
 ]);
+genericOptInResponses.add("keep me updated");
 const genericOptOutResponses = new Set([
   "no",
   "no thanks",
@@ -298,26 +301,52 @@ export const getPendingMarketingConsentContext = async (
   );
 
   if (!pending) {
-    return { pending: false, quotedRequest: false };
+    return {
+      pending: false,
+      quotedRequest: false,
+      genericResponseWindowOpen: false
+    };
   }
 
   const providerMessageId = quotedMessageId?.trim();
-  const quotedRequest = providerMessageId
-    ? Boolean(
-        await OutboundMessage.findOne({
-          restaurantId,
-          to: normalizedPhone,
-          status: "sent",
-          providerMessageId,
-          "metadata.kind": "marketing_consent_request",
-          "metadata.customerPhone": normalizedPhone
-        }).select("_id")
-      )
-    : false;
+  const requestScope = {
+    restaurantId,
+    to: normalizedPhone,
+    status: "sent",
+    "metadata.kind": "marketing_consent_request",
+    "metadata.customerPhone": normalizedPhone
+  } as const;
+  const [quotedMessage, latestSentRequest] = await Promise.all([
+    providerMessageId
+      ? OutboundMessage.findOne({
+          ...requestScope,
+          providerMessageId
+        }).select("_id sentAt")
+      : Promise.resolve(null),
+    OutboundMessage.findOne({
+      ...requestScope,
+      sentAt: { $exists: true }
+    })
+      .sort({ sentAt: -1 })
+      .select("_id sentAt")
+  ]);
+  const quotedRequest = Boolean(quotedMessage);
+  const interveningCustomerMessage = latestSentRequest?.sentAt
+    ? await AgentConversationMessage.exists({
+        restaurantId,
+        senderPhone: normalizedPhone,
+        senderRole: "customer",
+        direction: "user",
+        createdAt: { $gt: latestSentRequest.sentAt }
+      })
+    : null;
 
   return {
     pending: true,
     quotedRequest,
+    genericResponseWindowOpen: Boolean(
+      latestSentRequest?.sentAt && !interveningCustomerMessage
+    ),
     promptedAt: profile?.marketingConsentPromptedAt,
     promptOrderId: profile?.marketingConsentPromptOrderId
       ? String(profile.marketingConsentPromptOrderId)
