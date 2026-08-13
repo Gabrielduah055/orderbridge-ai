@@ -388,6 +388,10 @@ test("image workflow normalizes awaiting-image, awaiting-item, and confirmation 
       imageCase.expected.imageUploaded
     );
     assert.equal(state.imageWorkflow.itemName, imageCase.expected.itemName);
+    assert.equal(
+      state.imageWorkflow.createdAt,
+      new Date("2026-08-07T11:55:00.000Z").toISOString()
+    );
     const serialized = JSON.stringify(state);
     assert.equal(serialized.includes("res.cloudinary.com"), false);
     assert.equal(serialized.includes("private/image-id"), false);

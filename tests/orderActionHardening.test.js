@@ -1,7 +1,10 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { executeAgentTool } = require("../dist/agent-tools/tool.executor");
+const {
+  cancelPendingToolActionById,
+  executeAgentTool
+} = require("../dist/agent-tools/tool.executor");
 const { toolRegistry } = require("../dist/agent-tools/tool.registry");
 const {
   getAgentToolDefinitionsForRole
@@ -70,6 +73,43 @@ const makeOrder = (overrides = {}) => ({
     return this;
   },
   ...overrides
+});
+
+test("exact pending tool cancellation enforces tenant, sender, role, status, and expiry scope", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  const pendingActionId = "64b000000000000000000111";
+  let capturedFilter;
+  const pendingAction = {
+    status: "pending",
+    resultMessage: undefined,
+    saveCalls: 0,
+    async save() {
+      this.saveCalls += 1;
+      return this;
+    }
+  };
+
+  PendingAgentAction.findOne = async (filter) => {
+    capturedFilter = filter;
+    return pendingAction;
+  };
+
+  try {
+    const result = await cancelPendingToolActionById(pendingActionId, context);
+
+    assert.equal(result.success, true);
+    assert.equal(capturedFilter._id, pendingActionId);
+    assert.equal(capturedFilter.restaurantId, restaurantId);
+    assert.equal(capturedFilter.senderPhone, ownerPhone);
+    assert.equal(capturedFilter.senderRole, "owner");
+    assert.equal(capturedFilter.action, "TOOL_CALL");
+    assert.equal(capturedFilter.status, "pending");
+    assert.equal(capturedFilter.expiresAt.$gt instanceof Date, true);
+    assert.equal(pendingAction.status, "cancelled");
+    assert.equal(pendingAction.saveCalls, 1);
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
+  }
 });
 
 test("reject_order requires a meaningful reason in schema and executor", async () => {

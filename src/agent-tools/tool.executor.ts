@@ -115,10 +115,10 @@ export const executeConfirmedPendingToolAction = async (
     _id: pendingActionId,
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
+    action: "TOOL_CALL",
     ...(expectedToolName
       ? {
-          senderRole: context.sender.role,
-          action: "TOOL_CALL",
           toolName: expectedToolName
         }
       : {}),
@@ -166,6 +166,7 @@ export const cancelPendingToolAction = async (
   const pendingAction = await PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {
@@ -191,12 +192,47 @@ export const cancelPendingToolAction = async (
   };
 };
 
+export const cancelPendingToolActionById = async (
+  pendingActionId: string,
+  context: ToolExecutionContext
+): Promise<ToolResult> => {
+  const pendingAction = await PendingAgentAction.findOne({
+    _id: pendingActionId,
+    restaurantId: context.restaurantId,
+    senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
+    action: "TOOL_CALL",
+    status: "pending",
+    expiresAt: {
+      $gt: new Date()
+    }
+  });
+
+  if (!pendingAction) {
+    return {
+      success: false,
+      code: "PENDING_ACTION_NOT_FOUND",
+      message: "There is no pending action to cancel."
+    };
+  }
+
+  pendingAction.status = "cancelled";
+  pendingAction.resultMessage = "Pending action cancelled.";
+  await pendingAction.save();
+
+  return {
+    success: true,
+    message: "Okay, I cancelled that pending action."
+  };
+};
+
 export const findLatestPendingToolAction = async (
   context: ToolExecutionContext
 ) => {
   return PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {
@@ -211,6 +247,7 @@ export const findPendingToolActions = async (
   return PendingAgentAction.find({
     restaurantId: context.restaurantId,
     senderPhone: context.sender.normalizedPhone,
+    senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
     expiresAt: {
