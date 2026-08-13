@@ -1,6 +1,9 @@
 import { Types } from "mongoose";
 import { AgentConversationMessage } from "../models/agentConversation.model";
-import { CustomerProfile } from "../models/customerProfile.model";
+import {
+  CustomerProfile,
+  type MarketingConsentPromptSource
+} from "../models/customerProfile.model";
 import type { IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
@@ -58,6 +61,14 @@ export interface QueueMarketingConsentRequestResult {
   queued: boolean;
   reason?: string;
   idempotencyKey?: string;
+}
+
+export interface QueueMarketingConsentRequestInput {
+  restaurantId: string;
+  customerPhone: string;
+  source: MarketingConsentPromptSource;
+  orderId?: string;
+  requestedByPhone?: string;
 }
 
 const normalizeConsentResponse = (message: string): string =>
@@ -143,7 +154,7 @@ export const getMarketingConsentRequestIdempotencyKey = (
 export const buildMarketingConsentRequestMessage = (
   restaurantName: string
 ): string =>
-  `Would you like ${restaurantName.trim()} to occasionally send you offers, discounts and new menu updates here on WhatsApp? You can stop them anytime.`;
+  `Would you like ${restaurantName.trim()} to occasionally send you offers, discounts and new menu updates here on WhatsApp?\n\nReply YES to receive them or NO if you don't want them.\n\nYou can reply STOP anytime later.`;
 
 export const isOrderEligibleForMarketingConsentPrompt = (
   order: Pick<
@@ -155,29 +166,24 @@ export const isOrderEligibleForMarketingConsentPrompt = (
   order.completionConfirmedByCustomer === true &&
   order.completionSource !== "automatic_timeout";
 
-export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
-  order: Pick<
-    IOrderDocument,
-    | "_id"
-    | "restaurantId"
-    | "customerPhone"
-    | "status"
-    | "completionSource"
-    | "completionConfirmedByCustomer"
-  >,
+export const queueMarketingConsentRequest = async (
+  input: QueueMarketingConsentRequestInput,
   dependencies: QueueMarketingConsentRequestDependencies = {},
   now = new Date()
 ): Promise<QueueMarketingConsentRequestResult> => {
-  if (!isOrderEligibleForMarketingConsentPrompt(order)) {
-    return { queued: false, reason: "order_not_eligible" };
-  }
-
-  const restaurantId = String(order.restaurantId);
-  const orderId = String(order._id);
+  const restaurantId = input.restaurantId;
   const customerPhone = ensureScopedIdentity(
     restaurantId,
-    order.customerPhone
+    input.customerPhone
   );
+  const requestedByPhone = input.requestedByPhone
+    ? ensureScopedIdentity(restaurantId, input.requestedByPhone)
+    : undefined;
+
+  if (input.orderId && !Types.ObjectId.isValid(input.orderId)) {
+    throw new BadRequestError("Invalid orderId");
+  }
+
   const findProfile =
     dependencies.findProfile ??
     (async (scopedRestaurantId, scopedCustomerPhone) =>
@@ -189,8 +195,8 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
       ));
   const profile = await findProfile(restaurantId, customerPhone);
 
-  if (!profile || (profile.orderCount ?? 0) < 1) {
-    return { queued: false, reason: "completed_profile_missing" };
+  if (!profile) {
+    return { queued: false, reason: "profile_missing" };
   }
 
   if (profile.marketingConsent === true) {
@@ -241,7 +247,9 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
       purpose: "transactional_preference",
       restaurantId,
       customerPhone,
-      orderId
+      source: input.source,
+      ...(input.orderId ? { orderId: input.orderId } : {}),
+      ...(requestedByPhone ? { requestedByPhone } : {})
     }
   });
 
@@ -270,12 +278,92 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
     {
       $set: {
         marketingConsentPromptedAt: now,
-        marketingConsentPromptOrderId: new Types.ObjectId(orderId)
+        marketingConsentPromptSource: input.source,
+        ...(input.orderId
+          ? { marketingConsentPromptOrderId: new Types.ObjectId(input.orderId) }
+          : {}),
+        ...(requestedByPhone
+          ? { marketingConsentPromptedByPhone: requestedByPhone }
+          : {})
       }
     }
   );
 
   return { queued: true, idempotencyKey };
+};
+
+export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
+  order: Pick<
+    IOrderDocument,
+    | "_id"
+    | "restaurantId"
+    | "customerPhone"
+    | "status"
+    | "completionSource"
+    | "completionConfirmedByCustomer"
+  >,
+  dependencies: QueueMarketingConsentRequestDependencies = {},
+  now = new Date()
+): Promise<QueueMarketingConsentRequestResult> => {
+  if (!isOrderEligibleForMarketingConsentPrompt(order)) {
+    return { queued: false, reason: "order_not_eligible" };
+  }
+
+  const restaurantId = String(order.restaurantId);
+  const customerPhone = ensureScopedIdentity(restaurantId, order.customerPhone);
+  const findProfile =
+    dependencies.findProfile ??
+    (async (scopedRestaurantId, scopedCustomerPhone) =>
+      CustomerProfile.findOne({
+        restaurantId: scopedRestaurantId,
+        customerPhone: scopedCustomerPhone
+      }).select(
+        "marketingConsent isOptedOut marketingConsentPromptedAt orderCount"
+      ));
+  const profile = await findProfile(restaurantId, customerPhone);
+
+  if (!profile || (profile.orderCount ?? 0) < 1) {
+    return { queued: false, reason: "completed_profile_missing" };
+  }
+
+  return queueMarketingConsentRequest(
+    {
+      restaurantId,
+      customerPhone,
+      source: "post_order",
+      orderId: String(order._id)
+    },
+    {
+      ...dependencies,
+      findProfile: async () => profile
+    },
+    now
+  );
+};
+
+export const recordMarketingConsentPromptResponse = async (
+  restaurantId: string,
+  customerPhone: string,
+  response: MarketingConsentResponse,
+  now = new Date()
+): Promise<boolean> => {
+  const normalizedPhone = ensureScopedIdentity(restaurantId, customerPhone);
+  const result = await CustomerProfile.updateOne(
+    {
+      restaurantId,
+      customerPhone: normalizedPhone,
+      marketingConsentPromptedAt: { $exists: true },
+      marketingConsentPromptResponse: { $exists: false }
+    },
+    {
+      $set: {
+        marketingConsentPromptResponse: response,
+        marketingConsentPromptRespondedAt: now
+      }
+    }
+  );
+
+  return (result.modifiedCount ?? 0) > 0;
 };
 
 export const getPendingMarketingConsentContext = async (

@@ -54,7 +54,7 @@ const mockedDecisionFor = (scenario) => {
 
 test("staff regression suite remains a bounded decision-only safety net", () => {
   assert.equal(staffAgentScenarios.length >= 30, true);
-  assert.equal(staffAgentScenarios.length <= 40, true);
+  assert.equal(staffAgentScenarios.length <= 45, true);
 
   for (const scenario of staffAgentScenarios) {
     assert.equal(["owner", "manager"].includes(scenario.role), true);

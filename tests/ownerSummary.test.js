@@ -447,6 +447,7 @@ test("today orders and sales tools expose completed-only reporting metrics", asy
 
 test("get_business_report supports all periods and remains context scoped", async () => {
   const originalFind = Order.find;
+  const originalCustomerCountDocuments = CustomerProfile.countDocuments;
   const filters = [];
   const context = {
     restaurantId,
@@ -462,6 +463,7 @@ test("get_business_report supports all periods and remains context scoped", asyn
       filters.push(filter);
       return { select: async () => [] };
     };
+    CustomerProfile.countDocuments = async () => 0;
 
     for (const period of [
       "today",
@@ -477,9 +479,12 @@ test("get_business_report supports all periods and remains context scoped", asyn
       assert.equal(result.success, true);
       assert.equal(result.data.period.type, period);
       assert.match(result.data.formattedReport, /TENANT RESTAURANT/);
+      assert.equal(result.data.customerMarketing.totalCustomers, 0);
+      assert.match(result.data.formattedReport, /CUSTOMER MARKETING \(CURRENT SNAPSHOT\)/);
     }
   } finally {
     Order.find = originalFind;
+    CustomerProfile.countDocuments = originalCustomerCountDocuments;
   }
 
   assert.equal(filters.length, 8);

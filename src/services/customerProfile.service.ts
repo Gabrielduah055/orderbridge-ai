@@ -57,6 +57,11 @@ export interface CustomerProfileStatistics {
   marketingEligibleCustomers: number;
   marketingNotOptedInCustomers: number;
   marketingOptedOutCustomers: number;
+  marketingConsentInvitedCustomers: number;
+  marketingConsentAcceptedCustomers: number;
+  marketingConsentDeclinedCustomers: number;
+  marketingConsentAwaitingResponseCustomers: number;
+  marketingConsentNotAskedCustomers: number;
 }
 
 const normalizeDisplayText = (value: string): string => {
@@ -547,7 +552,10 @@ export const getCustomerProfileStatistics = async (
     customersWithCompletedOrders,
     returningCustomers,
     marketingEligibleCustomers,
-    marketingOptedOutCustomers
+    marketingOptedOutCustomers,
+    marketingConsentInvitedCustomers,
+    marketingConsentAcceptedCustomers,
+    marketingConsentDeclinedCustomers
   ] = await Promise.all([
     CustomerProfile.countDocuments(scope),
     CustomerProfile.countDocuments({
@@ -566,8 +574,27 @@ export const getCustomerProfileStatistics = async (
     CustomerProfile.countDocuments({
       ...scope,
       isOptedOut: true
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      marketingConsentPromptedAt: { $exists: true }
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      marketingConsentPromptResponse: "opt_in"
+    }),
+    CustomerProfile.countDocuments({
+      ...scope,
+      marketingConsentPromptResponse: "opt_out"
     })
   ]);
+
+  const marketingConsentAwaitingResponseCustomers = Math.max(
+    0,
+    marketingConsentInvitedCustomers -
+      marketingConsentAcceptedCustomers -
+      marketingConsentDeclinedCustomers
+  );
 
   return {
     totalCustomers,
@@ -580,6 +607,14 @@ export const getCustomerProfileStatistics = async (
         marketingEligibleCustomers -
         marketingOptedOutCustomers
     ),
-    marketingOptedOutCustomers
+    marketingOptedOutCustomers,
+    marketingConsentInvitedCustomers,
+    marketingConsentAcceptedCustomers,
+    marketingConsentDeclinedCustomers,
+    marketingConsentAwaitingResponseCustomers,
+    marketingConsentNotAskedCustomers: Math.max(
+      0,
+      totalCustomers - marketingConsentInvitedCustomers
+    )
   };
 };

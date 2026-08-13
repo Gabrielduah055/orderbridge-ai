@@ -1571,6 +1571,7 @@ for (const [message, expectedCommand, expectedOptedOut] of [
               isOptedOut: expectedOptedOut
             };
           },
+          recordMarketingConsentResponse: async () => true,
           runOrchestrator: async () => {
             throw new Error("marketing response must not reach AI");
           }
@@ -1761,7 +1762,8 @@ test("a quoted trusted consent request safely accepts yes beside an active order
             marketingConsent: true,
             isOptedOut: false
           };
-        }
+        },
+        recordMarketingConsentResponse: async () => true
       }
     );
 

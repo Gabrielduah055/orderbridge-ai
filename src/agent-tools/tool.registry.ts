@@ -34,6 +34,11 @@ import {
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
 import { getCustomerProfileStatistics } from "../services/customerProfile.service";
 import {
+  buildMarketingConsentOutreachPreviewMessage,
+  executeMarketingConsentOutreach,
+  previewMarketingConsentOutreach
+} from "../services/customerMarketingOutreach.service";
+import {
   businessReportPeriodTypes,
   getCurrentDailySummaryPeriod,
   getBusinessReport,
@@ -960,18 +965,38 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.get_business_report,
     schema: businessReportSchema,
     handler: async (args, context) => {
-      const report = await getBusinessReport({
-        restaurantId: context.restaurantId,
-        restaurantName: context.restaurant.name,
-        timezone: context.restaurant.timezone,
-        period: args.period,
-        compareWithPrevious: args.compareWithPrevious
-      });
+      const [report, customerMarketing] = await Promise.all([
+        getBusinessReport({
+          restaurantId: context.restaurantId,
+          restaurantName: context.restaurant.name,
+          timezone: context.restaurant.timezone,
+          period: args.period,
+          compareWithPrevious: args.compareWithPrevious
+        }),
+        getCustomerProfileStatistics(context.restaurantId)
+      ]);
+      const marketingSection = [
+        "CUSTOMER MARKETING (CURRENT SNAPSHOT)",
+        `Total customers: ${customerMarketing.totalCustomers}`,
+        `Receiving promotions: ${customerMarketing.marketingEligibleCustomers}`,
+        `Opted out: ${customerMarketing.marketingOptedOutCustomers}`,
+        `Awaiting consent response: ${customerMarketing.marketingConsentAwaitingResponseCustomers}`,
+        "Consent outreach:",
+        `Invited: ${customerMarketing.marketingConsentInvitedCustomers}`,
+        `Accepted: ${customerMarketing.marketingConsentAcceptedCustomers}`,
+        `Declined: ${customerMarketing.marketingConsentDeclinedCustomers}`,
+        `No response: ${customerMarketing.marketingConsentAwaitingResponseCustomers}`,
+        `Not asked yet: ${customerMarketing.marketingConsentNotAskedCustomers}`
+      ].join("\n");
 
       return {
         success: true,
         message: "Business report retrieved successfully.",
-        data: report
+        data: {
+          ...report,
+          customerMarketing,
+          formattedReport: `${report.formattedReport}\n\n${marketingSection}`
+        }
       };
     }
   },
@@ -1341,6 +1366,64 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           unavailableItems,
           ...customerStatistics
         }
+      };
+    }
+  },
+  invite_customers_to_marketing: {
+    definition: {
+      name: "invite_customers_to_marketing",
+      description:
+        "Owner/manager only. Preview and, only after explicit confirmation, send the backend-owned one-time marketing preference request to customers whose preference is unknown and who have never been asked. This is consent outreach, not a promotional campaign.",
+      parameters: {}
+    },
+    roles: toolPermissions.invite_customers_to_marketing,
+    sensitive: true,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      if (!context.confirmed) {
+        const preview = await previewMarketingConsentOutreach(
+          context.restaurantId,
+          context.sender.normalizedPhone
+        );
+
+        if (preview.eligible === 0) {
+          return {
+            success: true,
+            message:
+              "All customers have already either chosen a preference, have already been asked, or do not have a valid phone number.",
+            data: preview
+          };
+        }
+
+        const pending = await createPendingToolAction(
+          context,
+          "invite_customers_to_marketing",
+          {},
+          buildMarketingConsentOutreachPreviewMessage(preview)
+        );
+
+        return {
+          ...pending,
+          data: preview
+        };
+      }
+
+      const result = await executeMarketingConsentOutreach(
+        context.restaurantId,
+        context.sender.normalizedPhone
+      );
+
+      return {
+        success: true,
+        message:
+          result.queued === 0 && result.eligible === 0
+            ? "All customers have already either chosen a preference or have already been asked."
+            : `The consent request has been queued for ${result.queued} customer${result.queued === 1 ? "" : "s"}.${
+                result.failedToQueue > 0
+                  ? ` ${result.failedToQueue} could not be queued.`
+                  : ""
+              }`,
+        data: result
       };
     }
   },

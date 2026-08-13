@@ -99,13 +99,14 @@ test("first customer-confirmed successful order queues one consent request and r
   );
   assert.equal(
     queuedMessages[0].text,
-    "Would you like Golden Grill to occasionally send you offers, discounts and new menu updates here on WhatsApp? You can stop them anytime."
+    "Would you like Golden Grill to occasionally send you offers, discounts and new menu updates here on WhatsApp?\n\nReply YES to receive them or NO if you don't want them.\n\nYou can reply STOP anytime later."
   );
   assert.deepEqual(queuedMessages[0].metadata, {
     kind: "marketing_consent_request",
     purpose: "transactional_preference",
     restaurantId,
     customerPhone,
+    source: "post_order",
     orderId
   });
 });
@@ -414,6 +415,9 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       if (filter.orderCount?.$gte === 1) return 6;
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
+      if (filter.marketingConsentPromptResponse === "opt_in") return 5;
+      if (filter.marketingConsentPromptResponse === "opt_out") return 2;
+      if (filter.marketingConsentPromptedAt) return 8;
       return 8;
     };
 
@@ -425,7 +429,12 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       returningCustomers: 2,
       marketingEligibleCustomers: 5,
       marketingNotOptedInCustomers: 1,
-      marketingOptedOutCustomers: 2
+      marketingOptedOutCustomers: 2,
+      marketingConsentInvitedCustomers: 8,
+      marketingConsentAcceptedCustomers: 5,
+      marketingConsentDeclinedCustomers: 2,
+      marketingConsentAwaitingResponseCustomers: 1,
+      marketingConsentNotAskedCustomers: 0
     });
     assert.equal(filters.every((filter) => filter.restaurantId === restaurantId), true);
   } finally {
@@ -448,6 +457,9 @@ test("get_business_summary returns lifetime profile totals even with zero orders
       if (filter.orderCount?.$gte === 1) return 6;
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
+      if (filter.marketingConsentPromptResponse === "opt_in") return 5;
+      if (filter.marketingConsentPromptResponse === "opt_out") return 2;
+      if (filter.marketingConsentPromptedAt) return 8;
       return 8;
     };
 
