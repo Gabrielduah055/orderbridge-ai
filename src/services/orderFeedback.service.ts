@@ -22,9 +22,6 @@ import {
   feedbackCompletionEligibleStatuses
 } from "./orderCompletion.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
-import {
-  queueMarketingConsentRequestAfterSuccessfulOrder
-} from "./customerMarketingOnboarding.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -54,8 +51,7 @@ export interface HandleOrderFeedbackResponseResult {
 }
 
 export interface OrderFeedbackResponseDependencies {
-  queueMarketingConsentRequest?:
-    typeof queueMarketingConsentRequestAfterSuccessfulOrder;
+  // Reserved for future dependency injection in tests.
 }
 
 export const orderCheckInOutcomes = [
@@ -741,26 +737,6 @@ const markFeedbackAnswered = async (
   );
 };
 
-const tryQueueMarketingConsentRequest = async (
-  order: IOrderDocument,
-  dependencies: OrderFeedbackResponseDependencies
-): Promise<void> => {
-  try {
-    await (
-      dependencies.queueMarketingConsentRequest ??
-      queueMarketingConsentRequestAfterSuccessfulOrder
-    )(order);
-  } catch (error) {
-    console.error("Marketing consent request queueing failed", {
-      restaurantId: String(order.restaurantId),
-      orderId: String(order._id),
-      error:
-        error instanceof Error
-          ? error.message
-          : "Unknown marketing consent queueing error"
-    });
-  }
-};
 
 const handleDeliveryNotReceived = async (
   input: HandleOrderFeedbackResponseInput,
@@ -854,10 +830,6 @@ const handleNumberedResponse = async (
       feedbackAwaitingComplaint: false,
       feedbackReceiptClarificationPending: false
     });
-    await tryQueueMarketingConsentRequest(
-      completed.order,
-      dependencies
-    );
 
     return {
       handled: true,
@@ -1122,16 +1094,6 @@ export const handleOrderFeedbackCustomerResponse = async (
         feedbackReceiptClarificationPending: false
       }
     );
-
-    if (
-      classification.type !== "complaint" &&
-      !classification.requiresOwnerAttention
-    ) {
-      await tryQueueMarketingConsentRequest(
-        completed.order,
-        dependencies
-      );
-    }
 
     return {
       handled: true,
