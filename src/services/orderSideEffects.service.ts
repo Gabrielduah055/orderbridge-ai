@@ -6,6 +6,10 @@ import {
   getTrustedRestaurantRejectionReason
 } from "./order.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import { queueMarketingConsentRequest } from "./customerMarketingOnboarding.service";
+
+/** Delay in milliseconds before sending the marketing opt-in message after receipt delivery. */
+const MARKETING_CONSENT_DELAY_MS = 2 * 60 * 1_000; // 2 minutes
 
 export type SideEffectStepStatus = "success" | "queued" | "failed" | "skipped" | "not_attempted";
 
@@ -316,7 +320,46 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   });
   result.receiptDelivery = "queued";
 
+  // After the receipt is successfully queued, schedule the marketing opt-in
+  // message with a short delay so it arrives after the receipt, not alongside it.
+  tryQueueMarketingConsentAfterReceipt(restaurant, receiptOrder).catch(
+    (error) => {
+      console.error("Marketing consent request after receipt failed", {
+        restaurantId: String(restaurant._id),
+        orderId: String(receiptOrder._id),
+        orderNumber: receiptOrder.orderNumber,
+        error: error instanceof Error ? error.message : "Unknown error"
+      });
+    }
+  );
+
   return result;
+};
+
+/**
+ * Schedules the marketing opt-in message to be sent after a short delay
+ * following successful receipt delivery. The core queueMarketingConsentRequest
+ * function handles all deduplication (already prompted, already opted in/out)
+ * so calling this multiple times is safe.
+ */
+const tryQueueMarketingConsentAfterReceipt = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<void> => {
+  const nextAttemptAt = new Date(Date.now() + MARKETING_CONSENT_DELAY_MS);
+  await queueMarketingConsentRequest(
+    {
+      restaurantId: String(restaurant._id),
+      customerPhone: order.customerPhone,
+      source: "post_order",
+      orderId: String(order._id)
+    },
+    {
+      // Pass a custom enqueueMessage so we can inject the nextAttemptAt delay.
+      enqueueMessage: (input) =>
+        enqueueWasenderMessage({ ...input, nextAttemptAt })
+    }
+  );
 };
 
 export const retryAcceptedOrderReceiptDelivery = async (
