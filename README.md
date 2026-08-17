@@ -128,23 +128,15 @@ Response:
 
 ## Create the First Super Admin
 
-1. Create the first admin user in Firebase from the Firebase console or your frontend login flow.
-2. Copy the Firebase user UID.
-3. Insert a matching MongoDB `users` document:
+Create or sign in once with the intended account using Firebase Authentication, then run:
 
-```js
-db.users.insertOne({
-  firebaseUid: "firebase-user-uid",
-  name: "Super Admin",
-  email: "admin@orderbridge.ai",
-  role: "super_admin",
-  isActive: true,
-  createdAt: new Date(),
-  updatedAt: new Date()
-});
+```bash
+npm run bootstrap:superadmin -- --email=admin@example.com
 ```
 
-Restaurant admins must include `restaurantId`; super admins do not.
+The command looks up the existing Firebase user, then safely creates or updates the matching MongoDB user as an active `super_admin`. It does not create a public bootstrap endpoint or print credentials. It fails rather than guessing if an existing MongoDB record conflicts with the Firebase UID or email.
+
+The authenticated frontend profile is available at `GET /api/auth/me`. It returns only the user's id, email, role, and active state.
 
 ## Restaurant Routes
 
