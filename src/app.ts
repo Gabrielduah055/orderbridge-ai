@@ -3,6 +3,7 @@ import express, { type Request, type Response } from "express";
 import morgan from "morgan";
 import path from "path";
 import { errorMiddleware } from "./middleware/error.middleware";
+import authRoutes from "./routes/auth.routes";
 import agentCustomerRoutes from "./routes/agentCustomer.routes";
 import agentOwnerRoutes from "./routes/agentOwner.routes";
 import mcpRoutes from "./routes/mcp.routes";
@@ -26,6 +27,7 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.use("/api/restaurants/:restaurantId/orders", restaurantOrderRoutes);
+app.use("/api/auth", authRoutes);
 app.use("/api/restaurants", restaurantRoutes);
 app.use("/api/menu", menuRoutes);
 app.use("/api/orders", orderRoutes);

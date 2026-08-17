@@ -8,6 +8,7 @@
     "build": "tsc",
     "audit:menu-images": "node dist/scripts/auditMenuItemImages.js",
     "backfill:restaurant-config": "node dist/scripts/backfillRestaurantSchedulerConfig.js",
+    "bootstrap:superadmin": "npm run build && node dist/scripts/bootstrapSuperAdmin.js",
     "set:restaurant-wasender-token": "node dist/scripts/setRestaurantWasenderToken.js",
     "eval:staff": "tsc && node dist/evals/runStaffAgentEval.js",
     "eval:customer": "tsc && node dist/evals/runCustomerAgentEval.js",
