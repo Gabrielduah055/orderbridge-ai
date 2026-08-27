@@ -4,6 +4,7 @@ import { PendingAgentAction } from "../../models/pendingAgentAction.model";
 import type { IRestaurantDocument } from "../../models/Restaurant";
 import type { ResolvedSender, SenderRole } from "../../types/agent.types";
 import { getPendingOrderExpiryMinutes } from "../order.service";
+import { findTrustedQuotedOwnerOrderContext } from "../ownerOrderNotificationContext.service";
 
 export const staffOperationalStateLimits = {
   pendingActions: 5,
@@ -46,6 +47,7 @@ interface OrderSource {
   total?: unknown;
   createdAt?: unknown;
   customerConfirmedAt?: unknown;
+  customerAmendmentVersion?: unknown;
 }
 
 interface QueryLike<T> {
@@ -88,6 +90,10 @@ export interface StaffOrderView {
   customerName?: string;
   total?: number;
   createdAt?: string;
+  amendmentVersion?: number;
+  quotedAmendmentVersion?: number;
+  quotedVersionStale?: boolean;
+  quotedAction?: "order_decision" | "cancellation_request";
 }
 
 export interface StaffOrderSelectionReference {
@@ -151,7 +157,8 @@ const orderProjection = {
   customerName: 1,
   total: 1,
   createdAt: 1,
-  customerConfirmedAt: 1
+  customerConfirmedAt: 1,
+  customerAmendmentVersion: 1
 } as const;
 
 const defaultFindPendingActions: FindRecords<PendingActionSource> = (
@@ -199,7 +206,11 @@ const toOrderView = (order: OrderSource): StaffOrderView => ({
     typeof order.total === "number" && Number.isFinite(order.total)
       ? order.total
       : undefined,
-  createdAt: safeIsoDate(order.createdAt)
+  createdAt: safeIsoDate(order.createdAt),
+  ...(order.customerAmendmentVersion !== undefined &&
+  Number.isInteger(Number(order.customerAmendmentVersion))
+    ? { amendmentVersion: Number(order.customerAmendmentVersion) }
+    : {})
 });
 
 const getImageWorkflow = (
@@ -340,7 +351,11 @@ export const buildStaffOperationalState = async (
         .sort({ createdAt: 1 })
         .limit(staffOperationalStateLimits.orderSelectionCandidates)
     : Promise.resolve([]);
-  const quotedOrderPromise = quotedMessageId
+  const trustedQuotedContextPromise =
+    quotedMessageId && !dependencies.findOrders
+      ? findTrustedQuotedOwnerOrderContext(restaurantId, quotedMessageId)
+      : Promise.resolve(null);
+  const quotedOrderPromise = quotedMessageId && dependencies.findOrders
     ? findOrders(
         {
           restaurantId,
@@ -355,13 +370,15 @@ export const buildStaffOperationalState = async (
     freshPendingOrders,
     recentActiveOrders,
     selectionOrders,
-    quotedOrders
+    quotedOrders,
+    trustedQuotedContext
   ] =
     await Promise.all([
       freshPendingPromise,
       recentActivePromise,
       selectionOrdersPromise,
-      quotedOrderPromise
+      quotedOrderPromise,
+      trustedQuotedContextPromise
     ]);
 
   const imageWorkflow = getImageWorkflow(pendingActions);
@@ -440,9 +457,17 @@ export const buildStaffOperationalState = async (
       recentActive: recentActiveOrders.map(toOrderView)
     },
     recentReferences: {
-      quotedOrder: quotedOrders[0]
-        ? toOrderView(quotedOrders[0])
-        : undefined,
+      quotedOrder: trustedQuotedContext
+        ? {
+            ...toOrderView(trustedQuotedContext.order),
+            quotedAmendmentVersion:
+              trustedQuotedContext.expectedAmendmentVersion,
+            quotedVersionStale: trustedQuotedContext.stale,
+            quotedAction: trustedQuotedContext.action
+          }
+        : quotedOrders[0]
+          ? toOrderView(quotedOrders[0])
+          : undefined,
       orderSelection,
       menuItem: menuItemReference,
       campaign: campaignReference

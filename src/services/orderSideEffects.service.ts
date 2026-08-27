@@ -123,6 +123,36 @@ export const buildOwnerCustomerCancellationNotification = (
     "Please stop preparing or dispatching this order."
   ].join("\n");
 
+export const buildOwnerCustomerCancellationRequestNotification = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): string =>
+  [
+    "⚠️ CANCELLATION REQUEST",
+    "",
+    `${order.customerName || "Customer"} wants to cancel ${getOrderReference(order)}.`,
+    "",
+    `Restaurant: ${restaurant.name}`,
+    `Current status: ${formatTitleCase(order.status)}`,
+    "",
+    "Please approve or decline the cancellation request."
+  ].join("\n");
+
+export const buildCustomerCancellationResolutionNotification = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): string => {
+  const approved = order.customerCancellationRequestStatus === "approved";
+  const reason = order.customerCancellationResolutionReason?.trim();
+
+  return [
+    approved
+      ? `${restaurant.name} approved your cancellation request for ${getOrderReference(order)}. The order has been cancelled.`
+      : `${restaurant.name} could not approve your cancellation request for ${getOrderReference(order)}. The order remains ${formatTitleCase(order.status)}.`,
+    ...(reason ? ["", `Reason: ${reason}`] : [])
+  ].join("\n");
+};
+
 export const buildOwnerOrderAmendedNotification = (
   restaurant: IRestaurantDocument,
   order: IOrderDocument
@@ -213,6 +243,7 @@ export const notifyOwnerOfSubmittedOrder = async (
       kind: "owner_order_notification",
       orderId: String(order._id),
       orderNumber: order.orderNumber,
+      amendmentVersion: 0,
       recipientType: "owner"
     }
   });
@@ -255,6 +286,68 @@ export const notifyOwnerOfCustomerCancellation = async (
   });
 
   return { ownerNotification: "queued" };
+};
+
+export const notifyOwnerOfCustomerCancellationRequest = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  if (
+    order.customerCancellationRequestStatus !== "pending" ||
+    order.ownerCancellationRequestNotifiedAt
+  ) {
+    return { ownerNotification: "skipped" };
+  }
+
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: restaurant.ownerPhone,
+    type: "text",
+    text: buildOwnerCustomerCancellationRequestNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `owner-order-cancellation-request:${String(order._id)}`,
+    metadata: {
+      kind: "owner_order_cancellation_request_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      recipientType: "owner"
+    }
+  });
+
+  return { ownerNotification: "queued" };
+};
+
+export const notifyCustomerOfCancellationResolution = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  const decision = order.customerCancellationRequestStatus;
+  if (
+    (decision !== "approved" && decision !== "declined") ||
+    order.customerCancellationResolutionNotifiedAt
+  ) {
+    return { customerNotification: "skipped" };
+  }
+
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: order.customerPhone,
+    type: "text",
+    text: buildCustomerCancellationResolutionNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `customer-order-cancellation-resolution:${String(order._id)}:${decision}`,
+    metadata: {
+      kind: "customer_order_cancellation_resolution_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      cancellationDecision: decision,
+      recipientType: "customer"
+    }
+  });
+
+  return { customerNotification: "queued" };
 };
 
 export const notifyOwnerOfCustomerAmendment = async (

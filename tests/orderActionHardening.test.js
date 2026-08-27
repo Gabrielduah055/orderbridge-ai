@@ -112,30 +112,36 @@ test("exact pending tool cancellation enforces tenant, sender, role, status, and
   }
 });
 
-test("reject_order requires a meaningful reason in schema and executor", async () => {
+test("reject_order makes model reason optional but still requires trusted staff wording", async () => {
   assert.equal(
     toolRegistry.reject_order.schema.safeParse({ orderId }).success,
-    false
+    true
   );
   assert.equal(
     toolRegistry.reject_order.schema.safeParse({ orderId, reason: "  " }).success,
     false
   );
 
-  const result = await executeAgentTool("reject_order", { orderId }, context);
-  assert.equal(result.success, false);
-  assert.equal(result.code, "ORDER_REJECTION_REASON_REQUIRED");
-  assert.match(result.message, /reason/i);
+  const originalFindOne = Order.findOne;
+  Order.findOne = async () => makeOrder();
+  try {
+    const result = await executeAgentTool("reject_order", { orderId }, context);
+    assert.equal(result.success, false);
+    assert.equal(result.code, "ORDER_REJECTION_REASON_REQUIRED");
+    assert.match(result.message, /reason/i);
+  } finally {
+    Order.findOne = originalFindOne;
+  }
 });
 
-test("AI tool definitions require rejection reason and restrict staff progress statuses", () => {
+test("AI tool definitions keep rejection reason optional and restrict staff progress statuses", () => {
   const tools = getAgentToolDefinitionsForRole("owner");
   const rejectTool = tools.find(({ function: definition }) => definition.name === "reject_order");
   const statusTool = tools.find(
     ({ function: definition }) => definition.name === "update_order_status"
   );
 
-  assert.equal(rejectTool.function.parameters.required.includes("reason"), true);
+  assert.equal(rejectTool.function.parameters.required.includes("reason"), false);
   assert.deepEqual(
     statusTool.function.parameters.properties.status.enum,
     ["preparing", "ready", "out_for_delivery", "completed"]
@@ -263,7 +269,7 @@ test("reject_order stores exact inline staff text instead of model-authored text
   }
 });
 
-test("pending rejection binds the next staff reason to the exact selected order", async () => {
+test("pending rejection uses the live owner reason when the model omits reason", async () => {
   const originalFindOne = Order.findOne;
   const originalRejectOrder = orderService.rejectRestaurantOrder;
   const originalPendingUpdateMany = PendingAgentAction.updateMany;
@@ -284,10 +290,11 @@ test("pending rejection binds the next staff reason to the exact selected order"
   try {
     const result = await executeAgentTool(
       "reject_order",
-      { orderId, reason: "A model-authored substitute" },
+      { orderReference: "ORD-104" },
       {
         ...context,
-        originalMessage: "We've run out of Chicken Salad.",
+        originalMessage:
+          "We don't deliver to such place. It's too far. We will get a branch there soon.",
         trustedStaffOrderSelection: {
           decision: "reject",
           awaitingReason: true,
@@ -297,7 +304,12 @@ test("pending rejection binds the next staff reason to the exact selected order"
     );
 
     assert.equal(result.success, true);
-    assert.equal(storedReason, "We've run out of Chicken Salad.");
+    assert.equal(
+      storedReason,
+      "We don't deliver to such place. It's too far. We will get a branch there soon."
+    );
+    assert.equal(result.data.orderEvent, "rejected");
+    assert.equal(result.data.notifyCustomer, true);
   } finally {
     Order.findOne = originalFindOne;
     orderService.rejectRestaurantOrder = originalRejectOrder;

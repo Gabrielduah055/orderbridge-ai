@@ -10,6 +10,7 @@ export interface StaffAgentEvalScenario {
   expectedArguments?: Record<string, unknown>;
   expectNoTool?: boolean;
   forbiddenTools?: string[];
+  expectedTextPattern?: RegExp;
   staffState?: StaffOperationalState;
 }
 
@@ -152,6 +153,24 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     forbiddenTools: ["reject_order"]
   },
   {
+    name: "Pending rejection accepts live owner reason without model reason dependency",
+    role: "owner",
+    message:
+      "We don't deliver to such place. It's too far. We will get a branch there soon.",
+    expectedTool: "reject_order",
+    expectedArguments: { orderReference: "ORD-101" },
+    staffState: baseStaffState("owner", {
+      recentReferences: {
+        orderSelection: {
+          pendingActionId: "rejection-action-101",
+          decision: "reject",
+          awaitingReason: true,
+          candidates: [{ ...pendingOrder, position: 1 }]
+        }
+      }
+    })
+  },
+  {
     name: "Complete explicit order",
     role: "manager",
     message: "mark ORD-202 completed",
@@ -175,6 +194,25 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     expectedTool: "confirm_order",
     staffState: baseStaffState("owner", {
       recentReferences: { quotedOrder: pendingOrder }
+    })
+  },
+  {
+    name: "Quoted stale amendment cannot be accepted",
+    role: "owner",
+    message: "accept",
+    expectNoTool: true,
+    forbiddenTools: ["confirm_order", "reject_order"],
+    expectedTextPattern: /updated|latest|review/i,
+    staffState: baseStaffState("owner", {
+      recentReferences: {
+        quotedOrder: {
+          ...pendingOrder,
+          amendmentVersion: 2,
+          quotedAmendmentVersion: 1,
+          quotedVersionStale: true,
+          quotedAction: "order_decision"
+        }
+      }
     })
   },
   {

@@ -78,6 +78,10 @@ import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/
 import { BadRequestError } from "../utils/httpErrors";
 import { normalizeGhanaPhone } from "../utils/phone.util";
 import {
+  findTrustedQuotedOwnerOrderContext,
+  type QuotedOwnerOrderAction
+} from "../services/ownerOrderNotificationContext.service";
+import {
   OrderFeedback,
   orderFeedbackTypes,
   type IOrderFeedbackDocument
@@ -112,12 +116,11 @@ const orderLookupSchema = z
 const rejectOrderSchema = orderLookupSchema
   .extend({
     reason: z
-      .string({
-        required_error: "A meaningful rejection reason is required."
-      })
+      .string()
       .trim()
       .min(3, "A meaningful rejection reason is required.")
       .max(500, "The rejection reason is too long.")
+      .optional()
   })
   .strict();
 const listOrdersSchema = z
@@ -248,6 +251,12 @@ const amendSubmittedOrderSchema = orderLookupSchema
       });
     }
   });
+const resolveCustomerCancellationRequestSchema = orderLookupSchema
+  .extend({
+    decision: z.enum(["approve", "decline"]),
+    reason: z.string().trim().min(3).max(500).optional()
+  })
+  .strict();
 const respondToOrderCheckInSchema = z
   .object({
     outcome: z.enum(orderCheckInOutcomes),
@@ -514,7 +523,8 @@ const findMenuItemForRestaurant = async (
 
 const findOrderForRestaurant = async (
   context: ToolExecutionContext,
-  args: z.infer<typeof orderLookupSchema>
+  args: z.infer<typeof orderLookupSchema>,
+  expectedQuotedAction?: QuotedOwnerOrderAction
 ): Promise<IOrderDocument | ToolResult> => {
   const reference = args.orderId ?? args.orderReference;
 
@@ -563,17 +573,40 @@ const findOrderForRestaurant = async (
     };
   }
 
-  if (isStaff && !explicitReference && context.quotedMessageId) {
-    const quotedOrder = await Order.findOne({
-      restaurantId: context.restaurantId,
-      ownerNotificationProviderMessageId: context.quotedMessageId
-    });
+  if (isStaff && context.quotedMessageId) {
+    const quotedContext = await findTrustedQuotedOwnerOrderContext(
+      context.restaurantId,
+      context.quotedMessageId
+    );
 
-    if (quotedOrder && String(quotedOrder._id) !== String(order._id)) {
+    if (
+      quotedContext &&
+      String(quotedContext.order._id) !== String(order._id)
+    ) {
       return {
         success: false,
         code: "ORDER_REFERENCE_MISMATCH",
         message: "The requested order does not match the quoted order."
+      };
+    }
+
+    if (
+      quotedContext &&
+      expectedQuotedAction &&
+      quotedContext.action !== expectedQuotedAction
+    ) {
+      return {
+        success: false,
+        code: "QUOTED_ORDER_ACTION_MISMATCH",
+        message: "That quoted message is for a different order action."
+      };
+    }
+
+    if (quotedContext?.stale) {
+      return {
+        success: false,
+        code: "ORDER_NOTIFICATION_VERSION_STALE",
+        message: `That order has been updated since this message. Please review the latest ${order.orderNumber ?? "order"} update before accepting or rejecting it.`
       };
     }
   }
@@ -644,7 +677,7 @@ const getTrustedStaffRejectionReason = (
     return savedReason;
   }
 
-  if (!selection.awaitingReason) {
+  if (!selection.awaitingReason || selection.candidates.length !== 1) {
     return undefined;
   }
 
@@ -660,6 +693,102 @@ const getTrustedStaffRejectionReason = (
   }
 
   return orderService.getTrustedRestaurantRejectionReason(currentStaffText);
+};
+
+const hasExplicitSubmittedOrderRemovalIntent = (message?: string): boolean => {
+  const normalized = normalizeComparableText(message ?? "");
+  return (
+    /\b(remove|delete)\b/.test(normalized) ||
+    /\btake\b.+\boff\b/.test(normalized) ||
+    /\b(?:do not|don't|dont) want\b.+\b(?:anymore|again)\b/.test(normalized)
+  );
+};
+
+const resolveTrustedSubmittedOrderQuantity = (
+  modelQuantity: number,
+  message: string | undefined,
+  currentQuantity?: number
+): number | null => {
+  const trustedMessage = (message ?? "")
+    .replace(/\bORD-[A-Za-z0-9-]+\b/gi, " ")
+    .replace(/\b[a-f0-9]{24}\b/gi, " ");
+  const directlyGrounded = resolveTrustedQuantity(modelQuantity, trustedMessage);
+  if (directlyGrounded) {
+    return directlyGrounded;
+  }
+
+  const normalized = normalizeComparableText(trustedMessage);
+  const targetMatch = normalized.match(
+    /\bfrom\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+to\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/
+  );
+  if (targetMatch) {
+    const target = parseExplicitQuantity(targetMatch[1]);
+    return target === modelQuantity ? target : null;
+  }
+
+  const addMoreMatch = normalized.match(
+    /\badd\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+more\b/
+  );
+  if (addMoreMatch && currentQuantity) {
+    const increment = parseExplicitQuantity(addMoreMatch[1]);
+    const finalQuantity = increment ? currentQuantity + increment : null;
+    return finalQuantity === modelQuantity ? finalQuantity : null;
+  }
+
+  return null;
+};
+
+const messageGroundsItemName = (
+  message: string | undefined,
+  itemName: string
+): boolean => {
+  const normalizedMessage = normalizeComparableText(message ?? "");
+  const normalizedItem = normalizeComparableText(itemName);
+  if (!normalizedMessage || !normalizedItem) {
+    return false;
+  }
+
+  if (
+    normalizedMessage.includes(normalizedItem) ||
+    normalizedItem.includes(normalizedMessage)
+  ) {
+    return true;
+  }
+
+  return normalizedItem
+    .split(" ")
+    .filter((token) => token.length >= 4)
+    .some((token) => new RegExp(`\\b${token}\\b`, "i").test(normalizedMessage));
+};
+
+const getTrustedCancellationResolutionReason = (
+  message?: string
+): string | undefined => {
+  const normalized = message?.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return undefined;
+  }
+
+  const candidate =
+    normalized.match(/\bbecause\s+(.+)$/i)?.[1] ??
+    normalized.match(/^(?:approve|decline|deny|reject)\b.+?[,;:\-]\s*(.+)$/i)?.[1];
+  return orderService.getTrustedRestaurantRejectionReason(candidate);
+};
+
+const getExpectedQuotedOrderAmendmentVersion = async (
+  context: ToolExecutionContext
+): Promise<number | undefined> => {
+  if (!context.quotedMessageId) {
+    return undefined;
+  }
+
+  const quotedContext = await findTrustedQuotedOwnerOrderContext(
+    context.restaurantId,
+    context.quotedMessageId
+  );
+  return quotedContext?.action === "order_decision"
+    ? quotedContext.expectedAmendmentVersion
+    : undefined;
 };
 
 const completeMatchingOwnerOrderSelection = async (
@@ -2245,7 +2374,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.confirm_order,
     schema: orderLookupSchema,
     handler: async (args, context) => {
-      const order = await findOrderForRestaurant(context, args);
+      const order = await findOrderForRestaurant(context, args, "order_decision");
 
       if ("success" in order) {
         return order;
@@ -2253,7 +2382,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       const result = await orderService.confirmRestaurantOrder(
         String(order._id),
-        context.restaurantId
+        context.restaurantId,
+        await getExpectedQuotedOrderAmendmentVersion(context)
       );
       await completeMatchingOwnerOrderSelection(
         context,
@@ -2284,13 +2414,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       parameters: {
         orderReference: "Order number or order ID.",
         reason:
-          "Required owner/manager reason from the current message or trusted pending rejection state. The backend stores the grounded staff text, not model-authored wording."
+          "Optional hint only. The backend uses the owner/manager's actual current message or trusted pending rejection state and never trusts model-authored wording."
       }
     },
     roles: toolPermissions.reject_order,
     schema: rejectOrderSchema,
     handler: async (args, context) => {
-      const order = await findOrderForRestaurant(context, args);
+      const order = await findOrderForRestaurant(context, args, "order_decision");
 
       if ("success" in order) {
         return order;
@@ -2310,7 +2440,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const result = await orderService.rejectRestaurantOrder(
         String(order._id),
         trustedReason,
-        context.restaurantId
+        context.restaurantId,
+        await getExpectedQuotedOrderAmendmentVersion(context)
       );
       await completeMatchingOwnerOrderSelection(
         context,
@@ -2333,6 +2464,60 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  resolve_customer_cancellation_request: {
+    definition: {
+      name: "resolve_customer_cancellation_request",
+      description:
+        "Owner/manager only. Approve or decline a customer's pending cancellation request for an accepted or in-progress order.",
+      parameters: {
+        orderReference: "Order number or order ID.",
+        decision: "approve or decline",
+        reason:
+          "Optional hint only. Any saved explanation is derived from the owner's actual current message."
+      }
+    },
+    roles: toolPermissions.resolve_customer_cancellation_request,
+    schema: resolveCustomerCancellationRequestSchema,
+    handler: async (args, context) => {
+      const order = await findOrderForRestaurant(
+        context,
+        args,
+        "cancellation_request"
+      );
+
+      if ("success" in order) {
+        return order;
+      }
+
+      const result = await orderService.resolveCustomerCancellationRequest(
+        context.restaurantId,
+        String(order._id),
+        {
+          decision: args.decision,
+          resolvedByPhone: context.sender.normalizedPhone,
+          reason: getTrustedCancellationResolutionReason(
+            context.originalMessage
+          )
+        }
+      );
+
+      return {
+        success: true,
+        message:
+          result.decision === "approved"
+            ? `Cancellation approved for ${order.orderNumber ?? String(order._id)}. The customer will be notified.`
+            : `Cancellation declined for ${order.orderNumber ?? String(order._id)}. The customer will be notified.`,
+        data: {
+          order: safeOrderView(result.order, true),
+          orderEvent: "cancellation_resolved",
+          notifyCustomer: true,
+          cancellationDecision: result.decision,
+          receiptRequired: false,
+          idempotent: result.idempotent
+        }
+      };
+    }
+  },
   update_order_status: {
     definition: {
       name: "update_order_status",
@@ -2349,7 +2534,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       })
       .strict(),
     handler: async (args, context) => {
-      const order = await findOrderForRestaurant(context, args);
+      const order = await findOrderForRestaurant(context, args, "order_decision");
 
       if ("success" in order) {
         return order;
@@ -3049,7 +3234,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "amend_submitted_order",
       description:
-        "Customer-only. Update an already-submitted order while it is still awaiting restaurant confirmation. Supports one item quantity/addition/removal and/or pickup, delivery, or address changes. The owner is notified of the revised order.",
+        "Customer-only. Update an already-submitted order while it is still awaiting restaurant confirmation. Every changed value must be explicitly grounded in the customer's current message. The owner is notified of the revised order.",
       parameters: {
         orderReference: "Order number or order ID.",
         itemName: "Optional menu item to add, remove, or change.",
@@ -3080,8 +3265,34 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       let menuItemId: string | undefined;
+      let trustedNewQuantity = args.newQuantity;
 
-      if (args.itemName && typeof args.newQuantity === "number" && args.newQuantity > 0) {
+      if (args.orderType) {
+        const orderTypePattern =
+          args.orderType === "pickup" ? /\b(?:pickup|takeaway)\b/i : /\bdelivery\b/i;
+        if (!orderTypePattern.test(context.originalMessage ?? "")) {
+          return {
+            success: false,
+            code: "ORDER_CHANGE_NOT_GROUNDED",
+            message: "Please clearly say whether you want pickup or delivery."
+          };
+        }
+      }
+
+      if (
+        args.deliveryAddress &&
+        !normalizeComparableText(context.originalMessage ?? "").includes(
+          normalizeComparableText(args.deliveryAddress)
+        )
+      ) {
+        return {
+          success: false,
+          code: "ORDER_CHANGE_NOT_GROUNDED",
+          message: "Please provide the delivery address in your message."
+        };
+      }
+
+      if (args.itemName && typeof args.newQuantity === "number") {
         const normalizedItemName = normalizeComparableText(args.itemName);
         const existingMatches = order.items.filter((item) => {
           const savedName = normalizeComparableText(item.name);
@@ -3091,7 +3302,44 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           );
         });
 
-        if (existingMatches.length === 0) {
+        if (
+          !messageGroundsItemName(context.originalMessage, args.itemName) &&
+          order.items.length !== 1
+        ) {
+          return {
+            success: false,
+            code: "ORDER_ITEM_NOT_GROUNDED",
+            message: "Please name the item you want to change."
+          };
+        }
+
+        if (args.newQuantity === 0) {
+          if (!hasExplicitSubmittedOrderRemovalIntent(context.originalMessage)) {
+            return {
+              success: false,
+              code: "ORDER_ITEM_REMOVAL_NOT_GROUNDED",
+              message: "Please clearly say that you want the item removed."
+            };
+          }
+        } else {
+          trustedNewQuantity = resolveTrustedSubmittedOrderQuantity(
+            args.newQuantity,
+            context.originalMessage,
+            existingMatches.length === 1
+              ? existingMatches[0].quantity
+              : undefined
+          ) ?? undefined;
+
+          if (!trustedNewQuantity) {
+            return {
+              success: false,
+              code: "ORDER_QUANTITY_REQUIRED",
+              message: "How many would you like?"
+            };
+          }
+        }
+
+        if (args.newQuantity > 0 && existingMatches.length === 0) {
           const menuMatch = await findMenuItemMatch(
             context.restaurantId,
             args.itemName
@@ -3133,7 +3381,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         {
           itemName: args.itemName,
           menuItemId,
-          newQuantity: args.newQuantity,
+          newQuantity: trustedNewQuantity,
           orderType: args.orderType,
           deliveryAddress: args.deliveryAddress
         }
@@ -3155,7 +3403,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
   cancel_order: {
     definition: {
       name: "cancel_order",
-      description: "Cancel an eligible order.",
+      description:
+        "Cancel a pre-acceptance order immediately, or create a restaurant cancellation request when a customer asks after acceptance.",
       parameters: { orderReference: "Order number or order ID." }
     },
     roles: toolPermissions.cancel_order,
@@ -3179,7 +3428,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         };
       }
 
-      if (["completed", "cancelled", "rejected", "expired"].includes(order.status)) {
+      if (
+        context.sender.role !== "customer" &&
+        ["completed", "cancelled", "rejected", "expired"].includes(order.status)
+      ) {
         return {
           success: false,
           code: "ORDER_NOT_CANCELLABLE",
@@ -3195,14 +3447,31 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             context.sender.normalizedPhone
           )
         : await orderService.updateOrderStatus(String(order._id), "cancelled");
+      const cancellationRequestStatus =
+        customerCancelled && "mode" in result && result.mode === "requested"
+          ? result.order.customerCancellationRequestStatus
+          : undefined;
 
       return {
         success: true,
-        message: "Order cancelled successfully.",
+        message:
+          cancellationRequestStatus === "approved"
+            ? `The restaurant already approved the cancellation request for ${order.orderNumber ?? String(order._id)}. The order is cancelled.`
+            : cancellationRequestStatus === "declined"
+              ? `The restaurant already declined the cancellation request for ${order.orderNumber ?? String(order._id)}.`
+              : customerCancelled && "mode" in result && result.mode === "requested"
+                ? `I've sent a cancellation request for ${order.orderNumber ?? String(order._id)} to ${context.restaurant.name}. The restaurant will confirm whether it can still be cancelled.`
+            : "Order cancelled successfully.",
         data: {
           order: safeOrderView(result.order, context.sender.role !== "customer"),
-          orderEvent: "cancelled",
-          notifyOwner: customerCancelled,
+          orderEvent:
+            customerCancelled && "mode" in result && result.mode === "requested"
+              ? "cancellation_requested"
+              : "cancelled",
+          notifyOwner:
+            customerCancelled &&
+            cancellationRequestStatus !== "approved" &&
+            cancellationRequestStatus !== "declined",
           receiptRequired: false
         }
       };

@@ -38,6 +38,7 @@ export const toolPermissions = {
   remove_menu_item_image: ["owner", "manager"],
   confirm_order: ["owner", "manager"],
   reject_order: ["owner", "manager"],
+  resolve_customer_cancellation_request: ["owner", "manager"],
   update_order_status: ["owner", "manager"],
   create_order: [],
   cancel_order: ["owner", "manager", "customer"],

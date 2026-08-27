@@ -36,7 +36,9 @@ const makeRestaurant = () => ({
 const mockedDecisionFor = (scenario) => {
   if (scenario.expectNoTool) {
     return {
-      text: "I need a little more detail before I can safely do that.",
+      text: scenario.expectedTextPattern
+        ? "That order was updated. Please review the latest order message."
+        : "I need a little more detail before I can safely do that.",
       toolCalls: []
     };
   }

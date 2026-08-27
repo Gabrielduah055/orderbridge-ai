@@ -3,6 +3,7 @@ import { Order, type IOrderDocument } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import type { SenderRole } from "../types/agent.types";
 import * as orderService from "./order.service";
+import { findTrustedQuotedOwnerOrderContext } from "./ownerOrderNotificationContext.service";
 
 export type OwnerOrderDecision = "accept" | "reject";
 
@@ -320,11 +321,21 @@ const applyDecision = async (
   restaurantId: string,
   orderId: string,
   decision: OwnerOrderDecision,
-  reason?: string
+  reason?: string,
+  expectedAmendmentVersion?: number
 ): Promise<Awaited<ReturnType<typeof orderService.confirmRestaurantOrder>>> => {
   return decision === "accept"
-    ? orderService.confirmRestaurantOrder(orderId, restaurantId)
-    : orderService.rejectRestaurantOrder(orderId, reason, restaurantId);
+    ? orderService.confirmRestaurantOrder(
+        orderId,
+        restaurantId,
+        expectedAmendmentVersion
+      )
+    : orderService.rejectRestaurantOrder(
+        orderId,
+        reason,
+        restaurantId,
+        expectedAmendmentVersion
+      );
 };
 
 const formatDecisionDoneMessage = (
@@ -355,13 +366,23 @@ export const resolveQuotedOwnerOrderDecision = async (
     return { handled: false, success: false, message: "" };
   }
 
-  const order = await Order.findOne({
+  const quotedContext = await findTrustedQuotedOwnerOrderContext(
     restaurantId,
-    ownerNotificationProviderMessageId: quotedMessageId
-  });
+    quotedMessageId
+  );
 
-  if (!order) {
+  if (!quotedContext || quotedContext.action !== "order_decision") {
     return { handled: false, success: false, message: "" };
+  }
+
+  const order = quotedContext.order;
+
+  if (quotedContext.stale) {
+    return {
+      handled: true,
+      success: false,
+      message: `That order has been updated since this message. Please review the latest ${order.orderNumber ?? "order"} update before accepting or rejecting it.`
+    };
   }
 
   if (decision === "reject" && !reason?.trim()) {
@@ -383,7 +404,13 @@ export const resolveQuotedOwnerOrderDecision = async (
     };
   }
 
-  const result = await applyDecision(restaurantId, String(order._id), decision, reason);
+  const result = await applyDecision(
+    restaurantId,
+    String(order._id),
+    decision,
+    reason,
+    quotedContext.expectedAmendmentVersion
+  );
 
   return {
     handled: true,
