@@ -65,7 +65,8 @@ const customerMutations = [
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "amend_submitted_order"
 ];
 
 const draft = (

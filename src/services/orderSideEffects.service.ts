@@ -107,6 +107,60 @@ export const buildOwnerNewOrderNotification = (
   ].join("\n");
 };
 
+export const buildOwnerCustomerCancellationNotification = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): string =>
+  [
+    "Customer cancelled an order",
+    "",
+    `Restaurant: ${restaurant.name}`,
+    `Order: ${getOrderReference(order)}`,
+    `Customer: ${order.customerName || "Customer"}`,
+    `Phone: ${order.customerPhone}`,
+    "Status: Cancelled",
+    "",
+    "Please stop preparing or dispatching this order."
+  ].join("\n");
+
+export const buildOwnerOrderAmendedNotification = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): string => {
+  const items = order.items
+    .map(
+      (item) =>
+        `${item.quantity} x ${item.name} - ${formatGhanaCedi(item.totalPrice)}`
+    )
+    .join("\n");
+  const deliveryAddress =
+    order.orderType === "delivery" && order.deliveryAddress
+      ? [`Address: ${order.deliveryAddress}`]
+      : [];
+
+  return [
+    "Customer updated an order awaiting confirmation",
+    "",
+    `Restaurant: ${restaurant.name}`,
+    `Order: ${getOrderReference(order)}`,
+    `Customer: ${order.customerName || "Customer"}`,
+    `Phone: ${order.customerPhone}`,
+    `Type: ${formatTitleCase(order.orderType)}`,
+    ...deliveryAddress,
+    "",
+    "Updated items:",
+    items,
+    "",
+    order.deliveryFeePending
+      ? "Delivery fee: Pending confirmation"
+      : `Delivery fee: ${formatGhanaCedi(order.deliveryFee ?? 0)}`,
+    `Total: ${formatGhanaCedi(order.total)}`,
+    "Status: Awaiting confirmation",
+    "",
+    "Please review the updated order before accepting or rejecting it."
+  ].join("\n");
+};
+
 export const buildCustomerOrderConfirmedMessage = (
   restaurant: IRestaurantDocument,
   order: IOrderDocument,
@@ -174,6 +228,66 @@ export const notifyOwnerOfSubmittedOrder = async (
   return {
     ownerNotification: "queued"
   };
+};
+
+export const notifyOwnerOfCustomerCancellation = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  if (order.ownerCancellationNotifiedAt) {
+    return { ownerNotification: "skipped" };
+  }
+
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: restaurant.ownerPhone,
+    type: "text",
+    text: buildOwnerCustomerCancellationNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `owner-order-cancelled:${String(order._id)}`,
+    metadata: {
+      kind: "owner_order_cancelled_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      recipientType: "owner"
+    }
+  });
+
+  return { ownerNotification: "queued" };
+};
+
+export const notifyOwnerOfCustomerAmendment = async (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument
+): Promise<OrderSideEffectResult> => {
+  const amendmentVersion = order.customerAmendmentVersion ?? 0;
+
+  if (
+    amendmentVersion < 1 ||
+    (order.ownerAmendmentNotifiedVersion ?? 0) >= amendmentVersion
+  ) {
+    return { ownerNotification: "skipped" };
+  }
+
+  await enqueueWasenderMessage({
+    restaurantId: String(restaurant._id),
+    sessionId: restaurant.wasenderSessionId,
+    to: restaurant.ownerPhone,
+    type: "text",
+    text: buildOwnerOrderAmendedNotification(restaurant, order),
+    apiKey: restaurant.wasenderApiToken,
+    idempotencyKey: `owner-order-amended:${String(order._id)}:${amendmentVersion}`,
+    metadata: {
+      kind: "owner_order_amended_notification",
+      orderId: String(order._id),
+      orderNumber: order.orderNumber,
+      amendmentVersion,
+      recipientType: "owner"
+    }
+  });
+
+  return { ownerNotification: "queued" };
 };
 
 export const notifyCustomerOfRejectedOrder = async (

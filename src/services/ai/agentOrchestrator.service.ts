@@ -112,7 +112,8 @@ const customerOrderWorkflowMutationTools = new Set([
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "amend_submitted_order"
 ]);
 
 type CustomerWorkflowMutation = "active_order" | "order_feedback";
@@ -181,9 +182,12 @@ const getTrustedOrderReferenceGuardResult = (
       };
     }
 
-    const allowedOrderIds = selection.candidates.map((candidate) => candidate.id);
+    const allowedOrderReferences = selection.candidates.flatMap((candidate) => [
+      candidate.id,
+      ...(candidate.orderNumber ? [candidate.orderNumber] : [])
+    ]);
 
-    if (!referencesMatchAllowedValues(requestedReferences, allowedOrderIds)) {
+    if (!referencesMatchAllowedValues(requestedReferences, allowedOrderReferences)) {
       return {
         success: false,
         code: "ORDER_REFERENCE_MISMATCH",

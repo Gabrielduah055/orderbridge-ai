@@ -80,6 +80,15 @@ export interface IOrder {
   ownerNotificationProviderMessageId?: string;
   ownerNotificationFailedAt?: Date;
   ownerNotificationFailureReason?: string;
+  customerCancelledAt?: Date;
+  ownerCancellationNotifiedAt?: Date;
+  ownerCancellationNotificationFailedAt?: Date;
+  ownerCancellationNotificationFailureReason?: string;
+  customerAmendedAt?: Date;
+  customerAmendmentVersion: number;
+  ownerAmendmentNotifiedVersion: number;
+  ownerAmendmentNotificationFailedAt?: Date;
+  ownerAmendmentNotificationFailureReason?: string;
   restaurantConfirmedAt?: Date;
   restaurantRejectedAt?: Date;
   restaurantRejectionReason?: string;
@@ -270,6 +279,41 @@ const orderSchema = new Schema<IOrderDocument>(
       type: Date
     },
     ownerNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerCancelledAt: {
+      type: Date
+    },
+    ownerCancellationNotifiedAt: {
+      type: Date
+    },
+    ownerCancellationNotificationFailedAt: {
+      type: Date
+    },
+    ownerCancellationNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerAmendedAt: {
+      type: Date
+    },
+    customerAmendmentVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      required: true
+    },
+    ownerAmendmentNotifiedVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      required: true
+    },
+    ownerAmendmentNotificationFailedAt: {
+      type: Date
+    },
+    ownerAmendmentNotificationFailureReason: {
       type: String,
       trim: true
     },

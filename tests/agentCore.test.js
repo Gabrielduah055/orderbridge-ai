@@ -1668,6 +1668,51 @@ test("OpenRouter awaiting-reason workflow still permits exact reject_order execu
   assert.equal(result.executedTools[0].resultOrderId, expectedOrder.id);
 });
 
+test("OpenRouter awaiting-reason workflow accepts the selected visible order number", async () => {
+  const expectedOrderId = "64b000000000000000000104";
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: fakeRestaurant,
+      sender: fakeOwner,
+      message: "We do not deliver to that location",
+      staffState: makeAwaitingRejectionStaffState([expectedOrderId])
+    },
+    {
+      provider: makeSingleToolProvider(
+        "reject_order",
+        {
+          orderReference: "ORD-104",
+          reason: "We do not deliver to that location"
+        },
+        "Done, rejected."
+      ),
+      getHistory: getEmptyHistory,
+      saveMessage: saveNoop,
+      buildSystemPrompt: buildTestPrompt,
+      executeTool: async () => {
+        executionCount += 1;
+        return {
+          success: true,
+          message: "Order rejected.",
+          data: {
+            order: {
+              id: expectedOrderId,
+              orderNumber: "ORD-104",
+              status: "rejected"
+            }
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 1);
+  assert.equal(result.success, true);
+  assert.equal(result.executedTools[0].resultOrderId, expectedOrderId);
+  assert.equal(result.executedTools[0].resultOrderNumber, "ORD-104");
+});
+
 test("OpenRouter awaiting-reason workflow keeps read-only order tools available", async () => {
   const expectedOrderId = "64b000000000000000000104";
   let executionCount = 0;
@@ -2679,6 +2724,7 @@ test("OpenRouter tool definitions are role filtered", () => {
   assert.equal(customerTools.includes("get_order_draft"), true);
   assert.equal(customerTools.includes("confirm_order_draft"), true);
   assert.equal(customerTools.includes("cancel_order_draft"), true);
+  assert.equal(customerTools.includes("amend_submitted_order"), true);
   assert.equal(customerTools.includes("get_latest_customer_order"), true);
   assert.equal(customerTools.includes("respond_to_order_check_in"), true);
   assert.equal(customerTools.includes("get_customer_recommendations"), true);

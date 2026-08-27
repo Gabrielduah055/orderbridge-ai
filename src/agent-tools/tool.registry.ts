@@ -220,6 +220,34 @@ const updateOrderDraftSchema = z
     deliveryAddress: z.string().trim().min(1).optional()
   })
   .strict();
+const amendSubmittedOrderSchema = orderLookupSchema
+  .extend({
+    itemName: z.string().trim().min(1).optional(),
+    newQuantity: z.number().int().min(0).optional(),
+    orderType: z.enum(["pickup", "delivery"]).optional(),
+    deliveryAddress: z.string().trim().min(1).optional()
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (
+      args.newQuantity === undefined &&
+      !args.orderType &&
+      !args.deliveryAddress
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide at least one order change."
+      });
+    }
+
+    if (args.newQuantity !== undefined && !args.itemName) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["itemName"],
+        message: "Item name is required when changing an item quantity."
+      });
+    }
+  });
 const respondToOrderCheckInSchema = z
   .object({
     outcome: z.enum(orderCheckInOutcomes),
@@ -3017,6 +3045,113 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       };
     }
   },
+  amend_submitted_order: {
+    definition: {
+      name: "amend_submitted_order",
+      description:
+        "Customer-only. Update an already-submitted order while it is still awaiting restaurant confirmation. Supports one item quantity/addition/removal and/or pickup, delivery, or address changes. The owner is notified of the revised order.",
+      parameters: {
+        orderReference: "Order number or order ID.",
+        itemName: "Optional menu item to add, remove, or change.",
+        newQuantity:
+          "Optional exact new quantity. Use 0 to remove the item; a positive quantity adds or replaces it.",
+        orderType: "Optional pickup or delivery.",
+        deliveryAddress: "Optional new delivery address."
+      }
+    },
+    roles: toolPermissions.amend_submitted_order,
+    schema: amendSubmittedOrderSchema,
+    handler: async (args, context) => {
+      const order = await findOrderForRestaurant(context, args);
+
+      if ("success" in order) {
+        return order;
+      }
+
+      if (
+        normalizeGhanaPhone(order.customerPhone) !==
+        context.sender.normalizedPhone
+      ) {
+        return {
+          success: false,
+          code: "ORDER_FORBIDDEN",
+          message: "That order is not available for this customer."
+        };
+      }
+
+      let menuItemId: string | undefined;
+
+      if (args.itemName && typeof args.newQuantity === "number" && args.newQuantity > 0) {
+        const normalizedItemName = normalizeComparableText(args.itemName);
+        const existingMatches = order.items.filter((item) => {
+          const savedName = normalizeComparableText(item.name);
+          return (
+            savedName.includes(normalizedItemName) ||
+            normalizedItemName.includes(savedName)
+          );
+        });
+
+        if (existingMatches.length === 0) {
+          const menuMatch = await findMenuItemMatch(
+            context.restaurantId,
+            args.itemName
+          );
+
+          if (menuMatch.status === "none") {
+            return {
+              success: false,
+              code: "MENU_ITEM_NOT_FOUND",
+              message: menuMatch.message
+            };
+          }
+
+          if (menuMatch.status === "multiple") {
+            return {
+              success: false,
+              code: "MULTIPLE_MENU_ITEMS_FOUND",
+              message: menuMatch.message,
+              data: {
+                candidates: menuMatch.matches.map((item) => ({
+                  name: getMenuItemDisplayName(
+                    item,
+                    getMenuItemCategoryName(item)
+                  ),
+                  price: item.price
+                }))
+              }
+            };
+          }
+
+          menuItemId = String(menuMatch.item._id);
+        }
+      }
+
+      const result = await orderService.amendCustomerSubmittedOrder(
+        context.restaurantId,
+        String(order._id),
+        context.sender.normalizedPhone,
+        {
+          itemName: args.itemName,
+          menuItemId,
+          newQuantity: args.newQuantity,
+          orderType: args.orderType,
+          deliveryAddress: args.deliveryAddress
+        }
+      );
+
+      return {
+        success: true,
+        message: `Order ${result.order.orderNumber ?? String(result.order._id)} updated successfully. The restaurant owner will be notified.`,
+        data: {
+          order: safeOrderView(result.order),
+          orderEvent: "amended",
+          notifyOwner: true,
+          amendmentVersion: result.amendmentVersion,
+          receiptRequired: false
+        }
+      };
+    }
+  },
   cancel_order: {
     definition: {
       name: "cancel_order",
@@ -3044,7 +3179,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         };
       }
 
-      if (["completed", "cancelled"].includes(order.status)) {
+      if (["completed", "cancelled", "rejected", "expired"].includes(order.status)) {
         return {
           success: false,
           code: "ORDER_NOT_CANCELLABLE",
@@ -3052,13 +3187,23 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         };
       }
 
-      const result = await orderService.updateOrderStatus(String(order._id), "cancelled");
+      const customerCancelled = context.sender.role === "customer";
+      const result = customerCancelled
+        ? await orderService.cancelCustomerOrder(
+            context.restaurantId,
+            String(order._id),
+            context.sender.normalizedPhone
+          )
+        : await orderService.updateOrderStatus(String(order._id), "cancelled");
 
       return {
         success: true,
         message: "Order cancelled successfully.",
         data: {
-          order: safeOrderView(result.order, context.sender.role !== "customer")
+          order: safeOrderView(result.order, context.sender.role !== "customer"),
+          orderEvent: "cancelled",
+          notifyOwner: customerCancelled,
+          receiptRequired: false
         }
       };
     }

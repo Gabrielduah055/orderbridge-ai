@@ -80,6 +80,7 @@ const customerMutationToolNames = new Set([
   "confirm_order_draft",
   "cancel_order_draft",
   "cancel_order",
+  "amend_submitted_order",
   "respond_to_order_check_in"
 ]);
 

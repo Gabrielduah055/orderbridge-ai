@@ -62,6 +62,8 @@ const getErrorMessage = (result: WasenderSendResult): string =>
 
 const transactionalKinds = new Set([
   "owner_order_notification",
+  "owner_order_cancelled_notification",
+  "owner_order_amended_notification",
   "owner_action_reminder",
   "staff_reminder",
   "owner_summary",
@@ -624,6 +626,54 @@ export const updateOrderSideEffectAfterSend = async (
             $set: {
               ownerNotificationFailedAt: now,
               ownerNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
+  if (kind === "owner_order_cancelled_notification") {
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $set: { ownerCancellationNotifiedAt: now },
+            $unset: {
+              ownerCancellationNotificationFailedAt: "",
+              ownerCancellationNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              ownerCancellationNotificationFailedAt: now,
+              ownerCancellationNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
+  if (kind === "owner_order_amended_notification") {
+    const amendmentVersion = Number(message.metadata?.amendmentVersion);
+
+    if (!Number.isInteger(amendmentVersion) || amendmentVersion < 1) {
+      return;
+    }
+
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $max: { ownerAmendmentNotifiedVersion: amendmentVersion },
+            $unset: {
+              ownerAmendmentNotificationFailedAt: "",
+              ownerAmendmentNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              ownerAmendmentNotificationFailedAt: now,
+              ownerAmendmentNotificationFailureReason: failureReason
             }
           }
     );

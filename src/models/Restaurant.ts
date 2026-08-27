@@ -24,6 +24,7 @@ export interface IRestaurant {
   plan: RestaurantPlan;
   status: RestaurantStatus;
   subscriptionRenewalDate?: Date;
+  subscriptionLastPaidAt?: Date;
   subscriptionAmount?: number;
   billingStatus?: BillingStatus;
   wasenderSessionId: string;
@@ -146,6 +147,9 @@ const restaurantSchema = new Schema<IRestaurantDocument>(
       default: "trial"
     },
     subscriptionRenewalDate: {
+      type: Date
+    },
+    subscriptionLastPaidAt: {
       type: Date
     },
     subscriptionAmount: {
@@ -347,5 +351,6 @@ restaurantSchema.index({ status: 1, ownerDailySummaryEnabled: 1 });
 restaurantSchema.index({ status: 1, ownerWeeklySummaryEnabled: 1 });
 restaurantSchema.index({ status: 1, ownerPendingActionReminderEnabled: 1 });
 restaurantSchema.index({ status: 1, orderCheckInEnabled: 1 });
+restaurantSchema.index({ billingStatus: 1, subscriptionRenewalDate: 1 });
 
 export const Restaurant = model<IRestaurantDocument>("Restaurant", restaurantSchema);

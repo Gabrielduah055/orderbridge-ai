@@ -41,6 +41,7 @@ export const toolPermissions = {
   update_order_status: ["owner", "manager"],
   create_order: [],
   cancel_order: ["owner", "manager", "customer"],
+  amend_submitted_order: ["customer"],
   get_delivery_information: ["owner", "manager", "customer"],
   start_order: ["customer"],
   add_order_item_by_name: ["customer"],

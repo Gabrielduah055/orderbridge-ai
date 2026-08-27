@@ -72,7 +72,7 @@ export interface RestaurantAgentResponse {
   message: string;
   data?: {
     order?: IOrderDocument;
-    orderEvent?: "submitted" | "confirmed" | "rejected";
+    orderEvent?: "submitted" | "confirmed" | "rejected" | "cancelled" | "amended";
     notifyOwner?: boolean;
     notifyCustomer?: boolean;
     receiptRequired?: boolean;

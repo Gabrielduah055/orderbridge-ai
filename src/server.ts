@@ -8,6 +8,7 @@ import { startCustomerCampaignScheduler } from "./services/customerCampaignSched
 import { startOrderFeedbackScheduler } from "./services/orderFeedbackScheduler.service";
 import { startWasenderQueueWorker } from "./services/wasenderQueue.service";
 import { logScheduledMessagingCredentialDiagnostics } from "./services/schedulerDiagnostics.service";
+import { startSubscriptionBillingScheduler } from "./services/subscriptionBilling.service";
 
 const startServer = async (): Promise<void> => {
   await connectDb();
@@ -26,6 +27,7 @@ const startServer = async (): Promise<void> => {
   startOwnerPendingActionReminderScheduler();
   startCustomerCampaignScheduler();
   startOrderFeedbackScheduler();
+  startSubscriptionBillingScheduler();
 };
 
 void startServer();

@@ -30,6 +30,10 @@ Customers work in a MongoDB-backed draft. When `confirm_order_draft` succeeds, t
 }
 ```
 
+While the submitted order is still `awaiting_restaurant_confirmation` (or legacy `pending`), the same customer can use `amend_submitted_order` to change one item quantity, add or remove an item, switch pickup/delivery, or change the delivery address. The backend recalculates trusted menu prices and delivery fees, increments `customerAmendmentVersion`, returns `orderEvent: "amended"` with `notifyOwner: true`, and queues one idempotent owner notification per amendment version. Once the restaurant accepts, rejects, or begins preparing the order, customer amendments are blocked.
+
+An eligible active order can be cancelled by its customer with `cancel_order`. The backend records `customerCancelledAt`, returns `orderEvent: "cancelled"` with `notifyOwner: true`, and queues an idempotent owner cancellation notification.
+
 Repeated confirmation of the same converted draft returns the existing order.
 
 If the customer names an item without quantity, the draft stores that item as pending and asks for quantity. The item is not added as `1x` unless the customer explicitly supplied a singular quantity such as `one`, `a plate`, or `a pack`.

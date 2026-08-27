@@ -60,7 +60,7 @@ Owner, manager, and customer WhatsApp messages use OpenRouter when `AI_PROVIDER=
 
 Hermes is still available for rollback with `AI_PROVIDER=hermes`. To explicitly keep customers on the legacy deterministic ordering flow while staff use OpenRouter, set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false`. If customer OpenRouter fails, the backend returns a safe failure response unless `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` is explicitly configured. Legacy fallback is never invoked after a successful AI-side customer mutation.
 
-Customer OpenRouter tools are limited to customer-safe operations: reading the restaurant profile, menu, delivery information, the customer's own order details/latest order, and managing that customer's own order draft. Customers cannot update prices, change availability, read revenue, or access another customer's order.
+Customer OpenRouter tools are limited to customer-safe operations: reading the restaurant profile, menu, delivery information, the customer's own order details/latest order, managing that customer's own order draft, cancelling an active order, and amending a submitted order while it is still awaiting restaurant confirmation. Customers cannot update prices, change availability, read revenue, access another customer's order, or edit an order after the restaurant has acted on it. Customer cancellations and submitted-order amendments notify the owner.
 
 ## Order Confirmation Workflow
 

@@ -122,6 +122,12 @@ export const updateRestaurantPlanSchema = z
   })
   .strict();
 
+export const markSubscriptionPaidSchema = z
+  .object({
+    renewalDateOverride: z.coerce.date().optional()
+  })
+  .strict();
+
 const stringArraySchema = z.array(z.string().trim().min(1)).default([]);
 
 export const createMenuCategorySchema = z

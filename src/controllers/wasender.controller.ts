@@ -13,6 +13,8 @@ import { handleRestaurantAgentMessage } from "../services/restaurantAgent.servic
 import {
   notifyCustomerOfConfirmedOrderAndSendReceipt,
   notifyCustomerOfRejectedOrder,
+  notifyOwnerOfCustomerAmendment,
+  notifyOwnerOfCustomerCancellation,
   notifyOwnerOfSubmittedOrder
 } from "../services/orderSideEffects.service";
 import {
@@ -546,6 +548,16 @@ const sendSingleCustomerOrderSideEffect = async (
 
   if (orderEvent === "rejected" && customerResponse.data?.notifyCustomer) {
     await notifyCustomerOfRejectedOrder(restaurant, order);
+    return;
+  }
+
+  if (orderEvent === "cancelled" && customerResponse.data?.notifyOwner) {
+    await notifyOwnerOfCustomerCancellation(restaurant, order);
+    return;
+  }
+
+  if (orderEvent === "amended" && customerResponse.data?.notifyOwner) {
+    await notifyOwnerOfCustomerAmendment(restaurant, order);
   }
 };
 

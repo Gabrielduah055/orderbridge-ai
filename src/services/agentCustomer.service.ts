@@ -25,7 +25,7 @@ interface CustomerAgentResponse {
     cart?: ICustomerSessionDocument["cartItems"];
     menu?: unknown;
     order?: IOrderDocument;
-    orderEvent?: "submitted" | "confirmed" | "rejected";
+    orderEvent?: "submitted" | "confirmed" | "rejected" | "cancelled" | "amended";
     notifyOwner?: boolean;
     notifyCustomer?: boolean;
     receiptRequired?: boolean;
