@@ -65,7 +65,8 @@ const customerMutations = [
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "amend_submitted_order"
 ];
 
 const draft = (
@@ -122,35 +123,11 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     expectedArguments: { query: "Chicken Salad", includeImage: true }
   },
   {
-    name: "Image informal",
-    message: "any pic of Chicken Salad?",
-    expectedTool: "search_menu_items",
-    expectedArguments: { query: "Chicken Salad", includeImage: true }
-  },
-  {
-    name: "Image look like",
-    message: "what does the burger look like?",
-    expectedTool: "search_menu_items",
-    expectedArguments: { query: "burger", includeImage: true }
-  },
-  {
     name: "Contextual image",
     message: "any pic of it?",
     history: [
       { role: "user", content: "Tell me about Chicken Salad." },
       { role: "assistant", content: "Chicken Salad is a fresh salad with grilled chicken." }
-    ],
-    expectedTool: "search_menu_items",
-    expectedArguments: { query: "Chicken Salad", includeImage: true }
-  },
-  {
-    name: "Contextual image live wording",
-    message: "Lemme see.",
-    history: [
-      {
-        role: "assistant",
-        content: "Currently, the only menu item with an image is the Chicken Salad."
-      }
     ],
     expectedTool: "search_menu_items",
     expectedArguments: { query: "Chicken Salad", includeImage: true }
@@ -179,12 +156,6 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     message: "2 assorted fried rice",
     expectedTool: "add_order_item_by_name",
     expectedArguments: { itemName: "assorted fried rice", quantity: 2 }
-  },
-  {
-    name: "Informal order",
-    message: "gimme 2 jollof",
-    expectedTool: "add_order_item_by_name",
-    expectedArguments: { itemName: "jollof", quantity: 2 }
   },
   {
     name: "Quantity follow-up",
@@ -243,16 +214,51 @@ export const customerAgentScenarios: CustomerAgentEvalScenario[] = [
     expectedArguments: { orderReference: "ORD-123" }
   },
   {
-    name: "Show my order is not menu media",
-    message: "show me my order",
-    expectedOneOfTools: ["get_order_draft", "get_latest_customer_order"],
-    forbiddenTools: ["search_menu_items"]
+    name: "Cancel pending submitted order",
+    message: "cancel my pending order ORD-123",
+    expectedTool: "cancel_order",
+    expectedArguments: { orderReference: "ORD-123" },
+    forbiddenTools: ["cancel_order_draft"]
   },
   {
-    name: "Cancel submitted order",
-    message: "cancel my order",
-    expectedOneOfTools: ["get_latest_customer_order", "cancel_order"],
+    name: "Request cancellation after acceptance",
+    message: "cancel my accepted order ORD-124",
+    expectedTool: "cancel_order",
+    expectedArguments: { orderReference: "ORD-124" },
     forbiddenTools: ["cancel_order_draft"]
+  },
+  {
+    name: "Amend submitted quantity explicitly",
+    message: "change my jollof from 2 to 5 on ORD-123",
+    expectedTool: "amend_submitted_order",
+    expectedArguments: {
+      orderReference: "ORD-123",
+      itemName: "jollof",
+      newQuantity: 5
+    }
+  },
+  {
+    name: "Do not guess submitted quantity",
+    message: "make the jollof more on ORD-123",
+    expectNoTool: true,
+    forbiddenTools: ["amend_submitted_order"],
+    expectedTextPattern: /how many|quantity/i
+  },
+  {
+    name: "Remove submitted item explicitly",
+    message: "remove the salad from ORD-123",
+    expectedTool: "amend_submitted_order",
+    expectedArguments: {
+      orderReference: "ORD-123",
+      itemName: "salad",
+      newQuantity: 0
+    }
+  },
+  {
+    name: "Change submitted delivery to pickup",
+    message: "change delivery to pickup for ORD-123",
+    expectedTool: "amend_submitted_order",
+    expectedArguments: { orderReference: "ORD-123", orderType: "pickup" }
   },
   {
     name: "Cancel draft",

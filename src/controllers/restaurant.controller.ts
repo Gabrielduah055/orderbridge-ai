@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import * as restaurantService from "../services/restaurant.service";
+import { recordSubscriptionPayment } from "../services/subscriptionBilling.service";
 
 const getRestaurantId = (req: Request): string => {
   return String(req.params.restaurantId);
@@ -112,6 +113,27 @@ export const updateRestaurantPlan = async (
     res.status(200).json({
       success: true,
       message: "Restaurant plan updated successfully",
+      data: restaurant
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const markSubscriptionPaid = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const restaurant = await recordSubscriptionPayment(
+      getRestaurantId(req),
+      req.body
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Subscription payment recorded successfully",
       data: restaurant
     });
   } catch (error) {

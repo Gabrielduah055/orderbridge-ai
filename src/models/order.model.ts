@@ -34,6 +34,11 @@ export const feedbackFollowUpStatuses = [
   "cancelled",
   "automatically_closed"
 ] as const;
+export const customerCancellationRequestStatuses = [
+  "pending",
+  "approved",
+  "declined"
+] as const;
 
 export type OrderType = (typeof orderTypes)[number];
 export type OrderStatus = (typeof orderStatuses)[number];
@@ -41,6 +46,8 @@ export type PaymentMethod = (typeof paymentMethods)[number];
 export type PaymentStatus = (typeof paymentStatuses)[number];
 export type OrderCompletionSource = (typeof orderCompletionSources)[number];
 export type FeedbackFollowUpStatus = (typeof feedbackFollowUpStatuses)[number];
+export type CustomerCancellationRequestStatus =
+  (typeof customerCancellationRequestStatuses)[number];
 
 export interface IOrderItem {
   menuItemId: Types.ObjectId;
@@ -80,6 +87,26 @@ export interface IOrder {
   ownerNotificationProviderMessageId?: string;
   ownerNotificationFailedAt?: Date;
   ownerNotificationFailureReason?: string;
+  customerCancelledAt?: Date;
+  customerCancellationRequestedAt?: Date;
+  customerCancellationRequestStatus?: CustomerCancellationRequestStatus;
+  customerCancellationResolvedAt?: Date;
+  customerCancellationResolvedByPhone?: string;
+  customerCancellationResolutionReason?: string;
+  ownerCancellationRequestNotifiedAt?: Date;
+  ownerCancellationRequestNotificationFailedAt?: Date;
+  ownerCancellationRequestNotificationFailureReason?: string;
+  customerCancellationResolutionNotifiedAt?: Date;
+  customerCancellationResolutionNotificationFailedAt?: Date;
+  customerCancellationResolutionNotificationFailureReason?: string;
+  ownerCancellationNotifiedAt?: Date;
+  ownerCancellationNotificationFailedAt?: Date;
+  ownerCancellationNotificationFailureReason?: string;
+  customerAmendedAt?: Date;
+  customerAmendmentVersion: number;
+  ownerAmendmentNotifiedVersion: number;
+  ownerAmendmentNotificationFailedAt?: Date;
+  ownerAmendmentNotificationFailureReason?: string;
   restaurantConfirmedAt?: Date;
   restaurantRejectedAt?: Date;
   restaurantRejectionReason?: string;
@@ -270,6 +297,80 @@ const orderSchema = new Schema<IOrderDocument>(
       type: Date
     },
     ownerNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerCancelledAt: {
+      type: Date
+    },
+    customerCancellationRequestedAt: {
+      type: Date
+    },
+    customerCancellationRequestStatus: {
+      type: String,
+      enum: customerCancellationRequestStatuses,
+      index: true
+    },
+    customerCancellationResolvedAt: {
+      type: Date
+    },
+    customerCancellationResolvedByPhone: {
+      type: String,
+      trim: true
+    },
+    customerCancellationResolutionReason: {
+      type: String,
+      trim: true
+    },
+    ownerCancellationRequestNotifiedAt: {
+      type: Date
+    },
+    ownerCancellationRequestNotificationFailedAt: {
+      type: Date
+    },
+    ownerCancellationRequestNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerCancellationResolutionNotifiedAt: {
+      type: Date
+    },
+    customerCancellationResolutionNotificationFailedAt: {
+      type: Date
+    },
+    customerCancellationResolutionNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    ownerCancellationNotifiedAt: {
+      type: Date
+    },
+    ownerCancellationNotificationFailedAt: {
+      type: Date
+    },
+    ownerCancellationNotificationFailureReason: {
+      type: String,
+      trim: true
+    },
+    customerAmendedAt: {
+      type: Date
+    },
+    customerAmendmentVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      required: true
+    },
+    ownerAmendmentNotifiedVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      required: true
+    },
+    ownerAmendmentNotificationFailedAt: {
+      type: Date
+    },
+    ownerAmendmentNotificationFailureReason: {
       type: String,
       trim: true
     },

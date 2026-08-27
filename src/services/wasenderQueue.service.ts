@@ -62,11 +62,15 @@ const getErrorMessage = (result: WasenderSendResult): string =>
 
 const transactionalKinds = new Set([
   "owner_order_notification",
+  "owner_order_cancelled_notification",
+  "owner_order_cancellation_request_notification",
+  "owner_order_amended_notification",
   "owner_action_reminder",
   "staff_reminder",
   "owner_summary",
   "customer_order_confirmed_notification",
   "customer_order_rejected_notification",
+  "customer_order_cancellation_resolution_notification",
   "receipt_delivery",
   "order_feedback_request",
   "order_feedback_reminder",
@@ -78,6 +82,57 @@ export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>)
   const kind = typeof metadata?.kind === "string" ? metadata.kind : undefined;
 
   return Boolean(kind && transactionalKinds.has(kind));
+};
+
+export const getQueuedOwnerOrderNotificationStaleReason = async (
+  metadata?: Record<string, unknown>,
+  queuedRestaurantId?: string
+): Promise<string | null> => {
+  const kind = typeof metadata?.kind === "string" ? metadata.kind : "";
+  if (
+    kind !== "owner_order_notification" &&
+    kind !== "owner_order_amended_notification" &&
+    kind !== "owner_order_cancellation_request_notification"
+  ) {
+    return null;
+  }
+
+  const restaurantId =
+    typeof metadata?.restaurantId === "string"
+      ? metadata.restaurantId
+      : queuedRestaurantId ?? "";
+  const orderId = typeof metadata?.orderId === "string" ? metadata.orderId : "";
+  if (!restaurantId || !orderId) {
+    return "missing trusted order metadata";
+  }
+
+  const order = await Order.findOne({ _id: orderId, restaurantId });
+  if (!order) {
+    return "order no longer exists";
+  }
+
+  if (kind === "owner_order_cancellation_request_notification") {
+    return order.customerCancellationRequestStatus === "pending"
+      ? null
+      : "cancellation request is no longer pending";
+  }
+
+  if (
+    order.status !== "awaiting_restaurant_confirmation" &&
+    order.status !== "pending"
+  ) {
+    return `order status is ${order.status}`;
+  }
+
+  const expectedVersion = Number(metadata?.amendmentVersion);
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return "missing trusted amendment version";
+  }
+
+  const currentVersion = order.customerAmendmentVersion ?? 0;
+  return expectedVersion === currentVersion
+    ? null
+    : `order amendment version is ${currentVersion}, expected ${expectedVersion}`;
 };
 
 export const isQueuedConversationalMessageStale = (
@@ -630,6 +685,96 @@ export const updateOrderSideEffectAfterSend = async (
     return;
   }
 
+  if (kind === "owner_order_cancelled_notification") {
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $set: { ownerCancellationNotifiedAt: now },
+            $unset: {
+              ownerCancellationNotificationFailedAt: "",
+              ownerCancellationNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              ownerCancellationNotificationFailedAt: now,
+              ownerCancellationNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
+  if (kind === "owner_order_cancellation_request_notification") {
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $set: { ownerCancellationRequestNotifiedAt: now },
+            $unset: {
+              ownerCancellationRequestNotificationFailedAt: "",
+              ownerCancellationRequestNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              ownerCancellationRequestNotificationFailedAt: now,
+              ownerCancellationRequestNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
+  if (kind === "customer_order_cancellation_resolution_notification") {
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $set: { customerCancellationResolutionNotifiedAt: now },
+            $unset: {
+              customerCancellationResolutionNotificationFailedAt: "",
+              customerCancellationResolutionNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              customerCancellationResolutionNotificationFailedAt: now,
+              customerCancellationResolutionNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
+  if (kind === "owner_order_amended_notification") {
+    const amendmentVersion = Number(message.metadata?.amendmentVersion);
+
+    if (!Number.isInteger(amendmentVersion) || amendmentVersion < 1) {
+      return;
+    }
+
+    await Order.updateOne(
+      { _id: orderId, restaurantId },
+      result.success
+        ? {
+            $max: { ownerAmendmentNotifiedVersion: amendmentVersion },
+            $unset: {
+              ownerAmendmentNotificationFailedAt: "",
+              ownerAmendmentNotificationFailureReason: ""
+            }
+          }
+        : {
+            $set: {
+              ownerAmendmentNotificationFailedAt: now,
+              ownerAmendmentNotificationFailureReason: failureReason
+            }
+          }
+    );
+    return;
+  }
+
   if (kind === "customer_order_confirmed_notification") {
     await Order.updateOne(
       { _id: orderId, restaurantId },
@@ -1069,6 +1214,28 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   if (
+    locked.metadata?.kind === "owner_order_notification" ||
+    locked.metadata?.kind === "owner_order_amended_notification" ||
+    locked.metadata?.kind === "owner_order_cancellation_request_notification"
+  ) {
+    const staleReason = await getQueuedOwnerOrderNotificationStaleReason(
+      locked.metadata,
+      locked.restaurantId ? String(locked.restaurantId) : undefined
+    );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale owner order message: ${staleReason}`;
+      await locked.save();
+      console.info("Stale owner order message cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        orderId: locked.metadata.orderId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (
     locked.metadata?.kind === "order_feedback_request" ||
     locked.metadata?.kind === "order_feedback_reminder"
   ) {

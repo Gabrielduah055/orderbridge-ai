@@ -79,6 +79,15 @@ export const evaluateStaffAgentDecision = (
     }
   }
 
+  if (
+    scenario.expectedTextPattern &&
+    !scenario.expectedTextPattern.test(actual.text ?? "")
+  ) {
+    reasons.push(
+      `expected response text to match ${scenario.expectedTextPattern}; received ${JSON.stringify(actual.text ?? "")}`
+    );
+  }
+
   return reasons;
 };
 

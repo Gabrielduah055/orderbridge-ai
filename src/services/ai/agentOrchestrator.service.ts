@@ -101,6 +101,7 @@ const orderMutationToolNames = new Set([
   "cancel_order",
   "confirm_order",
   "reject_order",
+  "resolve_customer_cancellation_request",
   "update_order_status"
 ]);
 
@@ -112,7 +113,8 @@ const customerOrderWorkflowMutationTools = new Set([
   "update_order_draft",
   "confirm_order_draft",
   "cancel_order_draft",
-  "cancel_order"
+  "cancel_order",
+  "amend_submitted_order"
 ]);
 
 type CustomerWorkflowMutation = "active_order" | "order_feedback";
@@ -181,9 +183,12 @@ const getTrustedOrderReferenceGuardResult = (
       };
     }
 
-    const allowedOrderIds = selection.candidates.map((candidate) => candidate.id);
+    const allowedOrderReferences = selection.candidates.flatMap((candidate) => [
+      candidate.id,
+      ...(candidate.orderNumber ? [candidate.orderNumber] : [])
+    ]);
 
-    if (!referencesMatchAllowedValues(requestedReferences, allowedOrderIds)) {
+    if (!referencesMatchAllowedValues(requestedReferences, allowedOrderReferences)) {
       return {
         success: false,
         code: "ORDER_REFERENCE_MISMATCH",
@@ -196,6 +201,30 @@ const getTrustedOrderReferenceGuardResult = (
     /\b(ORD-[A-Za-z0-9-]+|[a-f0-9]{24})\b/i
   )?.[1];
   const quotedOrder = input.staffState?.recentReferences.quotedOrder;
+
+  if (
+    input.quotedMessageId &&
+    quotedOrder?.quotedVersionStale &&
+    ["confirm_order", "reject_order", "update_order_status"].includes(toolName)
+  ) {
+    return {
+      success: false,
+      code: "ORDER_NOTIFICATION_VERSION_STALE",
+      message: `That order has been updated since this message. Please review the latest ${quotedOrder.orderNumber ?? "order"} update before accepting or rejecting it.`
+    };
+  }
+
+  if (
+    input.quotedMessageId &&
+    quotedOrder?.quotedAction === "cancellation_request" &&
+    toolName !== "resolve_customer_cancellation_request"
+  ) {
+    return {
+      success: false,
+      code: "QUOTED_ORDER_ACTION_MISMATCH",
+      message: "That quoted message is a customer cancellation request. Please approve or decline that request."
+    };
+  }
 
   if (input.quotedMessageId && !explicitCurrentReference && quotedOrder) {
     if (

@@ -96,7 +96,14 @@ export interface AgentOrchestratorResult {
   message: string;
   data?: {
     order?: IOrderDocument;
-    orderEvent?: "submitted" | "confirmed" | "rejected";
+    orderEvent?:
+      | "submitted"
+      | "confirmed"
+      | "rejected"
+      | "cancelled"
+      | "cancellation_requested"
+      | "cancellation_resolved"
+      | "amended";
     notifyOwner?: boolean;
     notifyCustomer?: boolean;
     receiptRequired?: boolean;

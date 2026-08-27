@@ -49,6 +49,36 @@ export interface RestaurantOrderDecisionResult {
   idempotent: boolean;
 }
 
+export interface AmendCustomerSubmittedOrderInput {
+  itemName?: string;
+  menuItemId?: string;
+  newQuantity?: number;
+  orderType?: OrderType;
+  deliveryAddress?: string;
+}
+
+export interface AmendCustomerSubmittedOrderResult {
+  order: IOrderDocument;
+  amendmentVersion: number;
+}
+
+export type CustomerCancellationMode = "cancelled" | "requested";
+
+export interface CustomerCancellationResult extends UpdateOrderStatusResult {
+  mode: CustomerCancellationMode;
+}
+
+export interface ResolveCustomerCancellationRequestInput {
+  decision: "approve" | "decline";
+  resolvedByPhone: string;
+  reason?: string;
+}
+
+export interface ResolveCustomerCancellationRequestResult
+  extends UpdateOrderStatusResult {
+  decision: "approved" | "declined";
+}
+
 export interface DeliveryFeeResolution {
   amount: number | null;
   source: "pickup" | "flat_fee" | "free_delivery_threshold" | "zone" | "manual_confirmation" | "not_configured";
@@ -515,6 +545,205 @@ export const getOrderById = async (orderId: string): Promise<IOrderDocument> => 
   return getOrderOrThrow(orderId);
 };
 
+export const customerAmendableOrderStatuses = [
+  "awaiting_restaurant_confirmation",
+  "pending"
+] as const;
+
+export const customerDirectCancellationStatuses: readonly OrderStatus[] = [
+  "awaiting_restaurant_confirmation",
+  "pending"
+];
+
+export const customerCancellationRequestStatuses: readonly OrderStatus[] = [
+  "confirmed",
+  "accepted",
+  "preparing",
+  "ready",
+  "out_for_delivery"
+];
+
+export const amendCustomerSubmittedOrder = async (
+  restaurantId: string,
+  orderId: string,
+  customerPhone: string,
+  input: AmendCustomerSubmittedOrderInput
+): Promise<AmendCustomerSubmittedOrderResult> => {
+  const restaurant = await getRestaurantOrThrow(restaurantId);
+  const order = await getOrderOrThrow(orderId, restaurantId);
+  const normalizedCustomerPhone = normalizeGhanaPhone(customerPhone);
+
+  if (normalizeGhanaPhone(order.customerPhone) !== normalizedCustomerPhone) {
+    throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
+  }
+
+  if (!customerAmendableOrderStatuses.includes(order.status as (typeof customerAmendableOrderStatuses)[number])) {
+    throw new BadRequestError(
+      "This order can no longer be updated because the restaurant has already acted on it.",
+      "ORDER_NOT_AMENDABLE"
+    );
+  }
+
+  const hasItemChange = typeof input.newQuantity === "number";
+  let items = order.items.map((item) => ({
+    menuItemId: item.menuItemId,
+    name: item.name,
+    quantity: item.quantity,
+    unitPrice: item.unitPrice,
+    totalPrice: item.totalPrice
+  }));
+
+  if (hasItemChange) {
+    const normalizedItemName = normalizeComparableText(input.itemName ?? "");
+    const matches = normalizedItemName
+      ? items.filter((item) => {
+          const savedName = normalizeComparableText(item.name);
+          return savedName.includes(normalizedItemName) || normalizedItemName.includes(savedName);
+        })
+      : [];
+
+    if (matches.length > 1) {
+      throw new BadRequestError(
+        "More than one order item matched that name. Please be more specific.",
+        "MULTIPLE_ORDER_ITEMS_FOUND"
+      );
+    }
+
+    if (matches.length === 1) {
+      const matchedId = String(matches[0].menuItemId);
+      items =
+        input.newQuantity === 0
+          ? items.filter((item) => String(item.menuItemId) !== matchedId)
+          : items.map((item) =>
+              String(item.menuItemId) === matchedId
+                ? { ...item, quantity: input.newQuantity as number }
+                : item
+            );
+    } else if (input.newQuantity === 0) {
+      throw new BadRequestError(
+        "That item is not in the submitted order.",
+        "ORDER_ITEM_NOT_FOUND"
+      );
+    } else if (input.menuItemId) {
+      items.push({
+        menuItemId: new Types.ObjectId(input.menuItemId),
+        name: input.itemName ?? "Menu item",
+        quantity: input.newQuantity as number,
+        unitPrice: 0,
+        totalPrice: 0
+      });
+    } else {
+      throw new BadRequestError(
+        "That item is not in the submitted order.",
+        "ORDER_ITEM_NOT_FOUND"
+      );
+    }
+
+    if (items.length === 0) {
+      throw new BadRequestError(
+        "A submitted order must contain at least one item. Cancel the order instead.",
+        "ORDER_ITEMS_REQUIRED"
+      );
+    }
+  }
+
+  const refreshedItems = hasItemChange
+    ? await buildOrderItems(
+        restaurantId,
+        items.map((item) => ({
+          menuItemId: String(item.menuItemId),
+          quantity: item.quantity
+        }))
+      )
+    : order.items;
+  const subtotal = refreshedItems.reduce((sum, item) => sum + item.totalPrice, 0);
+  const orderType = input.orderType ?? order.orderType;
+
+  if (input.deliveryAddress && orderType !== "delivery") {
+    throw new BadRequestError(
+      "Change the order type to delivery before setting a delivery address.",
+      "DELIVERY_ORDER_TYPE_REQUIRED"
+    );
+  }
+
+  const deliveryAddress =
+    orderType === "delivery"
+      ? input.deliveryAddress?.trim() || order.deliveryAddress?.trim()
+      : undefined;
+
+  if (orderType === "delivery") {
+    if (!restaurant.deliveryEnabled) {
+      throw new BadRequestError("Delivery is not enabled for this restaurant");
+    }
+
+    if (!deliveryAddress) {
+      throw new BadRequestError(
+        "Delivery address is required for delivery orders",
+        "DELIVERY_ADDRESS_REQUIRED"
+      );
+    }
+  }
+
+  const deliveryFeeResolution = resolveDeliveryFee(
+    restaurant,
+    orderType,
+    deliveryAddress,
+    subtotal
+  );
+  const deliveryFeePending =
+    orderType === "delivery" &&
+    !deliveryFeeResolution.resolved &&
+    deliveryFeeResolution.source === "manual_confirmation";
+
+  if (
+    !deliveryFeePending &&
+    (!deliveryFeeResolution.resolved || deliveryFeeResolution.amount === null)
+  ) {
+    throw new BadRequestError("Delivery fee is not resolved for this order");
+  }
+
+  const deliveryFee = deliveryFeePending ? null : deliveryFeeResolution.amount ?? 0;
+  const amendmentVersion = (order.customerAmendmentVersion ?? 0) + 1;
+  const unsetFields: Record<string, 1> = {};
+  if (!deliveryAddress) unsetFields.deliveryAddress = 1;
+  if (deliveryFeePending) unsetFields.deliveryFeeResolvedAt = 1;
+
+  const amendedOrder = await Order.findOneAndUpdate(
+    {
+      _id: orderId,
+      restaurantId,
+      status: { $in: [...customerAmendableOrderStatuses] }
+    },
+    {
+      $set: {
+        customerPhone: normalizedCustomerPhone,
+        items: refreshedItems,
+        subtotal,
+        deliveryFee,
+        deliveryFeeSource: deliveryFeeResolution.source,
+        deliveryFeePending,
+        ...(deliveryFeePending ? {} : { deliveryFeeResolvedAt: new Date() }),
+        total: deliveryFeePending ? subtotal : subtotal + (deliveryFee ?? 0),
+        orderType,
+        ...(deliveryAddress ? { deliveryAddress } : {}),
+        customerAmendedAt: new Date(),
+        customerAmendmentVersion: amendmentVersion
+      },
+      ...(Object.keys(unsetFields).length > 0 ? { $unset: unsetFields } : {})
+    },
+    { new: true, runValidators: true }
+  );
+
+  if (!amendedOrder) {
+    throw new BadRequestError(
+      "This order changed while it was being updated. Please check its latest status.",
+      "ORDER_AMENDMENT_CONFLICT"
+    );
+  }
+
+  return { order: amendedOrder, amendmentVersion };
+};
+
 export const updateOrderStatus = async (
   orderId: string,
   status: OrderStatus
@@ -568,6 +797,194 @@ const applyOrderStatusUpdate = async (
   };
 };
 
+export const cancelCustomerOrder = async (
+  restaurantId: string,
+  orderId: string,
+  customerPhone: string
+): Promise<CustomerCancellationResult> => {
+  const order = await getOrderOrThrow(orderId, restaurantId);
+
+  if (normalizeGhanaPhone(order.customerPhone) !== normalizeGhanaPhone(customerPhone)) {
+    throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
+  }
+
+  if (order.status === "cancelled" && order.customerCancelledAt) {
+    return { order, mode: "cancelled", idempotent: true };
+  }
+
+  if (
+    order.status === "cancelled" &&
+    order.customerCancellationRequestStatus === "approved"
+  ) {
+    return { order, mode: "requested", idempotent: true };
+  }
+
+  if (order.customerCancellationRequestStatus === "pending") {
+    return { order, mode: "requested", idempotent: true };
+  }
+
+  if (customerDirectCancellationStatuses.includes(order.status)) {
+    const hadActiveFeedbackFollowUp = Boolean(
+      order.feedbackFollowUpStatus &&
+        order.feedbackFollowUpStatus !== "not_scheduled"
+    );
+    const cancelledOrder = await Order.findOneAndUpdate(
+      {
+        _id: orderId,
+        restaurantId,
+        status: { $in: [...customerDirectCancellationStatuses] }
+      },
+      {
+        $set: {
+          status: "cancelled",
+          customerCancelledAt: new Date(),
+          feedbackFollowUpStatus: "cancelled"
+        }
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!cancelledOrder) {
+      throw new BadRequestError(
+        "This order changed while cancellation was being processed. Please check its latest status.",
+        "ORDER_CANCELLATION_CONFLICT"
+      );
+    }
+
+    if (hadActiveFeedbackFollowUp) {
+      await cancelQueuedOrderFeedbackMessages(
+        restaurantId,
+        orderId,
+        "Customer cancelled order before restaurant acceptance"
+      );
+    }
+
+    return { order: cancelledOrder, mode: "cancelled", idempotent: false };
+  }
+
+  if (customerCancellationRequestStatuses.includes(order.status)) {
+    if (order.customerCancellationRequestStatus === "declined") {
+      return { order, mode: "requested", idempotent: true };
+    }
+
+    const requestedOrder = await Order.findOneAndUpdate(
+      {
+        _id: orderId,
+        restaurantId,
+        status: { $in: [...customerCancellationRequestStatuses] },
+        customerCancellationRequestStatus: { $ne: "pending" }
+      },
+      {
+        $set: {
+          customerCancellationRequestedAt: new Date(),
+          customerCancellationRequestStatus: "pending"
+        },
+        $unset: {
+          customerCancellationResolvedAt: 1,
+          customerCancellationResolvedByPhone: 1,
+          customerCancellationResolutionReason: 1,
+          customerCancellationResolutionNotifiedAt: 1,
+          customerCancellationResolutionNotificationFailedAt: 1,
+          customerCancellationResolutionNotificationFailureReason: 1
+        }
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!requestedOrder) {
+      const latest = await getOrderOrThrow(orderId, restaurantId);
+      if (latest.customerCancellationRequestStatus === "pending") {
+        return { order: latest, mode: "requested", idempotent: true };
+      }
+      throw new BadRequestError(
+        "This order changed while the cancellation request was being sent.",
+        "ORDER_CANCELLATION_CONFLICT"
+      );
+    }
+
+    return { order: requestedOrder, mode: "requested", idempotent: false };
+  }
+
+  throw new BadRequestError(
+    "This order cannot be cancelled in its current state.",
+    "ORDER_NOT_CANCELLABLE"
+  );
+};
+
+export const resolveCustomerCancellationRequest = async (
+  restaurantId: string,
+  orderId: string,
+  input: ResolveCustomerCancellationRequestInput
+): Promise<ResolveCustomerCancellationRequestResult> => {
+  const order = await getOrderOrThrow(orderId, restaurantId);
+  const resolvedStatus = input.decision === "approve" ? "approved" : "declined";
+
+  if (order.customerCancellationRequestStatus === resolvedStatus) {
+    return { order, decision: resolvedStatus, idempotent: true };
+  }
+
+  if (order.customerCancellationRequestStatus !== "pending") {
+    throw new BadRequestError(
+      "There is no pending customer cancellation request for this order.",
+      "CANCELLATION_REQUEST_NOT_PENDING"
+    );
+  }
+
+  const now = new Date();
+  const update = {
+    $set: {
+      customerCancellationRequestStatus: resolvedStatus,
+      customerCancellationResolvedAt: now,
+      customerCancellationResolvedByPhone: normalizeGhanaPhone(
+        input.resolvedByPhone
+      ),
+      ...(input.reason?.trim()
+        ? { customerCancellationResolutionReason: input.reason.trim() }
+        : {}),
+      ...(input.decision === "approve"
+        ? { status: "cancelled" as const, feedbackFollowUpStatus: "cancelled" as const }
+        : {})
+    }
+  };
+  const resolvedOrder = await Order.findOneAndUpdate(
+    {
+      _id: orderId,
+      restaurantId,
+      customerCancellationRequestStatus: "pending",
+      ...(input.decision === "approve"
+        ? { status: { $in: [...customerCancellationRequestStatuses] } }
+        : {})
+    },
+    update,
+    { new: true, runValidators: true }
+  );
+
+  if (!resolvedOrder) {
+    const latest = await getOrderOrThrow(orderId, restaurantId);
+    if (latest.customerCancellationRequestStatus === resolvedStatus) {
+      return { order: latest, decision: resolvedStatus, idempotent: true };
+    }
+    throw new BadRequestError(
+      "This cancellation request changed while it was being resolved.",
+      "CANCELLATION_REQUEST_CONFLICT"
+    );
+  }
+
+  if (input.decision === "approve") {
+    await cancelQueuedOrderFeedbackMessages(
+      restaurantId,
+      orderId,
+      "Restaurant approved customer cancellation request"
+    );
+  }
+
+  return {
+    order: resolvedOrder,
+    decision: resolvedStatus,
+    idempotent: false
+  };
+};
+
 export const updateRestaurantOrderStatus = async (
   restaurantId: string,
   orderId: string,
@@ -605,7 +1022,8 @@ export const updateRestaurantOrderStatus = async (
 
 export const confirmRestaurantOrder = async (
   orderId: string,
-  restaurantId?: string
+  restaurantId?: string,
+  expectedAmendmentVersion?: number
 ): Promise<RestaurantOrderDecisionResult> => {
   const order = await getOrderOrThrow(orderId, restaurantId);
 
@@ -636,7 +1054,17 @@ export const confirmRestaurantOrder = async (
     {
       _id: order._id,
       ...(restaurantId ? { restaurantId } : {}),
-      status: { $in: ["awaiting_restaurant_confirmation", "pending"] }
+      status: { $in: ["awaiting_restaurant_confirmation", "pending"] },
+      ...(expectedAmendmentVersion === undefined
+        ? {}
+        : expectedAmendmentVersion === 0
+          ? {
+              $or: [
+                { customerAmendmentVersion: 0 },
+                { customerAmendmentVersion: { $exists: false } }
+              ]
+            }
+          : { customerAmendmentVersion: expectedAmendmentVersion })
     },
     {
       $set: {
@@ -651,6 +1079,15 @@ export const confirmRestaurantOrder = async (
     const currentOrder = await getOrderOrThrow(orderId, restaurantId);
     if (currentOrder.status === "accepted" || currentOrder.status === "confirmed") {
       return { order: currentOrder, idempotent: true };
+    }
+    if (
+      expectedAmendmentVersion !== undefined &&
+      (currentOrder.customerAmendmentVersion ?? 0) !== expectedAmendmentVersion
+    ) {
+      throw new BadRequestError(
+        `That order has been updated since this message. Please review the latest ${currentOrder.orderNumber ?? "order"} update before accepting or rejecting it.`,
+        "ORDER_NOTIFICATION_VERSION_STALE"
+      );
     }
     throw new BadRequestError(
       "This order changed before it could be accepted.",
@@ -667,7 +1104,8 @@ export const confirmRestaurantOrder = async (
 export const rejectRestaurantOrder = async (
   orderId: string,
   reason?: string,
-  restaurantId?: string
+  restaurantId?: string,
+  expectedAmendmentVersion?: number
 ): Promise<RestaurantOrderDecisionResult> => {
   const normalizedReason = normalizeRestaurantRejectionReason(reason);
   const order = await getOrderOrThrow(orderId, restaurantId);
@@ -699,7 +1137,17 @@ export const rejectRestaurantOrder = async (
     {
       _id: order._id,
       ...(restaurantId ? { restaurantId } : {}),
-      status: { $in: ["awaiting_restaurant_confirmation", "pending"] }
+      status: { $in: ["awaiting_restaurant_confirmation", "pending"] },
+      ...(expectedAmendmentVersion === undefined
+        ? {}
+        : expectedAmendmentVersion === 0
+          ? {
+              $or: [
+                { customerAmendmentVersion: 0 },
+                { customerAmendmentVersion: { $exists: false } }
+              ]
+            }
+          : { customerAmendmentVersion: expectedAmendmentVersion })
     },
     {
       $set: {
@@ -719,6 +1167,15 @@ export const rejectRestaurantOrder = async (
       currentOrder.restaurantRejectedAt
     ) {
       return { order: currentOrder, idempotent: true };
+    }
+    if (
+      expectedAmendmentVersion !== undefined &&
+      (currentOrder.customerAmendmentVersion ?? 0) !== expectedAmendmentVersion
+    ) {
+      throw new BadRequestError(
+        `That order has been updated since this message. Please review the latest ${currentOrder.orderNumber ?? "order"} update before accepting or rejecting it.`,
+        "ORDER_NOTIFICATION_VERSION_STALE"
+      );
     }
     throw new BadRequestError(
       "This order changed before it could be rejected.",

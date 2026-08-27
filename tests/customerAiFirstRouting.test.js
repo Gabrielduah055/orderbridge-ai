@@ -1432,7 +1432,9 @@ test("customer eval suite is bounded, decision-only, and accepts correct mocked 
           text: scenario.expectedTextPattern
             ? scenario.name.includes("check-ins")
               ? "Which order do you mean: ORD-100 or ORD-101?"
-              : "Which item would you like to see?"
+              : scenario.name.includes("quantity")
+                ? "How many would you like?"
+                : "Which item would you like to see?"
             : "Happy to help.",
           toolCalls: []
         };
