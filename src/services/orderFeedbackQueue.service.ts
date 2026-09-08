@@ -2,7 +2,10 @@ import { Types } from "mongoose";
 import { OrderFeedback } from "../models/orderFeedback.model";
 import { Order, type IOrderDocument } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { feedbackCompletionEligibleStatuses } from "./orderCompletion.service";
 import type { WasenderSendResult } from "./wasender.service";
 
@@ -161,7 +164,7 @@ export const buildOrderFeedbackQueueMetadata = (
   restaurantId: String(order.restaurantId),
   orderId: String(order._id),
   orderNumber: order.orderNumber ?? String(order._id),
-  customerPhone: normalizeGhanaPhone(order.customerPhone),
+  customerPhone: normalizeWhatsappRecipient(order.customerPhone),
   followUpVersion,
   purpose: "transactional"
 });
@@ -229,9 +232,9 @@ export const scheduleOrderFeedbackFollowUp = async (
     return { scheduled: false, reason: "follow_up_no_longer_active" };
   }
 
-  const customerPhone = normalizeGhanaPhone(order.customerPhone);
+  const customerPhone = normalizeWhatsappRecipient(order.customerPhone);
 
-  if (!/^\+[1-9]\d{7,14}$/.test(customerPhone)) {
+  if (!isValidWhatsappRecipient(customerPhone)) {
     return { scheduled: false, reason: "invalid_customer_phone" };
   }
 
@@ -321,7 +324,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
   const orderId = getMetadataString(message.metadata, "orderId");
   const orderNumber = getMetadataString(message.metadata, "orderNumber");
   const purpose = getMetadataString(message.metadata, "purpose");
-  const customerPhone = normalizeGhanaPhone(
+  const customerPhone = normalizeWhatsappRecipient(
     getMetadataString(message.metadata, "customerPhone")
   );
   const followUpVersion = Number(message.metadata?.followUpVersion);
@@ -345,7 +348,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
     return "restaurant_scope_changed";
   }
 
-  if (normalizeGhanaPhone(message.to) !== customerPhone) {
+  if (normalizeWhatsappRecipient(message.to) !== customerPhone) {
     return "customer_phone_changed";
   }
 
@@ -384,7 +387,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
     return "order_number_changed";
   }
 
-  if (normalizeGhanaPhone(order.customerPhone) !== customerPhone) {
+  if (normalizeWhatsappRecipient(order.customerPhone) !== customerPhone) {
     return "order_customer_phone_changed";
   }
 

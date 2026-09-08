@@ -11,6 +11,7 @@ const {
   resolveWasenderUsername
 } = require("../dist/services/wasender.service");
 const {
+  rememberWasenderCustomerIdentity,
   resolveWasenderCustomerIdentity
 } = require("../dist/services/wasenderIdentity.service");
 const { resolveSenderIdentity } = require("../dist/services/senderIdentity.service");
@@ -26,7 +27,25 @@ const {
 const {
   sendAgentReplyDirectly
 } = require("../dist/controllers/wasender.controller");
-const { normalizeGhanaPhone } = require("../dist/utils/phone.util");
+const {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient,
+  normalizeWhatsappUsername
+} = require("../dist/utils/phone.util");
+const {
+  handleCustomerMarketingPreferenceCommand
+} = require("../dist/services/customerMarketingPreference.service");
+const { CustomerCampaignRecipient } = require("../dist/models/customerCampaignRecipient.model");
+const { OutboundMessage } = require("../dist/models/outboundMessage.model");
+const {
+  sendDocumentMessage,
+  sendImageMessage
+} = require("../dist/services/wasender.service");
+const wasenderQueueService = require("../dist/services/wasenderQueue.service");
+const {
+  notifyCustomerOfConfirmedOrderAndSendReceipt,
+  notifyCustomerOfRejectedOrder
+} = require("../dist/services/orderSideEffects.service");
 
 const restaurantId = "64b000000000000000000901";
 const otherRestaurantId = "64b000000000000000000902";
@@ -305,7 +324,278 @@ test("LID-only webhook falls back to username when no phone is available", async
   assert.equal(identity.addressingMode, "username");
   assert.equal(identity.resolutionSource, "provider_username_lookup");
   assert.deepEqual(remembered, [[restaurantId, lid, undefined, username]]);
-  assert.equal(normalizeGhanaPhone(username), username);
+  assert.equal(normalizeGhanaPhone(username), "");
+});
+
+test("phone and username normalization remain separate", () => {
+  assert.equal(normalizeGhanaPhone(username), "");
+  assert.equal(normalizeWhatsappRecipient(username), username);
+  assert.equal(normalizeWhatsappUsername("WhatsApp:@Ada_Name.1"), "@ada_name.1");
+
+  for (const invalid of [
+    "@a",
+    "@123456",
+    "@john-doe",
+    "@john+doe",
+    `@${"a".repeat(36)}`,
+    "aduamah.maxwell"
+  ]) {
+    assert.equal(normalizeWhatsappUsername(invalid), "", invalid);
+  }
+});
+
+test("fresh username replaces a stale stored username for the same LID", async () => {
+  const newUsername = "@maxwell.aduamah";
+  const webhook = normalizeIncomingWebhook(
+    makePayload({
+      remoteJid: lid,
+      senderLid: lid,
+      senderUsername: newUsername,
+      addressingMode: "lid"
+    })
+  );
+  const remembered = [];
+  const identity = await resolveWasenderCustomerIdentity(
+    restaurantId,
+    webhook,
+    undefined,
+    {
+      findByLid: async () => ({ lid, username }),
+      remember: async (...args) => {
+        remembered.push(args);
+        return { lid: args[1], username: args[3] };
+      },
+      resolvePhoneFromLid: async () => {
+        throw new Error("fresh username must not require a phone lookup");
+      }
+    }
+  );
+
+  assert.equal(identity.customerAddress, newUsername);
+  assert.equal(identity.resolutionSource, "username_field");
+  assert.deepEqual(remembered, [[restaurantId, lid, undefined, newUsername]]);
+});
+
+test("mutable usernames and username reuse are reconciled by trusted LID within a tenant", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  const originalCreate = CustomerChannelIdentity.create;
+  const originalUpdateMany = CustomerChannelIdentity.updateMany;
+  const records = [];
+  const makeRecord = (data) => {
+    const record = {
+      ...data,
+      save: async function () {
+        return this;
+      }
+    };
+    records.push(record);
+    return record;
+  };
+
+  try {
+    CustomerChannelIdentity.findOne = async (filter) =>
+      records.find(
+        (record) =>
+          String(record.restaurantId) === String(filter.restaurantId) &&
+          record.provider === filter.provider &&
+          record.channel === filter.channel &&
+          record.lid === filter.lid
+      ) ?? null;
+    CustomerChannelIdentity.create = async (data) => makeRecord(data);
+    CustomerChannelIdentity.updateMany = async (filter) => {
+      let modifiedCount = 0;
+      for (const record of records) {
+        if (
+          String(record.restaurantId) === String(filter.restaurantId) &&
+          record.provider === filter.provider &&
+          record.channel === filter.channel &&
+          record.username === filter.username &&
+          record.lid !== filter.lid.$ne
+        ) {
+          delete record.username;
+          modifiedCount += 1;
+        }
+      }
+      return { modifiedCount };
+    };
+
+    const lidA = "111111111@lid";
+    const lidB = "222222222@lid";
+    await rememberWasenderCustomerIdentity(restaurantId, lidA, undefined, "@old.name");
+    await rememberWasenderCustomerIdentity(restaurantId, lidA, undefined, "@new.name");
+    await rememberWasenderCustomerIdentity(restaurantId, lidB, undefined, "@old.name");
+
+    assert.equal(records.find((record) => record.lid === lidA).username, "@new.name");
+    assert.equal(records.find((record) => record.lid === lidB).username, "@old.name");
+    assert.equal(records.filter((record) => record.username === "@old.name").length, 1);
+
+    await rememberWasenderCustomerIdentity(otherRestaurantId, "333333333@lid", undefined, "@old.name");
+    assert.equal(records.filter((record) => record.username === "@old.name").length, 2);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+    CustomerChannelIdentity.create = originalCreate;
+    CustomerChannelIdentity.updateMany = originalUpdateMany;
+  }
+});
+
+test("username customer STOP updates marketing preference without E.164 failure", async () => {
+  const originalFindOne = CustomerProfile.findOne;
+  const originalFindOneAndUpdate = CustomerProfile.findOneAndUpdate;
+  const originalOutboundUpdateMany = OutboundMessage.updateMany;
+  const originalRecipientUpdateMany = CustomerCampaignRecipient.updateMany;
+
+  try {
+    CustomerProfile.findOne = async () => null;
+    CustomerProfile.findOneAndUpdate = async (filter, update) => ({
+      restaurantId: filter.restaurantId,
+      customerPhone: filter.customerPhone,
+      ...update.$set
+    });
+    OutboundMessage.updateMany = async () => ({ modifiedCount: 0 });
+    CustomerCampaignRecipient.updateMany = async () => ({ modifiedCount: 0 });
+
+    const result = await handleCustomerMarketingPreferenceCommand(
+      restaurantId,
+      username,
+      "STOP"
+    );
+
+    assert.equal(result.handled, true);
+    assert.equal(result.command, "opt_out");
+    assert.equal(result.profile.customerPhone, username);
+  } finally {
+    CustomerProfile.findOne = originalFindOne;
+    CustomerProfile.findOneAndUpdate = originalFindOneAndUpdate;
+    OutboundMessage.updateMany = originalOutboundUpdateMany;
+    CustomerCampaignRecipient.updateMany = originalRecipientUpdateMany;
+  }
+});
+
+test("username recipients can receive image and receipt document messages", async () => {
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const bodies = [];
+  process.env.WASENDER_API_URL = "https://wasender.example";
+  global.fetch = async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ success: true, data: { msgId: bodies.length } })
+    };
+  };
+
+  try {
+    await sendImageMessage("session-1", username, "https://example.com/menu.jpg", "Menu", {
+      apiKey: "restaurant-token"
+    });
+    await sendDocumentMessage("session-1", username, "https://example.com/receipt.pdf", "Receipt", {
+      apiKey: "restaurant-token"
+    });
+
+    assert.equal(bodies[0].to, username);
+    assert.equal(bodies[0].imageUrl, "https://example.com/menu.jpg");
+    assert.equal(bodies[1].to, username);
+    assert.equal(bodies[1].documentUrl, "https://example.com/receipt.pdf");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
+  }
+});
+
+test("username customer can create a persistent conversation and order identity", async () => {
+  const originalSessionFindOne = CustomerSession.findOne;
+  const originalSessionCreate = CustomerSession.create;
+  let createdSession;
+
+  try {
+    CustomerSession.findOne = async () => null;
+    CustomerSession.create = async (input) => {
+      createdSession = { ...input, save: async function () { return this; } };
+      return createdSession;
+    };
+
+    const session = await recordInboundCustomerTurn(
+      restaurantId,
+      username,
+      "username-order-turn-1"
+    );
+    assert.equal(session.customerPhone, username);
+    assert.equal(createdSession.customerPhone, username);
+
+    const order = new Order({
+      restaurantId,
+      customerName: "Maxwell",
+      customerPhone: username,
+      items: [{
+        menuItemId: "64b000000000000000000904",
+        name: "Jollof",
+        quantity: 1,
+        unitPrice: 40,
+        totalPrice: 40
+      }],
+      subtotal: 40,
+      deliveryFee: 0,
+      total: 40,
+      orderType: "pickup",
+      status: "awaiting_restaurant_confirmation",
+      paymentMethod: "cash",
+      paymentStatus: "unpaid",
+      customerConfirmedAt: new Date()
+    });
+    assert.equal(order.validateSync(), undefined);
+    assert.equal(order.customerPhone, username);
+  } finally {
+    CustomerSession.findOne = originalSessionFindOne;
+    CustomerSession.create = originalSessionCreate;
+  }
+});
+
+test("acceptance and rejection notifications keep the username recipient", async () => {
+  const originalEnqueue = wasenderQueueService.enqueueWasenderMessage;
+  const queued = [];
+  const restaurant = {
+    _id: restaurantId,
+    name: "Golden Grill",
+    wasenderSessionId: "session-1",
+    wasenderApiToken: "restaurant-token"
+  };
+  const baseOrder = {
+    _id: "64b000000000000000000905",
+    orderNumber: "ORD-USERNAME-1",
+    customerName: "Maxwell",
+    customerPhone: username,
+    status: "accepted",
+    receiptUrl: "https://example.com/receipt.pdf",
+    receiptGeneratedAt: new Date(),
+    receiptSentAt: new Date(),
+    save: async function () { return this; }
+  };
+
+  try {
+    wasenderQueueService.enqueueWasenderMessage = async (input) => {
+      queued.push(input);
+      return { _id: `queued-${queued.length}`, status: "pending" };
+    };
+
+    await notifyCustomerOfConfirmedOrderAndSendReceipt(restaurant, baseOrder);
+    await notifyCustomerOfRejectedOrder(restaurant, {
+      ...baseOrder,
+      _id: "64b000000000000000000906",
+      status: "rejected",
+      receiptSentAt: undefined
+    });
+
+    assert.equal(queued.length, 2);
+    assert.equal(queued[0].to, username);
+    assert.equal(queued[0].metadata.kind, "customer_order_confirmed_notification");
+    assert.equal(queued[1].to, username);
+    assert.equal(queued[1].metadata.kind, "customer_order_rejected_notification");
+  } finally {
+    wasenderQueueService.enqueueWasenderMessage = originalEnqueue;
+  }
 });
 
 test("agent replies can be sent directly to a resolved WhatsApp username", async () => {

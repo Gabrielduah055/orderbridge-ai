@@ -8,7 +8,12 @@ import type { IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isWhatsappPhoneAddress,
+  isValidWhatsappRecipient,
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
@@ -128,7 +133,7 @@ export const parseMarketingConsentResponse = (
   return null;
 };
 
-const ensureScopedIdentity = (
+const ensureScopedCustomerIdentity = (
   restaurantId: string,
   customerPhone: string
 ): string => {
@@ -136,10 +141,27 @@ const ensureScopedIdentity = (
     throw new BadRequestError("Invalid restaurantId");
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
+  }
+
+  return normalizedPhone;
+};
+
+const ensureScopedStaffPhone = (
+  restaurantId: string,
+  phone: string
+): string => {
+  if (!Types.ObjectId.isValid(restaurantId)) {
+    throw new BadRequestError("Invalid restaurantId");
+  }
+
+  const normalizedPhone = normalizeGhanaPhone(phone);
+
+  if (!isWhatsappPhoneAddress(normalizedPhone)) {
+    throw new BadRequestError("Invalid requestedByPhone");
   }
 
   return normalizedPhone;
@@ -149,7 +171,7 @@ export const getMarketingConsentRequestIdempotencyKey = (
   restaurantId: string,
   customerPhone: string
 ): string =>
-  `marketing-consent-request:${restaurantId}:${normalizeGhanaPhone(customerPhone)}`;
+  `marketing-consent-request:${restaurantId}:${normalizeWhatsappRecipient(customerPhone)}`;
 
 export const buildMarketingConsentRequestMessage = (
   restaurantName: string
@@ -172,12 +194,12 @@ export const queueMarketingConsentRequest = async (
   now = new Date()
 ): Promise<QueueMarketingConsentRequestResult> => {
   const restaurantId = input.restaurantId;
-  const customerPhone = ensureScopedIdentity(
+  const customerPhone = ensureScopedCustomerIdentity(
     restaurantId,
     input.customerPhone
   );
   const requestedByPhone = input.requestedByPhone
-    ? ensureScopedIdentity(restaurantId, input.requestedByPhone)
+    ? ensureScopedStaffPhone(restaurantId, input.requestedByPhone)
     : undefined;
 
   if (input.orderId && !Types.ObjectId.isValid(input.orderId)) {
@@ -310,7 +332,10 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
   }
 
   const restaurantId = String(order.restaurantId);
-  const customerPhone = ensureScopedIdentity(restaurantId, order.customerPhone);
+  const customerPhone = ensureScopedCustomerIdentity(
+    restaurantId,
+    order.customerPhone
+  );
   const findProfile =
     dependencies.findProfile ??
     (async (scopedRestaurantId, scopedCustomerPhone) =>
@@ -347,7 +372,10 @@ export const recordMarketingConsentPromptResponse = async (
   response: MarketingConsentResponse,
   now = new Date()
 ): Promise<boolean> => {
-  const normalizedPhone = ensureScopedIdentity(restaurantId, customerPhone);
+  const normalizedPhone = ensureScopedCustomerIdentity(
+    restaurantId,
+    customerPhone
+  );
   const result = await CustomerProfile.updateOne(
     {
       restaurantId,
@@ -371,7 +399,7 @@ export const getPendingMarketingConsentContext = async (
   customerPhone: string,
   quotedMessageId?: string
 ): Promise<PendingMarketingConsentContext> => {
-  const normalizedPhone = ensureScopedIdentity(
+  const normalizedPhone = ensureScopedCustomerIdentity(
     restaurantId,
     customerPhone
   );

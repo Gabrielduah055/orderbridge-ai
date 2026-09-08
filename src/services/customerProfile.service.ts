@@ -14,7 +14,10 @@ import {
   type OrderType
 } from "../models/order.model";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 
 export const MAX_FREQUENTLY_ORDERED_ITEMS = 10;
 export const MAX_COMMON_DELIVERY_ADDRESSES = 10;
@@ -228,9 +231,9 @@ const ensureValidRestaurantId = (restaurantId: string): void => {
 };
 
 const ensureCustomerPhone = (customerPhone: string): string => {
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (normalizedPhone.length < 7) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
   }
 
@@ -610,7 +613,7 @@ export const getCustomerProfileStatistics = async (
     })
   ]);
   const normalizeStatisticsPhone = (value: unknown): string =>
-    typeof value === "string" ? normalizeGhanaPhone(value) : "";
+    typeof value === "string" ? normalizeWhatsappRecipient(value) : "";
   const toPhoneSet = (values: unknown[]): Set<string> =>
     new Set(values.map(normalizeStatisticsPhone).filter(Boolean));
   const sentPhoneSet = toPhoneSet(sentConsentPhones);

@@ -30,7 +30,10 @@ import {
   ForbiddenError,
   NotFoundError
 } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { resolveZonedDateTime } from "../utils/zonedDateTime.util";
 import { isCustomerEligibleForMarketing } from "./customerMarketingPreference.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
@@ -220,7 +223,7 @@ const ensureObjectId = (value: string, label: string): void => {
 };
 
 const isValidMarketingPhone = (phone: string): boolean =>
-  /^\+[1-9]\d{7,14}$/.test(phone);
+  isValidWhatsappRecipient(phone);
 
 export const resolveCustomerCampaignScheduledAt = (
   scheduledAt: string | Date | undefined,
@@ -351,7 +354,7 @@ const loadCompletedOrderPhonesForMenuItem = async (
 
   return new Set(
     orders
-      .map((order) => normalizeGhanaPhone(order.customerPhone))
+      .map((order) => normalizeWhatsappRecipient(order.customerPhone))
       .filter(isValidMarketingPhone)
   );
 };
@@ -401,7 +404,7 @@ export const selectCustomerCampaignAudience = async (
   let excludedInvalidPhone = 0;
 
   for (const profile of profiles) {
-    const normalizedPhone = normalizeGhanaPhone(profile.customerPhone);
+    const normalizedPhone = normalizeWhatsappRecipient(profile.customerPhone);
     let qualificationReason: string | null = null;
 
     switch (targeting.type) {

@@ -6,7 +6,7 @@ import type {
   OrderType
 } from "../models/order.model";
 import { Order } from "../models/order.model";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
 
 export const CUSTOMER_MEMORY_RECENT_ORDER_LIMIT = 3;
@@ -192,7 +192,7 @@ export const loadCustomerMemorySummary = async (
   restaurantId: string,
   customerPhone: string
 ): Promise<CustomerMemorySummary | null> => {
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const profile = await CustomerProfile.findOne({
     restaurantId,
     customerPhone: normalizedPhone

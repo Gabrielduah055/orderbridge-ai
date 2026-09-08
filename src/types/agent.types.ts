@@ -7,6 +7,8 @@ export type SenderRole = "owner" | "manager" | "customer";
 export interface ResolvedSender {
   name?: string;
   phone: string;
+  normalizedAddress: string;
+  /** @deprecated Use normalizedAddress for customer identity/address logic. */
   normalizedPhone: string;
   role: SenderRole;
   verified: boolean;

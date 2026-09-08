@@ -12,7 +12,10 @@ import { Order, type IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { createAiProvider } from "./ai/aiProvider.factory";
 import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
@@ -22,6 +25,7 @@ import {
   feedbackCompletionEligibleStatuses
 } from "./orderCompletion.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import { queueMarketingConsentRequestAfterSuccessfulOrder } from "./customerMarketingOnboarding.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -51,7 +55,7 @@ export interface HandleOrderFeedbackResponseResult {
 }
 
 export interface OrderFeedbackResponseDependencies {
-  // Reserved for future dependency injection in tests.
+  queueMarketingConsentRequest?: typeof queueMarketingConsentRequestAfterSuccessfulOrder;
 }
 
 export const orderCheckInOutcomes = [
@@ -96,6 +100,25 @@ const aiFeedbackClassificationSchema = z
 
 const normalizeText = (value: string): string =>
   value.trim().replace(/\s+/g, " ");
+
+const tryQueueMarketingConsentAfterPositiveCompletion = async (
+  order: IOrderDocument,
+  dependencies: OrderFeedbackResponseDependencies
+): Promise<void> => {
+  const queueRequest =
+    dependencies.queueMarketingConsentRequest ??
+    queueMarketingConsentRequestAfterSuccessfulOrder;
+
+  try {
+    await queueRequest(order);
+  } catch (error) {
+    console.error("Marketing consent request after feedback completion failed", {
+      restaurantId: String(order.restaurantId),
+      orderId: String(order._id),
+      errorType: error instanceof Error ? error.name : "UnknownError"
+    });
+  }
+};
 
 const getOrderReference = (order: Pick<IOrderDocument, "_id" | "orderNumber">): string =>
   order.orderNumber ?? String(order._id);
@@ -503,7 +526,7 @@ export const createOrderFeedback = async (
       restaurantId: input.restaurantId,
       orderId: input.order._id,
       orderNumber: getOrderReference(input.order),
-      customerPhone: normalizeGhanaPhone(input.order.customerPhone),
+      customerPhone: normalizeWhatsappRecipient(input.order.customerPhone),
       customerName: input.order.customerName,
       type: input.classification.type,
       message: normalizedMessage,
@@ -618,7 +641,7 @@ export const resolveQuotedOrderFeedbackOrderId = async (
     return null;
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const queuedMessage = await OutboundMessage.findOne({
     restaurantId,
     to: normalizedPhone,
@@ -830,6 +853,10 @@ const handleNumberedResponse = async (
       feedbackAwaitingComplaint: false,
       feedbackReceiptClarificationPending: false
     });
+    await tryQueueMarketingConsentAfterPositiveCompletion(
+      completed.order,
+      dependencies
+    );
 
     return {
       handled: true,
@@ -1094,6 +1121,12 @@ export const handleOrderFeedbackCustomerResponse = async (
         feedbackReceiptClarificationPending: false
       }
     );
+    if (!classification.requiresOwnerAttention) {
+      await tryQueueMarketingConsentAfterPositiveCompletion(
+        completed.order,
+        dependencies
+      );
+    }
 
     return {
       handled: true,

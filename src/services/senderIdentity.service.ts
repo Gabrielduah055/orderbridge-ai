@@ -1,6 +1,9 @@
 import type { IRestaurantDocument } from "../models/Restaurant";
 import type { ResolvedSender } from "../types/agent.types";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 
 type RestaurantIdentitySource = Pick<
   IRestaurantDocument,
@@ -16,11 +19,13 @@ export const resolveSenderIdentity = (
   senderPhone: string
 ): ResolvedSender => {
   const normalizedPhone = normalizePhone(senderPhone);
+  const normalizedAddress = normalizeWhatsappRecipient(senderPhone);
 
   if (normalizedPhone && normalizedPhone === normalizePhone(restaurant.ownerPhone)) {
     return {
       name: restaurant.ownerName,
       phone: senderPhone,
+      normalizedAddress: normalizedPhone,
       normalizedPhone,
       role: "owner",
       verified: true
@@ -36,6 +41,7 @@ export const resolveSenderIdentity = (
     return {
       name: managerContact.name,
       phone: senderPhone,
+      normalizedAddress: normalizedPhone,
       normalizedPhone,
       role: "manager",
       verified: true
@@ -48,6 +54,7 @@ export const resolveSenderIdentity = (
   ) {
     return {
       phone: senderPhone,
+      normalizedAddress: normalizedPhone,
       normalizedPhone,
       role: "manager",
       verified: true
@@ -56,7 +63,10 @@ export const resolveSenderIdentity = (
 
   return {
     phone: senderPhone,
-    normalizedPhone,
+    normalizedAddress,
+    // Kept for compatibility with existing customer-key call sites. Staff
+    // authorization above only compares phone-normalized values.
+    normalizedPhone: normalizedAddress,
     role: "customer",
     verified: false
   };

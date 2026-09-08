@@ -7,7 +7,7 @@ import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import * as orderService from "./order.service";
 import { parseExplicitQuantity } from "./orderDraft.service";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
 
 interface CustomerMessageInput {
@@ -420,7 +420,7 @@ export const handleLegacyCustomerMessage = async (
   input: CustomerMessageInput
 ): Promise<CustomerAgentResponse> => {
   const restaurant = await getRestaurantOrThrow(input.restaurantId);
-  const customerPhone = normalizeGhanaPhone(input.customerPhone);
+  const customerPhone = normalizeWhatsappRecipient(input.customerPhone);
   const message = normalizeText(input.message);
   const normalizedMessage = normalizeComparableText(message);
   const preferenceResult =

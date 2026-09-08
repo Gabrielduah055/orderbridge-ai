@@ -78,10 +78,34 @@ export const rememberWasenderCustomerIdentity = async (
     throw new Error("Cannot persist an invalid WhatsApp LID");
   }
 
-  const existing = await CustomerChannelIdentity.findOne({
+  const identityScope = {
     restaurantId,
-    provider: "wasender",
-    channel: "whatsapp",
+    provider: "wasender" as const,
+    channel: "whatsapp" as const
+  };
+
+  // Usernames are mutable and reusable. A fresh provider username belongs to
+  // the current trusted LID, so release any stale tenant-local association
+  // before assigning it.
+  const releaseStaleUsername = async (): Promise<void> => {
+    if (!normalizedUsername) {
+      return;
+    }
+
+    await CustomerChannelIdentity.updateMany(
+      {
+        ...identityScope,
+        username: normalizedUsername,
+        lid: { $ne: normalizedLid }
+      },
+      { $unset: { username: "" } }
+    );
+  };
+
+  await releaseStaleUsername();
+
+  const existing = await CustomerChannelIdentity.findOne({
+    ...identityScope,
     lid: normalizedLid
   });
 
@@ -93,22 +117,20 @@ export const rememberWasenderCustomerIdentity = async (
     throw new Error("WhatsApp LID is already mapped to a different customer phone");
   }
 
-  if (
-    existing?.username &&
-    normalizedUsername &&
-    existing.username !== normalizedUsername
-  ) {
-    throw new Error("WhatsApp LID is already mapped to a different username");
-  }
-
   if (existing) {
+    let changed = false;
+
     if (normalizedPhone && !existing.phone) {
       existing.phone = normalizedPhone;
-      await existing.save();
+      changed = true;
     }
 
-    if (normalizedUsername && !existing.username) {
+    if (normalizedUsername && existing.username !== normalizedUsername) {
       existing.username = normalizedUsername;
+      changed = true;
+    }
+
+    if (changed) {
       await existing.save();
     }
 
@@ -135,10 +157,10 @@ export const rememberWasenderCustomerIdentity = async (
       throw error;
     }
 
+    await releaseStaleUsername();
+
     const concurrentlyCreated = await CustomerChannelIdentity.findOne({
-      restaurantId,
-      provider: "wasender",
-      channel: "whatsapp",
+      ...identityScope,
       lid: normalizedLid
     });
 
@@ -154,21 +176,21 @@ export const rememberWasenderCustomerIdentity = async (
       throw new Error("WhatsApp LID is already mapped to a different customer phone");
     }
 
+    let changed = false;
+    if (normalizedPhone && !concurrentlyCreated.phone) {
+      concurrentlyCreated.phone = normalizedPhone;
+      changed = true;
+    }
+
     if (
-      concurrentlyCreated.username &&
       normalizedUsername &&
       concurrentlyCreated.username !== normalizedUsername
     ) {
-      throw new Error("WhatsApp LID is already mapped to a different username");
-    }
-
-    if (normalizedPhone && !concurrentlyCreated.phone) {
-      concurrentlyCreated.phone = normalizedPhone;
-      await concurrentlyCreated.save();
-    }
-
-    if (normalizedUsername && !concurrentlyCreated.username) {
       concurrentlyCreated.username = normalizedUsername;
+      changed = true;
+    }
+
+    if (changed) {
       await concurrentlyCreated.save();
     }
 
@@ -234,25 +256,31 @@ export const resolveWasenderCustomerIdentity = async (
   const storedUsername = normalizeWhatsappUsername(storedIdentity?.username);
 
   if (storedPhone) {
+    if (username && username !== storedUsername) {
+      await remember(restaurantId, lid, storedPhone, username);
+    }
+
     return {
       customerPhone: storedPhone,
       customerAddress: storedPhone,
       lid,
-      username: storedUsername || undefined,
+      username: username || storedUsername || undefined,
       recipientAddress: storedPhone,
       addressingMode: "lid",
       resolutionSource: "stored_mapping"
     };
   }
 
-  if (storedUsername) {
+  if (username) {
+    await remember(restaurantId, lid, undefined, username);
+
     return {
-      customerAddress: storedUsername,
+      customerAddress: username,
       lid,
-      username: storedUsername,
-      recipientAddress: storedUsername,
+      username,
+      recipientAddress: username,
       addressingMode: "username",
-      resolutionSource: "stored_username"
+      resolutionSource: "username_field"
     };
   }
 
@@ -279,19 +307,6 @@ export const resolveWasenderCustomerIdentity = async (
     }
   }
 
-  if (username) {
-    await remember(restaurantId, lid, undefined, username);
-
-    return {
-      customerAddress: username,
-      lid,
-      username,
-      recipientAddress: username,
-      addressingMode: "username",
-      resolutionSource: "username_field"
-    };
-  }
-
   const usernameResolution = await fetchUsername(lid, { apiKey });
   const resolvedUsername = usernameResolution.success
     ? normalizeWhatsappUsername(usernameResolution.username)
@@ -307,6 +322,17 @@ export const resolveWasenderCustomerIdentity = async (
       recipientAddress: resolvedUsername,
       addressingMode: "username",
       resolutionSource: "provider_username_lookup"
+    };
+  }
+
+  if (storedUsername) {
+    return {
+      customerAddress: storedUsername,
+      lid,
+      username: storedUsername,
+      recipientAddress: storedUsername,
+      addressingMode: "username",
+      resolutionSource: "stored_username"
     };
   }
 

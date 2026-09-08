@@ -25,7 +25,10 @@ import {
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { redactUrls } from "../utils/error.util";
 import {
   applyOrderFeedbackProviderResult,
@@ -329,10 +332,10 @@ export const getQueuedCustomerCampaignStaleReason = async (
   const campaignVersion = Number(metadata.campaignVersion);
   const customerPhone =
     typeof metadata.customerPhone === "string"
-      ? normalizeGhanaPhone(metadata.customerPhone)
+      ? normalizeWhatsappRecipient(metadata.customerPhone)
       : "";
   const queuedPhone = queuedRecipientPhone
-    ? normalizeGhanaPhone(queuedRecipientPhone)
+    ? normalizeWhatsappRecipient(queuedRecipientPhone)
     : "";
 
   if (
@@ -403,7 +406,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "campaign_recipient_version_changed";
   }
 
-  if (normalizeGhanaPhone(recipient.customerPhone) !== customerPhone) {
+  if (normalizeWhatsappRecipient(recipient.customerPhone) !== customerPhone) {
     return "campaign_recipient_phone_changed";
   }
 
@@ -416,7 +419,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "customer_profile_missing";
   }
 
-  if (normalizeGhanaPhone(profile.customerPhone) !== customerPhone) {
+  if (normalizeWhatsappRecipient(profile.customerPhone) !== customerPhone) {
     return "customer_profile_phone_changed";
   }
 
@@ -471,8 +474,8 @@ export const getQueuedMarketingConsentRequestStaleReason = async (
       : undefined;
   const customerPhone =
     typeof metadata?.customerPhone === "string"
-      ? normalizeGhanaPhone(metadata.customerPhone)
-      : normalizeGhanaPhone(queuedCustomerPhone);
+      ? normalizeWhatsappRecipient(metadata.customerPhone)
+      : normalizeWhatsappRecipient(queuedCustomerPhone);
 
   if (!restaurantId || !customerPhone) {
     return "invalid_consent_request_scope";

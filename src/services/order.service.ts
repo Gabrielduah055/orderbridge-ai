@@ -13,7 +13,10 @@ import {
 import { Restaurant } from "../models/Restaurant";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import {
   cancelQueuedOrderFeedbackMessages
 } from "./orderCompletion.service";
@@ -571,9 +574,11 @@ export const amendCustomerSubmittedOrder = async (
 ): Promise<AmendCustomerSubmittedOrderResult> => {
   const restaurant = await getRestaurantOrThrow(restaurantId);
   const order = await getOrderOrThrow(orderId, restaurantId);
-  const normalizedCustomerPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedCustomerPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (normalizeGhanaPhone(order.customerPhone) !== normalizedCustomerPhone) {
+  if (
+    normalizeWhatsappRecipient(order.customerPhone) !== normalizedCustomerPhone
+  ) {
     throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
   }
 
@@ -760,7 +765,7 @@ const applyOrderStatusUpdate = async (
     order.feedbackFollowUpStatus &&
       order.feedbackFollowUpStatus !== "not_scheduled"
   );
-  order.customerPhone = normalizeGhanaPhone(order.customerPhone);
+  order.customerPhone = normalizeWhatsappRecipient(order.customerPhone);
   order.status = status;
 
   if (status === "completed") {
@@ -804,7 +809,10 @@ export const cancelCustomerOrder = async (
 ): Promise<CustomerCancellationResult> => {
   const order = await getOrderOrThrow(orderId, restaurantId);
 
-  if (normalizeGhanaPhone(order.customerPhone) !== normalizeGhanaPhone(customerPhone)) {
+  if (
+    normalizeWhatsappRecipient(order.customerPhone) !==
+    normalizeWhatsappRecipient(customerPhone)
+  ) {
     throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
   }
 

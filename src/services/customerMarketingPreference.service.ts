@@ -8,7 +8,10 @@ import {
 import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 
 export type CustomerMarketingPreferenceCommand = "opt_in" | "opt_out";
 
@@ -51,9 +54,9 @@ const ensureScopedPreferenceIdentity = (
     throw new BadRequestError("Invalid restaurantId");
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
   }
 

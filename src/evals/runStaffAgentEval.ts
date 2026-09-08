@@ -68,6 +68,7 @@ const buildSyntheticSender = (
 ): ResolvedSender => ({
   name: role === "owner" ? "Eval Owner" : "Eval Manager",
   phone: role === "owner" ? "+233500000001" : "+233500000002",
+  normalizedAddress: role === "owner" ? "+233500000001" : "+233500000002",
   normalizedPhone: role === "owner" ? "+233500000001" : "+233500000002",
   role,
   verified: true

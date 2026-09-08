@@ -12,7 +12,7 @@ import {
   type IOrderDocument
 } from "../models/order.model";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
 
 export const CUSTOMER_RECOMMENDATION_RECENT_ORDER_LIMIT = 3;
@@ -241,7 +241,7 @@ export const getCustomerRecommendations = async (
 ): Promise<CustomerRecommendationCandidate[]> => {
   ensureValidRestaurantId(restaurantId);
   const safeLimit = ensureRecommendationLimit(limit);
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const [profile, recentOrders] = await Promise.all([
     CustomerProfile.findOne({
       restaurantId,

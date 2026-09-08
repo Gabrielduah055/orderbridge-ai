@@ -33,7 +33,10 @@ import type {
   MenuItemImageDelivery,
   RestaurantAgentResponse
 } from "../types/agent.types";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import { resolveWasenderCustomerIdentity } from "../services/wasenderIdentity.service";
 import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
@@ -46,7 +49,7 @@ export const runCustomerConversationSequentially = async <T>(
   customerPhone: string,
   task: () => Promise<T>
 ): Promise<T> => {
-  const key = `${restaurantId}:${normalizeGhanaPhone(customerPhone)}`;
+  const key = `${restaurantId}:${normalizeWhatsappRecipient(customerPhone)}`;
   const previous = customerConversationQueues.get(key) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(task);
   const cleanup = next

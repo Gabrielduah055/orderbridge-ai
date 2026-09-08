@@ -2,7 +2,10 @@ import { Types } from "mongoose";
 import { CustomerProfile } from "../models/customerProfile.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { ForbiddenError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
   buildMarketingConsentRequestMessage,
@@ -45,9 +48,6 @@ interface MarketingConsentOutreachDependencies {
   }>>;
   queueRequest?: typeof queueMarketingConsentRequest;
 }
-
-const isValidCustomerPhone = (phone: string): boolean =>
-  /^\+[1-9]\d{7,14}$/.test(phone);
 
 const loadOutreachAudience = async (
   restaurantId: string,
@@ -112,9 +112,9 @@ const loadOutreachAudience = async (
       continue;
     }
 
-    const normalizedPhone = normalizeGhanaPhone(profile.customerPhone);
+    const normalizedPhone = normalizeWhatsappRecipient(profile.customerPhone);
 
-    if (!isValidCustomerPhone(normalizedPhone)) {
+    if (!isValidWhatsappRecipient(normalizedPhone)) {
       excludedInvalidPhone += 1;
       continue;
     }

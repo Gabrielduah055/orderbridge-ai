@@ -76,7 +76,7 @@ import {
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import {
   findTrustedQuotedOwnerOrderContext,
   type QuotedOwnerOrderAction
@@ -1472,7 +1472,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       if (
         isCustomer &&
-        normalizeGhanaPhone(order.customerPhone) !== context.sender.normalizedPhone
+        normalizeWhatsappRecipient(order.customerPhone) !==
+          context.sender.normalizedPhone
       ) {
         return {
           success: false,
@@ -3254,7 +3255,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (
-        normalizeGhanaPhone(order.customerPhone) !==
+        normalizeWhatsappRecipient(order.customerPhone) !==
         context.sender.normalizedPhone
       ) {
         return {
@@ -3419,7 +3420,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       if (
         context.sender.role === "customer" &&
-        normalizeGhanaPhone(order.customerPhone) !== context.sender.normalizedPhone
+        normalizeWhatsappRecipient(order.customerPhone) !==
+          context.sender.normalizedPhone
       ) {
         return {
           success: false,
