@@ -641,11 +641,12 @@ const processNormalizedWebhook = async (
       hasCleanedSenderPn: webhook.hasCleanedSenderPn,
       hasSenderPn: webhook.hasSenderPn,
       hasSenderLid: Boolean(webhook.senderLid),
+      hasSenderUsername: Boolean(webhook.senderUsername),
       resolutionSource: customerIdentity.resolutionSource
     });
 
-    if (!customerIdentity.customerPhone) {
-      console.warn("WhatsApp sender identity has no documented outbound recipient", {
+    if (!customerIdentity.customerAddress) {
+      console.warn("WhatsApp sender identity has no resolvable outbound recipient", {
         restaurantId: String(restaurant._id),
         addressingMode: customerIdentity.addressingMode,
         resolutionSource: customerIdentity.resolutionSource
@@ -656,17 +657,17 @@ const processNormalizedWebhook = async (
       return;
     }
 
-    const canonicalCustomerPhone = customerIdentity.customerPhone;
+    const canonicalCustomerAddress = customerIdentity.customerAddress;
     const replyAddress =
-      customerIdentity.recipientAddress ?? canonicalCustomerPhone;
-    const sender = resolveSenderIdentity(restaurant, canonicalCustomerPhone);
+      customerIdentity.recipientAddress ?? canonicalCustomerAddress;
+    const sender = resolveSenderIdentity(restaurant, canonicalCustomerAddress);
     const processWebhookTurn = async (): Promise<void> => {
       let conversationMetadata: Record<string, unknown> = {};
 
       if (sender.role === "customer") {
         const turnSession = await recordInboundCustomerTurn(
           String(restaurant._id),
-          canonicalCustomerPhone,
+          canonicalCustomerAddress,
           eventId,
           sender.name
         );
@@ -704,7 +705,7 @@ const processNormalizedWebhook = async (
           const trustedImage = await uploadTrustedDecryptedImageFromUrl(decryptedPublicUrl);
           const workflowResult = await prepareUploadedMenuItemImage({
             restaurantId: String(restaurant._id),
-            senderPhone: canonicalCustomerPhone,
+            senderPhone: canonicalCustomerAddress,
             senderRole: sender.role,
             image: trustedImage
           });
@@ -767,7 +768,7 @@ const processNormalizedWebhook = async (
 
       const agentResponse = await handleRestaurantAgentMessage({
         restaurant,
-        senderPhone: canonicalCustomerPhone,
+        senderPhone: canonicalCustomerAddress,
         message: webhook.message,
         quotedMessageId: webhook.quotedMessageId,
         inboundEventId: eventId
@@ -797,7 +798,7 @@ const processNormalizedWebhook = async (
           sessionId: restaurant.wasenderSessionId,
           to: replyAddress,
           customerPhone:
-            sender.role === "customer" ? canonicalCustomerPhone : undefined,
+            sender.role === "customer" ? canonicalCustomerAddress : undefined,
           delivery: menuItemImage,
           agentMessage: agentResponse.message,
           eventId,

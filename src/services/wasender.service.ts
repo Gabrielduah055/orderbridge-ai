@@ -1,9 +1,12 @@
 import crypto from "crypto";
 import { getSafeErrorMessage } from "../utils/error.util";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappUsername
+} from "../utils/phone.util";
 
 export type WasenderMessageType = "text" | "image" | "document" | "unknown";
-export type WasenderAddressingMode = "pn" | "lid";
+export type WasenderAddressingMode = "pn" | "lid" | "username";
 export type WasenderSenderPhoneSource =
   | "cleanedParticipantPn"
   | "cleanedSenderPn"
@@ -19,6 +22,7 @@ export interface NormalizedWasenderWebhook {
   senderPhone?: string;
   senderPhoneSource?: WasenderSenderPhoneSource;
   senderLid?: string;
+  senderUsername?: string;
   senderAddress: string;
   addressingMode?: WasenderAddressingMode;
   hasCleanedParticipantPn: boolean;
@@ -48,6 +52,11 @@ export interface WasenderSendOptions {
 
 export interface WasenderLidResolutionResult extends WasenderSendResult {
   phone?: string;
+}
+
+export interface WasenderUsernameResolutionResult extends WasenderSendResult {
+  username?: string;
+  jid?: string;
 }
 
 const defaultWasenderApiUrl = "https://www.wasenderapi.com";
@@ -216,6 +225,12 @@ const cleanWhatsappAddress = (value?: string): string => {
     return lid;
   }
 
+  const username = normalizeWhatsappUsername(value);
+
+  if (username) {
+    return username;
+  }
+
   const address = value
     .replace(/^whatsapp:/i, "")
     .replace(/@s\.whatsapp\.net$/i, "")
@@ -351,7 +366,11 @@ const postToWasender = async (
     typeof body.to === "string" ? body.to : undefined
   )
     ? "lid"
-    : "pn";
+    : normalizeWhatsappUsername(
+          typeof body.to === "string" ? body.to : undefined
+        )
+      ? "username"
+      : "pn";
 
   try {
     console.info("Wasender API send attempt", {
@@ -518,6 +537,98 @@ export const resolveWasenderPhoneFromLid = async (
     return {
       success: false,
       error: getSafeErrorMessage(error, "Wasender LID resolution request failed")
+    };
+  }
+};
+
+export const resolveWasenderUsername = async (
+  contactIdentifier: string,
+  options: WasenderSendOptions = {}
+): Promise<WasenderUsernameResolutionResult> => {
+  const normalizedIdentifier =
+    normalizeWhatsappLid(contactIdentifier) ||
+    normalizeWhatsappUsername(contactIdentifier);
+
+  if (!normalizedIdentifier) {
+    return {
+      success: false,
+      error: "Invalid WhatsApp LID or username"
+    };
+  }
+
+  const config = getWasenderConfig(options);
+
+  if (!config) {
+    return {
+      success: false,
+      error: "Wasender API is not configured"
+    };
+  }
+
+  const path = normalizeWasenderPath(
+    config.apiUrl,
+    `/api/fetch-username/${encodeURIComponent(normalizedIdentifier)}`
+  );
+
+  try {
+    const response = await fetch(`${config.apiUrl}${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        Accept: "application/json"
+      }
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    const data = contentType.includes("application/json")
+      ? ((await response.json()) as unknown)
+      : await response.text();
+    const explicitFailure =
+      data &&
+      typeof data === "object" &&
+      "success" in data &&
+      (data as { success?: unknown }).success === false;
+
+    if (!response.ok || explicitFailure) {
+      return {
+        success: false,
+        status: response.status,
+        data,
+        error: getSafeErrorMessage(
+          data,
+          `Wasender username lookup failed with status ${response.status}`
+        )
+      };
+    }
+
+    const rawUsername = firstString(data, ["data.username", "username"]);
+    const username = normalizeWhatsappUsername(
+      rawUsername?.startsWith("@")
+        ? rawUsername
+        : rawUsername
+          ? `@${rawUsername}`
+          : undefined
+    );
+
+    if (!username) {
+      return {
+        success: false,
+        status: response.status,
+        data,
+        error: "Wasender username lookup returned no valid username"
+      };
+    }
+
+    return {
+      success: true,
+      status: response.status,
+      data,
+      username,
+      jid: firstString(data, ["data.jid", "jid"])
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: getSafeErrorMessage(error, "Wasender username lookup request failed")
     };
   }
 };
@@ -750,6 +861,24 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     normalizeWhatsappLid(explicitSenderLid) ||
     normalizeWhatsappLid(rawRemoteAddress) ||
     undefined;
+  const explicitSenderUsername = firstStringFromSources(senderSources, [
+    "key.senderUsername",
+    "data.messages.key.senderUsername",
+    "key.username",
+    "data.messages.key.username",
+    "senderUsername",
+    "data.senderUsername",
+    "username",
+    "data.username"
+  ]);
+  const senderUsername =
+    normalizeWhatsappUsername(explicitSenderUsername?.startsWith("@")
+      ? explicitSenderUsername
+      : explicitSenderUsername
+        ? `@${explicitSenderUsername}`
+        : undefined) ||
+    normalizeWhatsappUsername(rawRemoteAddress) ||
+    undefined;
   const explicitAddressingMode = firstStringFromSources(senderSources, [
     "key.addressingMode",
     "data.messages.key.addressingMode",
@@ -757,16 +886,21 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     "data.addressingMode"
   ])?.toLowerCase();
   const addressingMode: WasenderAddressingMode | undefined =
-    explicitAddressingMode === "lid" || explicitAddressingMode === "pn"
+    explicitAddressingMode === "lid" ||
+    explicitAddressingMode === "pn" ||
+    explicitAddressingMode === "username"
       ? explicitAddressingMode
       : normalizeWhatsappLid(rawRemoteAddress)
         ? "lid"
+        : senderUsername
+          ? "username"
         : phoneIdentity.phone
           ? "pn"
           : undefined;
   const senderAddress =
     rawRemoteAddress?.replace(/^whatsapp:/i, "").trim() ??
     senderLid ??
+    senderUsername ??
     phoneIdentity.phone ??
     "";
   const from = cleanWhatsappAddress(
@@ -848,6 +982,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     senderPhone: phoneIdentity.phone,
     senderPhoneSource: phoneIdentity.source,
     senderLid,
+    senderUsername,
     senderAddress,
     addressingMode,
     hasCleanedParticipantPn: Boolean(cleanedParticipantPn),

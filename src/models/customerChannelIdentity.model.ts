@@ -6,6 +6,7 @@ export interface ICustomerChannelIdentity {
   channel: "whatsapp";
   phone?: string;
   lid?: string;
+  username?: string;
 }
 
 export interface ICustomerChannelIdentityDocument
@@ -42,6 +43,11 @@ const customerChannelIdentitySchema =
       lid: {
         type: String,
         trim: true
+      },
+      username: {
+        type: String,
+        trim: true,
+        lowercase: true
       }
     },
     {
@@ -61,6 +67,13 @@ customerChannelIdentitySchema.index(
   {
     unique: true,
     partialFilterExpression: { phone: { $type: "string" } }
+  }
+);
+customerChannelIdentitySchema.index(
+  { restaurantId: 1, provider: 1, channel: 1, username: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { username: { $type: "string" } }
   }
 );
 

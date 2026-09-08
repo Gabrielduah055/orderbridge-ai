@@ -7,7 +7,8 @@ const { CustomerSession } = require("../dist/models/customerSession.model");
 const { Order } = require("../dist/models/order.model");
 const {
   normalizeIncomingWebhook,
-  resolveWasenderPhoneFromLid
+  resolveWasenderPhoneFromLid,
+  resolveWasenderUsername
 } = require("../dist/services/wasender.service");
 const {
   resolveWasenderCustomerIdentity
@@ -32,6 +33,7 @@ const otherRestaurantId = "64b000000000000000000902";
 const customerPhone = "+233557038547";
 const customerPhoneDigits = "233557038547";
 const lid = "123456789@lid";
+const username = "@aduamah.maxwell";
 
 const makePayload = (key) => ({
   event: "messages.received",
@@ -210,6 +212,139 @@ test("LID-only webhook can use the documented WaSender PN lookup and persist it"
   }
 });
 
+test("direct username webhook preserves the username as the customer address", async () => {
+  const webhook = normalizeIncomingWebhook(
+    makePayload({
+      remoteJid: username,
+      senderUsername: "aduamah.maxwell",
+      addressingMode: "username"
+    })
+  );
+  const identity = await resolveWasenderCustomerIdentity(
+    restaurantId,
+    webhook
+  );
+
+  assert.equal(webhook.from, username);
+  assert.equal(webhook.senderPhone, undefined);
+  assert.equal(webhook.senderUsername, username);
+  assert.equal(identity.customerAddress, username);
+  assert.equal(identity.recipientAddress, username);
+  assert.equal(identity.resolutionSource, "username_field");
+});
+
+test("WaSender username lookup normalizes the documented response handle", async () => {
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const requests = [];
+  process.env.WASENDER_API_URL = "https://wasender.example";
+  global.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({
+        success: true,
+        data: { jid: lid, username: "aduamah.maxwell" }
+      })
+    };
+  };
+
+  try {
+    const result = await resolveWasenderUsername(lid, {
+      apiKey: "restaurant-token"
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.username, username);
+    assert.equal(result.jid, lid);
+    assert.equal(
+      requests[0].url,
+      "https://wasender.example/api/fetch-username/123456789%40lid"
+    );
+    assert.equal(requests[0].options.method, "GET");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) {
+      delete process.env.WASENDER_API_URL;
+    } else {
+      process.env.WASENDER_API_URL = originalApiUrl;
+    }
+  }
+});
+
+test("LID-only webhook falls back to username when no phone is available", async () => {
+  const webhook = normalizeIncomingWebhook(
+    makePayload({ remoteJid: lid, senderLid: lid, addressingMode: "lid" })
+  );
+  const remembered = [];
+  const identity = await resolveWasenderCustomerIdentity(
+    restaurantId,
+    webhook,
+    "restaurant-token",
+    {
+      findByLid: async () => null,
+      resolvePhoneFromLid: async () => ({ success: true, data: { pn: null } }),
+      resolveUsername: async () => ({
+        success: true,
+        username,
+        jid: lid
+      }),
+      remember: async (...args) => {
+        remembered.push(args);
+        return { lid: args[1], phone: args[2], username: args[3] };
+      }
+    }
+  );
+
+  assert.equal(identity.customerPhone, undefined);
+  assert.equal(identity.customerAddress, username);
+  assert.equal(identity.username, username);
+  assert.equal(identity.recipientAddress, username);
+  assert.equal(identity.addressingMode, "username");
+  assert.equal(identity.resolutionSource, "provider_username_lookup");
+  assert.deepEqual(remembered, [[restaurantId, lid, undefined, username]]);
+  assert.equal(normalizeGhanaPhone(username), username);
+});
+
+test("agent replies can be sent directly to a resolved WhatsApp username", async () => {
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const requests = [];
+  process.env.WASENDER_API_URL = "https://wasender.example";
+  global.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => "application/json" },
+      json: async () => ({ success: true, data: { msgId: 1 } })
+    };
+  };
+
+  try {
+    await sendAgentReplyDirectly(
+      "session-1",
+      username,
+      "Hello",
+      { restaurantId, eventId: "message-username-1", action: "reply" },
+      "restaurant-token"
+    );
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "https://wasender.example/api/send-message");
+    assert.equal(JSON.parse(requests[0].options.body).to, username);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) {
+      delete process.env.WASENDER_API_URL;
+    } else {
+      process.env.WASENDER_API_URL = originalApiUrl;
+    }
+  }
+});
+
 test("failed LID lookup remains LID-only without fabricating a customer phone", async () => {
   const webhook = normalizeIncomingWebhook(
     makePayload({ remoteJid: lid, senderLid: lid, addressingMode: "lid" })
@@ -222,6 +357,7 @@ test("failed LID lookup remains LID-only without fabricating a customer phone", 
     {
       findByLid: async () => null,
       resolvePhoneFromLid: async () => ({ success: false, status: 404 }),
+      resolveUsername: async () => ({ success: false, status: 404 }),
       remember: async (...args) => {
         remembered.push(args);
         return { lid: args[1] };
@@ -377,8 +513,9 @@ test("provider identity indexes include the restaurant tenant boundary", () => {
   const indexes = CustomerChannelIdentity.schema.indexes();
   const lidIndex = indexes.find(([keys]) => keys.lid === 1);
   const phoneIndex = indexes.find(([keys]) => keys.phone === 1);
+  const usernameIndex = indexes.find(([keys]) => keys.username === 1);
 
-  for (const [keys, options] of [lidIndex, phoneIndex]) {
+  for (const [keys, options] of [lidIndex, phoneIndex, usernameIndex]) {
     assert.equal(keys.restaurantId, 1);
     assert.equal(keys.provider, 1);
     assert.equal(keys.channel, 1);
@@ -400,6 +537,22 @@ test("an unresolved LID never receives owner or manager permissions", () => {
   assert.equal(sender.role, "customer");
   assert.equal(sender.verified, false);
   assert.equal(sender.normalizedPhone, "");
+});
+
+test("a username-only sender remains an unverified customer", () => {
+  const sender = resolveSenderIdentity(
+    {
+      ownerName: "Owner",
+      ownerPhone: customerPhone,
+      managerPhones: ["+233500000001"],
+      managerContacts: [{ name: "Manager", phone: "+233500000002" }]
+    },
+    username
+  );
+
+  assert.equal(sender.role, "customer");
+  assert.equal(sender.verified, false);
+  assert.equal(sender.normalizedPhone, username);
 });
 
 test("LID inbound resolves to a phone before the agent reply is sent", async () => {

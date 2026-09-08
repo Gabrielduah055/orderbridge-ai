@@ -1,5 +1,28 @@
+export const normalizeWhatsappUsername = (value?: string): string => {
+  if (!value) {
+    return "";
+  }
+
+  const username = value.replace(/^whatsapp:/i, "").trim().toLowerCase();
+
+  if (username === "@lid") {
+    return "";
+  }
+
+  return /^@[a-z0-9._-]+$/i.test(username) ? username : "";
+};
+
 export const normalizeGhanaPhone = (phone: string): string => {
   const value = phone.trim();
+
+  // Wasender accepts WhatsApp username handles wherever it accepts a phone
+  // recipient. Preserve the handle as the stable customer address when the
+  // account intentionally has no resolvable phone number.
+  const username = normalizeWhatsappUsername(value);
+
+  if (username) {
+    return username;
+  }
 
   // A WhatsApp LID is a provider address, not a phone number. Keeping this
   // guard at the shared normalization boundary prevents accidental callers
