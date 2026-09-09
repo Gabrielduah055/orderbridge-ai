@@ -15,6 +15,7 @@ export interface ICustomerCampaignRecipient {
   restaurantId: Types.ObjectId;
   campaignId: Types.ObjectId;
   customerProfileId: Types.ObjectId;
+  customerKey?: string;
   customerPhone: string;
   campaignVersion: number;
   qualificationReason: string;
@@ -53,6 +54,10 @@ const customerCampaignRecipientSchema =
         type: Schema.Types.ObjectId,
         ref: "CustomerProfile",
         required: true
+      },
+      customerKey: {
+        type: String,
+        trim: true
       },
       customerPhone: {
         type: String,

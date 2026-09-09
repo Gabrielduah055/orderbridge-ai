@@ -14,7 +14,14 @@ import {
   type OrderType
 } from "../models/order.model";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  getCustomerIdentityFilter,
+  normalizeCustomerKey
+} from "./customerIdentity.service";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 
 export const MAX_FREQUENTLY_ORDERED_ITEMS = 10;
 export const MAX_COMMON_DELIVERY_ADDRESSES = 10;
@@ -228,9 +235,9 @@ const ensureValidRestaurantId = (restaurantId: string): void => {
 };
 
 const ensureCustomerPhone = (customerPhone: string): string => {
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (normalizedPhone.length < 7) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
   }
 
@@ -240,10 +247,14 @@ const ensureCustomerPhone = (customerPhone: string): string => {
 export const rememberConfirmedCustomerName = async (
   restaurantId: string,
   customerPhone: string,
-  customerName: string
+  customerName: string,
+  customerKey?: string
 ): Promise<ICustomerProfileDocument> => {
   ensureValidRestaurantId(restaurantId);
   const normalizedPhone = ensureCustomerPhone(customerPhone);
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, normalizedPhone)
+    : "";
   const normalizedName = normalizeDisplayText(customerName);
 
   if (
@@ -253,16 +264,32 @@ export const rememberConfirmedCustomerName = async (
     throw new BadRequestError("A valid customer name is required");
   }
 
-  const existingProfile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  });
+  const existingProfile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      normalizedCustomerKey
+    )
+  );
 
   if (existingProfile?.customerNameSource === "customer_confirmed") {
+    if (
+      existingProfile.customerPhone !== normalizedPhone ||
+      (!existingProfile.customerKey && normalizedCustomerKey)
+    ) {
+      existingProfile.customerPhone = normalizedPhone;
+      existingProfile.customerKey =
+        existingProfile.customerKey ?? normalizedCustomerKey;
+      await existingProfile.save();
+    }
     return existingProfile;
   }
 
   if (existingProfile) {
+    if (normalizedCustomerKey && !existingProfile.customerKey) {
+      existingProfile.customerKey = normalizedCustomerKey;
+    }
+    existingProfile.customerPhone = normalizedPhone;
     existingProfile.customerName = normalizedName;
     existingProfile.customerNameSource = "customer_confirmed";
     return existingProfile.save();
@@ -271,6 +298,7 @@ export const rememberConfirmedCustomerName = async (
   try {
     return await CustomerProfile.create({
       restaurantId,
+      ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {}),
       customerPhone: normalizedPhone,
       customerName: normalizedName,
       customerNameSource: "customer_confirmed"
@@ -286,10 +314,13 @@ export const rememberConfirmedCustomerName = async (
       throw error;
     }
 
-    const concurrentlyCreatedProfile = await CustomerProfile.findOne({
-      restaurantId,
-      customerPhone: normalizedPhone
-    });
+    const concurrentlyCreatedProfile = await CustomerProfile.findOne(
+      getCustomerIdentityFilter<ICustomerProfileDocument>(
+        restaurantId,
+        normalizedPhone,
+        normalizedCustomerKey
+      )
+    );
 
     if (!concurrentlyCreatedProfile) {
       throw error;
@@ -324,15 +355,25 @@ export const getEquivalentCustomerPhones = (customerPhone: string): string[] => 
 
 export const refreshCustomerProfileFromCompletedOrders = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<ICustomerProfileDocument | null> => {
   ensureValidRestaurantId(restaurantId);
   const normalizedPhone = ensureCustomerPhone(customerPhone);
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, normalizedPhone)
+    : "";
   const completedOrders = await Order.find({
-    restaurantId,
-    customerPhone: {
-      $in: getEquivalentCustomerPhones(customerPhone)
-    },
+    ...(normalizedCustomerKey && normalizedCustomerKey !== normalizedPhone
+      ? getCustomerIdentityFilter<IOrderDocument>(
+          restaurantId,
+          normalizedPhone,
+          normalizedCustomerKey
+        )
+      : {
+          restaurantId,
+          customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) }
+        }),
     status: "completed"
   }).sort({ completedAt: -1, updatedAt: -1, createdAt: -1 });
   const stats = buildCompletedOrderProfileStats(completedOrders);
@@ -341,10 +382,13 @@ export const refreshCustomerProfileFromCompletedOrders = async (
     return null;
   }
 
-  const existingProfile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  }).select("customerNameSource preferredOrderTypeSource");
+  const existingProfile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      normalizedCustomerKey
+    )
+  ).select("customerNameSource preferredOrderTypeSource customerKey");
   const orderDerivedFields: Record<string, unknown> = {
     orderCount: stats.orderCount,
     lastOrderAt: stats.lastOrderAt,
@@ -366,15 +410,19 @@ export const refreshCustomerProfileFromCompletedOrders = async (
   }
 
   return CustomerProfile.findOneAndUpdate(
+    existingProfile
+      ? { _id: existingProfile._id, restaurantId }
+      : normalizedCustomerKey && normalizedCustomerKey !== normalizedPhone
+        ? { restaurantId, customerKey: normalizedCustomerKey }
+        : { restaurantId, customerPhone: normalizedPhone },
     {
-      restaurantId,
-      customerPhone: normalizedPhone
-    },
-    {
-      $set: orderDerivedFields,
+      $set: {
+        ...orderDerivedFields,
+        customerPhone: normalizedPhone,
+        ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {})
+      },
       $setOnInsert: {
-        restaurantId,
-        customerPhone: normalizedPhone
+        restaurantId
       }
     },
     {
@@ -395,17 +443,22 @@ export const updateCustomerProfileFromCompletedOrder = async (
 
   return refreshCustomerProfileFromCompletedOrders(
     String(order.restaurantId),
-    order.customerPhone
+    order.customerPhone,
+    order.customerKey
   );
 };
 
 export const updateConfirmedCustomerPreferences = async (
   restaurantId: string,
   customerPhone: string,
-  input: ConfirmedCustomerPreferencesInput
+  input: ConfirmedCustomerPreferencesInput,
+  customerKey?: string
 ): Promise<ICustomerProfileDocument> => {
   ensureValidRestaurantId(restaurantId);
   const normalizedPhone = ensureCustomerPhone(customerPhone);
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, normalizedPhone)
+    : "";
 
   if (input.confirmed !== true) {
     throw new BadRequestError(
@@ -501,21 +554,34 @@ export const updateConfirmedCustomerPreferences = async (
 
   preferenceFields.preferencesConfirmedAt = new Date();
 
+  const existingProfile = normalizedCustomerKey
+    ? await CustomerProfile.findOne(
+        getCustomerIdentityFilter<ICustomerProfileDocument>(
+          restaurantId,
+          normalizedPhone,
+          normalizedCustomerKey
+        )
+      )
+    : null;
   const profile = await CustomerProfile.findOneAndUpdate(
+    existingProfile
+      ? { _id: existingProfile._id, restaurantId }
+      : normalizedCustomerKey && normalizedCustomerKey !== normalizedPhone
+        ? { restaurantId, customerKey: normalizedCustomerKey }
+        : { restaurantId, customerPhone: normalizedPhone },
     {
-      restaurantId,
-      customerPhone: normalizedPhone
-    },
-    {
-      $set: preferenceFields,
+      $set: {
+        ...preferenceFields,
+        customerPhone: normalizedPhone,
+        ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {})
+      },
       ...(Object.keys(preferenceUnsetFields).length > 0
         ? {
             $unset: preferenceUnsetFields
           }
         : {}),
       $setOnInsert: {
-        restaurantId,
-        customerPhone: normalizedPhone
+        restaurantId
       }
     },
     {
@@ -535,14 +601,19 @@ export const updateConfirmedCustomerPreferences = async (
 
 export const getCustomerProfile = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<ICustomerProfileDocument | null> => {
   ensureValidRestaurantId(restaurantId);
 
-  return CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: ensureCustomerPhone(customerPhone)
-  });
+  const normalizedPhone = ensureCustomerPhone(customerPhone);
+  return CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      customerKey
+    )
+  );
 };
 
 export const getCustomerProfileStatistics = async (
@@ -610,7 +681,7 @@ export const getCustomerProfileStatistics = async (
     })
   ]);
   const normalizeStatisticsPhone = (value: unknown): string =>
-    typeof value === "string" ? normalizeGhanaPhone(value) : "";
+    typeof value === "string" ? normalizeWhatsappRecipient(value) : "";
   const toPhoneSet = (values: unknown[]): Set<string> =>
     new Set(values.map(normalizeStatisticsPhone).filter(Boolean));
   const sentPhoneSet = toPhoneSet(sentConsentPhones);

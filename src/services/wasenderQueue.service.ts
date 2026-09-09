@@ -25,7 +25,15 @@ import {
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
+import {
+  getCustomerIdentityFilter,
+  resolveCurrentWhatsappRecipientResult
+} from "./customerIdentity.service";
 import { redactUrls } from "../utils/error.util";
 import {
   applyOrderFeedbackProviderResult,
@@ -52,10 +60,26 @@ const defaultSpacingMs = 5_000;
 const workerIntervalMs = 1_000;
 const defaultMaxAttempts = 5;
 const staleSendingRecoveryMs = 5 * 60_000;
+const recipientVerificationMaxBackoffMs = 15 * 60_000;
 let workerStarted = false;
 let workerBusy = false;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getRecipientVerificationRetryDelayMs = (
+  attempts: number,
+  providerRetryAfterMs?: number
+): number => {
+  if (providerRetryAfterMs) {
+    return providerRetryAfterMs;
+  }
+
+  const exponent = Math.min(Math.max(attempts - 1, 0), 8);
+  return Math.min(
+    defaultSpacingMs * 2 ** exponent,
+    recipientVerificationMaxBackoffMs
+  );
+};
 
 const getErrorMessage = (result: WasenderSendResult): string =>
   result.error || (result.status ? `Wasender status ${result.status}` : "Wasender send failed");
@@ -76,6 +100,11 @@ const transactionalKinds = new Set([
   "order_feedback_reminder",
   "order_feedback_owner_notification",
   "marketing_consent_request"
+]);
+
+export const recoverableRecipientCancellationReasons = new Set([
+  "no_current_whatsapp_recipient",
+  "stale_username"
 ]);
 
 export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>): boolean => {
@@ -329,11 +358,15 @@ export const getQueuedCustomerCampaignStaleReason = async (
   const campaignVersion = Number(metadata.campaignVersion);
   const customerPhone =
     typeof metadata.customerPhone === "string"
-      ? normalizeGhanaPhone(metadata.customerPhone)
+      ? normalizeWhatsappRecipient(metadata.customerPhone)
       : "";
   const queuedPhone = queuedRecipientPhone
-    ? normalizeGhanaPhone(queuedRecipientPhone)
+    ? normalizeWhatsappRecipient(queuedRecipientPhone)
     : "";
+  const customerKey =
+    typeof metadata.customerKey === "string"
+      ? metadata.customerKey.trim().toLowerCase()
+      : "";
 
   if (
     !Types.ObjectId.isValid(restaurantId) ||
@@ -341,12 +374,12 @@ export const getQueuedCustomerCampaignStaleReason = async (
     !Types.ObjectId.isValid(campaignRecipientId) ||
     !Number.isInteger(campaignVersion) ||
     campaignVersion < 1 ||
-    !/^\+[1-9]\d{7,14}$/.test(customerPhone)
+    !isValidWhatsappRecipient(customerPhone)
   ) {
     return "invalid_metadata";
   }
 
-  if (queuedPhone && queuedPhone !== customerPhone) {
+  if (!customerKey && queuedPhone && queuedPhone !== customerPhone) {
     return "queued_recipient_changed";
   }
 
@@ -393,7 +426,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     campaignId,
     campaignVersion,
     status: "pending"
-  }).select("customerPhone campaignVersion");
+  }).select("customerKey customerPhone campaignVersion");
 
   if (!recipient) {
     return "campaign_recipient_missing_or_not_pending";
@@ -403,20 +436,31 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "campaign_recipient_version_changed";
   }
 
-  if (normalizeGhanaPhone(recipient.customerPhone) !== customerPhone) {
+  if (
+    customerKey
+      ? recipient.customerKey !== customerKey
+      : normalizeWhatsappRecipient(recipient.customerPhone) !== customerPhone
+  ) {
     return "campaign_recipient_phone_changed";
   }
 
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone
-  }).select("customerPhone marketingConsent isOptedOut");
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter(
+      restaurantId,
+      customerPhone,
+      customerKey || undefined
+    )
+  ).select("customerKey customerPhone marketingConsent isOptedOut");
 
   if (!profile) {
     return "customer_profile_missing";
   }
 
-  if (normalizeGhanaPhone(profile.customerPhone) !== customerPhone) {
+  if (
+    customerKey
+      ? profile.customerKey !== customerKey
+      : normalizeWhatsappRecipient(profile.customerPhone) !== customerPhone
+  ) {
     return "customer_profile_phone_changed";
   }
 
@@ -471,17 +515,20 @@ export const getQueuedMarketingConsentRequestStaleReason = async (
       : undefined;
   const customerPhone =
     typeof metadata?.customerPhone === "string"
-      ? normalizeGhanaPhone(metadata.customerPhone)
-      : normalizeGhanaPhone(queuedCustomerPhone);
+      ? normalizeWhatsappRecipient(metadata.customerPhone)
+      : normalizeWhatsappRecipient(queuedCustomerPhone);
+  const customerKey =
+    typeof metadata?.customerKey === "string"
+      ? metadata.customerKey
+      : undefined;
 
   if (!restaurantId || !customerPhone) {
     return "invalid_consent_request_scope";
   }
 
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone
-  }).select("marketingConsent isOptedOut");
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter(restaurantId, customerPhone, customerKey)
+  ).select("marketingConsent isOptedOut");
 
   // A missing profile may mean the prompt was queued just before the profile
   // audit update completed. Do not cancel that narrow enqueue/mark race.
@@ -1062,6 +1109,56 @@ export const enqueueWasenderMessage = async (
     const existing = await OutboundMessage.findOne(idempotencyFilter).select("+apiKey");
 
     if (existing) {
+      if (
+        existing.status === "cancelled" &&
+        recoverableRecipientCancellationReasons.has(existing.lastError ?? "")
+      ) {
+        const metadata = { ...existing.metadata, ...input.metadata };
+        const restaurantId =
+          input.restaurantId ??
+          (existing.restaurantId ? String(existing.restaurantId) : undefined);
+        const customerKey =
+          typeof metadata.customerKey === "string"
+            ? metadata.customerKey
+            : undefined;
+
+        if (restaurantId && customerKey) {
+          const resolution = await resolveCurrentWhatsappRecipientResult({
+            restaurantId,
+            customerKey,
+            fallbackAddress: input.to || existing.to,
+            apiKey: input.apiKey ?? existing.apiKey,
+            verifyUsername: true
+          });
+
+          if (resolution.resolved && resolution.recipient) {
+            existing.sessionId = input.sessionId;
+            existing.to = resolution.recipient;
+            existing.type = input.type;
+            existing.text = input.text;
+            existing.documentUrl = input.documentUrl;
+            existing.imageUrl = input.imageUrl;
+            existing.caption = input.caption;
+            existing.apiKey = input.apiKey ?? existing.apiKey;
+            existing.status = "pending";
+            existing.attempts = 0;
+            existing.nextAttemptAt = input.nextAttemptAt ?? new Date();
+            existing.lastError = undefined;
+            existing.lastStatus = undefined;
+            existing.providerData = undefined;
+            existing.providerMessageId = undefined;
+            existing.lastAttemptAt = undefined;
+            existing.sentAt = undefined;
+            existing.metadata = {
+              ...metadata,
+              customerPhone: resolution.recipient,
+              customerKey
+            };
+            await existing.save();
+          }
+        }
+      }
+
       return existing;
     }
   }
@@ -1156,6 +1253,106 @@ export interface ProcessQueuedWasenderMessageDependencies {
   sendMessage?: (message: IOutboundMessageDocument) => Promise<WasenderSendResult>;
   enqueueMessage?: typeof enqueueWasenderMessage;
 }
+
+const resolveQueuedCustomerIdentity = async (
+  message: IOutboundMessageDocument
+): Promise<{
+  restaurantId?: string;
+  customerKey?: string;
+  fallbackAddress: string;
+}> => {
+  const restaurantId =
+    typeof message.metadata?.restaurantId === "string"
+      ? message.metadata.restaurantId
+      : message.restaurantId
+        ? String(message.restaurantId)
+        : undefined;
+  let customerKey =
+    typeof message.metadata?.customerKey === "string"
+      ? message.metadata.customerKey
+      : undefined;
+  let fallbackAddress = message.to;
+  const orderId =
+    typeof message.metadata?.orderId === "string"
+      ? message.metadata.orderId
+      : undefined;
+
+  // This also protects customer messages queued before customerKey was added
+  // to their metadata, provided the queue item has trusted tenant/order scope.
+  if (
+    !customerKey &&
+    message.metadata?.recipientType === "customer" &&
+    restaurantId &&
+    orderId &&
+    Types.ObjectId.isValid(restaurantId) &&
+    Types.ObjectId.isValid(orderId)
+  ) {
+    const order = await Order.findOne({ _id: orderId, restaurantId }).select(
+      "customerKey customerPhone"
+    );
+    customerKey = order?.customerKey;
+    fallbackAddress = order?.customerPhone || fallbackAddress;
+  }
+
+  return { restaurantId, customerKey, fallbackAddress };
+};
+
+export const refreshQueuedCustomerRecipient = async (
+  message: IOutboundMessageDocument
+): Promise<{
+  safe: boolean;
+  reason?: string;
+  recipient?: string;
+  temporary?: boolean;
+  retryAfterMs?: number;
+}> => {
+  let reference: Awaited<ReturnType<typeof resolveQueuedCustomerIdentity>>;
+
+  try {
+    reference = await resolveQueuedCustomerIdentity(message);
+  } catch {
+    return {
+      safe: false,
+      reason: "no_current_whatsapp_recipient"
+    };
+  }
+
+  if (!reference.restaurantId || !reference.customerKey) {
+    return { safe: true, recipient: message.to };
+  }
+
+  const resolution = await resolveCurrentWhatsappRecipientResult({
+    restaurantId: reference.restaurantId,
+    customerKey: reference.customerKey,
+    fallbackAddress: reference.fallbackAddress,
+    apiKey: message.apiKey,
+    verifyUsername: true
+  });
+
+  if (!resolution.resolved || !resolution.recipient) {
+    return {
+      safe: false,
+      reason: resolution.reason,
+      temporary: resolution.temporary,
+      retryAfterMs: resolution.retryAfterMs
+    };
+  }
+
+  if (message.to !== resolution.recipient) {
+    message.to = resolution.recipient;
+    message.metadata = {
+      ...message.metadata,
+      customerPhone: resolution.recipient,
+      customerKey: reference.customerKey
+    };
+  }
+
+  return {
+    safe: true,
+    recipient: resolution.recipient,
+    reason: resolution.reason
+  };
+};
 
 export const processNextQueuedWasenderMessage = async (
   dependencies: ProcessQueuedWasenderMessageDependencies = {}
@@ -1348,9 +1545,19 @@ export const processNextQueuedWasenderMessage = async (
           : undefined;
     const customerPhone =
       typeof locked.metadata?.customerPhone === "string" ? locked.metadata.customerPhone : locked.to;
+    const customerKey =
+      typeof locked.metadata?.customerKey === "string"
+        ? locked.metadata.customerKey
+        : undefined;
     const session =
       restaurantId && customerPhone
-        ? await CustomerSession.findOne({ restaurantId, customerPhone }).select(
+        ? await CustomerSession.findOne(
+            getCustomerIdentityFilter(
+              restaurantId,
+              customerPhone,
+              customerKey
+            )
+          ).select(
             "_id conversationVersion currentStep cartItems pendingMenuItemId pendingCategoryId orderType deliveryFee"
           )
         : null;
@@ -1369,6 +1576,62 @@ export const processNextQueuedWasenderMessage = async (
       });
       return true;
     }
+  }
+
+  const refreshedRecipient = await refreshQueuedCustomerRecipient(locked);
+  if (!refreshedRecipient.safe) {
+    if (refreshedRecipient.temporary) {
+      locked.status = "pending";
+      locked.lastError = refreshedRecipient.reason;
+      locked.nextAttemptAt = new Date(
+        Date.now() +
+          getRecipientVerificationRetryDelayMs(
+            locked.attempts,
+            refreshedRecipient.retryAfterMs
+          )
+      );
+      await locked.save();
+      console.warn("Queued customer recipient verification deferred", {
+        restaurantId:
+          typeof locked.metadata?.restaurantId === "string"
+            ? locked.metadata.restaurantId
+            : locked.restaurantId
+              ? String(locked.restaurantId)
+              : undefined,
+        orderId: locked.metadata?.orderId,
+        kind: locked.metadata?.kind,
+        queueMessageId: String(locked._id),
+        reason: refreshedRecipient.reason
+      });
+      return true;
+    }
+
+    locked.status = "cancelled";
+    locked.lastError = recoverableRecipientCancellationReasons.has(
+      refreshedRecipient.reason ?? ""
+    )
+      ? refreshedRecipient.reason
+      : "no_current_whatsapp_recipient";
+    await locked.save();
+    if (locked.metadata?.kind === "customer_campaign") {
+      await cancelStaleCampaignRecipient(
+        locked.metadata,
+        refreshedRecipient.reason ?? "no_current_whatsapp_recipient"
+      );
+    }
+    console.warn("Queued customer WhatsApp message cancelled", {
+      restaurantId:
+        typeof locked.metadata?.restaurantId === "string"
+          ? locked.metadata.restaurantId
+          : locked.restaurantId
+            ? String(locked.restaurantId)
+            : undefined,
+      orderId: locked.metadata?.orderId,
+      kind: locked.metadata?.kind,
+      queueMessageId: String(locked._id),
+      reason: refreshedRecipient.reason
+    });
+    return true;
   }
 
   if (locked.type === "image") {

@@ -8,7 +8,14 @@ import {
 import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
+import {
+  getCustomerIdentityFilter,
+  normalizeCustomerKey
+} from "./customerIdentity.service";
 
 export type CustomerMarketingPreferenceCommand = "opt_in" | "opt_out";
 
@@ -51,9 +58,9 @@ const ensureScopedPreferenceIdentity = (
     throw new BadRequestError("Invalid restaurantId");
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
   }
 
@@ -152,16 +159,23 @@ export const setCustomerMarketingPreference = async (
   customerPhone: string,
   command: CustomerMarketingPreferenceCommand,
   source: MarketingPreferenceSource,
-  now = new Date()
+  now = new Date(),
+  customerKey?: string
 ): Promise<ICustomerProfileDocument> => {
   const normalizedPhone = ensureScopedPreferenceIdentity(
     restaurantId,
     customerPhone
   );
-  const existing = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  });
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, normalizedPhone)
+    : "";
+  const existing = await CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      normalizedCustomerKey
+    )
+  );
   const alreadyApplied =
     command === "opt_in"
       ? existing?.marketingConsent === true &&
@@ -204,12 +218,17 @@ export const setCustomerMarketingPreference = async (
           marketingPreferenceUpdatedAt: now
         };
   const profile = await CustomerProfile.findOneAndUpdate(
+    existing
+      ? { _id: existing._id, restaurantId }
+      : normalizedCustomerKey && normalizedCustomerKey !== normalizedPhone
+        ? { restaurantId, customerKey: normalizedCustomerKey }
+        : { restaurantId, customerPhone: normalizedPhone },
     {
-      restaurantId,
-      customerPhone: normalizedPhone
-    },
-    {
-      $set: preferenceFields,
+      $set: {
+        ...preferenceFields,
+        customerPhone: normalizedPhone,
+        ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {})
+      },
       ...(command === "opt_in"
         ? {
             $unset: {
@@ -219,8 +238,7 @@ export const setCustomerMarketingPreference = async (
           }
         : {}),
       $setOnInsert: {
-        restaurantId,
-        customerPhone: normalizedPhone
+        restaurantId
       }
     },
     {
@@ -252,7 +270,8 @@ export const setCustomerMarketingPreference = async (
 
 export const getCustomerMarketingPreference = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<{
   marketingConsent: boolean | null;
   isOptedOut: boolean;
@@ -263,10 +282,13 @@ export const getCustomerMarketingPreference = async (
     restaurantId,
     customerPhone
   );
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  }).select(
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      customerKey
+    )
+  ).select(
     "marketingConsent isOptedOut marketingPreferenceUpdatedAt"
   );
 
@@ -282,7 +304,8 @@ export const handleCustomerMarketingPreferenceCommand = async (
   restaurantId: string,
   customerPhone: string,
   message: string,
-  now = new Date()
+  now = new Date(),
+  customerKey?: string
 ): Promise<CustomerMarketingPreferenceCommandResult> => {
   const command = parseCustomerMarketingPreferenceCommand(message);
 
@@ -297,7 +320,8 @@ export const handleCustomerMarketingPreferenceCommand = async (
     customerPhone,
     command,
     "customer_message",
-    now
+    now,
+    customerKey
   );
 
   return {

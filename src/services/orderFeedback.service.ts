@@ -12,7 +12,10 @@ import { Order, type IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { createAiProvider } from "./ai/aiProvider.factory";
 import { getAiProviderName, getOpenRouterConfig } from "./ai/ai.config";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
@@ -22,6 +25,8 @@ import {
   feedbackCompletionEligibleStatuses
 } from "./orderCompletion.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import { queueMarketingConsentRequestAfterSuccessfulOrder } from "./customerMarketingOnboarding.service";
+import { getCustomerIdentityFilter } from "./customerIdentity.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -35,6 +40,7 @@ export interface FeedbackClassification {
 export interface HandleOrderFeedbackResponseInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   customerName?: string;
   message: string;
   inboundEventId?: string;
@@ -51,7 +57,7 @@ export interface HandleOrderFeedbackResponseResult {
 }
 
 export interface OrderFeedbackResponseDependencies {
-  // Reserved for future dependency injection in tests.
+  queueMarketingConsentRequest?: typeof queueMarketingConsentRequestAfterSuccessfulOrder;
 }
 
 export const orderCheckInOutcomes = [
@@ -65,6 +71,7 @@ export type OrderCheckInOutcome = (typeof orderCheckInOutcomes)[number];
 export interface RespondToOrderCheckInInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   customerName?: string;
   outcome: OrderCheckInOutcome;
   orderReference?: string;
@@ -96,6 +103,25 @@ const aiFeedbackClassificationSchema = z
 
 const normalizeText = (value: string): string =>
   value.trim().replace(/\s+/g, " ");
+
+const tryQueueMarketingConsentAfterPositiveCompletion = async (
+  order: IOrderDocument,
+  dependencies: OrderFeedbackResponseDependencies
+): Promise<void> => {
+  const queueRequest =
+    dependencies.queueMarketingConsentRequest ??
+    queueMarketingConsentRequestAfterSuccessfulOrder;
+
+  try {
+    await queueRequest(order);
+  } catch (error) {
+    console.error("Marketing consent request after feedback completion failed", {
+      restaurantId: String(order.restaurantId),
+      orderId: String(order._id),
+      errorType: error instanceof Error ? error.name : "UnknownError"
+    });
+  }
+};
 
 const getOrderReference = (order: Pick<IOrderDocument, "_id" | "orderNumber">): string =>
   order.orderNumber ?? String(order._id);
@@ -503,7 +529,7 @@ export const createOrderFeedback = async (
       restaurantId: input.restaurantId,
       orderId: input.order._id,
       orderNumber: getOrderReference(input.order),
-      customerPhone: normalizeGhanaPhone(input.order.customerPhone),
+      customerPhone: normalizeWhatsappRecipient(input.order.customerPhone),
       customerName: input.order.customerName,
       type: input.classification.type,
       message: normalizedMessage,
@@ -549,11 +575,20 @@ export const createOrderFeedback = async (
 
 export const findActiveFeedbackOrders = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<IOrderDocument[]> => {
   return Order.find({
-    restaurantId,
-    customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) },
+    ...(customerKey && customerKey !== normalizeWhatsappRecipient(customerPhone)
+      ? getCustomerIdentityFilter<IOrderDocument>(
+          restaurantId,
+          customerPhone,
+          customerKey
+        )
+      : {
+          restaurantId,
+          customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) }
+        }),
     feedbackRequestSentAt: { $exists: true },
     $or: [
       {
@@ -591,9 +626,14 @@ export interface ActiveOrderCheckInView {
 
 export const loadActiveOrderCheckInState = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<ActiveOrderCheckInView[]> => {
-  const orders = await findActiveFeedbackOrders(restaurantId, customerPhone);
+  const orders = await findActiveFeedbackOrders(
+    restaurantId,
+    customerPhone,
+    customerKey
+  );
 
   return orders.map((order) => ({
     orderNumber: getOrderReference(order),
@@ -610,7 +650,8 @@ export const loadActiveOrderCheckInState = async (
 export const resolveQuotedOrderFeedbackOrderId = async (
   restaurantId: string,
   customerPhone: string,
-  quotedMessageId?: string
+  quotedMessageId?: string,
+  customerKey?: string
 ): Promise<string | null> => {
   const providerMessageId = quotedMessageId?.trim();
 
@@ -618,16 +659,17 @@ export const resolveQuotedOrderFeedbackOrderId = async (
     return null;
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const queuedMessage = await OutboundMessage.findOne({
     restaurantId,
-    to: normalizedPhone,
     status: "sent",
     providerMessageId,
     "metadata.kind": {
       $in: ["order_feedback_request", "order_feedback_reminder"]
     },
-    "metadata.customerPhone": normalizedPhone
+    ...(customerKey
+      ? { "metadata.customerKey": customerKey }
+      : { to: normalizedPhone, "metadata.customerPhone": normalizedPhone })
   })
     .sort({ sentAt: -1 })
     .select("metadata");
@@ -830,6 +872,10 @@ const handleNumberedResponse = async (
       feedbackAwaitingComplaint: false,
       feedbackReceiptClarificationPending: false
     });
+    await tryQueueMarketingConsentAfterPositiveCompletion(
+      completed.order,
+      dependencies
+    );
 
     return {
       handled: true,
@@ -979,7 +1025,8 @@ export const handleOrderFeedbackCustomerResponse = async (
 
   const orders = await findActiveFeedbackOrders(
     input.restaurantId,
-    input.customerPhone
+    input.customerPhone,
+    input.customerKey
   );
 
   if (orders.length === 0) {
@@ -1094,6 +1141,12 @@ export const handleOrderFeedbackCustomerResponse = async (
         feedbackReceiptClarificationPending: false
       }
     );
+    if (!classification.requiresOwnerAttention) {
+      await tryQueueMarketingConsentAfterPositiveCompletion(
+        completed.order,
+        dependencies
+      );
+    }
 
     return {
       handled: true,
@@ -1143,6 +1196,7 @@ export const respondToOrderCheckIn = async (
   return handleOrderFeedbackCustomerResponse({
     restaurantId: input.restaurantId,
     customerPhone: input.customerPhone,
+    customerKey: input.customerKey,
     customerName: input.customerName,
     message,
     inboundEventId: input.inboundEventId

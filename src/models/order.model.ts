@@ -59,6 +59,7 @@ export interface IOrderItem {
 
 export interface IOrder {
   restaurantId: Types.ObjectId;
+  customerKey?: string;
   customerName?: string;
   customerPhone: string;
   items: IOrderItem[];
@@ -178,6 +179,10 @@ const orderSchema = new Schema<IOrderDocument>(
       ref: "Restaurant",
       required: true,
       index: true
+    },
+    customerKey: {
+      type: String,
+      trim: true
     },
     customerName: {
       type: String,
@@ -479,6 +484,12 @@ orderSchema.index({
   restaurantId: 1,
   feedbackFollowUpStatus: 1,
   feedbackRequestSentAt: 1
+});
+orderSchema.index({
+  restaurantId: 1,
+  customerKey: 1,
+  status: 1,
+  completedAt: -1
 });
 orderSchema.index({
   restaurantId: 1,

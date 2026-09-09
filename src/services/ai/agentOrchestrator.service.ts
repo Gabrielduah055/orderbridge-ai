@@ -664,7 +664,9 @@ export const runAgentOrchestrator = async (
   const saveMessage = dependencies.saveMessage ?? saveAgentConversationMessage;
   const buildSystemPrompt = dependencies.buildSystemPrompt ?? buildAgentSystemPrompt;
   const restaurantId = String(input.restaurant._id);
-  const conversationKey = `${restaurantId}:${input.sender.normalizedPhone}`;
+  const senderIdentityKey =
+    input.sender.customerKey ?? input.sender.normalizedPhone;
+  const conversationKey = `${restaurantId}:${senderIdentityKey}`;
   const tools = getAgentToolDefinitionsForRole(input.sender.role);
   const permittedToolNames = getPermittedAgentToolNamesForRole(input.sender.role);
   const systemPrompt = await buildSystemPrompt(
@@ -675,7 +677,7 @@ export const runAgentOrchestrator = async (
     input.staffState,
     input.trustedCustomerReplyContext
   );
-  const history = await getHistory(restaurantId, input.sender.normalizedPhone, 14);
+  const history = await getHistory(restaurantId, senderIdentityKey, 14);
   const messages: AiMessage[] = [
     {
       role: "system",
@@ -922,7 +924,7 @@ export const runAgentOrchestrator = async (
 
         await saveMessage({
           restaurantId,
-          senderPhone: input.sender.normalizedPhone,
+          senderPhone: senderIdentityKey,
           senderRole: input.sender.role,
           direction: "tool",
           content: JSON.stringify(buildToolResultForModel(toolName, result)),

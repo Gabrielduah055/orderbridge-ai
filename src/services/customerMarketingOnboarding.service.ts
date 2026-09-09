@@ -8,11 +8,20 @@ import type { IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isWhatsappPhoneAddress,
+  isValidWhatsappRecipient,
+  normalizeGhanaPhone,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
 } from "./wasenderQueue.service";
+import {
+  getCustomerIdentityFilter,
+  resolveCurrentWhatsappRecipient
+} from "./customerIdentity.service";
 
 export type MarketingConsentResponse = "opt_in" | "opt_out";
 
@@ -66,6 +75,7 @@ export interface QueueMarketingConsentRequestResult {
 export interface QueueMarketingConsentRequestInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   source: MarketingConsentPromptSource;
   orderId?: string;
   requestedByPhone?: string;
@@ -128,7 +138,7 @@ export const parseMarketingConsentResponse = (
   return null;
 };
 
-const ensureScopedIdentity = (
+const ensureScopedCustomerIdentity = (
   restaurantId: string,
   customerPhone: string
 ): string => {
@@ -136,10 +146,27 @@ const ensureScopedIdentity = (
     throw new BadRequestError("Invalid restaurantId");
   }
 
-  const normalizedPhone = normalizeGhanaPhone(customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (!/^\+[1-9]\d{7,14}$/.test(normalizedPhone)) {
+  if (!isValidWhatsappRecipient(normalizedPhone)) {
     throw new BadRequestError("Invalid customerPhone");
+  }
+
+  return normalizedPhone;
+};
+
+const ensureScopedStaffPhone = (
+  restaurantId: string,
+  phone: string
+): string => {
+  if (!Types.ObjectId.isValid(restaurantId)) {
+    throw new BadRequestError("Invalid restaurantId");
+  }
+
+  const normalizedPhone = normalizeGhanaPhone(phone);
+
+  if (!isWhatsappPhoneAddress(normalizedPhone)) {
+    throw new BadRequestError("Invalid requestedByPhone");
   }
 
   return normalizedPhone;
@@ -147,9 +174,10 @@ const ensureScopedIdentity = (
 
 export const getMarketingConsentRequestIdempotencyKey = (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): string =>
-  `marketing-consent-request:${restaurantId}:${normalizeGhanaPhone(customerPhone)}`;
+  `marketing-consent-request:${restaurantId}:${customerKey?.trim().toLowerCase() || normalizeWhatsappRecipient(customerPhone)}`;
 
 export const buildMarketingConsentRequestMessage = (
   restaurantName: string
@@ -172,12 +200,12 @@ export const queueMarketingConsentRequest = async (
   now = new Date()
 ): Promise<QueueMarketingConsentRequestResult> => {
   const restaurantId = input.restaurantId;
-  const customerPhone = ensureScopedIdentity(
+  const customerPhone = ensureScopedCustomerIdentity(
     restaurantId,
     input.customerPhone
   );
   const requestedByPhone = input.requestedByPhone
-    ? ensureScopedIdentity(restaurantId, input.requestedByPhone)
+    ? ensureScopedStaffPhone(restaurantId, input.requestedByPhone)
     : undefined;
 
   if (input.orderId && !Types.ObjectId.isValid(input.orderId)) {
@@ -187,10 +215,13 @@ export const queueMarketingConsentRequest = async (
   const findProfile =
     dependencies.findProfile ??
     (async (scopedRestaurantId, scopedCustomerPhone) =>
-      CustomerProfile.findOne({
-        restaurantId: scopedRestaurantId,
-        customerPhone: scopedCustomerPhone
-      }).select(
+      CustomerProfile.findOne(
+        getCustomerIdentityFilter(
+          scopedRestaurantId,
+          scopedCustomerPhone,
+          input.customerKey
+        )
+      ).select(
         "marketingConsent isOptedOut marketingConsentPromptedAt orderCount"
       ));
   const profile = await findProfile(restaurantId, customerPhone);
@@ -230,7 +261,8 @@ export const queueMarketingConsentRequest = async (
 
   const idempotencyKey = getMarketingConsentRequestIdempotencyKey(
     restaurantId,
-    customerPhone
+    customerPhone,
+    input.customerKey
   );
   const enqueueMessage =
     dependencies.enqueueMessage ?? enqueueWasenderMessage;
@@ -247,6 +279,7 @@ export const queueMarketingConsentRequest = async (
       purpose: "transactional_preference",
       restaurantId,
       customerPhone,
+      ...(input.customerKey ? { customerKey: input.customerKey } : {}),
       source: input.source,
       ...(input.orderId ? { orderId: input.orderId } : {}),
       ...(requestedByPhone ? { requestedByPhone } : {})
@@ -269,8 +302,11 @@ export const queueMarketingConsentRequest = async (
     ((filter, update) => CustomerProfile.updateOne(filter, update));
   await markPrompted(
     {
-      restaurantId,
-      customerPhone,
+      ...getCustomerIdentityFilter(
+        restaurantId,
+        customerPhone,
+        input.customerKey
+      ),
       marketingConsent: null,
       isOptedOut: { $ne: true },
       marketingConsentPromptedAt: { $exists: false }
@@ -297,6 +333,7 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
     IOrderDocument,
     | "_id"
     | "restaurantId"
+    | "customerKey"
     | "customerPhone"
     | "status"
     | "completionSource"
@@ -310,14 +347,24 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
   }
 
   const restaurantId = String(order.restaurantId);
-  const customerPhone = ensureScopedIdentity(restaurantId, order.customerPhone);
+  const customerPhone = await resolveCurrentWhatsappRecipient({
+    restaurantId,
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+  if (!customerPhone) {
+    return { queued: false, reason: "no_current_whatsapp_recipient" };
+  }
   const findProfile =
     dependencies.findProfile ??
     (async (scopedRestaurantId, scopedCustomerPhone) =>
-      CustomerProfile.findOne({
-        restaurantId: scopedRestaurantId,
-        customerPhone: scopedCustomerPhone
-      }).select(
+      CustomerProfile.findOne(
+        getCustomerIdentityFilter(
+          scopedRestaurantId,
+          scopedCustomerPhone,
+          order.customerKey
+        )
+      ).select(
         "marketingConsent isOptedOut marketingConsentPromptedAt orderCount"
       ));
   const profile = await findProfile(restaurantId, customerPhone);
@@ -330,6 +377,7 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
     {
       restaurantId,
       customerPhone,
+      customerKey: order.customerKey,
       source: "post_order",
       orderId: String(order._id)
     },
@@ -345,13 +393,20 @@ export const recordMarketingConsentPromptResponse = async (
   restaurantId: string,
   customerPhone: string,
   response: MarketingConsentResponse,
-  now = new Date()
+  now = new Date(),
+  customerKey?: string
 ): Promise<boolean> => {
-  const normalizedPhone = ensureScopedIdentity(restaurantId, customerPhone);
+  const normalizedPhone = ensureScopedCustomerIdentity(
+    restaurantId,
+    customerPhone
+  );
   const result = await CustomerProfile.updateOne(
     {
-      restaurantId,
-      customerPhone: normalizedPhone,
+      ...getCustomerIdentityFilter(
+        restaurantId,
+        normalizedPhone,
+        customerKey
+      ),
       marketingConsentPromptedAt: { $exists: true },
       marketingConsentPromptResponse: { $exists: false }
     },
@@ -369,16 +424,20 @@ export const recordMarketingConsentPromptResponse = async (
 export const getPendingMarketingConsentContext = async (
   restaurantId: string,
   customerPhone: string,
-  quotedMessageId?: string
+  quotedMessageId?: string,
+  customerKey?: string
 ): Promise<PendingMarketingConsentContext> => {
-  const normalizedPhone = ensureScopedIdentity(
+  const normalizedPhone = ensureScopedCustomerIdentity(
     restaurantId,
     customerPhone
   );
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  }).select(
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter(
+      restaurantId,
+      normalizedPhone,
+      customerKey
+    )
+  ).select(
     "marketingConsent isOptedOut marketingConsentPromptedAt marketingConsentPromptOrderId"
   );
   const pending = Boolean(
@@ -399,10 +458,11 @@ export const getPendingMarketingConsentContext = async (
   const providerMessageId = quotedMessageId?.trim();
   const requestScope = {
     restaurantId,
-    to: normalizedPhone,
     status: "sent",
     "metadata.kind": "marketing_consent_request",
-    "metadata.customerPhone": normalizedPhone
+    ...(customerKey
+      ? { "metadata.customerKey": customerKey }
+      : { to: normalizedPhone, "metadata.customerPhone": normalizedPhone })
   } as const;
   const [quotedMessage, latestSentRequest] = await Promise.all([
     providerMessageId

@@ -20,6 +20,7 @@ import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
 } from "./wasenderQueue.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 const CAMPAIGN_CHECK_INTERVAL_MS = 60_000;
 export const CUSTOMER_CAMPAIGN_BATCH_SIZE = 100;
@@ -442,10 +443,24 @@ export const runCustomerCampaignSchedulerPass = async (
             continue;
           }
 
+          const currentRecipient = await resolveCurrentWhatsappRecipient({
+            restaurantId,
+            customerKey: recipient.customerKey,
+            fallbackAddress: recipient.customerPhone
+          });
+          if (!currentRecipient) {
+            logError("Customer campaign recipient skipped", {
+              restaurantId,
+              campaignId,
+              campaignRecipientId: recipientId,
+              reason: "no_current_whatsapp_recipient"
+            });
+            continue;
+          }
           const queued = await enqueueMessage({
             restaurantId,
             sessionId: restaurant.wasenderSessionId,
-            to: recipient.customerPhone,
+            to: currentRecipient,
             type: "text",
             text: formatCustomerCampaignMessage(
               restaurant.name,
@@ -459,7 +474,10 @@ export const runCustomerCampaignSchedulerPass = async (
               campaignId,
               campaignRecipientId: recipientId,
               campaignVersion: campaign.campaignVersion,
-              customerPhone: recipient.customerPhone,
+              customerPhone: currentRecipient,
+              ...(recipient.customerKey
+                ? { customerKey: recipient.customerKey }
+                : {}),
               consentSnapshotUpdatedAt:
                 recipient.consentSnapshotUpdatedAt.toISOString(),
               recipientType: "customer",

@@ -12,6 +12,10 @@ import * as orderService from "./order.service";
 import { cancelPendingOrderItemClarifications } from "./agentClarification.service";
 import { rememberConfirmedCustomerName } from "./customerProfile.service";
 import { BadRequestError } from "../utils/httpErrors";
+import {
+  getCustomerIdentityFilter,
+  normalizeCustomerKey
+} from "./customerIdentity.service";
 
 const sessionTtlMs = 2 * 60 * 60 * 1000;
 const quantityCorrectionWindowMs = 5 * 60 * 1000;
@@ -236,9 +240,15 @@ export const recordInboundCustomerTurn = async (
   restaurantId: string,
   customerPhone: string,
   inboundEventId?: string,
-  customerName?: string
+  customerName?: string,
+  customerKey?: string
 ): Promise<ICustomerSessionDocument> => {
-  const session = await getOrCreateDraft(restaurantId, customerPhone, customerName);
+  const session = await getOrCreateDraft(
+    restaurantId,
+    customerPhone,
+    customerName,
+    customerKey
+  );
 
   if (inboundEventId && session.lastInboundEventId === inboundEventId) {
     return session;
@@ -253,16 +263,24 @@ export const recordInboundCustomerTurn = async (
 export const getOrCreateDraft = async (
   restaurantId: string,
   customerPhone: string,
-  customerName?: string
+  customerName?: string,
+  customerKey?: string
 ): Promise<ICustomerSessionDocument> => {
-  let session = await CustomerSession.findOne({
-    restaurantId,
-    customerPhone
-  });
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, customerPhone)
+    : "";
+  let session = await CustomerSession.findOne(
+    getCustomerIdentityFilter<ICustomerSessionDocument>(
+      restaurantId,
+      customerPhone,
+      normalizedCustomerKey
+    )
+  );
 
   if (!session) {
     return CustomerSession.create({
       restaurantId,
+      ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {}),
       customerPhone,
       customerName,
       cartItems: [],
@@ -272,6 +290,16 @@ export const getOrCreateDraft = async (
       conversationVersion: 0,
       expiresAt: getDraftExpiry()
     });
+  }
+
+  if (normalizedCustomerKey && !session.customerKey) {
+    session.customerKey = normalizedCustomerKey;
+  }
+
+  // This compatibility field remains the current delivery/contact address.
+  // Stable session lookup uses customerKey whenever a trusted LID is known.
+  if (session.customerPhone !== customerPhone) {
+    session.customerPhone = customerPhone;
   }
 
   if (session.expiresAt <= new Date()) {
@@ -288,11 +316,15 @@ export const getOrCreateDraft = async (
 
 export const findActiveDraft = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<ICustomerSessionDocument | null> => {
   return CustomerSession.findOne({
-    restaurantId,
-    customerPhone,
+    ...getCustomerIdentityFilter<ICustomerSessionDocument>(
+      restaurantId,
+      customerPhone,
+      customerKey
+    ),
     expiresAt: {
       $gt: new Date()
     }
@@ -814,13 +846,15 @@ const rememberSubmittedCustomerNameBestEffort = async (
   orderId: unknown,
   customerPhone: string,
   customerName: string,
-  rememberCustomerName: typeof rememberConfirmedCustomerName
+  rememberCustomerName: typeof rememberConfirmedCustomerName,
+  customerKey?: string
 ): Promise<void> => {
   try {
     await rememberCustomerName(
       restaurantId,
       customerPhone,
-      customerName
+      customerName,
+      customerKey
     );
   } catch {
     console.error("Customer name persistence failed", {
@@ -833,19 +867,28 @@ const rememberSubmittedCustomerNameBestEffort = async (
 export const submitOrderDraft = async (
   restaurant: IRestaurantDocument,
   customerPhone: string,
-  dependencies: SubmitOrderDraftDependencies = {}
+  dependencies: SubmitOrderDraftDependencies = {},
+  customerKey?: string
 ): Promise<{ order: IOrderDocument; idempotent: boolean; draft: ICustomerSessionDocument }> => {
   const restaurantId = String(restaurant._id);
   const createOrder = dependencies.createOrder ?? orderService.createOrder;
   const rememberCustomerName =
     dependencies.rememberCustomerName ?? rememberConfirmedCustomerName;
-  const draft = await getOrCreateDraft(restaurantId, customerPhone);
+  const draft = await getOrCreateDraft(
+    restaurantId,
+    customerPhone,
+    undefined,
+    customerKey
+  );
 
   if (draft.convertedOrderId) {
     const existingOrder = await Order.findOne({
       _id: draft.convertedOrderId,
-      restaurantId,
-      customerPhone: draft.customerPhone
+      ...getCustomerIdentityFilter<IOrderDocument>(
+        restaurantId,
+        draft.customerPhone,
+        draft.customerKey
+      )
     });
 
     if (existingOrder) {
@@ -858,7 +901,8 @@ export const submitOrderDraft = async (
           existingOrder._id,
           existingOrder.customerPhone,
           submittedCustomerName,
-          rememberCustomerName
+          rememberCustomerName,
+          existingOrder.customerKey ?? draft.customerKey
         );
       }
 
@@ -883,6 +927,7 @@ export const submitOrderDraft = async (
   const submittedCustomerName = draft.customerName!;
   const order = await createOrder(restaurantId, {
     customerName: draft.customerName,
+    customerKey: draft.customerKey,
     customerPhone: draft.customerPhone,
     items: draft.cartItems.map((item) => ({
       menuItemId: String(item.menuItemId),
@@ -906,7 +951,8 @@ export const submitOrderDraft = async (
     order._id,
     order.customerPhone,
     order.customerName?.trim() || submittedCustomerName,
-    rememberCustomerName
+    rememberCustomerName,
+    draft.customerKey
   );
 
   return {

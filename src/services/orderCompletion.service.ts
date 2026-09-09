@@ -9,7 +9,7 @@ import {
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { updateCustomerProfileFromCompletedOrder } from "./customerProfile.service";
 
 export const feedbackCompletionEligibleStatuses: OrderStatus[] = [
@@ -173,7 +173,7 @@ export const completeOrderThroughFeedback = async (
   }
 
   const now = input.completedAt ?? new Date();
-  const normalizedPhone = normalizeGhanaPhone(current.customerPhone);
+  const normalizedPhone = normalizeWhatsappRecipient(current.customerPhone);
   const updated = await Order.findOneAndUpdate(
     {
       _id: input.orderId,

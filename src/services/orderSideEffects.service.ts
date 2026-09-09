@@ -7,6 +7,7 @@ import {
 } from "./order.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { queueMarketingConsentRequest } from "./customerMarketingOnboarding.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 /** Delay in milliseconds before sending the marketing opt-in message after receipt delivery. */
 const MARKETING_CONSENT_DELAY_MS = 2 * 60 * 1_000; // 2 minutes
@@ -38,6 +39,34 @@ const formatTitleCase = (value: string): string => {
 
 const getOrderReference = (order: IOrderDocument): string => {
   return order.orderNumber ?? String(order._id);
+};
+
+const getCustomerQueueStatus = (message: {
+  status?: string;
+}): SideEffectStepStatus => {
+  if (message.status === "pending" || message.status === "sending") {
+    return "queued";
+  }
+
+  if (message.status === "sent") {
+    return "success";
+  }
+
+  return "failed";
+};
+
+const logMissingCustomerRecipient = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument,
+  kind: string
+): void => {
+  console.warn("Customer WhatsApp notification skipped", {
+    restaurantId: String(restaurant._id),
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    kind,
+    reason: "no_current_whatsapp_recipient"
+  });
 };
 
 export const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
@@ -330,10 +359,25 @@ export const notifyCustomerOfCancellationResolution = async (
     return { customerNotification: "skipped" };
   }
 
-  await enqueueWasenderMessage({
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+
+  if (!recipientAddress) {
+    logMissingCustomerRecipient(
+      restaurant,
+      order,
+      "customer_order_cancellation_resolution_notification"
+    );
+    return { customerNotification: "failed" };
+  }
+
+  const queued = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: order.customerPhone,
+    to: recipientAddress,
     type: "text",
     text: buildCustomerCancellationResolutionNotification(restaurant, order),
     apiKey: restaurant.wasenderApiToken,
@@ -343,11 +387,13 @@ export const notifyCustomerOfCancellationResolution = async (
       orderId: String(order._id),
       orderNumber: order.orderNumber,
       cancellationDecision: decision,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(order.customerKey ? { customerKey: order.customerKey } : {})
     }
   });
 
-  return { customerNotification: "queued" };
+  return { customerNotification: getCustomerQueueStatus(queued) };
 };
 
 export const notifyOwnerOfCustomerAmendment = async (
@@ -393,10 +439,25 @@ export const notifyCustomerOfRejectedOrder = async (
     };
   }
 
-  await enqueueWasenderMessage({
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+
+  if (!recipientAddress) {
+    logMissingCustomerRecipient(
+      restaurant,
+      order,
+      "customer_order_rejected_notification"
+    );
+    return { customerNotification: "failed" };
+  }
+
+  const queued = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: order.customerPhone,
+    to: recipientAddress,
     type: "text",
     text: buildCustomerOrderRejectedMessage(restaurant, order),
     apiKey: restaurant.wasenderApiToken,
@@ -405,12 +466,14 @@ export const notifyCustomerOfRejectedOrder = async (
       kind: "customer_order_rejected_notification",
       orderId: String(order._id),
       orderNumber: order.orderNumber,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(order.customerKey ? { customerKey: order.customerKey } : {})
     }
   });
 
   return {
-    customerNotification: "queued"
+    customerNotification: getCustomerQueueStatus(queued)
   };
 };
 
@@ -458,12 +521,36 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
 
   const publicReceiptUrl = getPublicReceiptUrl(receiptOrder.receiptUrl);
   const canSendReceipt = Boolean(publicReceiptUrl);
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: receiptOrder.customerKey,
+    fallbackAddress: receiptOrder.customerPhone
+  });
+
+  if (!recipientAddress) {
+    if (!receiptOrder.customerConfirmedNotificationSentAt) {
+      result.customerNotification = "failed";
+    }
+    if (!receiptOrder.receiptSentAt) {
+      result.receiptDelivery = "failed";
+      receiptOrder.receiptDeliveryFailedAt = new Date();
+      receiptOrder.receiptDeliveryFailureReason =
+        "no_current_whatsapp_recipient";
+      await receiptOrder.save();
+    }
+    logMissingCustomerRecipient(
+      restaurant,
+      receiptOrder,
+      "customer_order_confirmed_notification_and_receipt"
+    );
+    return result;
+  }
 
   if (!receiptOrder.customerConfirmedNotificationSentAt) {
-    await enqueueWasenderMessage({
+    const queuedNotification = await enqueueWasenderMessage({
       restaurantId: String(restaurant._id),
       sessionId: restaurant.wasenderSessionId,
-      to: receiptOrder.customerPhone,
+      to: recipientAddress,
       type: "text",
       text: buildCustomerOrderConfirmedMessage(restaurant, receiptOrder, canSendReceipt),
       apiKey: restaurant.wasenderApiToken,
@@ -472,10 +559,14 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
         kind: "customer_order_confirmed_notification",
         orderId: String(receiptOrder._id),
         orderNumber: receiptOrder.orderNumber,
-        recipientType: "customer"
+        recipientType: "customer",
+        customerPhone: recipientAddress,
+        ...(receiptOrder.customerKey
+          ? { customerKey: receiptOrder.customerKey }
+          : {})
       }
     });
-    result.customerNotification = "queued";
+    result.customerNotification = getCustomerQueueStatus(queuedNotification);
   }
 
   if (receiptOrder.receiptSentAt) {
@@ -506,7 +597,7 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   const queuedReceipt = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: receiptOrder.customerPhone,
+    to: recipientAddress,
     type: "document",
     documentUrl: publicReceiptUrl,
     caption: `Receipt for ${getOrderReference(receiptOrder)}`,
@@ -516,20 +607,33 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
       kind: "receipt_delivery",
       orderId: String(receiptOrder._id),
       orderNumber: receiptOrder.orderNumber,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(receiptOrder.customerKey
+        ? { customerKey: receiptOrder.customerKey }
+        : {})
     }
   });
+  result.receiptDelivery = getCustomerQueueStatus(queuedReceipt);
+
+  if (result.receiptDelivery !== "queued") {
+    return result;
+  }
+
   console.info("Receipt queued", {
     restaurantId: String(restaurant._id),
     orderId: String(receiptOrder._id),
     orderNumber: receiptOrder.orderNumber,
     queueMessageId: String(queuedReceipt._id)
   });
-  result.receiptDelivery = "queued";
 
   // After the receipt is successfully queued, schedule the marketing opt-in
   // message with a short delay so it arrives after the receipt, not alongside it.
-  tryQueueMarketingConsentAfterReceipt(restaurant, receiptOrder).catch(
+  tryQueueMarketingConsentAfterReceipt(
+    restaurant,
+    receiptOrder,
+    recipientAddress
+  ).catch(
     (error) => {
       console.error("Marketing consent request after receipt failed", {
         restaurantId: String(restaurant._id),
@@ -551,13 +655,15 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
  */
 const tryQueueMarketingConsentAfterReceipt = async (
   restaurant: IRestaurantDocument,
-  order: IOrderDocument
+  order: IOrderDocument,
+  recipientAddress?: string
 ): Promise<void> => {
   const nextAttemptAt = new Date(Date.now() + MARKETING_CONSENT_DELAY_MS);
   await queueMarketingConsentRequest(
     {
       restaurantId: String(restaurant._id),
-      customerPhone: order.customerPhone,
+      customerPhone: recipientAddress ?? order.customerPhone,
+      customerKey: order.customerKey,
       source: "post_order",
       orderId: String(order._id)
     },

@@ -30,7 +30,10 @@ import {
   ForbiddenError,
   NotFoundError
 } from "../utils/httpErrors";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import {
+  isValidWhatsappRecipient,
+  normalizeWhatsappRecipient
+} from "../utils/phone.util";
 import { resolveZonedDateTime } from "../utils/zonedDateTime.util";
 import { isCustomerEligibleForMarketing } from "./customerMarketingPreference.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
@@ -172,6 +175,7 @@ type CampaignStaffRole = Extract<SenderRole, "owner" | "manager">;
 
 export interface CustomerCampaignAudienceMember {
   customerProfileId: string;
+  customerKey?: string;
   customerPhone: string;
   qualificationReason: string;
   consentSnapshotUpdatedAt: Date;
@@ -204,6 +208,7 @@ export interface UpdateCustomerCampaignDraftInput
 type CampaignProfile = Pick<
   ICustomerProfileDocument,
   | "_id"
+  | "customerKey"
   | "customerPhone"
   | "orderCount"
   | "lastOrderAt"
@@ -220,7 +225,7 @@ const ensureObjectId = (value: string, label: string): void => {
 };
 
 const isValidMarketingPhone = (phone: string): boolean =>
-  /^\+[1-9]\d{7,14}$/.test(phone);
+  isValidWhatsappRecipient(phone);
 
 export const resolveCustomerCampaignScheduledAt = (
   scheduledAt: string | Date | undefined,
@@ -351,7 +356,7 @@ const loadCompletedOrderPhonesForMenuItem = async (
 
   return new Set(
     orders
-      .map((order) => normalizeGhanaPhone(order.customerPhone))
+      .map((order) => normalizeWhatsappRecipient(order.customerPhone))
       .filter(isValidMarketingPhone)
   );
 };
@@ -389,7 +394,7 @@ export const selectCustomerCampaignAudience = async (
   const profiles = (await CustomerProfile.find({
     restaurantId
   }).select(
-    "customerPhone orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
+    "customerKey customerPhone orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
   )) as CampaignProfile[];
   const recipientsByPhone = new Map<
     string,
@@ -401,7 +406,7 @@ export const selectCustomerCampaignAudience = async (
   let excludedInvalidPhone = 0;
 
   for (const profile of profiles) {
-    const normalizedPhone = normalizeGhanaPhone(profile.customerPhone);
+    const normalizedPhone = normalizeWhatsappRecipient(profile.customerPhone);
     let qualificationReason: string | null = null;
 
     switch (targeting.type) {
@@ -468,6 +473,7 @@ export const selectCustomerCampaignAudience = async (
     ) {
       recipientsByPhone.set(normalizedPhone, {
         customerProfileId: String(profile._id),
+        ...(profile.customerKey ? { customerKey: profile.customerKey } : {}),
         customerPhone: normalizedPhone,
         qualificationReason,
         consentSnapshotUpdatedAt:
@@ -924,6 +930,9 @@ export const approveCustomerCampaign = async (
             customerProfileId: new Types.ObjectId(
               recipient.customerProfileId
             ),
+            ...(recipient.customerKey
+              ? { customerKey: recipient.customerKey }
+              : {}),
             customerPhone: recipient.customerPhone,
             campaignVersion: expectedCampaignVersion,
             qualificationReason: recipient.qualificationReason,

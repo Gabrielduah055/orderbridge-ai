@@ -5,7 +5,7 @@ import {
   type OrderStatus
 } from "../models/order.model";
 import { ownerSummaryWeekdays, type OwnerSummaryWeekday } from "../types/restaurant.types";
-import { normalizeGhanaPhone } from "../utils/phone.util";
+import { normalizeWhatsappRecipient } from "../utils/phone.util";
 
 export type OwnerSummaryPeriodType = "daily" | "weekly" | "custom";
 export const businessReportPeriodTypes = [
@@ -447,7 +447,7 @@ const getNormalizedCustomerPhones = (
   const phones = new Set<string>();
 
   for (const order of orders) {
-    const phone = normalizeGhanaPhone(order.customerPhone);
+    const phone = normalizeWhatsappRecipient(order.customerPhone);
 
     if (phone) {
       phones.add(phone);

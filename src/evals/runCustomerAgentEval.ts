@@ -37,6 +37,7 @@ const restaurant = {
 const sender: ResolvedSender = {
   name: "Ruth",
   phone: "+233500000099",
+  normalizedAddress: "+233500000099",
   normalizedPhone: "+233500000099",
   role: "customer",
   verified: false

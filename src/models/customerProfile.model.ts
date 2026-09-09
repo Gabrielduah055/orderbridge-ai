@@ -46,6 +46,7 @@ export interface ICommonDeliveryAddress {
 
 export interface ICustomerProfile {
   restaurantId: Types.ObjectId;
+  customerKey?: string;
   customerPhone: string;
   customerName?: string;
   customerNameSource?: CustomerProfileValueSource;
@@ -139,6 +140,10 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
       type: Schema.Types.ObjectId,
       ref: "Restaurant",
       required: true
+    },
+    customerKey: {
+      type: String,
+      trim: true
     },
     customerPhone: {
       type: String,
@@ -250,8 +255,15 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
 );
 
 customerProfileSchema.index(
-  { restaurantId: 1, customerPhone: 1 },
-  { unique: true }
+  { restaurantId: 1, customerPhone: 1, customerKey: 1 },
+  { name: "customer_profile_recipient_lookup" }
+);
+customerProfileSchema.index(
+  { restaurantId: 1, customerKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { customerKey: { $type: "string" } }
+  }
 );
 customerProfileSchema.index({ restaurantId: 1, lastOrderAt: -1 });
 customerProfileSchema.index({ restaurantId: 1, orderCount: -1 });

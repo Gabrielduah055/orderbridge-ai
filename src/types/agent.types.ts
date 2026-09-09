@@ -7,7 +7,13 @@ export type SenderRole = "owner" | "manager" | "customer";
 export interface ResolvedSender {
   name?: string;
   phone: string;
+  normalizedAddress: string;
+  /** @deprecated Use normalizedAddress for customer identity/address logic. */
   normalizedPhone: string;
+  /** Stable customer identity. Never used for staff authorization. */
+  customerKey?: string;
+  /** Current routable WhatsApp address for customer delivery. */
+  recipientAddress?: string;
   role: SenderRole;
   verified: boolean;
 }
@@ -54,6 +60,8 @@ export interface RestaurantAgentContext {
 export interface RestaurantAgentMessageInput {
   restaurant: IRestaurantDocument;
   senderPhone: string;
+  customerKey?: string;
+  recipientAddress?: string;
   customerName?: string;
   message: string;
   quotedMessageId?: string;
