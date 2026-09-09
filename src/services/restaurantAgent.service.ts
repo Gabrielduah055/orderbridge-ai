@@ -163,7 +163,8 @@ export const resolveQuotedActiveOrderReplyContext = async (
   restaurantId: string,
   customerPhone: string,
   quotedMessageId: string | undefined,
-  draft: Awaited<ReturnType<typeof findActiveDraft>>
+  draft: Awaited<ReturnType<typeof findActiveDraft>>,
+  customerKey?: string
 ): Promise<TrustedCustomerReplyContext | null> => {
   const providerMessageId = quotedMessageId?.trim();
   const responsePurpose = draft
@@ -177,11 +178,12 @@ export const resolveQuotedActiveOrderReplyContext = async (
   const draftId = String(draft._id);
   const outbound = await OutboundMessage.findOne({
     restaurantId,
-    to: customerPhone,
     status: "sent",
     providerMessageId,
     "metadata.kind": "customer_agent_question",
-    "metadata.customerPhone": customerPhone,
+    ...(customerKey
+      ? { "metadata.customerKey": customerKey }
+      : { to: customerPhone, "metadata.customerPhone": customerPhone }),
     "metadata.draftId": draftId,
     "metadata.expectedDraftStep": draft.currentStep,
     "metadata.responsePurpose": responsePurpose
@@ -851,7 +853,7 @@ const handleLocalMenuRequest = async (
 
   await saveAgentConversationMessage({
     restaurantId,
-    senderPhone: sender.normalizedPhone,
+    senderPhone: sender.customerKey ?? sender.normalizedPhone,
     senderRole: sender.role,
     direction: "assistant",
     content: message,
@@ -946,13 +948,14 @@ const handleLocalCustomerRequest = async (
   const result = await legacyHandler({
     restaurantId,
     customerPhone: sender.normalizedPhone,
+    customerKey: sender.customerKey,
     customerName: sender.name,
     message: input.message
   });
 
   await saveAgentConversationMessage({
     restaurantId,
-    senderPhone: sender.normalizedPhone,
+    senderPhone: sender.customerKey ?? sender.normalizedPhone,
     senderRole: sender.role,
     direction: "assistant",
     content: result.message,
@@ -980,7 +983,7 @@ const saveAssistantResponse = async (
 ): Promise<void> => {
   await saveAgentConversationMessage({
     restaurantId,
-    senderPhone: sender.normalizedPhone,
+    senderPhone: sender.customerKey ?? sender.normalizedPhone,
     senderRole: sender.role,
     direction: "assistant",
     content: response.message,
@@ -993,7 +996,10 @@ export const handleRestaurantAgentMessage = async (
   dependencies: RestaurantAgentRoutingDependencies = {}
 ): Promise<RestaurantAgentResponse> => {
   const restaurantId = String(input.restaurant._id);
-  const resolvedSender = resolveSenderIdentity(input.restaurant, input.senderPhone);
+  const resolvedSender = resolveSenderIdentity(input.restaurant, input.senderPhone, {
+    customerKey: input.customerKey,
+    recipientAddress: input.recipientAddress
+  });
   const sender =
     resolvedSender.role === "customer" && input.customerName?.trim()
       ? { ...resolvedSender, name: input.customerName.trim() }
@@ -1075,13 +1081,15 @@ export const handleRestaurantAgentMessage = async (
       await handleCustomerMarketingPreferenceCommand(
         restaurantId,
         sender.normalizedPhone,
-        message
+        message,
+        undefined,
+        sender.customerKey
       );
 
     if (preferenceResult.handled && preferenceResult.message) {
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -1092,7 +1100,7 @@ export const handleRestaurantAgentMessage = async (
       });
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: preferenceResult.message,
@@ -1132,13 +1140,22 @@ export const handleRestaurantAgentMessage = async (
     if (ambiguousShortReply || consentResponse) {
       try {
         [activeDraft, activeCheckIns, marketingConsentContext] = await Promise.all([
-          findCustomerDraft(restaurantId, sender.normalizedPhone),
-          loadCustomerCheckIns(restaurantId, sender.normalizedPhone),
+          findCustomerDraft(
+            restaurantId,
+            sender.recipientAddress ?? sender.normalizedPhone,
+            sender.customerKey
+          ),
+          loadCustomerCheckIns(
+            restaurantId,
+            sender.recipientAddress ?? sender.normalizedPhone,
+            sender.customerKey
+          ),
           consentResponse
             ? loadMarketingConsentContext(
                 restaurantId,
                 sender.normalizedPhone,
-                input.quotedMessageId
+                input.quotedMessageId,
+                sender.customerKey
               )
             : Promise.resolve({
                 pending: false,
@@ -1183,7 +1200,7 @@ export const handleRestaurantAgentMessage = async (
 
         await saveAgentConversationMessage({
           restaurantId,
-          senderPhone: sender.normalizedPhone,
+          senderPhone: sender.customerKey ?? sender.normalizedPhone,
           senderRole: sender.role,
           direction: "user",
           content: message,
@@ -1194,7 +1211,7 @@ export const handleRestaurantAgentMessage = async (
         });
         await saveAgentConversationMessage({
           restaurantId,
-          senderPhone: sender.normalizedPhone,
+          senderPhone: sender.customerKey ?? sender.normalizedPhone,
           senderRole: sender.role,
           direction: "assistant",
           content: clarificationMessage,
@@ -1221,14 +1238,18 @@ export const handleRestaurantAgentMessage = async (
         restaurantId,
         sender.normalizedPhone,
         consentResponse.command,
-        "customer_message"
+        "customer_message",
+        undefined,
+        sender.customerKey
       );
       if (hasTrustedGenericConsentContext) {
         try {
           await recordMarketingConsentResponse(
             restaurantId,
             sender.normalizedPhone,
-            consentResponse.command
+            consentResponse.command,
+            undefined,
+            sender.customerKey
           );
         } catch (error) {
           console.error("[customerAgent] consent response audit failed", {
@@ -1244,7 +1265,7 @@ export const handleRestaurantAgentMessage = async (
 
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -1256,7 +1277,7 @@ export const handleRestaurantAgentMessage = async (
       });
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: preferenceMessage,
@@ -1289,7 +1310,8 @@ export const handleRestaurantAgentMessage = async (
         trustedQuotedOrderId = await resolveQuotedCustomerFeedback(
           restaurantId,
           sender.normalizedPhone,
-          input.quotedMessageId
+          input.quotedMessageId,
+          sender.customerKey
         );
       } catch (error) {
         console.error("[customerAgent] quoted feedback lookup failed", {
@@ -1310,7 +1332,8 @@ export const handleRestaurantAgentMessage = async (
             restaurantId,
             sender.normalizedPhone,
             input.quotedMessageId,
-            activeDraft
+            activeDraft,
+            sender.customerKey
           )) ?? undefined;
       } catch (error) {
         console.error("[customerAgent] quoted active-order lookup failed", {
@@ -1338,7 +1361,7 @@ export const handleRestaurantAgentMessage = async (
 
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -1349,7 +1372,7 @@ export const handleRestaurantAgentMessage = async (
       });
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: clarificationMessage,
@@ -1381,6 +1404,7 @@ export const handleRestaurantAgentMessage = async (
         ? await handleCustomerFeedback({
             restaurantId,
             customerPhone: sender.normalizedPhone,
+            customerKey: sender.customerKey,
             customerName: sender.name,
             message,
             inboundEventId: input.inboundEventId,
@@ -1391,7 +1415,7 @@ export const handleRestaurantAgentMessage = async (
     if (feedbackResult.handled && feedbackResult.message) {
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -1402,7 +1426,7 @@ export const handleRestaurantAgentMessage = async (
       });
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: feedbackResult.message,
@@ -1443,7 +1467,7 @@ export const handleRestaurantAgentMessage = async (
   if (!deferUserMessageSave) {
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "user",
       content: message,
@@ -1680,7 +1704,7 @@ export const handleRestaurantAgentMessage = async (
 
       const imageResult = await handlePendingImageReply({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         message,
         pendingActionId: currentStaffConfirmation.pendingActionId
@@ -1763,7 +1787,7 @@ export const handleRestaurantAgentMessage = async (
           try {
             reconciliationResult = await reconcileAwaitingSelection({
               restaurantId,
-              senderPhone: sender.normalizedPhone,
+              senderPhone: sender.customerKey ?? sender.normalizedPhone,
               senderRole: sender.role,
               pendingActionId:
                 staffOrderMutationIntent.pendingSelectionActionId,
@@ -1910,7 +1934,7 @@ export const handleRestaurantAgentMessage = async (
 
         await saveAgentConversationMessage({
           restaurantId,
-          senderPhone: sender.normalizedPhone,
+          senderPhone: sender.customerKey ?? sender.normalizedPhone,
           senderRole: sender.role,
           direction: "assistant",
           content: agentResult.message || temporaryAgentErrorMessage,
@@ -1971,7 +1995,7 @@ export const handleRestaurantAgentMessage = async (
     if (deferUserMessageSave) {
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -2001,7 +2025,7 @@ export const handleRestaurantAgentMessage = async (
       if (isExplicitCustomerClarificationResetMessage(message)) {
         await cancelCustomerClarifications({
           restaurantId,
-          senderPhone: sender.normalizedPhone
+          senderPhone: sender.customerKey ?? sender.normalizedPhone
         });
       }
 
@@ -2039,7 +2063,7 @@ export const handleRestaurantAgentMessage = async (
       // history window, persist the user message followed by the assistant response.
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "user",
         content: message,
@@ -2061,7 +2085,7 @@ export const handleRestaurantAgentMessage = async (
 
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: agentResult.message,
@@ -2133,7 +2157,7 @@ export const handleRestaurantAgentMessage = async (
       ? { handled: false, success: false, message: "" }
       : await handlePendingImageReply({
           restaurantId,
-          senderPhone: sender.normalizedPhone,
+          senderPhone: sender.customerKey ?? sender.normalizedPhone,
           senderRole: sender.role,
           message,
           pendingActionId: staffImageWorkflow?.pendingActionId
@@ -2176,7 +2200,7 @@ export const handleRestaurantAgentMessage = async (
 
     const imageRequestResult = await rememberImageRequest({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       message
     });
@@ -2232,7 +2256,7 @@ export const handleRestaurantAgentMessage = async (
     if (selectionResult.handled) {
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: selectionResult.message,
@@ -2267,7 +2291,7 @@ export const handleRestaurantAgentMessage = async (
     ) {
       const result = await requestRejectionReason({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         orderReference: staffOrderMutationIntent.orderReference
       });
@@ -2407,7 +2431,7 @@ export const handleRestaurantAgentMessage = async (
 
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: result.message,
@@ -2435,14 +2459,14 @@ export const handleRestaurantAgentMessage = async (
     ) {
       const result = await requestRejectionReason({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         orderReference: ownerOrderDecision.orderReference
       });
 
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: result.message,
@@ -2475,7 +2499,7 @@ export const handleRestaurantAgentMessage = async (
 
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: result.message,
@@ -2543,7 +2567,7 @@ export const handleRestaurantAgentMessage = async (
 
           await saveAgentConversationMessage({
             restaurantId,
-            senderPhone: sender.normalizedPhone,
+            senderPhone: sender.customerKey ?? sender.normalizedPhone,
             senderRole: sender.role,
             direction: "assistant",
             content: result.message,
@@ -2570,7 +2594,7 @@ export const handleRestaurantAgentMessage = async (
 
       await saveAgentConversationMessage({
         restaurantId,
-        senderPhone: sender.normalizedPhone,
+        senderPhone: sender.customerKey ?? sender.normalizedPhone,
         senderRole: sender.role,
         direction: "assistant",
         content: clarificationMessage,
@@ -2596,7 +2620,7 @@ export const handleRestaurantAgentMessage = async (
 
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: result.message,
@@ -2627,7 +2651,7 @@ export const handleRestaurantAgentMessage = async (
 
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: result.message,
@@ -2655,7 +2679,7 @@ export const handleRestaurantAgentMessage = async (
         : staffAgentFallbackResult?.message || temporaryAgentErrorMessage;
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: safeMessage,
@@ -2689,7 +2713,7 @@ export const handleRestaurantAgentMessage = async (
 
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: temporaryHermesErrorMessage,
@@ -2712,7 +2736,7 @@ export const handleRestaurantAgentMessage = async (
   if (!hermesAgentResult) {
     await saveAgentConversationMessage({
       restaurantId,
-      senderPhone: sender.normalizedPhone,
+      senderPhone: sender.customerKey ?? sender.normalizedPhone,
       senderRole: sender.role,
       direction: "assistant",
       content: temporaryHermesErrorMessage,
@@ -2732,7 +2756,7 @@ export const handleRestaurantAgentMessage = async (
 
   await saveAgentConversationMessage({
     restaurantId,
-    senderPhone: sender.normalizedPhone,
+    senderPhone: sender.customerKey ?? sender.normalizedPhone,
     senderRole: sender.role,
     direction: "assistant",
     content: hermesAgentResult.message,

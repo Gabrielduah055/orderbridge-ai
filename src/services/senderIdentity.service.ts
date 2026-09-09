@@ -16,7 +16,8 @@ const normalizePhone = (phone?: string): string => {
 
 export const resolveSenderIdentity = (
   restaurant: RestaurantIdentitySource,
-  senderPhone: string
+  senderPhone: string,
+  customerIdentity?: { customerKey?: string; recipientAddress?: string }
 ): ResolvedSender => {
   const normalizedPhone = normalizePhone(senderPhone);
   const normalizedAddress = normalizeWhatsappRecipient(senderPhone);
@@ -67,6 +68,10 @@ export const resolveSenderIdentity = (
     // Kept for compatibility with existing customer-key call sites. Staff
     // authorization above only compares phone-normalized values.
     normalizedPhone: normalizedAddress,
+    customerKey: customerIdentity?.customerKey || normalizedAddress,
+    recipientAddress:
+      normalizeWhatsappRecipient(customerIdentity?.recipientAddress) ||
+      normalizedAddress,
     role: "customer",
     verified: false
   };

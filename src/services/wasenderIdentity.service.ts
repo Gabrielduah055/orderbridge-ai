@@ -21,6 +21,7 @@ export type WasenderIdentityResolutionSource =
   | "lid_only";
 
 export interface ResolvedWasenderCustomerIdentity {
+  customerKey: string;
   customerPhone?: string;
   customerAddress?: string;
   lid?: string;
@@ -29,6 +30,11 @@ export interface ResolvedWasenderCustomerIdentity {
   addressingMode: "pn" | "lid" | "username";
   resolutionSource: WasenderIdentityResolutionSource;
 }
+
+export const buildWasenderCustomerKey = (lid: string): string => {
+  const normalizedLid = normalizeWhatsappLid(lid);
+  return normalizedLid ? `wasender:lid:${normalizedLid}` : "";
+};
 
 type StoredWasenderIdentity = Pick<
   ICustomerChannelIdentityDocument,
@@ -225,6 +231,7 @@ export const resolveWasenderCustomerIdentity = async (
     }
 
     return {
+      customerKey: lid ? buildWasenderCustomerKey(lid) : phone,
       customerPhone: phone,
       customerAddress: phone,
       lid: lid || undefined,
@@ -238,6 +245,7 @@ export const resolveWasenderCustomerIdentity = async (
   if (!lid) {
     if (username) {
       return {
+        customerKey: username,
         customerAddress: username,
         username,
         recipientAddress: username,
@@ -261,6 +269,7 @@ export const resolveWasenderCustomerIdentity = async (
     }
 
     return {
+      customerKey: buildWasenderCustomerKey(lid),
       customerPhone: storedPhone,
       customerAddress: storedPhone,
       lid,
@@ -275,6 +284,7 @@ export const resolveWasenderCustomerIdentity = async (
     await remember(restaurantId, lid, undefined, username);
 
     return {
+      customerKey: buildWasenderCustomerKey(lid),
       customerAddress: username,
       lid,
       username,
@@ -297,6 +307,7 @@ export const resolveWasenderCustomerIdentity = async (
       }
 
       return {
+        customerKey: buildWasenderCustomerKey(lid),
         customerPhone: resolvedPhone,
         customerAddress: resolvedPhone,
         lid,
@@ -316,6 +327,7 @@ export const resolveWasenderCustomerIdentity = async (
     await remember(restaurantId, lid, undefined, resolvedUsername);
 
     return {
+      customerKey: buildWasenderCustomerKey(lid),
       customerAddress: resolvedUsername,
       lid,
       username: resolvedUsername,
@@ -327,6 +339,7 @@ export const resolveWasenderCustomerIdentity = async (
 
   if (storedUsername) {
     return {
+      customerKey: buildWasenderCustomerKey(lid),
       customerAddress: storedUsername,
       lid,
       username: storedUsername,
@@ -339,6 +352,7 @@ export const resolveWasenderCustomerIdentity = async (
   await remember(restaurantId, lid);
 
   return {
+    customerKey: buildWasenderCustomerKey(lid),
     lid,
     addressingMode: "lid",
     resolutionSource: "lid_only"

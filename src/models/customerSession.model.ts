@@ -28,6 +28,7 @@ export interface ICustomerSessionCartItem {
 
 export interface ICustomerSession {
   restaurantId: Types.ObjectId;
+  customerKey?: string;
   customerPhone: string;
   customerName?: string;
   cartItems: ICustomerSessionCartItem[];
@@ -115,6 +116,10 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
       ref: "Restaurant",
       required: true,
       index: true
+    },
+    customerKey: {
+      type: String,
+      trim: true
     },
     customerPhone: {
       type: String,
@@ -240,6 +245,13 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
 );
 
 customerSessionSchema.index({ restaurantId: 1, customerPhone: 1 }, { unique: true });
+customerSessionSchema.index(
+  { restaurantId: 1, customerKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { customerKey: { $type: "string" } }
+  }
+);
 
 export const CustomerSession = model<ICustomerSessionDocument>(
   "CustomerSession",

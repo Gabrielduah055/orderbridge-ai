@@ -16,6 +16,7 @@ import {
   type OrderFeedbackEnqueue
 } from "./orderFeedbackQueue.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 const ORDER_FEEDBACK_SCHEDULER_INTERVAL_MS = 60_000;
 export const ORDER_FEEDBACK_BATCH_SIZE = 50;
@@ -240,10 +241,16 @@ export const queueOrderFeedbackReminder = async (
     return false;
   }
 
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId,
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+
   await enqueueMessage({
     restaurantId,
     sessionId: restaurant.wasenderSessionId,
-    to: order.customerPhone,
+    to: recipientAddress,
     type: "text",
     text: buildOrderFeedbackReminderMessage(restaurant, order),
     apiKey: restaurant.wasenderApiToken,

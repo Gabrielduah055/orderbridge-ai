@@ -21,6 +21,10 @@ import {
   cancelQueuedOrderFeedbackMessages
 } from "./orderCompletion.service";
 import { updateCustomerProfileFromCompletedOrder } from "./customerProfile.service";
+import {
+  isOrderOwnedByCustomer,
+  normalizeCustomerKey
+} from "./customerIdentity.service";
 
 interface CreateOrderItemInput {
   menuItemId: string;
@@ -29,6 +33,7 @@ interface CreateOrderItemInput {
 
 export interface CreateOrderInput {
   customerName?: string;
+  customerKey?: string;
   customerPhone: string;
   items: CreateOrderItemInput[];
   orderType: OrderType;
@@ -424,6 +429,9 @@ export const createOrder = async (
     return await Order.create({
       restaurantId,
       customerName,
+      ...(input.customerKey
+        ? { customerKey: normalizeCustomerKey(input.customerKey, input.customerPhone) }
+        : {}),
       customerPhone: input.customerPhone,
       items,
       subtotal,
@@ -570,15 +578,14 @@ export const amendCustomerSubmittedOrder = async (
   restaurantId: string,
   orderId: string,
   customerPhone: string,
-  input: AmendCustomerSubmittedOrderInput
+  input: AmendCustomerSubmittedOrderInput,
+  customerKey?: string
 ): Promise<AmendCustomerSubmittedOrderResult> => {
   const restaurant = await getRestaurantOrThrow(restaurantId);
   const order = await getOrderOrThrow(orderId, restaurantId);
   const normalizedCustomerPhone = normalizeWhatsappRecipient(customerPhone);
 
-  if (
-    normalizeWhatsappRecipient(order.customerPhone) !== normalizedCustomerPhone
-  ) {
+  if (!isOrderOwnedByCustomer(order, normalizedCustomerPhone, customerKey)) {
     throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
   }
 
@@ -722,6 +729,9 @@ export const amendCustomerSubmittedOrder = async (
     {
       $set: {
         customerPhone: normalizedCustomerPhone,
+        ...(customerKey
+          ? { customerKey: normalizeCustomerKey(customerKey, normalizedCustomerPhone) }
+          : {}),
         items: refreshedItems,
         subtotal,
         deliveryFee,
@@ -805,14 +815,12 @@ const applyOrderStatusUpdate = async (
 export const cancelCustomerOrder = async (
   restaurantId: string,
   orderId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<CustomerCancellationResult> => {
   const order = await getOrderOrThrow(orderId, restaurantId);
 
-  if (
-    normalizeWhatsappRecipient(order.customerPhone) !==
-    normalizeWhatsappRecipient(customerPhone)
-  ) {
+  if (!isOrderOwnedByCustomer(order, customerPhone, customerKey)) {
     throw new BadRequestError("That order is not available for this customer", "ORDER_FORBIDDEN");
   }
 

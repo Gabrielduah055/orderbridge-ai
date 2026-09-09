@@ -26,6 +26,7 @@ import {
 } from "./orderCompletion.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { queueMarketingConsentRequestAfterSuccessfulOrder } from "./customerMarketingOnboarding.service";
+import { getCustomerIdentityFilter } from "./customerIdentity.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -39,6 +40,7 @@ export interface FeedbackClassification {
 export interface HandleOrderFeedbackResponseInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   customerName?: string;
   message: string;
   inboundEventId?: string;
@@ -69,6 +71,7 @@ export type OrderCheckInOutcome = (typeof orderCheckInOutcomes)[number];
 export interface RespondToOrderCheckInInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   customerName?: string;
   outcome: OrderCheckInOutcome;
   orderReference?: string;
@@ -572,11 +575,20 @@ export const createOrderFeedback = async (
 
 export const findActiveFeedbackOrders = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<IOrderDocument[]> => {
   return Order.find({
-    restaurantId,
-    customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) },
+    ...(customerKey && customerKey !== normalizeWhatsappRecipient(customerPhone)
+      ? getCustomerIdentityFilter<IOrderDocument>(
+          restaurantId,
+          customerPhone,
+          customerKey
+        )
+      : {
+          restaurantId,
+          customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) }
+        }),
     feedbackRequestSentAt: { $exists: true },
     $or: [
       {
@@ -614,9 +626,14 @@ export interface ActiveOrderCheckInView {
 
 export const loadActiveOrderCheckInState = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<ActiveOrderCheckInView[]> => {
-  const orders = await findActiveFeedbackOrders(restaurantId, customerPhone);
+  const orders = await findActiveFeedbackOrders(
+    restaurantId,
+    customerPhone,
+    customerKey
+  );
 
   return orders.map((order) => ({
     orderNumber: getOrderReference(order),
@@ -633,7 +650,8 @@ export const loadActiveOrderCheckInState = async (
 export const resolveQuotedOrderFeedbackOrderId = async (
   restaurantId: string,
   customerPhone: string,
-  quotedMessageId?: string
+  quotedMessageId?: string,
+  customerKey?: string
 ): Promise<string | null> => {
   const providerMessageId = quotedMessageId?.trim();
 
@@ -644,13 +662,14 @@ export const resolveQuotedOrderFeedbackOrderId = async (
   const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const queuedMessage = await OutboundMessage.findOne({
     restaurantId,
-    to: normalizedPhone,
     status: "sent",
     providerMessageId,
     "metadata.kind": {
       $in: ["order_feedback_request", "order_feedback_reminder"]
     },
-    "metadata.customerPhone": normalizedPhone
+    ...(customerKey
+      ? { "metadata.customerKey": customerKey }
+      : { to: normalizedPhone, "metadata.customerPhone": normalizedPhone })
   })
     .sort({ sentAt: -1 })
     .select("metadata");
@@ -1006,7 +1025,8 @@ export const handleOrderFeedbackCustomerResponse = async (
 
   const orders = await findActiveFeedbackOrders(
     input.restaurantId,
-    input.customerPhone
+    input.customerPhone,
+    input.customerKey
   );
 
   if (orders.length === 0) {
@@ -1176,6 +1196,7 @@ export const respondToOrderCheckIn = async (
   return handleOrderFeedbackCustomerResponse({
     restaurantId: input.restaurantId,
     customerPhone: input.customerPhone,
+    customerKey: input.customerKey,
     customerName: input.customerName,
     message,
     inboundEventId: input.inboundEventId

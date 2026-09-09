@@ -39,6 +39,7 @@ import {
 } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import { resolveWasenderCustomerIdentity } from "../services/wasenderIdentity.service";
+import { syncCurrentCustomerRecipient } from "../services/customerIdentity.service";
 import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
 
@@ -46,10 +47,10 @@ const customerConversationQueues = new Map<string, Promise<void>>();
 
 export const runCustomerConversationSequentially = async <T>(
   restaurantId: string,
-  customerPhone: string,
+  customerKey: string,
   task: () => Promise<T>
 ): Promise<T> => {
-  const key = `${restaurantId}:${normalizeWhatsappRecipient(customerPhone)}`;
+  const key = `${restaurantId}:${customerKey.trim().toLowerCase()}`;
   const previous = customerConversationQueues.get(key) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(task);
   const cleanup = next
@@ -648,7 +649,7 @@ const processNormalizedWebhook = async (
       resolutionSource: customerIdentity.resolutionSource
     });
 
-    if (!customerIdentity.customerAddress) {
+    if (!customerIdentity.recipientAddress) {
       console.warn("WhatsApp sender identity has no resolvable outbound recipient", {
         restaurantId: String(restaurant._id),
         addressingMode: customerIdentity.addressingMode,
@@ -660,23 +661,33 @@ const processNormalizedWebhook = async (
       return;
     }
 
-    const canonicalCustomerAddress = customerIdentity.customerAddress;
-    const replyAddress =
-      customerIdentity.recipientAddress ?? canonicalCustomerAddress;
-    const sender = resolveSenderIdentity(restaurant, canonicalCustomerAddress);
+    const customerKey = customerIdentity.customerKey;
+    const recipientAddress = customerIdentity.recipientAddress;
+    const replyAddress = recipientAddress;
+    await syncCurrentCustomerRecipient({
+      restaurantId: String(restaurant._id),
+      customerKey,
+      recipientAddress
+    });
+    const sender = resolveSenderIdentity(restaurant, recipientAddress, {
+      customerKey,
+      recipientAddress
+    });
     const processWebhookTurn = async (): Promise<void> => {
       let conversationMetadata: Record<string, unknown> = {};
 
       if (sender.role === "customer") {
         const turnSession = await recordInboundCustomerTurn(
           String(restaurant._id),
-          canonicalCustomerAddress,
+          recipientAddress,
           eventId,
-          sender.name
+          sender.name,
+          customerKey
         );
 
         conversationMetadata = {
           customerPhone: turnSession.customerPhone,
+          customerKey: turnSession.customerKey,
           inboundEventId: eventId,
           draftId: String(turnSession._id),
           conversationVersion: turnSession.conversationVersion,
@@ -708,7 +719,7 @@ const processNormalizedWebhook = async (
           const trustedImage = await uploadTrustedDecryptedImageFromUrl(decryptedPublicUrl);
           const workflowResult = await prepareUploadedMenuItemImage({
             restaurantId: String(restaurant._id),
-            senderPhone: canonicalCustomerAddress,
+            senderPhone: recipientAddress,
             senderRole: sender.role,
             image: trustedImage
           });
@@ -771,7 +782,9 @@ const processNormalizedWebhook = async (
 
       const agentResponse = await handleRestaurantAgentMessage({
         restaurant,
-        senderPhone: canonicalCustomerAddress,
+        senderPhone: recipientAddress,
+        customerKey,
+        recipientAddress,
         message: webhook.message,
         quotedMessageId: webhook.quotedMessageId,
         inboundEventId: eventId
@@ -783,7 +796,11 @@ const processNormalizedWebhook = async (
       let replyMessage = agentResponse.message;
 
       if (sender.role === "customer") {
-        const latestDraft = await findActiveDraft(String(restaurant._id), sender.normalizedPhone);
+        const latestDraft = await findActiveDraft(
+          String(restaurant._id),
+          recipientAddress,
+          customerKey
+        );
 
         if (latestDraft) {
           conversationMetadata = {
@@ -801,7 +818,7 @@ const processNormalizedWebhook = async (
           sessionId: restaurant.wasenderSessionId,
           to: replyAddress,
           customerPhone:
-            sender.role === "customer" ? canonicalCustomerAddress : undefined,
+            sender.role === "customer" ? recipientAddress : undefined,
           delivery: menuItemImage,
           agentMessage: agentResponse.message,
           eventId,
@@ -844,7 +861,7 @@ const processNormalizedWebhook = async (
     if (sender.role === "customer") {
       await runCustomerConversationSequentially(
         String(restaurant._id),
-        sender.normalizedPhone,
+        customerKey,
         processWebhookTurn
       );
       return;

@@ -19,7 +19,8 @@ const {
   recordInboundCustomerTurn
 } = require("../dist/services/orderDraft.service");
 const {
-  getCustomerProfile
+  getCustomerProfile,
+  rememberConfirmedCustomerName
 } = require("../dist/services/customerProfile.service");
 const {
   loadCustomerMemorySummary
@@ -46,6 +47,11 @@ const {
   notifyCustomerOfConfirmedOrderAndSendReceipt,
   notifyCustomerOfRejectedOrder
 } = require("../dist/services/orderSideEffects.service");
+const { cancelCustomerOrder } = require("../dist/services/order.service");
+const {
+  isOrderOwnedByCustomer,
+  resolveCurrentWhatsappRecipient
+} = require("../dist/services/customerIdentity.service");
 
 const restaurantId = "64b000000000000000000901";
 const otherRestaurantId = "64b000000000000000000902";
@@ -112,6 +118,7 @@ test("LID plus cleaned sender phone uses the phone and remembers the LID mapping
   assert.equal(webhook.from, customerPhoneDigits);
   assert.equal(webhook.senderLid, lid);
   assert.equal(identity.customerPhone, customerPhone);
+  assert.equal(identity.customerKey, `wasender:lid:${lid}`);
   assert.equal(identity.recipientAddress, customerPhone);
   assert.equal(identity.resolutionSource, "phone_field");
   assert.deepEqual(remembered, [[restaurantId, lid, customerPhone]]);
@@ -141,6 +148,7 @@ test("LID plus senderPn uses the trusted sender phone and remembers the mapping"
 
   assert.equal(webhook.senderPhoneSource, "senderPn");
   assert.equal(identity.customerPhone, customerPhone);
+  assert.equal(identity.customerKey, `wasender:lid:${lid}`);
   assert.equal(identity.recipientAddress, customerPhone);
   assert.deepEqual(remembered, [restaurantId, lid, customerPhone]);
 });
@@ -248,6 +256,7 @@ test("direct username webhook preserves the username as the customer address", a
   assert.equal(webhook.senderPhone, undefined);
   assert.equal(webhook.senderUsername, username);
   assert.equal(identity.customerAddress, username);
+  assert.equal(identity.customerKey, username);
   assert.equal(identity.recipientAddress, username);
   assert.equal(identity.resolutionSource, "username_field");
 });
@@ -318,6 +327,7 @@ test("LID-only webhook falls back to username when no phone is available", async
   );
 
   assert.equal(identity.customerPhone, undefined);
+  assert.equal(identity.customerKey, `wasender:lid:${lid}`);
   assert.equal(identity.customerAddress, username);
   assert.equal(identity.username, username);
   assert.equal(identity.recipientAddress, username);
@@ -911,5 +921,320 @@ test("LID inbound resolves to a phone before the agent reply is sent", async () 
     } else {
       process.env.WASENDER_API_URL = originalApiUrl;
     }
+  }
+});
+
+test("same LID keeps one active cart and conversation chain after username changes", async () => {
+  const lidValue = "111111111@lid";
+  const oldUsername = "@old.name";
+  const newUsername = "@new.name";
+  const mappings = new Map();
+  const sessions = [];
+  const originalFindOne = CustomerSession.findOne;
+  const originalCreate = CustomerSession.create;
+  const dependencies = {
+    findByLid: async () => mappings.get(lidValue) ?? null,
+    remember: async (_restaurantId, seenLid, phone, seenUsername) => {
+      const record = {
+        lid: seenLid,
+        ...(phone ? { phone } : {}),
+        ...(seenUsername ? { username: seenUsername } : {})
+      };
+      mappings.set(seenLid, record);
+      return record;
+    },
+    resolvePhoneFromLid: async () => ({ success: false }),
+    resolveUsername: async () => ({ success: false })
+  };
+  const matches = (session, filter) => {
+    if (String(session.restaurantId) !== String(filter.restaurantId)) return false;
+    if (filter.$or) {
+      return filter.$or.some((condition) =>
+        condition.customerKey
+          ? session.customerKey === condition.customerKey
+          : !session.customerKey && session.customerPhone === condition.customerPhone
+      );
+    }
+    return session.customerPhone === filter.customerPhone;
+  };
+
+  try {
+    CustomerSession.findOne = async (filter) =>
+      sessions.find((session) => matches(session, filter)) ?? null;
+    CustomerSession.create = async (input) => {
+      const session = {
+        _id: `session-${sessions.length + 1}`,
+        ...input,
+        save: async function () { return this; }
+      };
+      sessions.push(session);
+      return session;
+    };
+
+    const firstIdentity = await resolveWasenderCustomerIdentity(
+      restaurantId,
+      normalizeIncomingWebhook(makePayload({
+        remoteJid: lidValue,
+        senderLid: lidValue,
+        senderUsername: oldUsername,
+        addressingMode: "lid"
+      })),
+      undefined,
+      dependencies
+    );
+    const firstTurn = await recordInboundCustomerTurn(
+      restaurantId,
+      firstIdentity.recipientAddress,
+      "turn-1",
+      undefined,
+      firstIdentity.customerKey
+    );
+    firstTurn.cartItems.push({ name: "Jollof", quantity: 2 });
+    firstTurn.currentStep = "choosing_items";
+    await firstTurn.save();
+
+    const secondIdentity = await resolveWasenderCustomerIdentity(
+      restaurantId,
+      normalizeIncomingWebhook(makePayload({
+        remoteJid: lidValue,
+        senderLid: lidValue,
+        senderUsername: newUsername,
+        addressingMode: "lid"
+      })),
+      undefined,
+      dependencies
+    );
+    const secondTurn = await recordInboundCustomerTurn(
+      restaurantId,
+      secondIdentity.recipientAddress,
+      "turn-2",
+      undefined,
+      secondIdentity.customerKey
+    );
+
+    assert.equal(firstIdentity.customerKey, "wasender:lid:111111111@lid");
+    assert.equal(secondIdentity.customerKey, firstIdentity.customerKey);
+    assert.equal(secondTurn, firstTurn);
+    assert.equal(sessions.length, 1);
+    assert.equal(secondTurn.customerPhone, newUsername);
+    assert.equal(secondTurn.cartItems[0].quantity, 2);
+    assert.equal(secondTurn.conversationVersion, 2);
+  } finally {
+    CustomerSession.findOne = originalFindOne;
+    CustomerSession.create = originalCreate;
+  }
+});
+
+test("same LID updates one profile instead of creating a username-keyed duplicate", async () => {
+  const customerKey = "wasender:lid:111111111@lid";
+  const profiles = [];
+  const originalFindOne = CustomerProfile.findOne;
+  const originalCreate = CustomerProfile.create;
+  const matches = (profile, filter) => {
+    if (String(profile.restaurantId) !== String(filter.restaurantId)) return false;
+    if (filter.$or) {
+      return filter.$or.some((condition) =>
+        condition.customerKey
+          ? profile.customerKey === condition.customerKey
+          : !profile.customerKey && profile.customerPhone === condition.customerPhone
+      );
+    }
+    return profile.customerPhone === filter.customerPhone;
+  };
+
+  try {
+    CustomerProfile.findOne = async (filter) =>
+      profiles.find((profile) => matches(profile, filter)) ?? null;
+    CustomerProfile.create = async (input) => {
+      const profile = {
+        ...input,
+        save: async function () { return this; }
+      };
+      profiles.push(profile);
+      return profile;
+    };
+
+    const first = await rememberConfirmedCustomerName(
+      restaurantId,
+      "@old.name",
+      "Maxwell",
+      customerKey
+    );
+    const second = await rememberConfirmedCustomerName(
+      restaurantId,
+      "@new.name",
+      "Maxwell",
+      customerKey
+    );
+
+    assert.equal(second, first);
+    assert.equal(profiles.length, 1);
+    assert.equal(second.customerKey, customerKey);
+    assert.equal(second.customerPhone, "@new.name");
+  } finally {
+    CustomerProfile.findOne = originalFindOne;
+    CustomerProfile.create = originalCreate;
+  }
+});
+
+test("stable order ownership survives a username change and blocks username reuse", async () => {
+  const orderId = "64b000000000000000000990";
+  const keyA = "wasender:lid:111111111@lid";
+  const keyB = "wasender:lid:222222222@lid";
+  const order = {
+    _id: orderId,
+    restaurantId,
+    customerKey: keyA,
+    customerPhone: "@old.name",
+    status: "pending",
+    feedbackFollowUpStatus: "not_scheduled"
+  };
+  const originalFindOne = Order.findOne;
+  const originalFindOneAndUpdate = Order.findOneAndUpdate;
+
+  try {
+    Order.findOne = async () => order;
+    Order.findOneAndUpdate = async (_filter, update) => {
+      Object.assign(order, update.$set);
+      return order;
+    };
+
+    const result = await cancelCustomerOrder(
+      restaurantId,
+      orderId,
+      "@new.name",
+      keyA
+    );
+    assert.equal(result.order.status, "cancelled");
+    assert.equal(isOrderOwnedByCustomer(order, "@old.name", keyB), false);
+  } finally {
+    Order.findOne = originalFindOne;
+    Order.findOneAndUpdate = originalFindOneAndUpdate;
+  }
+});
+
+test("acceptance, rejection, and receipt delivery resolve the latest username", async () => {
+  const customerKey = "wasender:lid:111111111@lid";
+  const oldUsername = "@old.name";
+  const newUsername = "@new.name";
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalEnqueue = wasenderQueueService.enqueueWasenderMessage;
+  const queued = [];
+  const restaurant = {
+    _id: restaurantId,
+    name: "Golden Grill",
+    wasenderSessionId: "session-1",
+    wasenderApiToken: "restaurant-token"
+  };
+  const makeOrder = (id, status) => ({
+    _id: id,
+    restaurantId,
+    orderNumber: `ORD-${id.slice(-3)}`,
+    customerName: "Maxwell",
+    customerKey,
+    customerPhone: oldUsername,
+    status,
+    receiptUrl: "https://example.com/receipt.pdf",
+    receiptGeneratedAt: new Date(),
+    save: async function () { return this; }
+  });
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ lid: "111111111@lid", username: newUsername })
+    });
+    CustomerProfile.findOne = () => ({ select: async () => null });
+    wasenderQueueService.enqueueWasenderMessage = async (input) => {
+      queued.push(input);
+      return { _id: `queued-${queued.length}`, status: "pending" };
+    };
+
+    await notifyCustomerOfConfirmedOrderAndSendReceipt(
+      restaurant,
+      makeOrder("64b000000000000000000991", "accepted")
+    );
+    await notifyCustomerOfRejectedOrder(
+      restaurant,
+      makeOrder("64b000000000000000000992", "rejected")
+    );
+
+    assert.deepEqual(
+      queued
+        .filter((message) => [
+          "customer_order_confirmed_notification",
+          "receipt_delivery",
+          "customer_order_rejected_notification"
+        ].includes(message.metadata.kind))
+        .map((message) => message.to),
+      [newUsername, newUsername, newUsername]
+    );
+  } finally {
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    CustomerProfile.findOne = originalProfileFindOne;
+    wasenderQueueService.enqueueWasenderMessage = originalEnqueue;
+  }
+});
+
+test("stable identity schema indexes are additive, partial, and tenant scoped", () => {
+  for (const model of [CustomerSession, CustomerProfile]) {
+    const [keys, options] = model.schema.indexes().find(
+      ([indexKeys]) => indexKeys.customerKey === 1
+    );
+    assert.equal(keys.restaurantId, 1);
+    assert.equal(options.unique, true);
+    assert.deepEqual(options.partialFilterExpression, {
+      customerKey: { $type: "string" }
+    });
+  }
+
+  const orderIndex = Order.schema.indexes().find(
+    ([indexKeys]) => indexKeys.customerKey === 1
+  );
+  assert.equal(orderIndex[0].restaurantId, 1);
+  assert.equal(orderIndex[1].unique, undefined);
+});
+
+test("current recipient lookup is tenant scoped and safely falls back for legacy records", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  const seenFilters = [];
+
+  try {
+    CustomerChannelIdentity.findOne = (filter) => ({
+      select: async () => {
+        seenFilters.push(filter);
+        return String(filter.restaurantId) === restaurantId
+          ? { username: "@current.name" }
+          : null;
+      }
+    });
+
+    assert.equal(
+      await resolveCurrentWhatsappRecipient({
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@old.name"
+      }),
+      "@current.name"
+    );
+    assert.equal(
+      await resolveCurrentWhatsappRecipient({
+        restaurantId: otherRestaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@tenant.two"
+      }),
+      "@tenant.two"
+    );
+    assert.equal(
+      await resolveCurrentWhatsappRecipient({
+        restaurantId,
+        fallbackAddress: customerPhone
+      }),
+      customerPhone
+    );
+    assert.equal(seenFilters[0].restaurantId, restaurantId);
+    assert.equal(seenFilters[1].restaurantId, otherRestaurantId);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
   }
 });

@@ -11,6 +11,7 @@ import {
   buildMarketingConsentRequestMessage,
   queueMarketingConsentRequest
 } from "./customerMarketingOnboarding.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 export interface MarketingConsentOutreachCounts {
   totalCustomers: number;
@@ -34,6 +35,7 @@ export interface MarketingConsentOutreachResult
 
 interface OutreachAudience extends MarketingConsentOutreachPreview {
   eligiblePhones: string[];
+  eligibleRecipients: Array<{ customerPhone: string; customerKey?: string }>;
   restaurant: IRestaurantDocument;
   requestedByPhone: string;
 }
@@ -41,6 +43,7 @@ interface OutreachAudience extends MarketingConsentOutreachPreview {
 interface MarketingConsentOutreachDependencies {
   findRestaurant?: (restaurantId: string) => Promise<IRestaurantDocument | null>;
   findProfiles?: (restaurantId: string) => Promise<Array<{
+    customerKey?: string;
     customerPhone: string;
     marketingConsent?: boolean | null;
     isOptedOut?: boolean;
@@ -88,9 +91,13 @@ const loadOutreachAudience = async (
   const profiles = dependencies.findProfiles
     ? await dependencies.findProfiles(restaurantId)
     : await CustomerProfile.find({ restaurantId }).select(
-        "customerPhone marketingConsent isOptedOut marketingConsentPromptedAt"
+        "customerKey customerPhone marketingConsent isOptedOut marketingConsentPromptedAt"
       );
   const eligiblePhones: string[] = [];
+  const eligibleRecipients: Array<{
+    customerPhone: string;
+    customerKey?: string;
+  }> = [];
   let excludedAlreadyOptedIn = 0;
   let excludedOptedOut = 0;
   let excludedAlreadyAsked = 0;
@@ -120,12 +127,17 @@ const loadOutreachAudience = async (
     }
 
     eligiblePhones.push(normalizedPhone);
+    eligibleRecipients.push({
+      customerPhone: normalizedPhone,
+      ...(profile.customerKey ? { customerKey: profile.customerKey } : {})
+    });
   }
 
   return {
     restaurant,
     requestedByPhone: sender.normalizedPhone,
     eligiblePhones,
+    eligibleRecipients,
     totalCustomers: profiles.length,
     eligible: eligiblePhones.length,
     excludedAlreadyOptedIn,
@@ -195,12 +207,20 @@ export const executeMarketingConsentOutreach = async (
   let queued = 0;
   let failedToQueue = 0;
 
-  for (const customerPhone of audience.eligiblePhones) {
+  for (const recipient of audience.eligibleRecipients) {
     try {
+      const customerPhone = await resolveCurrentWhatsappRecipient({
+        restaurantId,
+        customerKey: recipient.customerKey,
+        fallbackAddress: recipient.customerPhone
+      });
       const result = await queueRequest(
         {
           restaurantId,
           customerPhone,
+          ...(recipient.customerKey
+            ? { customerKey: recipient.customerKey }
+            : {}),
           source: "staff_outreach",
           requestedByPhone: audience.requestedByPhone
         },

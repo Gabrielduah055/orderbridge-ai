@@ -14,6 +14,7 @@ import {
 import { BadRequestError } from "../utils/httpErrors";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
+import { getCustomerIdentityFilter } from "./customerIdentity.service";
 
 export const CUSTOMER_RECOMMENDATION_RECENT_ORDER_LIMIT = 3;
 export const DEFAULT_CUSTOMER_RECOMMENDATION_LIMIT = 5;
@@ -237,23 +238,33 @@ export const buildGroundedCustomerRecommendations = ({
 export const getCustomerRecommendations = async (
   restaurantId: string,
   customerPhone: string,
-  limit = DEFAULT_CUSTOMER_RECOMMENDATION_LIMIT
+  limit = DEFAULT_CUSTOMER_RECOMMENDATION_LIMIT,
+  customerKey?: string
 ): Promise<CustomerRecommendationCandidate[]> => {
   ensureValidRestaurantId(restaurantId);
   const safeLimit = ensureRecommendationLimit(limit);
   const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
   const [profile, recentOrders] = await Promise.all([
-    CustomerProfile.findOne({
-      restaurantId,
-      customerPhone: normalizedPhone
-    }).select(
+    CustomerProfile.findOne(
+      getCustomerIdentityFilter<ICustomerProfileDocument>(
+        restaurantId,
+        normalizedPhone,
+        customerKey
+      )
+    ).select(
       "restaurantId frequentlyOrderedItems.menuItemId frequentlyOrderedItems.orderCount"
     ),
     Order.find({
-      restaurantId,
-      customerPhone: {
-        $in: getEquivalentCustomerPhones(customerPhone)
-      },
+      ...(customerKey && customerKey !== normalizedPhone
+        ? getCustomerIdentityFilter<IOrderDocument>(
+            restaurantId,
+            normalizedPhone,
+            customerKey
+          )
+        : {
+            restaurantId,
+            customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) }
+          }),
       status: "completed"
     })
       .select("restaurantId status items.menuItemId")

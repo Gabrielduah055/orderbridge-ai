@@ -9,10 +9,15 @@ import { parseExplicitQuantity } from "./orderDraft.service";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { handleCustomerMarketingPreferenceCommand } from "./customerMarketingPreference.service";
+import {
+  getCustomerIdentityFilter,
+  normalizeCustomerKey
+} from "./customerIdentity.service";
 
 interface CustomerMessageInput {
   restaurantId: string;
   customerPhone: string;
+  customerKey?: string;
   customerName?: string;
   message: string;
 }
@@ -104,16 +109,24 @@ const resetSessionState = (session: ICustomerSessionDocument): void => {
 const getOrCreateSession = async (
   restaurantId: string,
   customerPhone: string,
-  customerName?: string
+  customerName?: string,
+  customerKey?: string
 ): Promise<ICustomerSessionDocument> => {
-  let session = await CustomerSession.findOne({
-    restaurantId,
-    customerPhone
-  });
+  const normalizedCustomerKey = customerKey
+    ? normalizeCustomerKey(customerKey, customerPhone)
+    : "";
+  let session = await CustomerSession.findOne(
+    getCustomerIdentityFilter<ICustomerSessionDocument>(
+      restaurantId,
+      customerPhone,
+      normalizedCustomerKey
+    )
+  );
 
   if (!session) {
     return CustomerSession.create({
       restaurantId,
+      ...(normalizedCustomerKey ? { customerKey: normalizedCustomerKey } : {}),
       customerPhone,
       customerName,
       cartItems: [],
@@ -124,6 +137,11 @@ const getOrCreateSession = async (
       expiresAt: getSessionExpiry()
     });
   }
+
+  if (normalizedCustomerKey && !session.customerKey) {
+    session.customerKey = normalizedCustomerKey;
+  }
+  session.customerPhone = customerPhone;
 
   if (session.expiresAt <= new Date()) {
     resetSessionState(session);
@@ -427,7 +445,9 @@ export const handleLegacyCustomerMessage = async (
     await handleCustomerMarketingPreferenceCommand(
       input.restaurantId,
       customerPhone,
-      message
+      message,
+      undefined,
+      input.customerKey
     );
 
   if (preferenceResult.handled && preferenceResult.message) {
@@ -440,7 +460,8 @@ export const handleLegacyCustomerMessage = async (
   const session = await getOrCreateSession(
     input.restaurantId,
     customerPhone,
-    input.customerName
+    input.customerName,
+    input.customerKey
   );
 
   await touchSession(session, message);
@@ -505,8 +526,11 @@ export const handleLegacyCustomerMessage = async (
   if (confirmationAliases.includes(normalizedMessage) && session.convertedOrderId) {
     const existingOrder = await Order.findOne({
       _id: session.convertedOrderId,
-      restaurantId: input.restaurantId,
-      customerPhone: session.customerPhone
+      ...getCustomerIdentityFilter<IOrderDocument>(
+        input.restaurantId,
+        session.customerPhone,
+        session.customerKey
+      )
     });
 
     if (existingOrder) {
@@ -565,6 +589,7 @@ export const handleLegacyCustomerMessage = async (
   if (session.currentStep === "confirming_order" && confirmationAliases.includes(normalizedMessage)) {
     const order = await orderService.createOrder(input.restaurantId, {
       customerName: session.customerName,
+      customerKey: session.customerKey,
       customerPhone: session.customerPhone,
       items: session.cartItems.map((item) => ({
         menuItemId: String(item.menuItemId),

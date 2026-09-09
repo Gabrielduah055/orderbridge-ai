@@ -6,6 +6,9 @@ import { toolRegistry } from "./tool.registry";
 import { getSafeErrorMessage } from "../utils/error.util";
 import { BadRequestError } from "../utils/httpErrors";
 
+const getSenderIdentityKey = (context: ToolExecutionContext): string =>
+  context.sender.customerKey ?? context.sender.normalizedPhone;
+
 const isToolName = (toolName: string): toolName is ToolName => {
   return toolName in toolRegistry;
 };
@@ -114,7 +117,7 @@ export const executeConfirmedPendingToolAction = async (
   const pendingAction = await PendingAgentAction.findOne({
     _id: pendingActionId,
     restaurantId: context.restaurantId,
-    senderPhone: context.sender.normalizedPhone,
+    senderPhone: getSenderIdentityKey(context),
     senderRole: context.sender.role,
     action: "TOOL_CALL",
     ...(expectedToolName
@@ -165,7 +168,7 @@ export const cancelPendingToolAction = async (
 ): Promise<ToolResult> => {
   const pendingAction = await PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
-    senderPhone: context.sender.normalizedPhone,
+    senderPhone: getSenderIdentityKey(context),
     senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
@@ -199,7 +202,7 @@ export const cancelPendingToolActionById = async (
   const pendingAction = await PendingAgentAction.findOne({
     _id: pendingActionId,
     restaurantId: context.restaurantId,
-    senderPhone: context.sender.normalizedPhone,
+    senderPhone: getSenderIdentityKey(context),
     senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
@@ -231,7 +234,7 @@ export const findLatestPendingToolAction = async (
 ) => {
   return PendingAgentAction.findOne({
     restaurantId: context.restaurantId,
-    senderPhone: context.sender.normalizedPhone,
+    senderPhone: getSenderIdentityKey(context),
     senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",
@@ -246,7 +249,7 @@ export const findPendingToolActions = async (
 ) => {
   return PendingAgentAction.find({
     restaurantId: context.restaurantId,
-    senderPhone: context.sender.normalizedPhone,
+    senderPhone: getSenderIdentityKey(context),
     senderRole: context.sender.role,
     action: "TOOL_CALL",
     status: "pending",

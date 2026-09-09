@@ -8,6 +8,7 @@ import {
 } from "../utils/phone.util";
 import { feedbackCompletionEligibleStatuses } from "./orderCompletion.service";
 import type { WasenderSendResult } from "./wasender.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 export const ORDER_FEEDBACK_FOLLOW_UP_VERSION = 1;
 export const DEFAULT_PICKUP_CHECK_IN_DELAY_MINUTES = 45;
@@ -155,7 +156,7 @@ export const buildOrderFeedbackReminderMessage = (
 export const buildOrderFeedbackQueueMetadata = (
   order: Pick<
     IOrderDocument,
-    "_id" | "restaurantId" | "orderNumber" | "customerPhone"
+    "_id" | "restaurantId" | "orderNumber" | "customerPhone" | "customerKey"
   >,
   kind: "order_feedback_request" | "order_feedback_reminder",
   followUpVersion = ORDER_FEEDBACK_FOLLOW_UP_VERSION
@@ -165,6 +166,7 @@ export const buildOrderFeedbackQueueMetadata = (
   orderId: String(order._id),
   orderNumber: order.orderNumber ?? String(order._id),
   customerPhone: normalizeWhatsappRecipient(order.customerPhone),
+  ...(order.customerKey ? { customerKey: order.customerKey } : {}),
   followUpVersion,
   purpose: "transactional"
 });
@@ -232,7 +234,11 @@ export const scheduleOrderFeedbackFollowUp = async (
     return { scheduled: false, reason: "follow_up_no_longer_active" };
   }
 
-  const customerPhone = normalizeWhatsappRecipient(order.customerPhone);
+  const customerPhone = await resolveCurrentWhatsappRecipient({
+    restaurantId,
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
 
   if (!isValidWhatsappRecipient(customerPhone)) {
     return { scheduled: false, reason: "invalid_customer_phone" };
@@ -327,6 +333,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
   const customerPhone = normalizeWhatsappRecipient(
     getMetadataString(message.metadata, "customerPhone")
   );
+  const customerKey = getMetadataString(message.metadata, "customerKey");
   const followUpVersion = Number(message.metadata?.followUpVersion);
 
   if (
@@ -334,7 +341,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
     !Types.ObjectId.isValid(orderId) ||
     !orderNumber ||
     purpose !== "transactional" ||
-    !/^\+[1-9]\d{7,14}$/.test(customerPhone) ||
+    !isValidWhatsappRecipient(customerPhone) ||
     !Number.isInteger(followUpVersion) ||
     followUpVersion < 1
   ) {
@@ -355,7 +362,7 @@ export const getQueuedOrderFeedbackStaleReason = async (
   const [restaurant, order] = await Promise.all([
     loadActiveRestaurant(restaurantId),
     Order.findOne({ _id: orderId, restaurantId }).select(
-      "status orderNumber customerPhone feedbackFollowUpStatus feedbackFollowUpVersion feedbackReceivedAt feedbackRequestSentAt feedbackReminderSentAt"
+      "status orderNumber customerKey customerPhone feedbackFollowUpStatus feedbackFollowUpVersion feedbackReceivedAt feedbackRequestSentAt feedbackReminderSentAt"
     )
   ]);
 
@@ -387,7 +394,11 @@ export const getQueuedOrderFeedbackStaleReason = async (
     return "order_number_changed";
   }
 
-  if (normalizeWhatsappRecipient(order.customerPhone) !== customerPhone) {
+  if (
+    customerKey
+      ? order.customerKey !== customerKey
+      : normalizeWhatsappRecipient(order.customerPhone) !== customerPhone
+  ) {
     return "order_customer_phone_changed";
   }
 

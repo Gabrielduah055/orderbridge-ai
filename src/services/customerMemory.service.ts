@@ -8,6 +8,7 @@ import type {
 import { Order } from "../models/order.model";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import { getEquivalentCustomerPhones } from "./customerProfile.service";
+import { getCustomerIdentityFilter } from "./customerIdentity.service";
 
 export const CUSTOMER_MEMORY_RECENT_ORDER_LIMIT = 3;
 export const CUSTOMER_MEMORY_RECENT_ORDER_ITEM_LIMIT = 4;
@@ -190,13 +191,17 @@ export const buildCustomerMemorySummary = (
 
 export const loadCustomerMemorySummary = async (
   restaurantId: string,
-  customerPhone: string
+  customerPhone: string,
+  customerKey?: string
 ): Promise<CustomerMemorySummary | null> => {
   const normalizedPhone = normalizeWhatsappRecipient(customerPhone);
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone: normalizedPhone
-  }).select(
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter<ICustomerProfileDocument>(
+      restaurantId,
+      normalizedPhone,
+      customerKey
+    )
+  ).select(
     [
       "customerName",
       "orderCount",
@@ -216,10 +221,16 @@ export const loadCustomerMemorySummary = async (
   }
 
   const recentOrders = await Order.find({
-    restaurantId,
-    customerPhone: {
-      $in: getEquivalentCustomerPhones(customerPhone)
-    },
+    ...(customerKey && customerKey !== normalizedPhone
+      ? getCustomerIdentityFilter<IOrderDocument>(
+          restaurantId,
+          normalizedPhone,
+          customerKey
+        )
+      : {
+          restaurantId,
+          customerPhone: { $in: getEquivalentCustomerPhones(customerPhone) }
+        }),
     status: "completed"
   })
     .select(

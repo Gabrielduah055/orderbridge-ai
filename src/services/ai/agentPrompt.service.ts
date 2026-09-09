@@ -35,8 +35,14 @@ export const buildAgentSystemPrompt = async (
     dependencies.loadActiveCheckIns ?? loadActiveOrderCheckInState;
   const restaurantId = String(restaurant._id);
   const isCustomer = sender.role === "customer";
+  const recipientAddress = sender.recipientAddress ?? sender.normalizedPhone;
+  const customerIdentityKey = sender.customerKey ?? sender.normalizedPhone;
   const customerMemoryPromise = isCustomer
-    ? loadCustomerMemory(restaurantId, sender.normalizedPhone).catch(
+    ? loadCustomerMemory(
+        restaurantId,
+        recipientAddress,
+        sender.customerKey
+      ).catch(
         (error: unknown) => {
           console.error("Customer memory lookup failed", {
             restaurantId,
@@ -50,7 +56,11 @@ export const buildAgentSystemPrompt = async (
       )
     : Promise.resolve(null);
   const activeCheckInsPromise = isCustomer
-    ? loadActiveCheckIns(restaurantId, sender.normalizedPhone).catch(
+    ? loadActiveCheckIns(
+        restaurantId,
+        recipientAddress,
+        sender.customerKey
+      ).catch(
         (error: unknown) => {
           console.error("Active order check-in lookup failed", {
             restaurantId,
@@ -73,12 +83,12 @@ export const buildAgentSystemPrompt = async (
     await Promise.all([
       buildRestaurantContext(restaurant, sender, permissions),
       isCustomer
-        ? findDraft(restaurantId, sender.normalizedPhone)
+        ? findDraft(restaurantId, recipientAddress, sender.customerKey)
         : Promise.resolve(null),
       isCustomer
         ? findClarification({
             restaurantId,
-            senderPhone: sender.normalizedPhone
+            senderPhone: customerIdentityKey
           })
         : Promise.resolve(null),
       customerMemoryPromise,

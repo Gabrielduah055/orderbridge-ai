@@ -26,9 +26,11 @@ import {
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
 import {
+  isValidWhatsappRecipient,
   normalizeGhanaPhone,
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
+import { getCustomerIdentityFilter } from "./customerIdentity.service";
 import { redactUrls } from "../utils/error.util";
 import {
   applyOrderFeedbackProviderResult,
@@ -337,6 +339,10 @@ export const getQueuedCustomerCampaignStaleReason = async (
   const queuedPhone = queuedRecipientPhone
     ? normalizeWhatsappRecipient(queuedRecipientPhone)
     : "";
+  const customerKey =
+    typeof metadata.customerKey === "string"
+      ? metadata.customerKey.trim().toLowerCase()
+      : "";
 
   if (
     !Types.ObjectId.isValid(restaurantId) ||
@@ -344,12 +350,12 @@ export const getQueuedCustomerCampaignStaleReason = async (
     !Types.ObjectId.isValid(campaignRecipientId) ||
     !Number.isInteger(campaignVersion) ||
     campaignVersion < 1 ||
-    !/^\+[1-9]\d{7,14}$/.test(customerPhone)
+    !isValidWhatsappRecipient(customerPhone)
   ) {
     return "invalid_metadata";
   }
 
-  if (queuedPhone && queuedPhone !== customerPhone) {
+  if (!customerKey && queuedPhone && queuedPhone !== customerPhone) {
     return "queued_recipient_changed";
   }
 
@@ -396,7 +402,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     campaignId,
     campaignVersion,
     status: "pending"
-  }).select("customerPhone campaignVersion");
+  }).select("customerKey customerPhone campaignVersion");
 
   if (!recipient) {
     return "campaign_recipient_missing_or_not_pending";
@@ -406,20 +412,31 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "campaign_recipient_version_changed";
   }
 
-  if (normalizeWhatsappRecipient(recipient.customerPhone) !== customerPhone) {
+  if (
+    customerKey
+      ? recipient.customerKey !== customerKey
+      : normalizeWhatsappRecipient(recipient.customerPhone) !== customerPhone
+  ) {
     return "campaign_recipient_phone_changed";
   }
 
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone
-  }).select("customerPhone marketingConsent isOptedOut");
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter(
+      restaurantId,
+      customerPhone,
+      customerKey || undefined
+    )
+  ).select("customerKey customerPhone marketingConsent isOptedOut");
 
   if (!profile) {
     return "customer_profile_missing";
   }
 
-  if (normalizeWhatsappRecipient(profile.customerPhone) !== customerPhone) {
+  if (
+    customerKey
+      ? profile.customerKey !== customerKey
+      : normalizeWhatsappRecipient(profile.customerPhone) !== customerPhone
+  ) {
     return "customer_profile_phone_changed";
   }
 
@@ -476,15 +493,18 @@ export const getQueuedMarketingConsentRequestStaleReason = async (
     typeof metadata?.customerPhone === "string"
       ? normalizeWhatsappRecipient(metadata.customerPhone)
       : normalizeWhatsappRecipient(queuedCustomerPhone);
+  const customerKey =
+    typeof metadata?.customerKey === "string"
+      ? metadata.customerKey
+      : undefined;
 
   if (!restaurantId || !customerPhone) {
     return "invalid_consent_request_scope";
   }
 
-  const profile = await CustomerProfile.findOne({
-    restaurantId,
-    customerPhone
-  }).select("marketingConsent isOptedOut");
+  const profile = await CustomerProfile.findOne(
+    getCustomerIdentityFilter(restaurantId, customerPhone, customerKey)
+  ).select("marketingConsent isOptedOut");
 
   // A missing profile may mean the prompt was queued just before the profile
   // audit update completed. Do not cancel that narrow enqueue/mark race.
@@ -1351,9 +1371,19 @@ export const processNextQueuedWasenderMessage = async (
           : undefined;
     const customerPhone =
       typeof locked.metadata?.customerPhone === "string" ? locked.metadata.customerPhone : locked.to;
+    const customerKey =
+      typeof locked.metadata?.customerKey === "string"
+        ? locked.metadata.customerKey
+        : undefined;
     const session =
       restaurantId && customerPhone
-        ? await CustomerSession.findOne({ restaurantId, customerPhone }).select(
+        ? await CustomerSession.findOne(
+            getCustomerIdentityFilter(
+              restaurantId,
+              customerPhone,
+              customerKey
+            )
+          ).select(
             "_id conversationVersion currentStep cartItems pendingMenuItemId pendingCategoryId orderType deliveryFee"
           )
         : null;

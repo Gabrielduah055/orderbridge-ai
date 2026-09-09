@@ -78,6 +78,10 @@ import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/
 import { BadRequestError } from "../utils/httpErrors";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import {
+  getCustomerIdentityFilter,
+  isOrderOwnedByCustomer
+} from "../services/customerIdentity.service";
+import {
   findTrustedQuotedOwnerOrderContext,
   type QuotedOwnerOrderAction
 } from "../services/ownerOrderNotificationContext.service";
@@ -101,6 +105,10 @@ import {
 } from "../services/menuItemImageWorkflow.service";
 
 const emptySchema = z.object({}).strict();
+const getSenderRecipient = (context: ToolExecutionContext): string =>
+  context.sender.recipientAddress ?? context.sender.normalizedPhone;
+const getSenderCustomerKey = (context: ToolExecutionContext): string | undefined =>
+  context.sender.customerKey;
 const businessReportSchema = z
   .object({
     period: z.enum(businessReportPeriodTypes),
@@ -1041,8 +1049,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const recommendations =
         await customerRecommendationService.getCustomerRecommendations(
           context.restaurantId,
-          context.sender.normalizedPhone,
-          args.limit
+          getSenderRecipient(context),
+          args.limit,
+          getSenderCustomerKey(context)
         );
 
       return {
@@ -1071,7 +1080,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       message: "Marketing preference retrieved.",
       data: await getCustomerMarketingPreference(
         context.restaurantId,
-        context.sender.normalizedPhone
+        getSenderRecipient(context),
+        getSenderCustomerKey(context)
       )
     })
   },
@@ -1367,8 +1377,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     schema: emptySchema,
     handler: async (_args, context) => {
       const order = await Order.findOne({
-        restaurantId: context.restaurantId,
-        customerPhone: context.sender.normalizedPhone
+        ...getCustomerIdentityFilter<IOrderDocument>(
+          context.restaurantId,
+          getSenderRecipient(context),
+          getSenderCustomerKey(context)
+        )
       }).sort({ createdAt: -1 });
 
       if (!order) {
@@ -1406,7 +1419,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const feedbackText = args.feedbackText ?? context.originalMessage;
       const result = await respondToOrderCheckIn({
         restaurantId: context.restaurantId,
-        customerPhone: context.sender.normalizedPhone,
+        customerPhone: getSenderRecipient(context),
+        customerKey: getSenderCustomerKey(context),
         customerName: context.sender.name,
         outcome: args.outcome,
         orderReference: args.orderReference,
@@ -1472,8 +1486,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       if (
         isCustomer &&
-        normalizeWhatsappRecipient(order.customerPhone) !==
-          context.sender.normalizedPhone
+        !isOrderOwnedByCustomer(
+          order,
+          getSenderRecipient(context),
+          getSenderCustomerKey(context)
+        )
       ) {
         return {
           success: false,
@@ -2582,7 +2599,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (args, context) => {
       const order = await orderService.createOrder(context.restaurantId, {
         customerName: args.customerName,
-        customerPhone: context.sender.normalizedPhone,
+        customerKey: getSenderCustomerKey(context),
+        customerPhone: getSenderRecipient(context),
         items: args.items,
         orderType: args.orderType,
         deliveryAddress: args.deliveryAddress,
@@ -2616,8 +2634,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (args, context) => {
       const draft = await getOrCreateDraft(
         context.restaurantId,
-        context.sender.normalizedPhone,
-        args.customerName
+        getSenderRecipient(context),
+        args.customerName,
+        getSenderCustomerKey(context)
       );
 
       if (draft.currentStep === "idle") {
@@ -2648,7 +2667,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.add_order_item_by_name,
     schema: addOrderItemByNameSchema,
     handler: async (args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
       const explicitQuantity = resolveTrustedQuantity(
         args.quantity,
         context.originalMessage ?? args.itemName
@@ -2934,7 +2958,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.remove_order_item_by_name,
     schema: removeOrderItemByNameSchema,
     handler: async (args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
       const message = removeItemFromDraft(draft, args.itemName, args.quantity);
       clearPendingMenuItem(draft);
       synchronizeDraftCurrentStep(draft);
@@ -2960,7 +2989,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.update_order_item_quantity,
     schema: updateOrderItemQuantitySchema,
     handler: async (args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
 
       if (draft.cartItems.length === 0) {
         return {
@@ -3035,7 +3069,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.update_order_draft,
     schema: updateOrderDraftSchema,
     handler: async (args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
 
       if (args.orderType === "delivery" && !context.restaurant.deliveryEnabled) {
         return {
@@ -3125,8 +3164,17 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     schema: emptySchema,
     handler: async (_args, context) => {
       const draft =
-        (await findActiveDraft(context.restaurantId, context.sender.normalizedPhone)) ??
-        (await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone));
+        (await findActiveDraft(
+          context.restaurantId,
+          getSenderRecipient(context),
+          getSenderCustomerKey(context)
+        )) ??
+        (await getOrCreateDraft(
+          context.restaurantId,
+          getSenderRecipient(context),
+          undefined,
+          getSenderCustomerKey(context)
+        ));
 
       return {
         success: true,
@@ -3148,10 +3196,20 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.confirm_order_draft,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
 
       if (draft.convertedOrderId) {
-        const result = await submitOrderDraft(context.restaurant, context.sender.normalizedPhone);
+        const result = await submitOrderDraft(
+          context.restaurant,
+          getSenderRecipient(context),
+          {},
+          getSenderCustomerKey(context)
+        );
 
         return {
           success: true,
@@ -3183,7 +3241,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       let result: Awaited<ReturnType<typeof submitOrderDraft>>;
 
       try {
-        result = await submitOrderDraft(context.restaurant, context.sender.normalizedPhone);
+        result = await submitOrderDraft(
+          context.restaurant,
+          getSenderRecipient(context),
+          {},
+          getSenderCustomerKey(context)
+        );
       } catch (error) {
         if (error instanceof BadRequestError) {
           return {
@@ -3220,7 +3283,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     roles: toolPermissions.cancel_order_draft,
     schema: emptySchema,
     handler: async (_args, context) => {
-      const draft = await getOrCreateDraft(context.restaurantId, context.sender.normalizedPhone);
+      const draft = await getOrCreateDraft(
+        context.restaurantId,
+        getSenderRecipient(context),
+        undefined,
+        getSenderCustomerKey(context)
+      );
       resetDraftState(draft);
       clearConvertedDraftState(draft);
       await draft.save();
@@ -3255,8 +3323,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       }
 
       if (
-        normalizeWhatsappRecipient(order.customerPhone) !==
-        context.sender.normalizedPhone
+        !isOrderOwnedByCustomer(
+          order,
+          getSenderRecipient(context),
+          getSenderCustomerKey(context)
+        )
       ) {
         return {
           success: false,
@@ -3378,14 +3449,15 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const result = await orderService.amendCustomerSubmittedOrder(
         context.restaurantId,
         String(order._id),
-        context.sender.normalizedPhone,
+        getSenderRecipient(context),
         {
           itemName: args.itemName,
           menuItemId,
           newQuantity: trustedNewQuantity,
           orderType: args.orderType,
           deliveryAddress: args.deliveryAddress
-        }
+        },
+        getSenderCustomerKey(context)
       );
 
       return {
@@ -3420,8 +3492,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       if (
         context.sender.role === "customer" &&
-        normalizeWhatsappRecipient(order.customerPhone) !==
-          context.sender.normalizedPhone
+        !isOrderOwnedByCustomer(
+          order,
+          getSenderRecipient(context),
+          getSenderCustomerKey(context)
+        )
       ) {
         return {
           success: false,
@@ -3446,7 +3521,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         ? await orderService.cancelCustomerOrder(
             context.restaurantId,
             String(order._id),
-            context.sender.normalizedPhone
+            getSenderRecipient(context),
+            getSenderCustomerKey(context)
           )
         : await orderService.updateOrderStatus(String(order._id), "cancelled");
       const cancellationRequestStatus =

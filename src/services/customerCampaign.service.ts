@@ -175,6 +175,7 @@ type CampaignStaffRole = Extract<SenderRole, "owner" | "manager">;
 
 export interface CustomerCampaignAudienceMember {
   customerProfileId: string;
+  customerKey?: string;
   customerPhone: string;
   qualificationReason: string;
   consentSnapshotUpdatedAt: Date;
@@ -207,6 +208,7 @@ export interface UpdateCustomerCampaignDraftInput
 type CampaignProfile = Pick<
   ICustomerProfileDocument,
   | "_id"
+  | "customerKey"
   | "customerPhone"
   | "orderCount"
   | "lastOrderAt"
@@ -392,7 +394,7 @@ export const selectCustomerCampaignAudience = async (
   const profiles = (await CustomerProfile.find({
     restaurantId
   }).select(
-    "customerPhone orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
+    "customerKey customerPhone orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
   )) as CampaignProfile[];
   const recipientsByPhone = new Map<
     string,
@@ -471,6 +473,7 @@ export const selectCustomerCampaignAudience = async (
     ) {
       recipientsByPhone.set(normalizedPhone, {
         customerProfileId: String(profile._id),
+        ...(profile.customerKey ? { customerKey: profile.customerKey } : {}),
         customerPhone: normalizedPhone,
         qualificationReason,
         consentSnapshotUpdatedAt:
@@ -927,6 +930,9 @@ export const approveCustomerCampaign = async (
             customerProfileId: new Types.ObjectId(
               recipient.customerProfileId
             ),
+            ...(recipient.customerKey
+              ? { customerKey: recipient.customerKey }
+              : {}),
             customerPhone: recipient.customerPhone,
             campaignVersion: expectedCampaignVersion,
             qualificationReason: recipient.qualificationReason,

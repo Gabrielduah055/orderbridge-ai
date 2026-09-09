@@ -7,6 +7,7 @@ import {
 } from "./order.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { queueMarketingConsentRequest } from "./customerMarketingOnboarding.service";
+import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
 
 /** Delay in milliseconds before sending the marketing opt-in message after receipt delivery. */
 const MARKETING_CONSENT_DELAY_MS = 2 * 60 * 1_000; // 2 minutes
@@ -330,10 +331,16 @@ export const notifyCustomerOfCancellationResolution = async (
     return { customerNotification: "skipped" };
   }
 
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+
   await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: order.customerPhone,
+    to: recipientAddress,
     type: "text",
     text: buildCustomerCancellationResolutionNotification(restaurant, order),
     apiKey: restaurant.wasenderApiToken,
@@ -393,10 +400,16 @@ export const notifyCustomerOfRejectedOrder = async (
     };
   }
 
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: order.customerKey,
+    fallbackAddress: order.customerPhone
+  });
+
   await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: order.customerPhone,
+    to: recipientAddress,
     type: "text",
     text: buildCustomerOrderRejectedMessage(restaurant, order),
     apiKey: restaurant.wasenderApiToken,
@@ -458,12 +471,17 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
 
   const publicReceiptUrl = getPublicReceiptUrl(receiptOrder.receiptUrl);
   const canSendReceipt = Boolean(publicReceiptUrl);
+  const recipientAddress = await resolveCurrentWhatsappRecipient({
+    restaurantId: String(restaurant._id),
+    customerKey: receiptOrder.customerKey,
+    fallbackAddress: receiptOrder.customerPhone
+  });
 
   if (!receiptOrder.customerConfirmedNotificationSentAt) {
     await enqueueWasenderMessage({
       restaurantId: String(restaurant._id),
       sessionId: restaurant.wasenderSessionId,
-      to: receiptOrder.customerPhone,
+      to: recipientAddress,
       type: "text",
       text: buildCustomerOrderConfirmedMessage(restaurant, receiptOrder, canSendReceipt),
       apiKey: restaurant.wasenderApiToken,
@@ -506,7 +524,7 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   const queuedReceipt = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
-    to: receiptOrder.customerPhone,
+    to: recipientAddress,
     type: "document",
     documentUrl: publicReceiptUrl,
     caption: `Receipt for ${getOrderReference(receiptOrder)}`,
@@ -529,7 +547,11 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
 
   // After the receipt is successfully queued, schedule the marketing opt-in
   // message with a short delay so it arrives after the receipt, not alongside it.
-  tryQueueMarketingConsentAfterReceipt(restaurant, receiptOrder).catch(
+  tryQueueMarketingConsentAfterReceipt(
+    restaurant,
+    receiptOrder,
+    recipientAddress
+  ).catch(
     (error) => {
       console.error("Marketing consent request after receipt failed", {
         restaurantId: String(restaurant._id),
@@ -551,13 +573,15 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
  */
 const tryQueueMarketingConsentAfterReceipt = async (
   restaurant: IRestaurantDocument,
-  order: IOrderDocument
+  order: IOrderDocument,
+  recipientAddress?: string
 ): Promise<void> => {
   const nextAttemptAt = new Date(Date.now() + MARKETING_CONSENT_DELAY_MS);
   await queueMarketingConsentRequest(
     {
       restaurantId: String(restaurant._id),
-      customerPhone: order.customerPhone,
+      customerPhone: recipientAddress ?? order.customerPhone,
+      customerKey: order.customerKey,
       source: "post_order",
       orderId: String(order._id)
     },
