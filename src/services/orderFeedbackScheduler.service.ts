@@ -247,6 +247,15 @@ export const queueOrderFeedbackReminder = async (
     fallbackAddress: order.customerPhone
   });
 
+  if (!recipientAddress) {
+    console.warn("Order feedback reminder skipped", {
+      restaurantId,
+      orderId,
+      reason: "no_current_whatsapp_recipient"
+    });
+    return false;
+  }
+
   await enqueueMessage({
     restaurantId,
     sessionId: restaurant.wasenderSessionId,

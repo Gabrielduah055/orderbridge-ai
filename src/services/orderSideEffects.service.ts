@@ -41,6 +41,20 @@ const getOrderReference = (order: IOrderDocument): string => {
   return order.orderNumber ?? String(order._id);
 };
 
+const logMissingCustomerRecipient = (
+  restaurant: IRestaurantDocument,
+  order: IOrderDocument,
+  kind: string
+): void => {
+  console.warn("Customer WhatsApp notification skipped", {
+    restaurantId: String(restaurant._id),
+    orderId: String(order._id),
+    orderNumber: order.orderNumber,
+    kind,
+    reason: "no_current_whatsapp_recipient"
+  });
+};
+
 export const getPublicReceiptUrl = (receiptUrl?: string): string | null => {
   if (!receiptUrl) {
     return null;
@@ -337,6 +351,15 @@ export const notifyCustomerOfCancellationResolution = async (
     fallbackAddress: order.customerPhone
   });
 
+  if (!recipientAddress) {
+    logMissingCustomerRecipient(
+      restaurant,
+      order,
+      "customer_order_cancellation_resolution_notification"
+    );
+    return { customerNotification: "failed" };
+  }
+
   await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
@@ -350,7 +373,9 @@ export const notifyCustomerOfCancellationResolution = async (
       orderId: String(order._id),
       orderNumber: order.orderNumber,
       cancellationDecision: decision,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(order.customerKey ? { customerKey: order.customerKey } : {})
     }
   });
 
@@ -406,6 +431,15 @@ export const notifyCustomerOfRejectedOrder = async (
     fallbackAddress: order.customerPhone
   });
 
+  if (!recipientAddress) {
+    logMissingCustomerRecipient(
+      restaurant,
+      order,
+      "customer_order_rejected_notification"
+    );
+    return { customerNotification: "failed" };
+  }
+
   await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
@@ -418,7 +452,9 @@ export const notifyCustomerOfRejectedOrder = async (
       kind: "customer_order_rejected_notification",
       orderId: String(order._id),
       orderNumber: order.orderNumber,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(order.customerKey ? { customerKey: order.customerKey } : {})
     }
   });
 
@@ -477,6 +513,25 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
     fallbackAddress: receiptOrder.customerPhone
   });
 
+  if (!recipientAddress) {
+    if (!receiptOrder.customerConfirmedNotificationSentAt) {
+      result.customerNotification = "failed";
+    }
+    if (!receiptOrder.receiptSentAt) {
+      result.receiptDelivery = "failed";
+      receiptOrder.receiptDeliveryFailedAt = new Date();
+      receiptOrder.receiptDeliveryFailureReason =
+        "no_current_whatsapp_recipient";
+      await receiptOrder.save();
+    }
+    logMissingCustomerRecipient(
+      restaurant,
+      receiptOrder,
+      "customer_order_confirmed_notification_and_receipt"
+    );
+    return result;
+  }
+
   if (!receiptOrder.customerConfirmedNotificationSentAt) {
     await enqueueWasenderMessage({
       restaurantId: String(restaurant._id),
@@ -490,7 +545,11 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
         kind: "customer_order_confirmed_notification",
         orderId: String(receiptOrder._id),
         orderNumber: receiptOrder.orderNumber,
-        recipientType: "customer"
+        recipientType: "customer",
+        customerPhone: recipientAddress,
+        ...(receiptOrder.customerKey
+          ? { customerKey: receiptOrder.customerKey }
+          : {})
       }
     });
     result.customerNotification = "queued";
@@ -534,7 +593,11 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
       kind: "receipt_delivery",
       orderId: String(receiptOrder._id),
       orderNumber: receiptOrder.orderNumber,
-      recipientType: "customer"
+      recipientType: "customer",
+      customerPhone: recipientAddress,
+      ...(receiptOrder.customerKey
+        ? { customerKey: receiptOrder.customerKey }
+        : {})
     }
   });
   console.info("Receipt queued", {

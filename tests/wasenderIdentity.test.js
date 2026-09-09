@@ -45,13 +45,19 @@ const {
 const wasenderQueueService = require("../dist/services/wasenderQueue.service");
 const {
   notifyCustomerOfConfirmedOrderAndSendReceipt,
-  notifyCustomerOfRejectedOrder
+  notifyCustomerOfRejectedOrder,
+  notifyCustomerOfCancellationResolution
 } = require("../dist/services/orderSideEffects.service");
 const { cancelCustomerOrder } = require("../dist/services/order.service");
 const {
+  getCustomerIdentityFilter,
   isOrderOwnedByCustomer,
-  resolveCurrentWhatsappRecipient
+  resolveCurrentWhatsappRecipient,
+  resolveCurrentWhatsappRecipientResult
 } = require("../dist/services/customerIdentity.service");
+const {
+  ensureCustomerIdentityIndexes
+} = require("../dist/models/customerIdentityIndexes");
 
 const restaurantId = "64b000000000000000000901";
 const otherRestaurantId = "64b000000000000000000902";
@@ -948,6 +954,7 @@ test("same LID keeps one active cart and conversation chain after username chang
   };
   const matches = (session, filter) => {
     if (String(session.restaurantId) !== String(filter.restaurantId)) return false;
+    if (filter.customerKey) return session.customerKey === filter.customerKey;
     if (filter.$or) {
       return filter.$or.some((condition) =>
         condition.customerKey
@@ -1032,6 +1039,7 @@ test("same LID updates one profile instead of creating a username-keyed duplicat
   const originalCreate = CustomerProfile.create;
   const matches = (profile, filter) => {
     if (String(profile.restaurantId) !== String(filter.restaurantId)) return false;
+    if (filter.customerKey) return profile.customerKey === filter.customerKey;
     if (filter.$or) {
       return filter.$or.some((condition) =>
         condition.customerKey
@@ -1179,13 +1187,33 @@ test("acceptance, rejection, and receipt delivery resolve the latest username", 
 test("stable identity schema indexes are additive, partial, and tenant scoped", () => {
   for (const model of [CustomerSession, CustomerProfile]) {
     const [keys, options] = model.schema.indexes().find(
-      ([indexKeys]) => indexKeys.customerKey === 1
+      ([indexKeys]) =>
+        indexKeys.restaurantId === 1 &&
+        indexKeys.customerKey === 1 &&
+        Object.keys(indexKeys).length === 2
     );
     assert.equal(keys.restaurantId, 1);
     assert.equal(options.unique, true);
     assert.deepEqual(options.partialFilterExpression, {
       customerKey: { $type: "string" }
     });
+
+    const obsoleteUniqueRecipientIndex = model.schema.indexes().find(
+      ([indexKeys, indexOptions]) =>
+        indexKeys.restaurantId === 1 &&
+        indexKeys.customerPhone === 1 &&
+        Object.keys(indexKeys).length === 2 &&
+        indexOptions.unique === true
+    );
+    assert.equal(obsoleteUniqueRecipientIndex, undefined);
+
+    const recipientLookupIndex = model.schema.indexes().find(
+      ([indexKeys]) =>
+        indexKeys.restaurantId === 1 &&
+        indexKeys.customerPhone === 1 &&
+        indexKeys.customerKey === 1
+    );
+    assert.equal(recipientLookupIndex[1].unique, undefined);
   }
 
   const orderIndex = Order.schema.indexes().find(
@@ -1195,7 +1223,7 @@ test("stable identity schema indexes are additive, partial, and tenant scoped", 
   assert.equal(orderIndex[1].unique, undefined);
 });
 
-test("current recipient lookup is tenant scoped and safely falls back for legacy records", async () => {
+test("current recipient lookup is tenant scoped and never falls back to a stale username", async () => {
   const originalFindOne = CustomerChannelIdentity.findOne;
   const seenFilters = [];
 
@@ -1223,7 +1251,7 @@ test("current recipient lookup is tenant scoped and safely falls back for legacy
         customerKey: "wasender:lid:111111111@lid",
         fallbackAddress: "@tenant.two"
       }),
-      "@tenant.two"
+      ""
     );
     assert.equal(
       await resolveCurrentWhatsappRecipient({
@@ -1234,6 +1262,409 @@ test("current recipient lookup is tenant scoped and safely falls back for legacy
     );
     assert.equal(seenFilters[0].restaurantId, restaurantId);
     assert.equal(seenFilters[1].restaurantId, otherRestaurantId);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("stable LID lookup uses legacy fallback for phones but never for usernames", () => {
+  const customerKey = "wasender:lid:222222222@lid";
+
+  assert.deepEqual(
+    getCustomerIdentityFilter(restaurantId, "@old.name", customerKey),
+    { restaurantId, customerKey }
+  );
+  assert.deepEqual(
+    getCustomerIdentityFilter(restaurantId, customerPhone, customerKey),
+    {
+      restaurantId,
+      $or: [
+        { customerKey },
+        {
+          customerKey: { $exists: false },
+          customerPhone
+        }
+      ]
+    }
+  );
+});
+
+test("trusted LID plus phone can safely backfill legacy session and profile records", async () => {
+  const customerKey = "wasender:lid:333333333@lid";
+  const originalSessionFindOne = CustomerSession.findOne;
+  const originalSessionCreate = CustomerSession.create;
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalProfileCreate = CustomerProfile.create;
+  const legacySession = {
+    restaurantId,
+    customerPhone,
+    cartItems: [{ name: "Waakye", quantity: 1 }],
+    currentStep: "choosing_items",
+    orderType: null,
+    deliveryFeeResolved: false,
+    conversationVersion: 2,
+    expiresAt: new Date(Date.now() + 60_000),
+    save: async function () { return this; }
+  };
+  const legacyProfile = {
+    restaurantId,
+    customerPhone,
+    customerName: "Ama",
+    customerNameSource: "customer_confirmed",
+    save: async function () { return this; }
+  };
+
+  try {
+    CustomerSession.findOne = async (filter) => {
+      assert.equal(filter.$or[1].customerPhone, customerPhone);
+      return legacySession;
+    };
+    CustomerSession.create = async () => {
+      throw new Error("legacy phone session should be reused");
+    };
+    CustomerProfile.findOne = async (filter) => {
+      assert.equal(filter.$or[1].customerPhone, customerPhone);
+      return legacyProfile;
+    };
+    CustomerProfile.create = async () => {
+      throw new Error("legacy phone profile should be reused");
+    };
+
+    const session = await recordInboundCustomerTurn(
+      restaurantId,
+      customerPhone,
+      "legacy-phone-turn",
+      undefined,
+      customerKey
+    );
+    const profile = await rememberConfirmedCustomerName(
+      restaurantId,
+      customerPhone,
+      "Ama",
+      customerKey
+    );
+
+    assert.equal(session, legacySession);
+    assert.equal(session.customerKey, customerKey);
+    assert.equal(session.cartItems[0].name, "Waakye");
+    assert.equal(profile, legacyProfile);
+    assert.equal(profile.customerKey, customerKey);
+  } finally {
+    CustomerSession.findOne = originalSessionFindOne;
+    CustomerSession.create = originalSessionCreate;
+    CustomerProfile.findOne = originalProfileFindOne;
+    CustomerProfile.create = originalProfileCreate;
+  }
+});
+
+test("customer identity index migration is inspected and idempotent", async () => {
+  const makeCollection = (legacyName) => {
+    let indexes = [
+      { name: "_id_", key: { _id: 1 } },
+      {
+        name: legacyName,
+        key: { restaurantId: 1, customerPhone: 1 },
+        unique: true
+      }
+    ];
+    const dropped = [];
+
+    return {
+      dropped,
+      createIndex: async (key, options = {}) => {
+        const existing = indexes.find(
+          (index) => JSON.stringify(index.key) === JSON.stringify(key)
+        );
+        if (!existing) {
+          indexes.push({
+            name:
+              options.name ||
+              Object.entries(key).map(([field, value]) => `${field}_${value}`).join("_"),
+            key: { ...key },
+            ...(options.unique ? { unique: true } : {}),
+            ...(options.partialFilterExpression
+              ? { partialFilterExpression: options.partialFilterExpression }
+              : {})
+          });
+        }
+        return options.name || "created";
+      },
+      indexes: async () => indexes.map((index) => ({ ...index })),
+      dropIndex: async (name) => {
+        dropped.push(name);
+        indexes = indexes.filter((index) => index.name !== name);
+      }
+    };
+  };
+  const sessionCollection = makeCollection("legacy_session_phone_unique");
+  const profileCollection = makeCollection("custom_profile_phone_constraint");
+
+  await ensureCustomerIdentityIndexes({ sessionCollection, profileCollection });
+  await ensureCustomerIdentityIndexes({ sessionCollection, profileCollection });
+
+  for (const [collection, legacyName, lookupName] of [
+    [sessionCollection, "legacy_session_phone_unique", "customer_session_recipient_lookup"],
+    [profileCollection, "custom_profile_phone_constraint", "customer_profile_recipient_lookup"]
+  ]) {
+    const indexes = await collection.indexes();
+    assert.deepEqual(collection.dropped, [legacyName]);
+    assert.equal(indexes.some((index) => index.name === legacyName), false);
+    assert.equal(indexes.some((index) => index.name === lookupName), true);
+    assert.equal(
+      indexes.some((index) =>
+        index.unique === true &&
+        index.key.restaurantId === 1 &&
+        index.key.customerKey === 1
+      ),
+      true
+    );
+  }
+});
+
+test("reassigned username cannot claim legacy state or receive the original customer's order", async () => {
+  const keyA = "wasender:lid:111111111@lid";
+  const keyB = "wasender:lid:222222222@lid";
+  const oldUsername = "@old.name";
+  const legacySessionA = {
+    _id: "legacy-session-a",
+    restaurantId,
+    customerPhone: oldUsername,
+    cartItems: [{ name: "A's Jollof", quantity: 2 }],
+    currentStep: "choosing_items",
+    orderType: null,
+    deliveryFeeResolved: false,
+    conversationVersion: 4,
+    expiresAt: new Date(Date.now() + 60_000),
+    save: async function () { return this; }
+  };
+  const legacyProfileA = {
+    restaurantId,
+    customerPhone: oldUsername,
+    customerName: "Customer A",
+    customerNameSource: "customer_confirmed",
+    save: async function () { return this; }
+  };
+  const sessions = [legacySessionA];
+  const profiles = [legacyProfileA];
+  const queued = [];
+  const originalSessionFindOne = CustomerSession.findOne;
+  const originalSessionCreate = CustomerSession.create;
+  const originalProfileFindOne = CustomerProfile.findOne;
+  const originalProfileCreate = CustomerProfile.create;
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalEnqueue = wasenderQueueService.enqueueWasenderMessage;
+  const orderA = {
+    _id: "64b000000000000000000995",
+    restaurantId,
+    orderNumber: "ORD-995",
+    customerKey: keyA,
+    customerPhone: oldUsername,
+    customerName: "Customer A",
+    status: "accepted",
+    receiptUrl: "https://example.com/a-receipt.pdf",
+    receiptGeneratedAt: new Date(),
+    save: async function () { return this; }
+  };
+  const restaurant = {
+    _id: restaurantId,
+    name: "Golden Grill",
+    wasenderSessionId: "session-1",
+    wasenderApiToken: "restaurant-token"
+  };
+
+  try {
+    CustomerSession.findOne = async (filter) =>
+      sessions.find((session) =>
+        filter.customerKey && session.customerKey === filter.customerKey
+      ) ?? null;
+    CustomerSession.create = async (input) => {
+      const session = {
+        _id: "session-b",
+        ...input,
+        save: async function () { return this; }
+      };
+      sessions.push(session);
+      return session;
+    };
+    CustomerProfile.findOne = async (filter) =>
+      profiles.find((profile) =>
+        filter.customerKey && profile.customerKey === filter.customerKey
+      ) ?? null;
+    CustomerProfile.create = async (input) => {
+      const profile = {
+        ...input,
+        save: async function () { return this; }
+      };
+      profiles.push(profile);
+      return profile;
+    };
+    CustomerChannelIdentity.findOne = (filter) => ({
+      select: async () => {
+        assert.equal(filter.restaurantId, restaurantId);
+        assert.equal(filter.lid, "111111111@lid");
+        return { lid: "111111111@lid" };
+      }
+    });
+    wasenderQueueService.enqueueWasenderMessage = async (input) => {
+      queued.push(input);
+      return { _id: `queued-${queued.length}`, status: "pending" };
+    };
+
+    const sessionB = await recordInboundCustomerTurn(
+      restaurantId,
+      oldUsername,
+      "b-turn-1",
+      "Customer B",
+      keyB
+    );
+    const profileB = await rememberConfirmedCustomerName(
+      restaurantId,
+      oldUsername,
+      "Customer B",
+      keyB
+    );
+    const result = await notifyCustomerOfConfirmedOrderAndSendReceipt(
+      restaurant,
+      orderA
+    );
+
+    assert.notEqual(sessionB, legacySessionA);
+    assert.equal(sessionB.customerKey, keyB);
+    assert.deepEqual(sessionB.cartItems, []);
+    assert.notEqual(profileB, legacyProfileA);
+    assert.equal(profileB.customerKey, keyB);
+    assert.equal(isOrderOwnedByCustomer(orderA, oldUsername, keyB), false);
+    assert.equal(queued.length, 0);
+    assert.equal(result.customerNotification, "failed");
+    assert.equal(result.receiptDelivery, "failed");
+  } finally {
+    CustomerSession.findOne = originalSessionFindOne;
+    CustomerSession.create = originalSessionCreate;
+    CustomerProfile.findOne = originalProfileFindOne;
+    CustomerProfile.create = originalProfileCreate;
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    wasenderQueueService.enqueueWasenderMessage = originalEnqueue;
+  }
+});
+
+test("stale username suppresses acceptance, receipt, rejection, and cancellation delivery", async () => {
+  const customerKey = "wasender:lid:111111111@lid";
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalEnqueue = wasenderQueueService.enqueueWasenderMessage;
+  const queued = [];
+  const restaurant = {
+    _id: restaurantId,
+    name: "Golden Grill",
+    wasenderSessionId: "session-1",
+    wasenderApiToken: "restaurant-token"
+  };
+  const makeOrder = (id, status) => ({
+    _id: id,
+    restaurantId,
+    orderNumber: `ORD-${id.slice(-3)}`,
+    customerName: "Customer A",
+    customerKey,
+    customerPhone: "@old.name",
+    status,
+    receiptUrl: "https://example.com/receipt.pdf",
+    receiptGeneratedAt: new Date(),
+    customerCancellationRequestStatus: "approved",
+    save: async function () { return this; }
+  });
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ lid: "111111111@lid" })
+    });
+    wasenderQueueService.enqueueWasenderMessage = async (input) => {
+      queued.push(input);
+      return { _id: `queued-${queued.length}`, status: "pending" };
+    };
+
+    const accepted = await notifyCustomerOfConfirmedOrderAndSendReceipt(
+      restaurant,
+      makeOrder("64b000000000000000000996", "accepted")
+    );
+    const rejected = await notifyCustomerOfRejectedOrder(
+      restaurant,
+      makeOrder("64b000000000000000000997", "rejected")
+    );
+    const cancellation = await notifyCustomerOfCancellationResolution(
+      restaurant,
+      makeOrder("64b000000000000000000998", "cancelled")
+    );
+
+    assert.equal(queued.length, 0);
+    assert.equal(accepted.customerNotification, "failed");
+    assert.equal(accepted.receiptDelivery, "failed");
+    assert.equal(rejected.customerNotification, "failed");
+    assert.equal(cancellation.customerNotification, "failed");
+  } finally {
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    wasenderQueueService.enqueueWasenderMessage = originalEnqueue;
+  }
+});
+
+test("queued customer messages re-resolve at send time and reject stale usernames", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  const customerKey = "wasender:lid:111111111@lid";
+  let currentIdentity = { username: "@new.name" };
+
+  try {
+    CustomerChannelIdentity.findOne = (filter) => ({
+      select: async () => {
+        assert.equal(filter.restaurantId, restaurantId);
+        assert.equal(filter.lid, "111111111@lid");
+        return currentIdentity;
+      }
+    });
+    const queued = {
+      to: "@old.name",
+      metadata: { restaurantId, customerKey, kind: "receipt_delivery" }
+    };
+    const refreshed = await wasenderQueueService.refreshQueuedCustomerRecipient(queued);
+
+    assert.equal(refreshed.safe, true);
+    assert.equal(queued.to, "@new.name");
+
+    currentIdentity = {};
+    queued.to = "@old.name";
+    const stale = await wasenderQueueService.refreshQueuedCustomerRecipient(queued);
+    assert.equal(stale.safe, false);
+    assert.equal(stale.reason, "no_current_whatsapp_recipient");
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("LID recipient resolution prefers a current phone and reports stale usernames", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ phone: customerPhone, username: "@new.name" })
+    });
+    const phoneResult = await resolveCurrentWhatsappRecipientResult({
+      restaurantId,
+      customerKey: "wasender:lid:111111111@lid",
+      fallbackAddress: "@old.name"
+    });
+    assert.deepEqual(phoneResult, {
+      recipient: customerPhone,
+      resolved: true,
+      reason: "current_phone"
+    });
+
+    CustomerChannelIdentity.findOne = () => ({ select: async () => null });
+    const staleResult = await resolveCurrentWhatsappRecipientResult({
+      restaurantId,
+      customerKey: "wasender:lid:111111111@lid",
+      fallbackAddress: "@old.name"
+    });
+    assert.deepEqual(staleResult, {
+      resolved: false,
+      reason: "stale_username"
+    });
   } finally {
     CustomerChannelIdentity.findOne = originalFindOne;
   }

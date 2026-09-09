@@ -352,6 +352,9 @@ export const queueMarketingConsentRequestAfterSuccessfulOrder = async (
     customerKey: order.customerKey,
     fallbackAddress: order.customerPhone
   });
+  if (!customerPhone) {
+    return { queued: false, reason: "no_current_whatsapp_recipient" };
+  }
   const findProfile =
     dependencies.findProfile ??
     (async (scopedRestaurantId, scopedCustomerPhone) =>

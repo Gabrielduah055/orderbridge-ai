@@ -4,11 +4,27 @@ import { CustomerChannelIdentity } from "../models/customerChannelIdentity.model
 import { CustomerProfile } from "../models/customerProfile.model";
 import { CustomerSession } from "../models/customerSession.model";
 import {
+  isWhatsappPhoneAddress,
+  isWhatsappUsername,
   isValidWhatsappRecipient,
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
 
 const WASENDER_LID_KEY_PREFIX = "wasender:lid:";
+
+export type WhatsappRecipientResolutionReason =
+  | "current_phone"
+  | "current_username"
+  | "legacy_phone_fallback"
+  | "direct_recipient"
+  | "stale_username"
+  | "no_routable_address";
+
+export interface WhatsappRecipientResolution {
+  recipient?: string;
+  resolved: boolean;
+  reason: WhatsappRecipientResolutionReason;
+}
 
 export interface CustomerIdentityReference {
   customerKey?: string;
@@ -36,6 +52,10 @@ export const getCustomerIdentityKey = (
   normalizeCustomerKey(customerKey, recipientAddress) ||
   normalizeWhatsappRecipient(recipientAddress);
 
+export const canUseLegacyRecipientFallback = (
+  recipientAddress: string
+): boolean => isWhatsappPhoneAddress(recipientAddress);
+
 export const getCustomerIdentityFilter = <T>(
   restaurantId: string,
   recipientAddress: string,
@@ -45,6 +65,10 @@ export const getCustomerIdentityFilter = <T>(
   const stableKey = normalizeCustomerKey(customerKey, recipient);
 
   if (stableKey && stableKey !== recipient) {
+    if (!canUseLegacyRecipientFallback(recipient)) {
+      return { restaurantId, customerKey: stableKey } as FilterQuery<T>;
+    }
+
     return {
       restaurantId,
       $or: [
@@ -72,22 +96,33 @@ export const isOrderOwnedByCustomer = (
     return senderKey === orderKey;
   }
 
+  if (
+    senderKey.startsWith(WASENDER_LID_KEY_PREFIX) &&
+    isWhatsappUsername(recipientAddress)
+  ) {
+    // A mutable username cannot prove ownership of a legacy order that has no
+    // stable key. This prevents a newly assigned LID from claiming it.
+    return false;
+  }
+
   return (
     normalizeWhatsappRecipient(order.customerPhone) ===
     normalizeWhatsappRecipient(recipientAddress)
   );
 };
 
-export const resolveCurrentWhatsappRecipient = async (input: {
+export const resolveCurrentWhatsappRecipientResult = async (input: {
   restaurantId: string;
   customerKey?: string;
   fallbackAddress: string;
-}): Promise<string> => {
+}): Promise<WhatsappRecipientResolution> => {
   const fallback = normalizeWhatsappRecipient(input.fallbackAddress);
   const key = normalizeCustomerKey(input.customerKey, fallback);
 
   if (!key.startsWith(WASENDER_LID_KEY_PREFIX)) {
-    return fallback;
+    return isValidWhatsappRecipient(fallback)
+      ? { recipient: fallback, resolved: true, reason: "direct_recipient" }
+      : { resolved: false, reason: "no_routable_address" };
   }
 
   const lid = key.slice(WASENDER_LID_KEY_PREFIX.length);
@@ -99,15 +134,60 @@ export const resolveCurrentWhatsappRecipient = async (input: {
       channel: "whatsapp",
       lid
     }).select("phone username");
-    const current = normalizeWhatsappRecipient(
-      identity?.phone || identity?.username
-    );
+    const currentPhone = normalizeWhatsappRecipient(identity?.phone);
+    if (isWhatsappPhoneAddress(currentPhone)) {
+      return {
+        recipient: currentPhone,
+        resolved: true,
+        reason: "current_phone"
+      };
+    }
 
-    return isValidWhatsappRecipient(current) ? current : fallback;
+    const currentUsername = normalizeWhatsappRecipient(identity?.username);
+    if (isWhatsappUsername(currentUsername)) {
+      return {
+        recipient: currentUsername,
+        resolved: true,
+        reason: "current_username"
+      };
+    }
+
+    if (canUseLegacyRecipientFallback(fallback)) {
+      return {
+        recipient: fallback,
+        resolved: true,
+        reason: "legacy_phone_fallback"
+      };
+    }
+
+    return {
+      resolved: false,
+      reason: isWhatsappUsername(fallback)
+        ? "stale_username"
+        : "no_routable_address"
+    };
   } catch {
-    return fallback;
+    return canUseLegacyRecipientFallback(fallback)
+      ? {
+          recipient: fallback,
+          resolved: true,
+          reason: "legacy_phone_fallback"
+        }
+      : {
+          resolved: false,
+          reason: isWhatsappUsername(fallback)
+            ? "stale_username"
+            : "no_routable_address"
+        };
   }
 };
+
+export const resolveCurrentWhatsappRecipient = async (input: {
+  restaurantId: string;
+  customerKey?: string;
+  fallbackAddress: string;
+}): Promise<string> =>
+  (await resolveCurrentWhatsappRecipientResult(input)).recipient ?? "";
 
 export const syncCurrentCustomerRecipient = async (input: {
   restaurantId: string;

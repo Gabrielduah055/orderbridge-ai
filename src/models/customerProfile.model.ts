@@ -255,8 +255,8 @@ const customerProfileSchema = new Schema<ICustomerProfileDocument>(
 );
 
 customerProfileSchema.index(
-  { restaurantId: 1, customerPhone: 1 },
-  { unique: true }
+  { restaurantId: 1, customerPhone: 1, customerKey: 1 },
+  { name: "customer_profile_recipient_lookup" }
 );
 customerProfileSchema.index(
   { restaurantId: 1, customerKey: 1 },

@@ -30,7 +30,10 @@ import {
   normalizeGhanaPhone,
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
-import { getCustomerIdentityFilter } from "./customerIdentity.service";
+import {
+  getCustomerIdentityFilter,
+  resolveCurrentWhatsappRecipientResult
+} from "./customerIdentity.service";
 import { redactUrls } from "../utils/error.util";
 import {
   applyOrderFeedbackProviderResult,
@@ -1180,6 +1183,100 @@ export interface ProcessQueuedWasenderMessageDependencies {
   enqueueMessage?: typeof enqueueWasenderMessage;
 }
 
+const resolveQueuedCustomerIdentity = async (
+  message: IOutboundMessageDocument
+): Promise<{
+  restaurantId?: string;
+  customerKey?: string;
+  fallbackAddress: string;
+}> => {
+  const restaurantId =
+    typeof message.metadata?.restaurantId === "string"
+      ? message.metadata.restaurantId
+      : message.restaurantId
+        ? String(message.restaurantId)
+        : undefined;
+  let customerKey =
+    typeof message.metadata?.customerKey === "string"
+      ? message.metadata.customerKey
+      : undefined;
+  let fallbackAddress = message.to;
+  const orderId =
+    typeof message.metadata?.orderId === "string"
+      ? message.metadata.orderId
+      : undefined;
+
+  // This also protects customer messages queued before customerKey was added
+  // to their metadata, provided the queue item has trusted tenant/order scope.
+  if (
+    !customerKey &&
+    message.metadata?.recipientType === "customer" &&
+    restaurantId &&
+    orderId &&
+    Types.ObjectId.isValid(restaurantId) &&
+    Types.ObjectId.isValid(orderId)
+  ) {
+    const order = await Order.findOne({ _id: orderId, restaurantId }).select(
+      "customerKey customerPhone"
+    );
+    customerKey = order?.customerKey;
+    fallbackAddress = order?.customerPhone || fallbackAddress;
+  }
+
+  return { restaurantId, customerKey, fallbackAddress };
+};
+
+export const refreshQueuedCustomerRecipient = async (
+  message: IOutboundMessageDocument
+): Promise<{
+  safe: boolean;
+  reason?: string;
+  recipient?: string;
+}> => {
+  let reference: Awaited<ReturnType<typeof resolveQueuedCustomerIdentity>>;
+
+  try {
+    reference = await resolveQueuedCustomerIdentity(message);
+  } catch {
+    return {
+      safe: false,
+      reason: "no_current_whatsapp_recipient"
+    };
+  }
+
+  if (!reference.restaurantId || !reference.customerKey) {
+    return { safe: true, recipient: message.to };
+  }
+
+  const resolution = await resolveCurrentWhatsappRecipientResult({
+    restaurantId: reference.restaurantId,
+    customerKey: reference.customerKey,
+    fallbackAddress: reference.fallbackAddress
+  });
+
+  if (!resolution.resolved || !resolution.recipient) {
+    return {
+      safe: false,
+      reason: "no_current_whatsapp_recipient"
+    };
+  }
+
+  if (message.to !== resolution.recipient) {
+    message.to = resolution.recipient;
+    message.metadata = {
+      ...message.metadata,
+      customerPhone: resolution.recipient,
+      customerKey: reference.customerKey
+    };
+  }
+
+  return {
+    safe: true,
+    recipient: resolution.recipient,
+    reason: resolution.reason
+  };
+};
+
 export const processNextQueuedWasenderMessage = async (
   dependencies: ProcessQueuedWasenderMessageDependencies = {}
 ): Promise<boolean> => {
@@ -1402,6 +1499,32 @@ export const processNextQueuedWasenderMessage = async (
       });
       return true;
     }
+  }
+
+  const refreshedRecipient = await refreshQueuedCustomerRecipient(locked);
+  if (!refreshedRecipient.safe) {
+    locked.status = "cancelled";
+    locked.lastError = refreshedRecipient.reason;
+    await locked.save();
+    if (locked.metadata?.kind === "customer_campaign") {
+      await cancelStaleCampaignRecipient(
+        locked.metadata,
+        refreshedRecipient.reason ?? "no_current_whatsapp_recipient"
+      );
+    }
+    console.warn("Queued customer WhatsApp message cancelled", {
+      restaurantId:
+        typeof locked.metadata?.restaurantId === "string"
+          ? locked.metadata.restaurantId
+          : locked.restaurantId
+            ? String(locked.restaurantId)
+            : undefined,
+      orderId: locked.metadata?.orderId,
+      kind: locked.metadata?.kind,
+      queueMessageId: String(locked._id),
+      reason: refreshedRecipient.reason
+    });
+    return true;
   }
 
   if (locked.type === "image") {

@@ -448,6 +448,15 @@ export const runCustomerCampaignSchedulerPass = async (
             customerKey: recipient.customerKey,
             fallbackAddress: recipient.customerPhone
           });
+          if (!currentRecipient) {
+            logError("Customer campaign recipient skipped", {
+              restaurantId,
+              campaignId,
+              campaignRecipientId: recipientId,
+              reason: "no_current_whatsapp_recipient"
+            });
+            continue;
+          }
           const queued = await enqueueMessage({
             restaurantId,
             sessionId: restaurant.wasenderSessionId,

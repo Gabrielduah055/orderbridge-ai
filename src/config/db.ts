@@ -1,6 +1,7 @@
 import dns from "dns";
 import mongoose from "mongoose";
 import { ensureCustomerCampaignRecipientIndexes } from "../models/customerCampaignRecipient.model";
+import { ensureCustomerIdentityIndexes } from "../models/customerIdentityIndexes";
 import { env } from "./env";
 
 const getMongoErrorMessage = (error: unknown): string => {
@@ -38,6 +39,7 @@ export const connectDb = async (
     });
 
     if (options.ensureIndexes !== false) {
+      await ensureCustomerIdentityIndexes();
       await ensureCustomerCampaignRecipientIndexes();
     }
 

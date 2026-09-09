@@ -241,7 +241,12 @@ export const scheduleOrderFeedbackFollowUp = async (
   });
 
   if (!isValidWhatsappRecipient(customerPhone)) {
-    return { scheduled: false, reason: "invalid_customer_phone" };
+    return {
+      scheduled: false,
+      reason: customerPhone
+        ? "invalid_customer_phone"
+        : "no_current_whatsapp_recipient"
+    };
   }
 
   if (

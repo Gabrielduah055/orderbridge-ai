@@ -214,6 +214,14 @@ export const executeMarketingConsentOutreach = async (
         customerKey: recipient.customerKey,
         fallbackAddress: recipient.customerPhone
       });
+      if (!customerPhone) {
+        failedToQueue += 1;
+        console.warn("Marketing consent outreach recipient skipped", {
+          restaurantId,
+          reason: "no_current_whatsapp_recipient"
+        });
+        continue;
+      }
       const result = await queueRequest(
         {
           restaurantId,

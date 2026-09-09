@@ -2807,6 +2807,13 @@ test("customer profile model has restaurant-scoped lookup and marketing indexes"
     ([fields]) =>
       fields.restaurantId === 1 &&
       fields.customerPhone === 1 &&
+      fields.customerKey === 1 &&
+      Object.keys(fields).length === 3
+  );
+  const stableIdentityIndex = indexes.find(
+    ([fields]) =>
+      fields.restaurantId === 1 &&
+      fields.customerKey === 1 &&
       Object.keys(fields).length === 2
   );
   const marketingIndex = indexes.find(
@@ -2816,7 +2823,8 @@ test("customer profile model has restaurant-scoped lookup and marketing indexes"
       fields.isOptedOut === 1
   );
 
-  assert.equal(scopedIndex[1].unique, true);
+  assert.equal(scopedIndex[1].unique, undefined);
+  assert.equal(stableIdentityIndex[1].unique, true);
   assert.ok(marketingIndex);
 });
 

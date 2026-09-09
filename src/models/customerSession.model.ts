@@ -244,7 +244,10 @@ const customerSessionSchema = new Schema<ICustomerSessionDocument>(
   }
 );
 
-customerSessionSchema.index({ restaurantId: 1, customerPhone: 1 }, { unique: true });
+customerSessionSchema.index(
+  { restaurantId: 1, customerPhone: 1, customerKey: 1 },
+  { name: "customer_session_recipient_lookup" }
+);
 customerSessionSchema.index(
   { restaurantId: 1, customerKey: 1 },
   {
