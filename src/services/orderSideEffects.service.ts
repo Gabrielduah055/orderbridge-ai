@@ -41,6 +41,20 @@ const getOrderReference = (order: IOrderDocument): string => {
   return order.orderNumber ?? String(order._id);
 };
 
+const getCustomerQueueStatus = (message: {
+  status?: string;
+}): SideEffectStepStatus => {
+  if (message.status === "pending" || message.status === "sending") {
+    return "queued";
+  }
+
+  if (message.status === "sent") {
+    return "success";
+  }
+
+  return "failed";
+};
+
 const logMissingCustomerRecipient = (
   restaurant: IRestaurantDocument,
   order: IOrderDocument,
@@ -360,7 +374,7 @@ export const notifyCustomerOfCancellationResolution = async (
     return { customerNotification: "failed" };
   }
 
-  await enqueueWasenderMessage({
+  const queued = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
     to: recipientAddress,
@@ -379,7 +393,7 @@ export const notifyCustomerOfCancellationResolution = async (
     }
   });
 
-  return { customerNotification: "queued" };
+  return { customerNotification: getCustomerQueueStatus(queued) };
 };
 
 export const notifyOwnerOfCustomerAmendment = async (
@@ -440,7 +454,7 @@ export const notifyCustomerOfRejectedOrder = async (
     return { customerNotification: "failed" };
   }
 
-  await enqueueWasenderMessage({
+  const queued = await enqueueWasenderMessage({
     restaurantId: String(restaurant._id),
     sessionId: restaurant.wasenderSessionId,
     to: recipientAddress,
@@ -459,7 +473,7 @@ export const notifyCustomerOfRejectedOrder = async (
   });
 
   return {
-    customerNotification: "queued"
+    customerNotification: getCustomerQueueStatus(queued)
   };
 };
 
@@ -533,7 +547,7 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
   }
 
   if (!receiptOrder.customerConfirmedNotificationSentAt) {
-    await enqueueWasenderMessage({
+    const queuedNotification = await enqueueWasenderMessage({
       restaurantId: String(restaurant._id),
       sessionId: restaurant.wasenderSessionId,
       to: recipientAddress,
@@ -552,7 +566,7 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
           : {})
       }
     });
-    result.customerNotification = "queued";
+    result.customerNotification = getCustomerQueueStatus(queuedNotification);
   }
 
   if (receiptOrder.receiptSentAt) {
@@ -600,13 +614,18 @@ export const notifyCustomerOfConfirmedOrderAndSendReceipt = async (
         : {})
     }
   });
+  result.receiptDelivery = getCustomerQueueStatus(queuedReceipt);
+
+  if (result.receiptDelivery !== "queued") {
+    return result;
+  }
+
   console.info("Receipt queued", {
     restaurantId: String(restaurant._id),
     orderId: String(receiptOrder._id),
     orderNumber: receiptOrder.orderNumber,
     queueMessageId: String(queuedReceipt._id)
   });
-  result.receiptDelivery = "queued";
 
   // After the receipt is successfully queued, schedule the marketing opt-in
   // message with a short delay so it arrives after the receipt, not alongside it.

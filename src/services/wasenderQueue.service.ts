@@ -60,10 +60,26 @@ const defaultSpacingMs = 5_000;
 const workerIntervalMs = 1_000;
 const defaultMaxAttempts = 5;
 const staleSendingRecoveryMs = 5 * 60_000;
+const recipientVerificationMaxBackoffMs = 15 * 60_000;
 let workerStarted = false;
 let workerBusy = false;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getRecipientVerificationRetryDelayMs = (
+  attempts: number,
+  providerRetryAfterMs?: number
+): number => {
+  if (providerRetryAfterMs) {
+    return providerRetryAfterMs;
+  }
+
+  const exponent = Math.min(Math.max(attempts - 1, 0), 8);
+  return Math.min(
+    defaultSpacingMs * 2 ** exponent,
+    recipientVerificationMaxBackoffMs
+  );
+};
 
 const getErrorMessage = (result: WasenderSendResult): string =>
   result.error || (result.status ? `Wasender status ${result.status}` : "Wasender send failed");
@@ -84,6 +100,11 @@ const transactionalKinds = new Set([
   "order_feedback_reminder",
   "order_feedback_owner_notification",
   "marketing_consent_request"
+]);
+
+export const recoverableRecipientCancellationReasons = new Set([
+  "no_current_whatsapp_recipient",
+  "stale_username"
 ]);
 
 export const isTransactionalQueuedMessage = (metadata?: Record<string, unknown>): boolean => {
@@ -1088,6 +1109,56 @@ export const enqueueWasenderMessage = async (
     const existing = await OutboundMessage.findOne(idempotencyFilter).select("+apiKey");
 
     if (existing) {
+      if (
+        existing.status === "cancelled" &&
+        recoverableRecipientCancellationReasons.has(existing.lastError ?? "")
+      ) {
+        const metadata = { ...existing.metadata, ...input.metadata };
+        const restaurantId =
+          input.restaurantId ??
+          (existing.restaurantId ? String(existing.restaurantId) : undefined);
+        const customerKey =
+          typeof metadata.customerKey === "string"
+            ? metadata.customerKey
+            : undefined;
+
+        if (restaurantId && customerKey) {
+          const resolution = await resolveCurrentWhatsappRecipientResult({
+            restaurantId,
+            customerKey,
+            fallbackAddress: input.to || existing.to,
+            apiKey: input.apiKey ?? existing.apiKey,
+            verifyUsername: true
+          });
+
+          if (resolution.resolved && resolution.recipient) {
+            existing.sessionId = input.sessionId;
+            existing.to = resolution.recipient;
+            existing.type = input.type;
+            existing.text = input.text;
+            existing.documentUrl = input.documentUrl;
+            existing.imageUrl = input.imageUrl;
+            existing.caption = input.caption;
+            existing.apiKey = input.apiKey ?? existing.apiKey;
+            existing.status = "pending";
+            existing.attempts = 0;
+            existing.nextAttemptAt = input.nextAttemptAt ?? new Date();
+            existing.lastError = undefined;
+            existing.lastStatus = undefined;
+            existing.providerData = undefined;
+            existing.providerMessageId = undefined;
+            existing.lastAttemptAt = undefined;
+            existing.sentAt = undefined;
+            existing.metadata = {
+              ...metadata,
+              customerPhone: resolution.recipient,
+              customerKey
+            };
+            await existing.save();
+          }
+        }
+      }
+
       return existing;
     }
   }
@@ -1232,6 +1303,8 @@ export const refreshQueuedCustomerRecipient = async (
   safe: boolean;
   reason?: string;
   recipient?: string;
+  temporary?: boolean;
+  retryAfterMs?: number;
 }> => {
   let reference: Awaited<ReturnType<typeof resolveQueuedCustomerIdentity>>;
 
@@ -1251,13 +1324,17 @@ export const refreshQueuedCustomerRecipient = async (
   const resolution = await resolveCurrentWhatsappRecipientResult({
     restaurantId: reference.restaurantId,
     customerKey: reference.customerKey,
-    fallbackAddress: reference.fallbackAddress
+    fallbackAddress: reference.fallbackAddress,
+    apiKey: message.apiKey,
+    verifyUsername: true
   });
 
   if (!resolution.resolved || !resolution.recipient) {
     return {
       safe: false,
-      reason: "no_current_whatsapp_recipient"
+      reason: resolution.reason,
+      temporary: resolution.temporary,
+      retryAfterMs: resolution.retryAfterMs
     };
   }
 
@@ -1503,8 +1580,38 @@ export const processNextQueuedWasenderMessage = async (
 
   const refreshedRecipient = await refreshQueuedCustomerRecipient(locked);
   if (!refreshedRecipient.safe) {
+    if (refreshedRecipient.temporary) {
+      locked.status = "pending";
+      locked.lastError = refreshedRecipient.reason;
+      locked.nextAttemptAt = new Date(
+        Date.now() +
+          getRecipientVerificationRetryDelayMs(
+            locked.attempts,
+            refreshedRecipient.retryAfterMs
+          )
+      );
+      await locked.save();
+      console.warn("Queued customer recipient verification deferred", {
+        restaurantId:
+          typeof locked.metadata?.restaurantId === "string"
+            ? locked.metadata.restaurantId
+            : locked.restaurantId
+              ? String(locked.restaurantId)
+              : undefined,
+        orderId: locked.metadata?.orderId,
+        kind: locked.metadata?.kind,
+        queueMessageId: String(locked._id),
+        reason: refreshedRecipient.reason
+      });
+      return true;
+    }
+
     locked.status = "cancelled";
-    locked.lastError = refreshedRecipient.reason;
+    locked.lastError = recoverableRecipientCancellationReasons.has(
+      refreshedRecipient.reason ?? ""
+    )
+      ? refreshedRecipient.reason
+      : "no_current_whatsapp_recipient";
     await locked.save();
     if (locked.metadata?.kind === "customer_campaign") {
       await cancelStaleCampaignRecipient(

@@ -5,6 +5,7 @@ const { CustomerChannelIdentity } = require("../dist/models/customerChannelIdent
 const { CustomerProfile } = require("../dist/models/customerProfile.model");
 const { CustomerSession } = require("../dist/models/customerSession.model");
 const { Order } = require("../dist/models/order.model");
+const { Restaurant } = require("../dist/models/Restaurant");
 const {
   normalizeIncomingWebhook,
   resolveWasenderPhoneFromLid,
@@ -1605,12 +1606,30 @@ test("stale username suppresses acceptance, receipt, rejection, and cancellation
   }
 });
 
-test("queued customer messages re-resolve at send time and reject stale usernames", async () => {
+test("queued customer messages verify usernames at send time and reject stale stored usernames", async () => {
   const originalFindOne = CustomerChannelIdentity.findOne;
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
   const customerKey = "wasender:lid:111111111@lid";
   let currentIdentity = { username: "@new.name" };
+  let providerUsername = "new.name";
 
   try {
+    process.env.WASENDER_API_URL = "https://wasender.example";
+    global.fetch = async (_url, options) => {
+      assert.equal(options.headers.Authorization, "Bearer restaurant-token");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          success: true,
+          data: providerUsername
+            ? { jid: "111111111@lid", username: providerUsername }
+            : {}
+        })
+      };
+    };
     CustomerChannelIdentity.findOne = (filter) => ({
       select: async () => {
         assert.equal(filter.restaurantId, restaurantId);
@@ -1620,6 +1639,7 @@ test("queued customer messages re-resolve at send time and reject stale username
     });
     const queued = {
       to: "@old.name",
+      apiKey: "restaurant-token",
       metadata: { restaurantId, customerKey, kind: "receipt_delivery" }
     };
     const refreshed = await wasenderQueueService.refreshQueuedCustomerRecipient(queued);
@@ -1628,12 +1648,16 @@ test("queued customer messages re-resolve at send time and reject stale username
     assert.equal(queued.to, "@new.name");
 
     currentIdentity = {};
+    providerUsername = "";
     queued.to = "@old.name";
     const stale = await wasenderQueueService.refreshQueuedCustomerRecipient(queued);
     assert.equal(stale.safe, false);
     assert.equal(stale.reason, "no_current_whatsapp_recipient");
   } finally {
     CustomerChannelIdentity.findOne = originalFindOne;
+    global.fetch = originalFetch;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
   }
 });
 
@@ -1667,5 +1691,648 @@ test("LID recipient resolution prefers a current phone and reports stale usernam
     });
   } finally {
     CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("provider verification replaces a stored LID username in the same tenant", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  const remembered = [];
+
+  try {
+    CustomerChannelIdentity.findOne = (filter) => ({
+      select: async () => {
+        assert.equal(filter.restaurantId, restaurantId);
+        assert.equal(filter.provider, "wasender");
+        assert.equal(filter.channel, "whatsapp");
+        assert.equal(filter.lid, "111111111@lid");
+        return { username: "@old.name" };
+      }
+    });
+
+    const result = await resolveCurrentWhatsappRecipientResult(
+      {
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@old.name",
+        apiKey: "restaurant-token",
+        verifyUsername: true
+      },
+      {
+        resolveUsername: async (_lid, options) => {
+          assert.equal(options.apiKey, "restaurant-token");
+          return {
+            success: true,
+            status: 200,
+            username: "@new.name",
+            jid: "111111111@lid"
+          };
+        },
+        rememberIdentity: async (...args) => {
+          remembered.push(args);
+          return { lid: args[1], username: args[3] };
+        }
+      }
+    );
+
+    assert.equal(result.resolved, true);
+    assert.equal(result.recipient, "@new.name");
+    assert.equal(result.reason, "current_username");
+    assert.deepEqual(remembered, [[
+      restaurantId,
+      "111111111@lid",
+      undefined,
+      "@new.name"
+    ]]);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("temporary provider failures never fall back to a stored LID username", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ username: "@old.name" })
+    });
+    const input = {
+      restaurantId,
+      customerKey: "wasender:lid:111111111@lid",
+      fallbackAddress: "@old.name",
+      apiKey: "restaurant-token",
+      verifyUsername: true
+    };
+
+    const unavailable = await resolveCurrentWhatsappRecipientResult(input, {
+      resolveUsername: async () => ({
+        success: false,
+        status: 503,
+        data: { retry_after: 2 },
+        error: "temporarily unavailable"
+      })
+    });
+    assert.deepEqual(unavailable, {
+      resolved: false,
+      reason: "username_lookup_failed",
+      temporary: true,
+      providerStatus: 503,
+      retryAfterMs: 2_000
+    });
+
+    const timeout = await resolveCurrentWhatsappRecipientResult(input, {
+      resolveUsername: async () => {
+        throw new Error("timeout");
+      }
+    });
+    assert.deepEqual(timeout, {
+      resolved: false,
+      reason: "username_lookup_failed",
+      temporary: true
+    });
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("a provider-confirmed unchanged LID username is safe without rewriting its mapping", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  let rememberCalled = false;
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ username: "@current.name" })
+    });
+    const result = await resolveCurrentWhatsappRecipientResult(
+      {
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@current.name",
+        apiKey: "restaurant-token",
+        verifyUsername: true
+      },
+      {
+        resolveUsername: async () => ({
+          success: true,
+          status: 200,
+          username: "@current.name",
+          jid: "111111111@lid"
+        }),
+        rememberIdentity: async () => {
+          rememberCalled = true;
+          return { lid: "111111111@lid", username: "@current.name" };
+        }
+      }
+    );
+
+    assert.equal(result.resolved, true);
+    assert.equal(result.recipient, "@current.name");
+    assert.equal(rememberCalled, false);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("a provider response with no username rejects the stored LID username", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ username: "@old.name" })
+    });
+    const result = await resolveCurrentWhatsappRecipientResult(
+      {
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@old.name",
+        apiKey: "restaurant-token",
+        verifyUsername: true
+      },
+      {
+        resolveUsername: async () => ({
+          success: false,
+          status: 200,
+          error: "no username"
+        })
+      }
+    );
+
+    assert.deepEqual(result, {
+      resolved: false,
+      reason: "no_current_whatsapp_recipient",
+      providerStatus: 200
+    });
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+test("a current phone wins without performing LID username verification", async () => {
+  const originalFindOne = CustomerChannelIdentity.findOne;
+  let providerCalled = false;
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ phone: customerPhone, username: "@current.name" })
+    });
+    const result = await resolveCurrentWhatsappRecipientResult(
+      {
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        fallbackAddress: "@old.name",
+        apiKey: "restaurant-token",
+        verifyUsername: true
+      },
+      {
+        resolveUsername: async () => {
+          providerCalled = true;
+          return { success: false, status: 500 };
+        }
+      }
+    );
+
+    assert.equal(result.recipient, customerPhone);
+    assert.equal(result.reason, "current_phone");
+    assert.equal(providerCalled, false);
+  } finally {
+    CustomerChannelIdentity.findOne = originalFindOne;
+  }
+});
+
+const queueResolvedQuery = (value) => ({
+  sort() {
+    return this;
+  },
+  select() {
+    return Promise.resolve(value);
+  }
+});
+
+test("a temporary send-time username lookup failure remains pending for retry", async () => {
+  const originalOutboundFindOne = OutboundMessage.findOne;
+  const originalOutboundFindOneAndUpdate = OutboundMessage.findOneAndUpdate;
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const originalWarn = console.warn;
+  const before = Date.now();
+  let sends = 0;
+  const candidate = {
+    _id: "receipt-temp-lookup",
+    sessionId: "session-1",
+    nextAttemptAt: new Date(0),
+    async save() { return this; }
+  };
+  const locked = {
+    ...candidate,
+    restaurantId,
+    to: "@old.name",
+    type: "document",
+    documentUrl: "https://example.com/receipt.pdf",
+    apiKey: "restaurant-token",
+    status: "sending",
+    attempts: 1,
+    maxAttempts: 5,
+    metadata: {
+      kind: "receipt_delivery",
+      restaurantId,
+      orderId: "64b000000000000000000903",
+      recipientType: "customer",
+      customerPhone: "@old.name",
+      customerKey: "wasender:lid:111111111@lid"
+    },
+    async save() { return this; }
+  };
+
+  try {
+    console.warn = () => undefined;
+    process.env.WASENDER_API_URL = "https://wasender.example";
+    global.fetch = async () => ({
+      ok: false,
+      status: 503,
+      headers: { get: () => "application/json" },
+      json: async () => ({ success: false, retry_after: 2 })
+    });
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ username: "@old.name" })
+    });
+    OutboundMessage.findOne = (filter) =>
+      queueResolvedQuery(filter.status === "sent" ? null : candidate);
+    OutboundMessage.findOneAndUpdate = () => queueResolvedQuery(locked);
+
+    const processed = await wasenderQueueService.processNextQueuedWasenderMessage({
+      sendMessage: async () => {
+        sends += 1;
+        return { success: true, status: 200 };
+      }
+    });
+
+    assert.equal(processed, true);
+    assert.equal(sends, 0);
+    assert.equal(locked.status, "pending");
+    assert.equal(locked.lastError, "username_lookup_failed");
+    assert.equal(locked.nextAttemptAt.getTime() >= before + 1_500, true);
+  } finally {
+    OutboundMessage.findOne = originalOutboundFindOne;
+    OutboundMessage.findOneAndUpdate = originalOutboundFindOneAndUpdate;
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    global.fetch = originalFetch;
+    console.warn = originalWarn;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
+  }
+});
+
+test("a no-safe-recipient cancellation later reuses and reactivates its idempotent row", async () => {
+  const originalOutboundFindOne = OutboundMessage.findOne;
+  const originalOutboundFindOneAndUpdate = OutboundMessage.findOneAndUpdate;
+  const originalOutboundCreate = OutboundMessage.create;
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const originalWarn = console.warn;
+  let creates = 0;
+  let saves = 0;
+  let sends = 0;
+  let providerUsername = "";
+  let currentIdentity = { username: "@old.name" };
+  const existing = {
+    _id: "existing-receipt-row",
+    restaurantId,
+    sessionId: "old-session",
+    to: "@old.name",
+    type: "document",
+    documentUrl: "https://example.com/old-receipt.pdf",
+    apiKey: "restaurant-token",
+    status: "pending",
+    attempts: 3,
+    maxAttempts: 5,
+    nextAttemptAt: new Date(0),
+    lastError: undefined,
+    metadata: {
+      kind: "receipt_delivery",
+      restaurantId,
+      orderId: "64b000000000000000000903",
+      recipientType: "customer",
+      customerKey: "wasender:lid:111111111@lid",
+      customerPhone: "@old.name"
+    },
+    async save() {
+      saves += 1;
+      return this;
+    }
+  };
+
+  try {
+    console.warn = () => undefined;
+    process.env.WASENDER_API_URL = "https://wasender.example";
+    global.fetch = async (_url, options) => {
+      assert.equal(options.headers.Authorization, "Bearer restaurant-token");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          success: true,
+          data: providerUsername
+            ? { jid: "111111111@lid", username: providerUsername }
+            : {}
+        })
+      };
+    };
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => currentIdentity
+    });
+    OutboundMessage.findOne = (filter) => {
+      if (filter.status === "sent") {
+        return queueResolvedQuery(null);
+      }
+      if (filter.status === "pending") {
+        return queueResolvedQuery(existing);
+      }
+      return { select: async () => existing };
+    };
+    OutboundMessage.findOneAndUpdate = () => {
+      existing.status = "sending";
+      existing.attempts += 1;
+      return queueResolvedQuery(existing);
+    };
+    OutboundMessage.create = async () => {
+      creates += 1;
+      throw new Error("must not create a duplicate row");
+    };
+
+    const processed = await wasenderQueueService.processNextQueuedWasenderMessage({
+      sendMessage: async () => {
+        sends += 1;
+        return { success: true, status: 200 };
+      }
+    });
+    assert.equal(processed, true);
+    assert.equal(sends, 0);
+    assert.equal(existing.status, "cancelled");
+    assert.equal(existing.lastError, "no_current_whatsapp_recipient");
+
+    providerUsername = "new.name";
+    currentIdentity = { username: "@new.name" };
+
+    const result = await wasenderQueueService.enqueueWasenderMessage({
+      restaurantId,
+      sessionId: "session-1",
+      to: "@old.name",
+      type: "document",
+      documentUrl: "https://example.com/current-receipt.pdf",
+      apiKey: "restaurant-token",
+      idempotencyKey: "receipt-delivery:64b000000000000000000903",
+      metadata: {
+        kind: "receipt_delivery",
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid",
+        customerPhone: "@old.name"
+      }
+    });
+
+    assert.equal(result, existing);
+    assert.equal(existing.status, "pending");
+    assert.equal(existing.to, "@new.name");
+    assert.equal(existing.metadata.customerPhone, "@new.name");
+    assert.equal(existing.attempts, 0);
+    assert.equal(existing.lastError, undefined);
+    assert.equal(existing.lastStatus, undefined);
+    assert.equal(existing.nextAttemptAt instanceof Date, true);
+    assert.equal(saves, 2);
+    assert.equal(creates, 0);
+  } finally {
+    OutboundMessage.findOne = originalOutboundFindOne;
+    OutboundMessage.findOneAndUpdate = originalOutboundFindOneAndUpdate;
+    OutboundMessage.create = originalOutboundCreate;
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    global.fetch = originalFetch;
+    console.warn = originalWarn;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
+  }
+});
+
+test("non-recoverable cancelled idempotent messages remain cancelled", async () => {
+  const originalOutboundFindOne = OutboundMessage.findOne;
+  const originalOutboundCreate = OutboundMessage.create;
+  let creates = 0;
+  let saves = 0;
+  const existing = {
+    _id: "cancelled-campaign-row",
+    status: "cancelled",
+    lastError: "Stale customer campaign message: campaign_version_changed",
+    async save() {
+      saves += 1;
+      return this;
+    }
+  };
+
+  try {
+    OutboundMessage.findOne = () => ({ select: async () => existing });
+    OutboundMessage.create = async () => {
+      creates += 1;
+      return {};
+    };
+    const result = await wasenderQueueService.enqueueWasenderMessage({
+      restaurantId,
+      sessionId: "session-1",
+      to: "@current.name",
+      type: "text",
+      text: "Campaign",
+      apiKey: "restaurant-token",
+      idempotencyKey: "campaign:1:recipient:1:v2",
+      metadata: {
+        kind: "customer_campaign",
+        restaurantId,
+        customerKey: "wasender:lid:111111111@lid"
+      }
+    });
+
+    assert.equal(result, existing);
+    assert.equal(existing.status, "cancelled");
+    assert.equal(saves, 0);
+    assert.equal(creates, 0);
+    assert.deepEqual(
+      [...wasenderQueueService.recoverableRecipientCancellationReasons].sort(),
+      ["no_current_whatsapp_recipient", "stale_username"]
+    );
+  } finally {
+    OutboundMessage.findOne = originalOutboundFindOne;
+    OutboundMessage.create = originalOutboundCreate;
+  }
+});
+
+test("order side effects do not report an unrecoverable cancelled row as queued", async () => {
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalEnqueue = wasenderQueueService.enqueueWasenderMessage;
+  const restaurant = {
+    _id: restaurantId,
+    name: "Golden Grill",
+    wasenderSessionId: "session-1",
+    wasenderApiToken: "restaurant-token"
+  };
+  const order = {
+    _id: "64b000000000000000000903",
+    restaurantId,
+    orderNumber: "ORD-903",
+    customerName: "Ama",
+    customerKey: "wasender:lid:111111111@lid",
+    customerPhone: "@current.name",
+    status: "accepted",
+    receiptUrl: "https://example.com/receipt.pdf",
+    receiptGeneratedAt: new Date(),
+    async save() { return this; }
+  };
+
+  try {
+    CustomerChannelIdentity.findOne = () => ({
+      select: async () => ({ username: "@current.name" })
+    });
+    wasenderQueueService.enqueueWasenderMessage = async () => ({
+      _id: "cancelled-row",
+      status: "cancelled",
+      lastError: "Stale customer campaign message: campaign_version_changed"
+    });
+
+    const result = await notifyCustomerOfConfirmedOrderAndSendReceipt(
+      restaurant,
+      order
+    );
+    assert.equal(result.customerNotification, "failed");
+    assert.equal(result.receiptDelivery, "failed");
+  } finally {
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    wasenderQueueService.enqueueWasenderMessage = originalEnqueue;
+  }
+});
+
+test("receipt worker verifies, reconciles, sends, and records the current username", async () => {
+  const originalOutboundFindOne = OutboundMessage.findOne;
+  const originalOutboundFindOneAndUpdate = OutboundMessage.findOneAndUpdate;
+  const originalIdentityFindOne = CustomerChannelIdentity.findOne;
+  const originalIdentityUpdateMany = CustomerChannelIdentity.updateMany;
+  const originalOrderFindOne = Order.findOne;
+  const originalOrderUpdateOne = Order.updateOne;
+  const originalRestaurantFindOne = Restaurant.findOne;
+  const originalFetch = global.fetch;
+  const originalApiUrl = process.env.WASENDER_API_URL;
+  const originalInfo = console.info;
+  const receiptUpdates = [];
+  const identityUpdates = [];
+  let sends = 0;
+  let identitySaves = 0;
+  const identity = {
+    lid: "111111111@lid",
+    username: "@old.name",
+    async save() {
+      identitySaves += 1;
+      return this;
+    }
+  };
+  const candidate = {
+    _id: "receipt-successful-recovery",
+    sessionId: "session-1",
+    nextAttemptAt: new Date(0),
+    async save() { return this; }
+  };
+  const locked = {
+    ...candidate,
+    restaurantId,
+    to: "@old.name",
+    type: "document",
+    documentUrl: "https://example.com/receipt.pdf",
+    caption: "Receipt",
+    apiKey: "restaurant-token",
+    status: "sending",
+    attempts: 1,
+    maxAttempts: 5,
+    metadata: {
+      kind: "receipt_delivery",
+      restaurantId,
+      orderId: "64b000000000000000000903",
+      orderNumber: "ORD-903",
+      recipientType: "customer",
+      customerPhone: "@old.name",
+      customerKey: "wasender:lid:111111111@lid"
+    },
+    async save() { return this; }
+  };
+
+  try {
+    console.info = () => undefined;
+    process.env.WASENDER_API_URL = "https://wasender.example";
+    global.fetch = async (_url, options) => {
+      assert.equal(options.headers.Authorization, "Bearer restaurant-token");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          success: true,
+          data: { jid: "111111111@lid", username: "new.name" }
+        })
+      };
+    };
+    CustomerChannelIdentity.findOne = (filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      const query = {
+        select: async () => identity,
+        then: (resolve, reject) => Promise.resolve(identity).then(resolve, reject)
+      };
+      return query;
+    };
+    CustomerChannelIdentity.updateMany = async (filter) => {
+      identityUpdates.push(filter);
+      return { modifiedCount: 0 };
+    };
+    OutboundMessage.findOne = (filter) =>
+      queueResolvedQuery(filter.status === "sent" ? null : candidate);
+    OutboundMessage.findOneAndUpdate = () => queueResolvedQuery(locked);
+    Order.findOne = async () => null;
+    Order.updateOne = async (filter, update) => {
+      receiptUpdates.push({ filter, update });
+      return { modifiedCount: 1 };
+    };
+    Restaurant.findOne = () => queueResolvedQuery(null);
+
+    const processed = await wasenderQueueService.processNextQueuedWasenderMessage({
+      sendMessage: async (message) => {
+        sends += 1;
+        assert.equal(message.to, "@new.name");
+        assert.equal(message.metadata.customerPhone, "@new.name");
+        assert.equal(message.metadata.apiKey, undefined);
+        return { success: true, status: 200, data: { id: "provider-receipt-1" } };
+      }
+    });
+
+    assert.equal(processed, true);
+    assert.equal(sends, 1);
+    assert.equal(identity.username, "@new.name");
+    assert.equal(identitySaves, 1);
+    assert.equal(locked.to, "@new.name");
+    assert.equal(locked.status, "sent");
+    assert.equal(
+      identityUpdates[0].restaurantId,
+      restaurantId,
+      "username reconciliation must stay tenant scoped"
+    );
+    assert.equal(identityUpdates[0].username, "@new.name");
+    assert.equal(
+      receiptUpdates.some(({ update }) => update.$set?.receiptSentAt instanceof Date),
+      true
+    );
+  } finally {
+    OutboundMessage.findOne = originalOutboundFindOne;
+    OutboundMessage.findOneAndUpdate = originalOutboundFindOneAndUpdate;
+    CustomerChannelIdentity.findOne = originalIdentityFindOne;
+    CustomerChannelIdentity.updateMany = originalIdentityUpdateMany;
+    Order.findOne = originalOrderFindOne;
+    Order.updateOne = originalOrderUpdateOne;
+    Restaurant.findOne = originalRestaurantFindOne;
+    global.fetch = originalFetch;
+    console.info = originalInfo;
+    if (originalApiUrl === undefined) delete process.env.WASENDER_API_URL;
+    else process.env.WASENDER_API_URL = originalApiUrl;
   }
 });
