@@ -11,6 +11,8 @@ export const toolPermissions = {
   resolve_customer_feedback: ["owner", "manager"],
   get_sales_summary: ["owner", "manager"],
   get_business_report: ["owner", "manager"],
+  get_item_performance: ["owner", "manager"],
+  list_customers: ["owner", "manager"],
   get_latest_customer_order: ["customer"],
   respond_to_order_check_in: ["customer"],
   get_customer_recommendations: ["customer"],

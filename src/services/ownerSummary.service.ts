@@ -6,13 +6,16 @@ import {
 } from "../models/order.model";
 import { ownerSummaryWeekdays, type OwnerSummaryWeekday } from "../types/restaurant.types";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
+import { BadRequestError } from "../utils/httpErrors";
 
 export type OwnerSummaryPeriodType = "daily" | "weekly" | "custom";
 export const businessReportPeriodTypes = [
   "today",
   "yesterday",
   "this_week",
-  "last_week"
+  "last_week",
+  "all_time",
+  "custom"
 ] as const;
 export type BusinessReportPeriodType =
   (typeof businessReportPeriodTypes)[number];
@@ -60,7 +63,7 @@ export interface OwnerSummaryMetrics {
 export interface BusinessReportPeriod {
   type: BusinessReportPeriodType;
   label: string;
-  summaryType: "daily" | "weekly";
+  summaryType: OwnerSummaryPeriodType;
   timezone: string;
   periodStart: Date;
   periodEnd: Date;
@@ -120,6 +123,8 @@ export interface GetBusinessReportInput {
   restaurantName: string;
   timezone?: string;
   period: BusinessReportPeriodType;
+  startDate?: string;
+  endDate?: string;
   compareWithPrevious?: boolean;
   now?: Date;
 }
@@ -261,6 +266,65 @@ const localDateTimeToUtc = (
   return new Date(utcTimestamp);
 };
 
+const parseLocalDate = (value: string, fieldName: string): LocalDateParts => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+
+  if (!match) {
+    throw new BadRequestError(
+      `${fieldName} must use YYYY-MM-DD or an ISO date-time with a timezone.`,
+      "INVALID_REPORT_DATE"
+    );
+  }
+
+  const parts = {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3])
+  };
+  const verified = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+
+  if (
+    verified.getUTCFullYear() !== parts.year ||
+    verified.getUTCMonth() + 1 !== parts.month ||
+    verified.getUTCDate() !== parts.day
+  ) {
+    throw new BadRequestError(`${fieldName} is not a valid date.`, "INVALID_REPORT_DATE");
+  }
+
+  return parts;
+};
+
+const parseReportDateBoundary = (
+  value: string,
+  fieldName: "startDate" | "endDate",
+  timezone: string
+): Date => {
+  const trimmed = value.trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const localDate = parseLocalDate(trimmed, fieldName);
+    return localMidnightToUtc(
+      fieldName === "endDate" ? shiftLocalDate(localDate, 1) : localDate,
+      timezone
+    );
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}T.+(?:Z|[+-]\d{2}:\d{2})$/i.test(trimmed)) {
+    throw new BadRequestError(
+      `${fieldName} must use YYYY-MM-DD or an ISO date-time with a timezone.`,
+      "INVALID_REPORT_DATE"
+    );
+  }
+
+  parseLocalDate(trimmed.slice(0, 10), fieldName);
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new BadRequestError(`${fieldName} is not a valid date.`, "INVALID_REPORT_DATE");
+  }
+
+  return parsed;
+};
+
 const localMidnightToUtc = (
   localDate: LocalDateParts,
   timezone: string
@@ -337,7 +401,7 @@ const getMonday = (localDate: LocalDateParts): LocalDateParts => {
 };
 
 const buildBusinessReportPeriod = (
-  type: BusinessReportPeriodType,
+  type: Exclude<BusinessReportPeriodType, "all_time" | "custom">,
   timezone: string,
   startLocalDate: LocalDateParts,
   periodEnd: Date
@@ -369,7 +433,7 @@ const buildBusinessReportPeriod = (
 };
 
 export const resolveBusinessReportPeriod = (
-  type: BusinessReportPeriodType,
+  type: Exclude<BusinessReportPeriodType, "all_time" | "custom">,
   now = new Date(),
   timezone = DEFAULT_TIMEZONE
 ): BusinessReportPeriod => {
@@ -401,6 +465,85 @@ export const resolveBusinessReportPeriod = (
   );
 };
 
+export interface ResolveRequestedBusinessReportPeriodInput {
+  restaurantId: string;
+  period: BusinessReportPeriodType;
+  timezone?: string;
+  startDate?: string;
+  endDate?: string;
+  now?: Date;
+}
+
+export const resolveRequestedBusinessReportPeriod = async (
+  input: ResolveRequestedBusinessReportPeriodInput,
+  dependencies: {
+    findEarliestOrder?: (restaurantId: string) => Promise<{ createdAt: Date } | null>;
+  } = {}
+): Promise<BusinessReportPeriod> => {
+  const timezone = input.timezone || DEFAULT_TIMEZONE;
+  const now = input.now ?? new Date();
+
+  if (!isValidOwnerSummaryTimezone(timezone)) {
+    throw new BadRequestError("The restaurant timezone is invalid.", "INVALID_TIMEZONE");
+  }
+
+  if (input.period !== "all_time" && input.period !== "custom") {
+    return resolveBusinessReportPeriod(input.period, now, timezone);
+  }
+
+  if (input.period === "all_time") {
+    const findEarliestOrder =
+      dependencies.findEarliestOrder ??
+      (async (restaurantId: string) =>
+        Order.findOne({ restaurantId }).sort({ createdAt: 1 }).select("createdAt"));
+    const earliestOrder = await findEarliestOrder(input.restaurantId);
+    const periodStart = earliestOrder?.createdAt ?? now;
+
+    return {
+      type: "all_time",
+      label: "All time",
+      summaryType: "custom",
+      timezone,
+      periodStart,
+      periodEnd: now,
+      key: `all_time_to_${now.toISOString()}`
+    };
+  }
+
+  if (!input.startDate?.trim()) {
+    throw new BadRequestError(
+      "startDate is required for a custom report.",
+      "CUSTOM_REPORT_START_DATE_REQUIRED"
+    );
+  }
+
+  const periodStart = parseReportDateBoundary(
+    input.startDate,
+    "startDate",
+    timezone
+  );
+  const periodEnd = input.endDate?.trim()
+    ? parseReportDateBoundary(input.endDate, "endDate", timezone)
+    : now;
+
+  if (periodStart > periodEnd) {
+    throw new BadRequestError(
+      "startDate must not be after endDate.",
+      "INVALID_REPORT_DATE_RANGE"
+    );
+  }
+
+  return {
+    type: "custom",
+    label: "Custom period",
+    summaryType: "custom",
+    timezone,
+    periodStart,
+    periodEnd,
+    key: `${periodStart.toISOString()}_to_${periodEnd.toISOString()}`
+  };
+};
+
 const shiftZonedDateTime = (
   value: Date,
   days: number,
@@ -423,8 +566,24 @@ const shiftZonedDateTime = (
 export const resolvePreviousEquivalentBusinessReportPeriod = (
   period: BusinessReportPeriod
 ): BusinessReportPeriod => {
-  const shiftDays =
-    period.type === "today" || period.type === "yesterday" ? -1 : -7;
+  if (period.type === "all_time") {
+    throw new BadRequestError(
+      "All-time periods do not have a previous equivalent period.",
+      "ALL_TIME_COMPARISON_UNAVAILABLE"
+    );
+  }
+
+  if (period.type === "custom") {
+    const durationMs = period.periodEnd.getTime() - period.periodStart.getTime();
+    return {
+      ...period,
+      label: "Previous equal-length period",
+      periodStart: new Date(period.periodStart.getTime() - durationMs),
+      periodEnd: new Date(period.periodStart.getTime())
+    };
+  }
+
+  const shiftDays = period.type === "today" || period.type === "yesterday" ? -1 : -7;
 
   return {
     ...period,
@@ -646,6 +805,10 @@ const getPreviousPeriodLabel = (
       return "Last week";
     case "last_week":
       return "Week before last";
+    case "custom":
+      return "Previous equal-length period";
+    case "all_time":
+      return "No previous period";
   }
 };
 
@@ -763,6 +926,10 @@ const getReportTitle = (type: BusinessReportPeriodType): string => {
       return "WEEKLY REPORT";
     case "last_week":
       return "LAST WEEK'S REPORT";
+    case "all_time":
+      return "ALL-TIME REPORT";
+    case "custom":
+      return "CUSTOM REPORT";
   }
 };
 
@@ -851,14 +1018,20 @@ export const getBusinessReport = async (
   input: GetBusinessReportInput,
   dependencies: {
     getMetrics?: typeof getOwnerSummaryMetrics;
+    resolvePeriod?: typeof resolveRequestedBusinessReportPeriod;
   } = {}
 ): Promise<BusinessReportData> => {
   const timezone = input.timezone || DEFAULT_TIMEZONE;
-  const period = resolveBusinessReportPeriod(
-    input.period,
-    input.now ?? new Date(),
-    timezone
-  );
+  const resolvePeriod =
+    dependencies.resolvePeriod ?? resolveRequestedBusinessReportPeriod;
+  const period = await resolvePeriod({
+    restaurantId: input.restaurantId,
+    period: input.period,
+    timezone,
+    startDate: input.startDate,
+    endDate: input.endDate,
+    now: input.now
+  });
   const getMetrics = dependencies.getMetrics ?? getOwnerSummaryMetrics;
   const currentMetrics = await getMetrics({
     restaurantId: input.restaurantId,
@@ -869,7 +1042,7 @@ export const getBusinessReport = async (
   });
   let comparison: BusinessReportComparison | null = null;
 
-  if (input.compareWithPrevious) {
+  if (input.compareWithPrevious && period.type !== "all_time") {
     const previousPeriod = resolvePreviousEquivalentBusinessReportPeriod(period);
     const previousMetrics = await getMetrics({
       restaurantId: input.restaurantId,

@@ -37,7 +37,7 @@ const mockedDecisionFor = (scenario) => {
   if (scenario.expectNoTool) {
     return {
       text: scenario.expectedTextPattern
-        ? "That order was updated. Please review the latest order message."
+        ? "That order was updated. Please review the latest order message. Which period or date range should I use?"
         : "I need a little more detail before I can safely do that.",
       toolCalls: []
     };
@@ -56,7 +56,7 @@ const mockedDecisionFor = (scenario) => {
 
 test("staff regression suite remains a bounded decision-only safety net", () => {
   assert.equal(staffAgentScenarios.length >= 30, true);
-  assert.equal(staffAgentScenarios.length <= 45, true);
+  assert.equal(staffAgentScenarios.length <= 50, true);
 
   for (const scenario of staffAgentScenarios) {
     assert.equal(["owner", "manager"].includes(scenario.role), true);
