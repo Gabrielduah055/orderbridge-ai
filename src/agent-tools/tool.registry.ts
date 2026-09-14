@@ -2451,7 +2451,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "remove_menu_item_image",
       description:
-          "Owner only. Remove the image from a menu item. Requires owner confirmation.",
+        "Owner only. Remove the image from a menu item. Requires owner confirmation.",
       parameters: {
         itemName: "Menu item name (optional if itemId provided).",
         itemId: "Optional menu item ID."

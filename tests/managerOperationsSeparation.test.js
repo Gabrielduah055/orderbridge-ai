@@ -15,10 +15,15 @@ const {
 } = require("../dist/services/ownerOrderNotificationContext.service");
 const ownerOrderResolution = require("../dist/services/ownerOrderResolution.service");
 const {
-  getAgentToolDefinitionsForRole,
   isToolAllowedForRole
 } = require("../dist/agent-tools/tool.permissions");
 const { toolRegistry } = require("../dist/agent-tools/tool.registry");
+const {
+  getAgentToolDefinitionsForRole
+} = require("../dist/services/ai/agentToolDefinitions.service");
+const {
+  buildAgentSystemPrompt
+} = require("../dist/services/ai/agentPrompt.service");
 
 const restaurantId = "64b000000000000000000001";
 const otherRestaurantId = "64b000000000000000000002";
@@ -135,6 +140,10 @@ test("two managers receive each operational order event once while the owner is 
       restaurant,
       makeOrder({ customerCancellationRequestStatus: "pending" })
     );
+    await sideEffects.notifyOwnerOfCustomerCancellation(
+      restaurant,
+      makeOrder({ status: "cancelled", customerCancelledAt: new Date() })
+    );
 
     const amended = created.filter(
       (message) => message.metadata.kind === "staff_order_amended_notification"
@@ -143,8 +152,12 @@ test("two managers receive each operational order event once while the owner is 
       (message) =>
         message.metadata.kind === "staff_order_cancellation_request_notification"
     );
+    const cancellations = created.filter(
+      (message) => message.metadata.kind === "staff_order_cancelled_notification"
+    );
     assert.equal(amended.length, 2);
     assert.equal(cancellationRequests.length, 2);
+    assert.equal(cancellations.length, 2);
     assert.ok(amended.every((message) => message.idempotencyKey.includes(":v2:")));
     assert.ok(cancellationRequests.every((message) => message.metadata.recipientPhone === message.to));
   } finally {
@@ -444,6 +457,40 @@ test("manager operations are allowed while owner intelligence and menu administr
     }).success,
     false
   );
+});
+
+test("manager prompt states the operational boundary without owner-only tool instructions", async () => {
+  const permissions = getAgentToolDefinitionsForRole("manager").map(
+    (tool) => tool.function.name
+  );
+  const sender = {
+    phone: amaPhone,
+    normalizedPhone: amaPhone,
+    role: "manager",
+    verified: true,
+    name: "Ama"
+  };
+  const prompt = await buildAgentSystemPrompt(
+    makeRestaurant(),
+    sender,
+    permissions,
+    {
+      buildRestaurantContext: async () => ({
+        restaurant: { name: "Golden Grill" },
+        sender: { role: "manager", verified: true },
+        people: {},
+        settings: {},
+        summary: {},
+        permissions
+      })
+    }
+  );
+
+  assert.match(prompt, /Managers handle restaurant operations only/i);
+  assert.doesNotMatch(prompt, /Use get_business_report/);
+  assert.doesNotMatch(prompt, /Use list_customers/);
+  assert.doesNotMatch(prompt, /start_menu_item_image_upload/);
+  assert.doesNotMatch(prompt, /update_campaign_draft/);
 });
 
 test("order decisions remain tenant scoped", async () => {

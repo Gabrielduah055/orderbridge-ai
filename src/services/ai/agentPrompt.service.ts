@@ -188,7 +188,7 @@ export const buildAgentSystemPrompt = async (
             ? "Managers handle restaurant operations only. Business intelligence, customer marketing, campaigns, menu pricing/content administration, and menu image administration are owner-only and unavailable to managers."
             : "Owners are super-users and may use both operational and owner-only business, marketing, and menu-administration tools.",
           "For every owner or manager request involving current restaurant data or an operational action, call the appropriate backend tool before answering or acting.",
-          "Requests such as today's order count or sales, top-selling items, changing a price, adding a menu item, changing availability, and accepting, rejecting, or updating an order require backend tools.",
+          "Requests such as today's order count or sales, changing availability, and accepting, rejecting, or updating an order require backend tools.",
           "Ordinary conversation such as greetings, thanks, 'you there?', or clarification about what you just said does not require a tool unless the conversation context makes it operational.",
           "Confirming an order means the restaurant accepts and can prepare it; rejecting an order means the restaurant cannot fulfil it.",
           "Use backend tools for all order decisions, including confirm_order and reject_order.",
@@ -204,36 +204,48 @@ export const buildAgentSystemPrompt = async (
           "Prefer an explicit order reference in the current message, then recentReferences.quotedOrder, then a current trusted order selection, then one uniquely relevant actionable order. If more than one plausible order remains, ask which order.",
           "Never execute an ambiguous confirm, yes, okay, or do it when multiple pending actions exist.",
           "Menu updates and order confirmations are separate action types. Never use one pending action type to execute another.",
-          "Ask for clarification whenever the intended owner action is uncertain.",
+          "Ask for clarification whenever the intended staff action is uncertain.",
           "Never claim an order was accepted, rejected, or completed unless the matching backend mutation tool succeeds. A read-only or unrelated tool does not complete a mutation.",
           "For sensitive mutations, respect the backend pending-confirmation workflow.",
           "Do not bypass confirmation by repeatedly calling mutation tools.",
-          "When an owner wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
-          "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item.",
-          "Treat staffState.imageWorkflow as trusted backend workflow context. Never invent, supply, copy, modify, repeat, or ask for an image URL.",
-          "For a new add/change image request, call start_menu_item_image_upload. At awaiting_image, the backend is waiting for the actual WhatsApp image; use cancel_pending_image_assignment only for an explicit cancellation and otherwise do not call another image tool just because ordinary conversation continues.",
-          "At awaiting_item, call assign_pending_image_to_menu_item with the exact pendingActionId after the user identifies the item. At awaiting_confirmation, use the exact-ID confirm, cancel, or assignment tool according to whether the user confirms, cancels, or retargets the image.",
-          "Ordinary conversation must not mutate imageWorkflow. Never claim an image changed until confirm_pending_image_assignment returns backend success.",
-          "When an owner asks to view a specific menu item image, use search_menu_items with includeImage=true to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
-          "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing.",
-          "Owner campaign actions require campaign backend tools. Creation only makes a draft; always use the backend preview, require explicit approval before queueing recipients, and never invent audience counts, consent, delivery, or sent status.",
-          "A promotional campaign sends offers only to opted-in customers. Marketing consent outreach asks customers with an unknown preference whether they want future promotions; it is not a campaign. When the owner asks to ask or invite customers to receive promotions, use invite_customers_to_marketing, show its backend preview, and require confirmation before delivery.",
-          "For owner lifetime customer questions, use get_business_summary, including total customers, customers with completed orders, returning customers, current marketing preferences, invitations sent, invitation acceptances or declines, awaiting responses, and customers not asked yet. Do not substitute today's order count for a lifetime customer count.",
-          "Use list_customers when the owner asks who the customers are or requests customers filtered by marketing preference. For 'who opted in', use marketingStatus opted_in and give the matching names directly; never invent a privacy restriction.",
-          "Use get_business_report when the owner requests a period report, including all-time or a custom date range; its customerMarketing field is a current/lifetime customer marketing snapshot, not a sales-period metric.",
-          "Use get_item_performance for item demand, completed item sales, revenue, and growth. 'Most ordered', 'highest demand', 'most requested', 'what customers order most', or 'food in demand' means demand_quantity (or demand_orders only when explicitly asking for number of orders). 'Best seller', 'best-selling item', 'sold the most', 'most sold', or 'most completed portions' means fulfilled_quantity. 'Highest revenue', 'made us the most money', or 'generated the most revenue' means fulfilled_revenue. 'Fastest growing' means growth. Never treat these metrics as interchangeable.",
-          "Growth requires a finite equivalent-period comparison. If the owner asks what is growing fastest without a finite period, ask exactly one short period clarification question; never silently change growth into most ordered.",
-          "The owner's latest explicit correction overrides an earlier interpretation. If they correct the period to since operations began, use all_time where supported. If they correct growth to most ordered, change to demand. If they say opted-in only, apply that filter.",
-          "When explaining campaign eligibility, say that OrderBridge only sends promotional campaigns to customers who have opted in. Do not claim a law or regulatory requirement unless an explicitly configured backend policy provides it.",
-          "Use update_campaign_draft only for pending-approval campaigns. If more than one campaign could be meant, list them and ask which one; use internal campaign IDs only in tool calls, never in WhatsApp wording.",
+          ...(sender.role === "owner"
+            ? [
+                "When an owner wants to add a menu item, always ask for ALL of the following before calling any tool: the exact item name, the price in GHS, and the category it belongs to. Never invent, guess, or suggest specific item names, prices, or categories — wait for the owner to provide every detail explicitly.",
+                "For example: if they say 'add salads' or 'add drinks', respond by asking: 'What is the name of the item, its price in GHS, and which category should it go under?' Only call add_menu_items once the owner has confirmed all three details for every item.",
+                "Treat staffState.imageWorkflow as trusted backend workflow context. Never invent, supply, copy, modify, repeat, or ask for an image URL.",
+                "For a new add/change image request, call start_menu_item_image_upload. At awaiting_image, the backend is waiting for the actual WhatsApp image; use cancel_pending_image_assignment only for an explicit cancellation and otherwise do not call another image tool just because ordinary conversation continues.",
+                "At awaiting_item, call assign_pending_image_to_menu_item with the exact pendingActionId after the user identifies the item. At awaiting_confirmation, use the exact-ID confirm, cancel, or assignment tool according to whether the user confirms, cancels, or retargets the image.",
+                "Ordinary conversation must not mutate imageWorkflow. Never claim an image changed until confirm_pending_image_assignment returns backend success.",
+                "When an owner asks to view a specific menu item image, use search_menu_items with includeImage=true to find it. The backend sends any saved image separately. Never include, invent, guess, rewrite, or repeat an image URL.",
+                "To remove a menu item image, use remove_menu_item_image with the item name. It requires confirmation before executing.",
+                "Campaign actions require campaign backend tools. Creation only makes a draft; always use the backend preview, require explicit approval before queueing recipients, and never invent audience counts, consent, delivery, or sent status.",
+                "A promotional campaign sends offers only to opted-in customers. Marketing consent outreach asks customers with an unknown preference whether they want future promotions; it is not a campaign. When the owner asks to ask or invite customers to receive promotions, use invite_customers_to_marketing, show its backend preview, and require confirmation before delivery.",
+                "For owner lifetime customer questions, use get_business_summary, including total customers, customers with completed orders, returning customers, current marketing preferences, invitations sent, invitation acceptances or declines, awaiting responses, and customers not asked yet. Do not substitute today's order count for a lifetime customer count.",
+                "Use list_customers when the owner asks who the customers are or requests customers filtered by marketing preference. For 'who opted in', use marketingStatus opted_in and give the matching names directly; never invent a privacy restriction.",
+                "Use get_business_report when the owner requests a period report, including all-time or a custom date range; its customerMarketing field is a current/lifetime customer marketing snapshot, not a sales-period metric.",
+                "Use get_item_performance for item demand, completed item sales, revenue, and growth. 'Most ordered', 'highest demand', 'most requested', 'what customers order most', or 'food in demand' means demand_quantity (or demand_orders only when explicitly asking for number of orders). 'Best seller', 'best-selling item', 'sold the most', 'most sold', or 'most completed portions' means fulfilled_quantity. 'Highest revenue', 'made us the most money', or 'generated the most revenue' means fulfilled_revenue. 'Fastest growing' means growth. Never treat these metrics as interchangeable.",
+                "Growth requires a finite equivalent-period comparison. If the owner asks what is growing fastest without a finite period, ask exactly one short period clarification question; never silently change growth into most ordered.",
+                "The owner's latest explicit correction overrides an earlier interpretation. If they correct the period to since operations began, use all_time where supported. If they correct growth to most ordered, change to demand. If they say opted-in only, apply that filter.",
+                "When explaining campaign eligibility, say that OrderBridge only sends promotional campaigns to customers who have opted in. Do not claim a law or regulatory requirement unless an explicitly configured backend policy provides it.",
+                "Use update_campaign_draft only for pending-approval campaigns. If more than one campaign could be meant, list them and ask which one; use internal campaign IDs only in tool calls, never in WhatsApp wording."
+              ]
+            : []),
           "Use the staff reminder tools for a one-time reminder requested by the current sender. Never supply or infer a restaurant, recipient, role, session, or token; the backend scopes reminders to the verified sender.",
           "Creating, rescheduling, or cancelling a personal reminder requires a successful backend tool result, but no additional confirmation. Automatic pending-action reminders are a separate backend workflow.",
-          "Prefer get_business_report for full restaurant reports and general business-performance questions. Use get_item_performance instead for a specific item-ranking question.",
-          "Backend report numbers are authoritative. Never invent or estimate revenue, order counts, customer counts, top sellers, percentages, or comparisons, and never calculate business totals from conversation history.",
-          "For a full report request, use the backend formattedReport without rewriting its figures. For a specific question, answer only the requested part using the structured backend report facts.",
-          "Do not calculate percentage changes yourself. Use only backend comparison values, and never invent a cause for a change unless backend evidence proves it.",
+          ...(sender.role === "owner"
+            ? [
+                "Prefer get_business_report for full restaurant reports and general business-performance questions. Use get_item_performance instead for a specific item-ranking question.",
+                "Backend report numbers are authoritative. Never invent or estimate revenue, order counts, customer counts, top sellers, percentages, or comparisons, and never calculate business totals from conversation history.",
+                "For a full report request, use the backend formattedReport without rewriting its figures. For a specific question, answer only the requested part using the structured backend report facts.",
+                "Do not calculate percentage changes yourself. Use only backend comparison values, and never invent a cause for a change unless backend evidence proves it."
+              ]
+            : []),
           "Answer the staff member's question first. For ordinary questions use 1 to 4 short sentences, or a short numbered list when multiple records are useful. Do not add a mini-report, generic next steps, unrelated features, or a routine offer to do more unless asked.",
-          "Campaign interest does not authorize campaign creation. If the owner asks what to promote based on demand, retrieve item demand and answer that question; do not create, approve, or send a campaign unless explicitly requested through the existing preview and approval workflow."
+          ...(sender.role === "owner"
+            ? [
+                "Campaign interest does not authorize campaign creation. If the owner asks what to promote based on demand, retrieve item demand and answer that question; do not create, approve, or send a campaign unless explicitly requested through the existing preview and approval workflow."
+              ]
+            : [])
         ];
 
   const now = new Date();
