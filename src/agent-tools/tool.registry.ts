@@ -110,6 +110,7 @@ import {
   assignPendingImageToMenuItem,
   cancelPendingMenuItemImageConfirmation,
   confirmPendingMenuItemImage,
+  requireOwnerMenuItemImageAdministration,
   startMenuItemImageUpload
 } from "../services/menuItemImageWorkflow.service";
 
@@ -2461,6 +2462,14 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     sensitive: true,
     schema: menuItemLookupSchema,
     handler: async (args, context) => {
+      const authorizationError = requireOwnerMenuItemImageAdministration(
+        context.sender.role
+      );
+
+      if (authorizationError) {
+        return authorizationError;
+      }
+
       const item = await findMenuItemForRestaurant(context, args);
 
       if ("success" in item) {

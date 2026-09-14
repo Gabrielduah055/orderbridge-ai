@@ -1101,6 +1101,23 @@ test("existing image display and confirmation-safe removal tools remain availabl
     assert.equal(shown.success, true);
     assert.equal(shown.data[0].imageUrl, secureUrl);
 
+    const shownToCustomer = await executeAgentTool(
+      "search_menu_items",
+      { query: "Chicken Salad" },
+      context({
+        sender: {
+          phone: otherSenderPhone,
+          normalizedPhone: otherSenderPhone,
+          customerKey: `wasender:pn:${otherSenderPhone}`,
+          recipientAddress: otherSenderPhone,
+          role: "customer",
+          verified: true
+        }
+      })
+    );
+    assert.equal(shownToCustomer.success, true);
+    assert.equal(shownToCustomer.data[0].imageUrl, secureUrl);
+
     const removal = await executeAgentTool(
       "remove_menu_item_image",
       { itemName: "Chicken Salad" },

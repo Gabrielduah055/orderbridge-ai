@@ -35,6 +35,9 @@ const menuItemService = require("../dist/services/menuItem.service");
 const {
   classifySuspiciousMenuItemImageUrl
 } = require("../dist/scripts/auditMenuItemImages");
+const {
+  processInboundStaffMenuImage
+} = require("../dist/controllers/wasender.controller");
 
 const restaurantId = "64b000000000000000000001";
 const otherRestaurantId = "64b000000000000000000002";
@@ -75,7 +78,7 @@ const makePendingImage = (overrides = {}) => ({
   _id: "64b000000000000000000901",
   restaurantId,
   senderPhone,
-  senderRole: "manager",
+  senderRole: "owner",
   action: "IMAGE_ASSIGNMENT",
   toolName: "confirm_pending_image_assignment",
   arguments: { itemId: menuItemId },
@@ -126,7 +129,7 @@ const withSuccessfulImageConfirmation = async (message) => {
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       message
     });
     return { result, pending, persistedUrl };
@@ -148,6 +151,140 @@ test("webhook normalization preserves the complete raw WhatsApp image message", 
   assert.equal(normalized.messageType, "image");
   assert.equal(normalized.mediaUrl, encryptedUrl);
   assert.deepEqual(normalized.rawMessage, rawMessage);
+});
+
+test("manager inbound image is rejected before decrypt, upload, or workflow preparation", async () => {
+  const calls = [];
+  const replies = [];
+
+  await processInboundStaffMenuImage(
+    {
+      restaurantId,
+      sessionId: "session-1",
+      replyAddress: senderPhone,
+      senderPhone,
+      senderRole: "manager",
+      rawMessage,
+      eventId: "manager-image-event",
+      messageId: "manager-image-message",
+      apiKey: "restaurant-token"
+    },
+    {
+      isUploadConfigured: () => {
+        calls.push("configured");
+        return true;
+      },
+      validateMetadata: () => calls.push("validate"),
+      decryptMedia: async () => {
+        calls.push("decrypt");
+        return decryptedUrl;
+      },
+      uploadTrustedImage: async () => {
+        calls.push("upload");
+        return trustedImage;
+      },
+      prepareImage: async () => {
+        calls.push("prepare");
+        return { handled: true, success: true, message: "unexpected" };
+      },
+      enqueueText: async (_sessionId, _to, message, context) => {
+        replies.push({ message, context });
+      }
+    }
+  );
+
+  assert.deepEqual(calls, []);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].message, /available to the restaurant owner/i);
+  assert.equal(replies[0].context.action, "menu_image_owner_only");
+});
+
+test("owner inbound image still decrypts, uploads, and prepares the workflow", async () => {
+  const calls = [];
+  const replies = [];
+
+  await processInboundStaffMenuImage(
+    {
+      restaurantId,
+      sessionId: "session-1",
+      replyAddress: senderPhone,
+      senderPhone,
+      senderRole: "owner",
+      rawMessage,
+      eventId: "owner-image-event",
+      messageId: "owner-image-message",
+      apiKey: "restaurant-token"
+    },
+    {
+      isUploadConfigured: () => {
+        calls.push("configured");
+        return true;
+      },
+      validateMetadata: () => calls.push("validate"),
+      decryptMedia: async (message, options) => {
+        calls.push("decrypt");
+        assert.equal(message, rawMessage);
+        assert.equal(options.apiKey, "restaurant-token");
+        return decryptedUrl;
+      },
+      uploadTrustedImage: async (url) => {
+        calls.push("upload");
+        assert.equal(url, decryptedUrl);
+        return trustedImage;
+      },
+      prepareImage: async (input) => {
+        calls.push("prepare");
+        assert.equal(input.senderRole, "owner");
+        assert.equal(input.image, trustedImage);
+        return {
+          handled: true,
+          success: true,
+          message: "Which menu item does this image belong to?"
+        };
+      },
+      enqueueText: async (_sessionId, _to, message, context) => {
+        calls.push("enqueue");
+        replies.push({ message, context });
+      }
+    }
+  );
+
+  assert.deepEqual(calls, [
+    "configured",
+    "validate",
+    "decrypt",
+    "upload",
+    "prepare",
+    "enqueue"
+  ]);
+  assert.equal(replies[0].context.action, "image_received");
+  assert.match(replies[0].message, /Which menu item/i);
+});
+
+test("menu image workflow service rejects a manager before reading old pending state", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  let reads = 0;
+  PendingAgentAction.findOne = () => {
+    reads += 1;
+    return sortable(makePendingImage({ senderRole: "manager" }));
+  };
+
+  try {
+    const result = await handlePendingMenuItemImageReply({
+      restaurantId,
+      senderPhone,
+      senderRole: "manager",
+      pendingActionId: "old-manager-image-action",
+      message: "yes, use it"
+    });
+
+    assert.equal(result.handled, true);
+    assert.equal(result.success, false);
+    assert.match(result.message, /available to the restaurant owner/i);
+    assert.equal(reads, 0);
+  } finally {
+    restore(PendingAgentAction, "findOne", originalFindOne);
+  }
 });
 
 test("deterministic image metadata validation rejects unsupported and oversized media", () => {
@@ -395,7 +532,7 @@ test("yea add it to the chicken salad resolves the item and completes assignment
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       message: "yea add it to the chicken salad"
     });
     assert.equal(result.success, true);
@@ -432,7 +569,7 @@ test("an awaiting-item image resolves a relational item reply without using the 
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       message: "it belongs to Chicken Salad"
     });
 
@@ -484,7 +621,7 @@ test("legacy safety fallback retargets awaiting-confirmation without confirming 
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       pendingActionId: String(pending._id),
       message: "actually use it for Jollof instead"
     });
@@ -530,7 +667,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     await prepareUploadedMenuItemImage({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       image: trustedImage
     });
     assert.equal(created.action, "IMAGE_ASSIGNMENT");
@@ -542,7 +679,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
     assert.deepEqual(supersedeFilter, {
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       action: "IMAGE_ASSIGNMENT",
       status: "pending"
     });
@@ -653,7 +790,7 @@ test("multiple matching menu items require clarification without modifying state
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       message: "yea add it to the chicken salad"
     });
     assert.equal(result.success, false);
@@ -683,7 +820,7 @@ test("missing menu item does not modify the pending image or database", async ()
     const result = await handlePendingMenuItemImageReply({
       restaurantId,
       senderPhone,
-      senderRole: "manager",
+      senderRole: "owner",
       message: "yea add it to the missing meal"
     });
     assert.equal(result.success, false);
@@ -705,7 +842,7 @@ test("expired pending upload is rejected and marked expired", async () => {
       pendingActionId: String(pending._id),
       restaurantId,
       senderPhone,
-      senderRole: "manager"
+      senderRole: "owner"
     });
     assert.equal(result.success, false);
     assert.equal(result.code, "PENDING_IMAGE_NOT_FOUND");
@@ -736,7 +873,7 @@ test("repeated confirmation is idempotent", async () => {
       pendingActionId: String(pending._id),
       restaurantId,
       senderPhone,
-      senderRole: "manager"
+      senderRole: "owner"
     });
     assert.equal(result.success, true);
     assert.equal(result.data.idempotent, true);
@@ -772,7 +909,7 @@ for (const isolationCase of [
         pendingActionId: "64b000000000000000000901",
         restaurantId: isolationCase.attemptedRestaurantId,
         senderPhone: isolationCase.attemptedSenderPhone,
-        senderRole: "manager"
+        senderRole: "owner"
       });
       assert.equal(result.success, false);
       assert.equal(capturedFilter.restaurantId, isolationCase.attemptedRestaurantId);

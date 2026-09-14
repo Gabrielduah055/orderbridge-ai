@@ -1509,6 +1509,10 @@ export const handleRestaurantAgentMessage = async (
       });
     }
 
+    if (sender.role === "manager" && staffState.imageWorkflow) {
+      staffState = { ...staffState, imageWorkflow: null };
+    }
+
     staffImageWorkflow = staffState.imageWorkflow;
     staffOperationalState = staffState;
     const genericStaffConfirmationMessage =
@@ -2148,7 +2152,7 @@ export const handleRestaurantAgentMessage = async (
   const legacyStaffSource =
     aiProviderName === "openrouter" ? "legacy_owner" : "hermes_tools";
 
-  if (sender.role === "owner" || sender.role === "manager") {
+  if (sender.role === "owner") {
     const genericDecisionTargetsTool =
       currentStaffConfirmation?.kind === "tool" &&
       !hasExplicitImageWorkflowLanguage(message) &&

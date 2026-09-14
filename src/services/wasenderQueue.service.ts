@@ -717,8 +717,12 @@ export const updateOrderSideEffectAfterSend = async (
 
   const now = new Date();
   const failureReason = result.success ? undefined : getErrorMessage(result);
+  const isOwnerFallback = message.metadata?.recipientType === "owner";
 
-  if (kind === "owner_order_notification") {
+  if (
+    kind === "owner_order_notification" ||
+    (kind === "staff_order_notification" && isOwnerFallback)
+  ) {
     const providerMessageId = result.success ? extractWasenderProviderMessageId(result.data) : undefined;
     await Order.updateOne(
       { _id: orderId, restaurantId },
@@ -743,7 +747,10 @@ export const updateOrderSideEffectAfterSend = async (
     return;
   }
 
-  if (kind === "owner_order_cancelled_notification") {
+  if (
+    kind === "owner_order_cancelled_notification" ||
+    (kind === "staff_order_cancelled_notification" && isOwnerFallback)
+  ) {
     await Order.updateOne(
       { _id: orderId, restaurantId },
       result.success
@@ -764,7 +771,10 @@ export const updateOrderSideEffectAfterSend = async (
     return;
   }
 
-  if (kind === "owner_order_cancellation_request_notification") {
+  if (
+    kind === "owner_order_cancellation_request_notification" ||
+    (kind === "staff_order_cancellation_request_notification" && isOwnerFallback)
+  ) {
     await Order.updateOne(
       { _id: orderId, restaurantId },
       result.success
@@ -806,7 +816,10 @@ export const updateOrderSideEffectAfterSend = async (
     return;
   }
 
-  if (kind === "owner_order_amended_notification") {
+  if (
+    kind === "owner_order_amended_notification" ||
+    (kind === "staff_order_amended_notification" && isOwnerFallback)
+  ) {
     const amendmentVersion = Number(message.metadata?.amendmentVersion);
 
     if (!Number.isInteger(amendmentVersion) || amendmentVersion < 1) {

@@ -385,7 +385,8 @@ export const buildStaffOperationalState = async (
       trustedQuotedContextPromise
     ]);
 
-  const imageWorkflow = getImageWorkflow(pendingActions);
+  const imageWorkflow =
+    input.sender.role === "owner" ? getImageWorkflow(pendingActions) : null;
   const visiblePendingActions = pendingActions
     .filter((action) => !imageActionTypes.has(action.action))
     .slice(0, staffOperationalStateLimits.pendingActions)

@@ -14,6 +14,8 @@ import * as menuItemService from "./menuItem.service";
 
 const imageContextTtlMs = 10 * 60 * 1000;
 const missingImageMessage = "I can’t find the uploaded image anymore. Please send it again.";
+export const menuItemImageOwnerOnlyMessage =
+  "Menu image administration is available to the restaurant owner.";
 
 interface MenuItemImageWorkflowInput {
   restaurantId: string;
@@ -28,6 +30,31 @@ interface ImageWorkflowResult {
   itemName?: string;
   pendingActionId?: string;
 }
+
+export const requireOwnerMenuItemImageAdministration = (
+  senderRole: SenderRole
+): ToolResult | null =>
+  senderRole === "owner"
+    ? null
+    : {
+        success: false,
+        code: "OWNER_ONLY_MENU_IMAGE_ADMINISTRATION",
+        message: menuItemImageOwnerOnlyMessage
+      };
+
+const getOwnerOnlyImageWorkflowResult = (
+  senderRole: SenderRole
+): ImageWorkflowResult | null => {
+  const authorizationError = requireOwnerMenuItemImageAdministration(senderRole);
+
+  return authorizationError
+    ? {
+        handled: true,
+        success: false,
+        message: authorizationError.message
+      }
+    : null;
+};
 
 export type MenuItemImageStage =
   | "awaiting_image"
@@ -366,6 +393,12 @@ const createMenuItemImageUploadContext = async (
     itemName?: string;
   }
 ): Promise<ToolResult> => {
+  const authorizationError = requireOwnerMenuItemImageAdministration(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   await cancelPendingImageRequestContexts(
     input.restaurantId,
     input.senderPhone,
@@ -417,6 +450,12 @@ export const startMenuItemImageUpload = createMenuItemImageUploadContext;
 export const rememberMenuItemImageRequest = async (
   input: MenuItemImageWorkflowInput & { message: string }
 ): Promise<ImageWorkflowResult> => {
+  const authorizationError = getOwnerOnlyImageWorkflowResult(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const requestedItemName = parseMenuItemImageIntent(input.message);
 
   if (!requestedItemName) {
@@ -451,6 +490,12 @@ export const rememberMenuItemImageRequest = async (
 export const prepareUploadedMenuItemImage = async (
   input: MenuItemImageWorkflowInput & { image: TrustedCloudinaryImage }
 ): Promise<ImageWorkflowResult> => {
+  const authorizationError = getOwnerOnlyImageWorkflowResult(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   if (!validateTrustedCloudinaryImage(input.image)) {
     throw new Error("The uploaded image failed trusted Cloudinary validation.");
   }
@@ -533,6 +578,12 @@ export const assignPendingImageToMenuItem = async (
     itemName: string;
   }
 ): Promise<ToolResult> => {
+  const authorizationError = requireOwnerMenuItemImageAdministration(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const pendingImage = await PendingAgentAction.findOne({
     _id: input.pendingActionId,
     restaurantId: input.restaurantId,
@@ -619,6 +670,12 @@ export const assignPendingImageToMenuItem = async (
 export const confirmPendingMenuItemImage = async (
   input: MenuItemImageWorkflowInput & { pendingActionId: string }
 ): Promise<ToolResult> => {
+  const authorizationError = requireOwnerMenuItemImageAdministration(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const scopedFilter = {
     _id: input.pendingActionId,
     restaurantId: input.restaurantId,
@@ -779,6 +836,12 @@ export const confirmPendingMenuItemImage = async (
 export const cancelPendingMenuItemImageConfirmation = async (
   input: MenuItemImageWorkflowInput & { pendingActionId: string }
 ): Promise<ToolResult> => {
+  const authorizationError = requireOwnerMenuItemImageAdministration(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const scopedFilter = {
     _id: input.pendingActionId,
     restaurantId: input.restaurantId,
@@ -860,6 +923,12 @@ export const attachPendingImageToNamedMenuItem = async (
     pendingActionId?: string;
   }
 ): Promise<ImageWorkflowResult> => {
+  const authorizationError = getOwnerOnlyImageWorkflowResult(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const pendingImage = input.pendingActionId
     ? await PendingAgentAction.findOne({
         _id: input.pendingActionId,
@@ -931,6 +1000,12 @@ export const handlePendingMenuItemImageReply = async (
     pendingActionId?: string;
   }
 ): Promise<ImageWorkflowResult> => {
+  const authorizationError = getOwnerOnlyImageWorkflowResult(input.senderRole);
+
+  if (authorizationError) {
+    return authorizationError;
+  }
+
   const pendingImage = input.pendingActionId
     ? await PendingAgentAction.findOne({
         _id: input.pendingActionId,

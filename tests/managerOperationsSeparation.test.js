@@ -193,6 +193,102 @@ test("submitted orders use the owner only when no valid manager exists", async (
   }
 });
 
+test("owner-fallback staff deliveries preserve legacy order notification bookkeeping", async () => {
+  const { updateOrderSideEffectAfterSend } = require("../dist/services/wasenderQueue.service");
+  const originalUpdateOne = Order.updateOne;
+  const updates = [];
+  Order.updateOne = async (filter, update) => {
+    updates.push({ filter, update });
+    return { modifiedCount: 1 };
+  };
+  const message = (kind, recipientType = "owner", metadata = {}) => ({
+    restaurantId,
+    metadata: {
+      restaurantId,
+      orderId,
+      kind,
+      recipientType,
+      ...metadata
+    }
+  });
+
+  try {
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_notification"),
+      { success: true, status: 200, data: { id: "provider-owner-1" } }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_notification"),
+      { success: false, status: 503, error: "provider unavailable" }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_notification", "manager"),
+      { success: true, status: 200, data: { id: "provider-manager-1" } }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_amended_notification", "owner", {
+        amendmentVersion: 4
+      }),
+      { success: true, status: 200 }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_amended_notification", "manager", {
+        amendmentVersion: 4
+      }),
+      { success: true, status: 200 }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_cancelled_notification"),
+      { success: true, status: 200 }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_cancelled_notification"),
+      { success: false, status: 500, error: "cancellation delivery failed" }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_cancellation_request_notification"),
+      { success: true, status: 200 }
+    );
+    await updateOrderSideEffectAfterSend(
+      message("staff_order_cancellation_request_notification"),
+      { success: false, status: 500, error: "request delivery failed" }
+    );
+
+    assert.equal(updates.length, 7);
+    assert.ok(updates[0].update.$set.ownerNotifiedAt instanceof Date);
+    assert.equal(
+      updates[0].update.$set.ownerNotificationProviderMessageId,
+      "provider-owner-1"
+    );
+    assert.ok(updates[1].update.$set.ownerNotificationFailedAt instanceof Date);
+    assert.equal(
+      updates[1].update.$set.ownerNotificationFailureReason,
+      "provider unavailable"
+    );
+    assert.equal(updates[2].update.$max.ownerAmendmentNotifiedVersion, 4);
+    assert.ok(updates[3].update.$set.ownerCancellationNotifiedAt instanceof Date);
+    assert.ok(
+      updates[4].update.$set.ownerCancellationNotificationFailedAt instanceof Date
+    );
+    assert.equal(
+      updates[4].update.$set.ownerCancellationNotificationFailureReason,
+      "cancellation delivery failed"
+    );
+    assert.ok(
+      updates[5].update.$set.ownerCancellationRequestNotifiedAt instanceof Date
+    );
+    assert.ok(
+      updates[6].update.$set.ownerCancellationRequestNotificationFailedAt instanceof Date
+    );
+    assert.equal(
+      updates[6].update.$set.ownerCancellationRequestNotificationFailureReason,
+      "request delivery failed"
+    );
+  } finally {
+    restore(Order, "updateOne", originalUpdateOne);
+  }
+});
+
 test("manager quoted order context is exact-recipient scoped and stale-version protected", async () => {
   const originals = {
     orderFindOne: Order.findOne,

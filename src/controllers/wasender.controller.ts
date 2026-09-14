@@ -31,7 +31,8 @@ import {
 } from "../services/cloudinary.service";
 import type {
   MenuItemImageDelivery,
-  RestaurantAgentResponse
+  RestaurantAgentResponse,
+  SenderRole
 } from "../types/agent.types";
 import {
   normalizeGhanaPhone,
@@ -40,7 +41,10 @@ import {
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import { resolveWasenderCustomerIdentity } from "../services/wasenderIdentity.service";
 import { syncCurrentCustomerRecipient } from "../services/customerIdentity.service";
-import { prepareUploadedMenuItemImage } from "../services/menuItemImageWorkflow.service";
+import {
+  menuItemImageOwnerOnlyMessage,
+  prepareUploadedMenuItemImage
+} from "../services/menuItemImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
 
 const customerConversationQueues = new Map<string, Promise<void>>();
@@ -335,6 +339,123 @@ const enqueueTextMessageOrThrow = async (
       usesRestaurantApiToken: Boolean(apiKey?.trim())
     }
   });
+};
+
+interface ProcessInboundStaffMenuImageInput {
+  restaurantId: string;
+  sessionId: string;
+  replyAddress: string;
+  senderPhone: string;
+  senderRole: Extract<SenderRole, "owner" | "manager">;
+  rawMessage: Record<string, unknown>;
+  eventId: string;
+  messageId?: string;
+  apiKey?: string;
+}
+
+interface ProcessInboundStaffMenuImageDependencies {
+  isUploadConfigured: typeof isCloudinaryConfigured;
+  validateMetadata: typeof validateWasenderMenuItemImageMetadata;
+  decryptMedia: typeof decryptWasenderMedia;
+  uploadTrustedImage: typeof uploadTrustedDecryptedImageFromUrl;
+  prepareImage: typeof prepareUploadedMenuItemImage;
+  enqueueText: typeof enqueueTextMessageOrThrow;
+}
+
+export const processInboundStaffMenuImage = async (
+  input: ProcessInboundStaffMenuImageInput,
+  dependencies: Partial<ProcessInboundStaffMenuImageDependencies> = {}
+): Promise<void> => {
+  const enqueueText = dependencies.enqueueText ?? enqueueTextMessageOrThrow;
+
+  if (input.senderRole !== "owner") {
+    await enqueueText(
+      input.sessionId,
+      input.replyAddress,
+      menuItemImageOwnerOnlyMessage,
+      {
+        action: "menu_image_owner_only",
+        restaurantId: input.restaurantId,
+        eventId: input.eventId
+      },
+      input.apiKey
+    );
+    return;
+  }
+
+  const isUploadConfigured =
+    dependencies.isUploadConfigured ?? isCloudinaryConfigured;
+
+  if (!isUploadConfigured()) {
+    await enqueueText(
+      input.sessionId,
+      input.replyAddress,
+      "Image uploads are not configured yet. Please contact support.",
+      {
+        action: "image_upload_error",
+        restaurantId: input.restaurantId,
+        eventId: input.eventId
+      },
+      input.apiKey
+    );
+    throw new Error("Cloudinary image upload is not configured.");
+  }
+
+  try {
+    (dependencies.validateMetadata ?? validateWasenderMenuItemImageMetadata)(
+      input.rawMessage
+    );
+    const decryptedPublicUrl = await (
+      dependencies.decryptMedia ?? decryptWasenderMedia
+    )(input.rawMessage, { apiKey: input.apiKey });
+    const trustedImage = await (
+      dependencies.uploadTrustedImage ?? uploadTrustedDecryptedImageFromUrl
+    )(decryptedPublicUrl);
+    const workflowResult = await (
+      dependencies.prepareImage ?? prepareUploadedMenuItemImage
+    )({
+      restaurantId: input.restaurantId,
+      senderPhone: input.senderPhone,
+      senderRole: input.senderRole,
+      image: trustedImage
+    });
+
+    await enqueueText(
+      input.sessionId,
+      input.replyAddress,
+      workflowResult.message,
+      {
+        action: "image_received",
+        restaurantId: input.restaurantId,
+        eventId: input.eventId
+      },
+      input.apiKey
+    );
+  } catch (imageProcessingError) {
+    const errorMessage = getSafeErrorMessage(
+      imageProcessingError,
+      "Image decryption or Cloudinary upload failed"
+    );
+
+    console.error("Owner image processing failed", {
+      restaurantId: input.restaurantId,
+      messageId: input.messageId,
+      error: errorMessage
+    });
+    await enqueueText(
+      input.sessionId,
+      input.replyAddress,
+      "Sorry, I couldn't process that image. Please send it again.",
+      {
+        action: "image_upload_failed",
+        restaurantId: input.restaurantId,
+        eventId: input.eventId
+      },
+      input.apiKey
+    );
+
+    throw new Error(`Owner image processing failed: ${errorMessage}`);
+  }
 };
 
 const trustedActiveOrderQuestionPurposes = new Set([
@@ -696,62 +817,20 @@ const processNormalizedWebhook = async (
       }
 
       // ── Inbound image from owner/manager ──────────────────────────────────
-      // Decrypt the complete raw message through WaSender, then upload only its
-      // temporary public URL and prepare the menu-item confirmation workflow.
+      // Authorization happens before any media decryption or upload. Only owners
+      // may prepare the menu-item confirmation workflow.
       if (webhook.messageType === "image" && sender.role !== "customer") {
-        if (!isCloudinaryConfigured()) {
-          await enqueueTextMessageOrThrow(
-            restaurant.wasenderSessionId,
-            replyAddress,
-            "Image uploads are not configured yet. Please contact support.",
-            { action: "image_upload_error", restaurantId: String(restaurant._id), eventId },
-            restaurant.wasenderApiToken
-          );
-
-          throw new Error("Cloudinary image upload is not configured.");
-        }
-
-        try {
-          validateWasenderMenuItemImageMetadata(webhook.rawMessage);
-          const decryptedPublicUrl = await decryptWasenderMedia(webhook.rawMessage, {
-            apiKey: restaurant.wasenderApiToken
-          });
-          const trustedImage = await uploadTrustedDecryptedImageFromUrl(decryptedPublicUrl);
-          const workflowResult = await prepareUploadedMenuItemImage({
-            restaurantId: String(restaurant._id),
-            senderPhone: recipientAddress,
-            senderRole: sender.role,
-            image: trustedImage
-          });
-
-          await enqueueTextMessageOrThrow(
-            restaurant.wasenderSessionId,
-            replyAddress,
-            workflowResult.message,
-            { action: "image_received", restaurantId: String(restaurant._id), eventId },
-            restaurant.wasenderApiToken
-          );
-        } catch (imageProcessingError) {
-          const errorMessage = getSafeErrorMessage(
-            imageProcessingError,
-            "Image decryption or Cloudinary upload failed"
-          );
-
-          console.error("Owner image processing failed", {
-            restaurantId: String(restaurant._id),
-            messageId: webhook.messageId,
-            error: errorMessage
-          });
-          await enqueueTextMessageOrThrow(
-            restaurant.wasenderSessionId,
-            replyAddress,
-            "Sorry, I couldn't process that image. Please send it again.",
-            { action: "image_upload_failed", restaurantId: String(restaurant._id), eventId },
-            restaurant.wasenderApiToken
-          );
-
-          throw new Error(`Owner image processing failed: ${errorMessage}`);
-        }
+        await processInboundStaffMenuImage({
+          restaurantId: String(restaurant._id),
+          sessionId: restaurant.wasenderSessionId,
+          replyAddress,
+          senderPhone: recipientAddress,
+          senderRole: sender.role,
+          rawMessage: webhook.rawMessage,
+          eventId,
+          messageId: webhook.messageId,
+          apiKey: restaurant.wasenderApiToken
+        });
 
         webhookEvent.status = "processed";
         webhookEvent.processedAt = new Date();
