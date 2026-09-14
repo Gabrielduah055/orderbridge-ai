@@ -23,6 +23,7 @@ const {
   getAgentToolDefinitionsForRole
 } = require("../dist/services/ai/agentToolDefinitions.service");
 const {
+  isDirectCustomerListRequest,
   runAgentOrchestrator,
   sanitizeStaffFacingFinalText
 } = require("../dist/services/ai/agentOrchestrator.service");
@@ -260,10 +261,10 @@ test("item demand and fulfilled sales use separate submitted-order metrics", asy
   const jollofId = "64b000000000000000000b01";
   const friedRiceId = "64b000000000000000000b02";
   const orders = [
-    order("completed", [item("Jollof", 60, 1200, jollofId)]),
-    order("rejected", [item("Jollof", 40, 800, jollofId)]),
-    order("completed", [item("Fried Rice", 48, 960, friedRiceId)]),
-    order("cancelled", [item("Fried Rice", 2, 40, friedRiceId)]),
+    order("completed", [item("Jollof", 40, 800, jollofId)]),
+    order("rejected", [item("Jollof", 60, 1200, jollofId)]),
+    order("completed", [item("Fried Rice", 65, 1300, friedRiceId)]),
+    order("cancelled", [item("Fried Rice", 5, 100, friedRiceId)]),
     order("awaiting_customer_confirmation", [
       item("Unsubmitted Draft Snapshot", 999, 9999, "64b000000000000000000b03")
     ])
@@ -287,13 +288,19 @@ test("item demand and fulfilled sales use separate submitted-order metrics", asy
     { restaurantId, period: "custom", metric: "fulfilled_quantity" },
     dependencies
   );
+  const revenue = await getItemPerformance(
+    { restaurantId, period: "custom", metric: "fulfilled_revenue" },
+    dependencies
+  );
 
   assert.equal(demand.items[0].name, "Jollof");
   assert.equal(demand.items[0].demandQuantity, 100);
-  assert.equal(demand.items[0].fulfilledQuantity, 60);
+  assert.equal(demand.items[0].fulfilledQuantity, 40);
   assert.equal(demand.items[0].demandOrderCount, 2);
-  assert.equal(fulfilled.items[0].name, "Jollof");
-  assert.equal(fulfilled.items[1].fulfilledQuantity, 48);
+  assert.equal(fulfilled.items[0].name, "Fried Rice");
+  assert.equal(fulfilled.items[0].fulfilledQuantity, 65);
+  assert.equal(revenue.items[0].name, "Fried Rice");
+  assert.equal(revenue.items[0].fulfilledRevenue, 1300);
   assert.equal(demand.items.some((entry) => entry.name.includes("Draft")), false);
   assert.ok(filters.every((filter) => filter.restaurantId === restaurantId));
   assert.ok(
@@ -345,7 +352,10 @@ test("growth compares equal finite ranges and never invents a zero-baseline perc
 
 test("list_customers returns masked, restaurant-scoped opted-in profiles", async () => {
   const originalFind = CustomerProfile.find;
-  let observedFilter;
+  const originalCountDocuments = CustomerProfile.countDocuments;
+  let observedListFilter;
+  let observedCountFilter;
+  let observedLimit;
   const profiles = [
     {
       restaurantId,
@@ -370,15 +380,23 @@ test("list_customers returns masked, restaurant-scoped opted-in profiles", async
   ];
 
   try {
+    CustomerProfile.countDocuments = async (filter) => {
+      observedCountFilter = filter;
+      return profiles.filter(
+        (profile) => profile.restaurantId === filter.restaurantId
+      ).length;
+    };
     CustomerProfile.find = (filter) => {
-      observedFilter = filter;
+      observedListFilter = filter;
       const query = {
         select: () => query,
         sort: () => query,
-        limit: async () =>
-          profiles.filter(
+        limit: async (limit) => {
+          observedLimit = limit;
+          return profiles.filter(
             (profile) => profile.restaurantId === filter.restaurantId
-          )
+          );
+        }
       };
       return query;
     };
@@ -388,24 +406,82 @@ test("list_customers returns masked, restaurant-scoped opted-in profiles", async
       marketingStatus: "opted_in"
     });
 
-    assert.deepEqual(observedFilter, {
+    assert.deepEqual(observedListFilter, {
       restaurantId,
       marketingConsent: true,
       isOptedOut: { $ne: true }
     });
-    assert.deepEqual(customers, [
-      {
-        name: "Ama Mensah",
-        maskedPhone: "***1234",
-        orderCount: 4,
-        lastOrderAt: "2026-09-10T10:00:00.000Z",
-        averageOrderValue: 82.35,
-        marketingStatus: "opted_in"
-      }
-    ]);
+    assert.equal(observedCountFilter, observedListFilter);
+    assert.equal(observedLimit, 25);
+    assert.deepEqual(customers, {
+      totalMatched: 1,
+      returnedCount: 1,
+      truncated: false,
+      customers: [
+        {
+          name: "Ama Mensah",
+          maskedPhone: "***1234",
+          orderCount: 4,
+          lastOrderAt: "2026-09-10T10:00:00.000Z",
+          averageOrderValue: 82.35,
+          marketingStatus: "opted_in"
+        }
+      ]
+    });
     assert.doesNotMatch(JSON.stringify(customers), /Other Tenant Customer/);
   } finally {
     CustomerProfile.find = originalFind;
+    CustomerProfile.countDocuments = originalCountDocuments;
+  }
+});
+
+test("list_customers reports database totals without fetching every match", async () => {
+  const originalFind = CustomerProfile.find;
+  const originalCountDocuments = CustomerProfile.countDocuments;
+  const returnedProfiles = Array.from({ length: 25 }, (_, index) => ({
+    customerName: `Customer ${index + 1}`,
+    customerPhone: `+23350000${String(index).padStart(4, "0")}`,
+    orderCount: 1,
+    lastOrderAt: null,
+    averageOrderValue: 20,
+    marketingConsent: true,
+    isOptedOut: false
+  }));
+  let countFilter;
+  let listFilter;
+
+  try {
+    CustomerProfile.countDocuments = async (filter) => {
+      countFilter = filter;
+      return 87;
+    };
+    CustomerProfile.find = (filter) => {
+      listFilter = filter;
+      const query = {
+        select: () => query,
+        sort: () => query,
+        limit: async (limit) => {
+          assert.equal(limit, 25);
+          return returnedProfiles;
+        }
+      };
+      return query;
+    };
+
+    const result = await listCustomers({
+      restaurantId,
+      marketingStatus: "opted_in"
+    });
+
+    assert.equal(countFilter, listFilter);
+    assert.equal(countFilter.restaurantId, restaurantId);
+    assert.equal(result.totalMatched, 87);
+    assert.equal(result.returnedCount, 25);
+    assert.equal(result.truncated, true);
+    assert.equal(result.customers.length, 25);
+  } finally {
+    CustomerProfile.find = originalFind;
+    CustomerProfile.countDocuments = originalCountDocuments;
   }
 });
 
@@ -442,7 +518,9 @@ test("new owner intelligence tools are staff-only with compact schemas", () => {
 
 test("no opted-in customers returns a direct answer instead of invented privacy", async () => {
   const originalFind = CustomerProfile.find;
+  const originalCountDocuments = CustomerProfile.countDocuments;
   try {
+    CustomerProfile.countDocuments = async () => 0;
     CustomerProfile.find = () => {
       const query = {
         select: () => query,
@@ -463,6 +541,7 @@ test("no opted-in customers returns a direct answer instead of invented privacy"
     assert.doesNotMatch(result.message, /privacy|security|cannot access/i);
   } finally {
     CustomerProfile.find = originalFind;
+    CustomerProfile.countDocuments = originalCountDocuments;
   }
 });
 
@@ -732,6 +811,59 @@ test("multi-turn metric correction changes weekly growth to weekly demand", asyn
   assert.doesNotMatch(result.message, /growing|growth|get_business_report/i);
 });
 
+const runGroundedCustomerListScenario = async ({
+  message,
+  data,
+  modelText = "Sarah and John are opted in.",
+  arguments: toolArguments = { marketingStatus: "opted_in" }
+}) => {
+  let call = 0;
+  return runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "Golden Grill",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: "+233500000000",
+        normalizedPhone: "+233500000000",
+        role: "owner",
+        verified: true
+      },
+      message
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => {
+          call += 1;
+          return call === 1
+            ? {
+                toolCalls: [
+                  {
+                    id: "call_customers",
+                    name: "list_customers",
+                    arguments: toolArguments
+                  }
+                ]
+              }
+            : { text: modelText, toolCalls: [] };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "Use backend facts.",
+      executeTool: async () => ({
+        success: true,
+        message: "Customer list retrieved.",
+        data
+      })
+    }
+  );
+};
+
 test("successful opted-in lookup replaces hallucinated customer names with backend truth", async () => {
   let call = 0;
   const result = await runAgentOrchestrator(
@@ -777,10 +909,15 @@ test("successful opted-in lookup replaces hallucinated customer names with backe
       executeTool: async () => ({
         success: true,
         message: "2 customers matched.",
-        data: [
-          { name: "Ama Mensah", maskedPhone: "***1234" },
-          { name: "Kojo Asante", maskedPhone: "***9876" }
-        ]
+        data: {
+          totalMatched: 2,
+          returnedCount: 2,
+          truncated: false,
+          customers: [
+            { name: "Ama Mensah", maskedPhone: "***1234" },
+            { name: "Kojo Asante", maskedPhone: "***9876" }
+          ]
+        }
       })
     }
   );
@@ -790,6 +927,110 @@ test("successful opted-in lookup replaces hallucinated customer names with backe
     "2 customers have opted in:\n1. Ama Mensah\n2. Kojo Asante"
   );
   assert.doesNotMatch(result.message, /Sarah|John/i);
+});
+
+test("truncated customer lists report the database total and returned count", async () => {
+  const customers = Array.from({ length: 25 }, (_, index) => ({
+    name: `Customer ${index + 1}`,
+    maskedPhone: `***${String(index).padStart(4, "0")}`
+  }));
+  const result = await runGroundedCustomerListScenario({
+    message: "Give me the opted-in customers.",
+    modelText:
+      "25 customers have opted in. Sarah is first according to list_customers.",
+    data: {
+      totalMatched: 87,
+      returnedCount: 25,
+      truncated: true,
+      customers
+    }
+  });
+
+  assert.match(result.message, /^87 customers have opted in\. Showing the first 25:/);
+  assert.doesNotMatch(result.message, /^25 customers have opted in/);
+  assert.doesNotMatch(result.message, /Sarah|list_customers/i);
+  assert.match(result.message, /1\. Customer 1/);
+  assert.match(result.message, /25\. Customer 25/);
+});
+
+test("complete customer lists report the exact total without truncation wording", async () => {
+  const result = await runGroundedCustomerListScenario({
+    message: "Name the customers who opted in.",
+    data: {
+      totalMatched: 3,
+      returnedCount: 3,
+      truncated: false,
+      customers: [
+        { name: "Ama Mensah", maskedPhone: "***1234" },
+        { name: "Kojo Asante", maskedPhone: "***9876" },
+        { name: "Sarah Owusu", maskedPhone: "***4321" }
+      ]
+    }
+  });
+
+  assert.equal(
+    result.message,
+    "3 customers have opted in:\n1. Ama Mensah\n2. Kojo Asante\n3. Sarah Owusu"
+  );
+});
+
+for (const phrasing of [
+  "Give me the opted-in customers.",
+  "Name the customers who opted in.",
+  "Tell me the returning customers.",
+  "Can I see my opted-in customers?"
+]) {
+  test(`direct customer-list phrasing is deterministically grounded: ${phrasing}`, async () => {
+    const result = await runGroundedCustomerListScenario({
+      message: phrasing,
+      arguments: phrasing.includes("returning")
+        ? { returningOnly: true }
+        : { marketingStatus: "opted_in" },
+      data: {
+        totalMatched: 2,
+        returnedCount: 2,
+        truncated: false,
+        customers: [
+          { name: "Ama Mensah", maskedPhone: "***1234" },
+          { name: "Kojo Asante", maskedPhone: "***9876" }
+        ]
+      }
+    });
+
+    assert.match(result.message, /Ama Mensah/);
+    assert.match(result.message, /Kojo Asante/);
+    assert.doesNotMatch(result.message, /Sarah|John/i);
+  });
+}
+
+test("detailed customer-list requests use only backend-grounded safe details", async () => {
+  const result = await runGroundedCustomerListScenario({
+    message: "Show me the opted-in customers and their order counts.",
+    data: {
+      totalMatched: 2,
+      returnedCount: 2,
+      truncated: false,
+      customers: [
+        { name: "Ama Mensah", maskedPhone: "***1234", orderCount: 4 },
+        { name: "Kojo Asante", maskedPhone: "***9876", orderCount: 2 }
+      ]
+    }
+  });
+
+  assert.equal(
+    result.message,
+    "2 customers have opted in:\n1. Ama Mensah — 4 completed orders — ***1234\n2. Kojo Asante — 2 completed orders — ***9876"
+  );
+});
+
+test("direct customer-list intent excludes count-only business questions", () => {
+  assert.equal(isDirectCustomerListRequest("Which people accepted marketing?"), true);
+  assert.equal(
+    isDirectCustomerListRequest("Show the customers that agreed to promotions."),
+    true
+  );
+  assert.equal(isDirectCustomerListRequest("How many customers opted in?"), false);
+  assert.equal(isDirectCustomerListRequest("Tell me the audience size."), false);
 });
 
 test("successful empty opted-in lookup overrides an ungrounded refusal", async () => {
@@ -837,7 +1078,12 @@ test("successful empty opted-in lookup overrides an ungrounded refusal", async (
       executeTool: async () => ({
         success: true,
         message: "There are currently no opted-in customers.",
-        data: []
+        data: {
+          totalMatched: 0,
+          returnedCount: 0,
+          truncated: false,
+          customers: []
+        }
       })
     }
   );
@@ -874,6 +1120,9 @@ test("owner prompt encodes corrections, metric distinctions, campaign safety, an
 
   assert.match(prompt, /latest explicit correction overrides/i);
   assert.match(prompt, /Most ordered.*demand_quantity/i);
+  assert.match(prompt, /Best seller.*fulfilled_quantity/i);
+  assert.match(prompt, /Highest revenue.*fulfilled_revenue/i);
+  assert.match(prompt, /Fastest growing.*growth/i);
   assert.match(prompt, /Growth requires a finite/i);
   assert.match(prompt, /does not authorize campaign creation/i);
   assert.match(prompt, /1 to 4 short sentences/i);

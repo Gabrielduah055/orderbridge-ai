@@ -1228,7 +1228,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_item_performance",
       description:
-        "Owner/manager only. Rank restaurant items using backend-calculated customer demand, completed-order quantity/revenue, or demand growth. Use demand_quantity for 'most ordered' or 'highest demand', fulfilled_quantity for completed portions, fulfilled_revenue for completed revenue, and growth only with a finite comparison period.",
+        "Owner/manager only. Rank restaurant items using backend-calculated customer demand, completed-order quantity/revenue, or demand growth. Use demand_quantity for 'most ordered', 'highest demand', or 'most requested'; fulfilled_quantity for 'best seller', 'sold the most', or completed portions; fulfilled_revenue for highest revenue or most money made; and growth for 'fastest growing' only with a finite comparison period.",
       parameters: {
         period: businessReportPeriodTypes.join(" | "),
         metric: itemPerformanceMetrics.join(" | "),
@@ -1264,7 +1264,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "list_customers",
       description:
-        "Owner/manager only. List safe restaurant-scoped customer profiles, including opted-in customers, with masked phone numbers and stored completed-order statistics.",
+        "Owner/manager only. List safe restaurant-scoped customer profiles, including opted-in customers, with masked phone numbers, stored completed-order statistics, the exact total match count, and truncation metadata.",
       parameters: {
         marketingStatus: customerMarketingStatuses.join(" | "),
         hasCompletedOrder: "Optional completed-order filter.",
@@ -1284,11 +1284,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message:
-          customers.length === 0
+          customers.totalMatched === 0
             ? args.marketingStatus === "opted_in"
               ? "There are currently no opted-in customers."
               : "No customers matched those filters."
-            : `${customers.length} customer${customers.length === 1 ? "" : "s"} matched.`,
+            : `${customers.totalMatched} customer${customers.totalMatched === 1 ? "" : "s"} matched${customers.truncated ? `; returning the first ${customers.returnedCount}` : ""}.`,
         data: customers
       };
     }

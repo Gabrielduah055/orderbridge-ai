@@ -380,11 +380,32 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     expectedArguments: { period: "today" }
   },
   {
+    name: "Highest demand this week",
+    role: "owner",
+    message: "what is our highest demand food this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "demand_quantity" }
+  },
+  {
     name: "Best seller this week",
     role: "manager",
     message: "what be our best seller this week?",
     expectedTool: "get_item_performance",
-    expectedArguments: { period: "this_week", metric: "demand_quantity" }
+    expectedArguments: { period: "this_week", metric: "fulfilled_quantity" }
+  },
+  {
+    name: "Most sold this week",
+    role: "owner",
+    message: "which food sold the most this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "fulfilled_quantity" }
+  },
+  {
+    name: "Highest revenue this week",
+    role: "owner",
+    message: "which food generated the highest revenue this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "fulfilled_revenue" }
   },
   {
     name: "Lifetime most ordered food",
@@ -392,6 +413,13 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     message: "What is the most ordered food since we started?",
     expectedTool: "get_item_performance",
     expectedArguments: { period: "all_time", metric: "demand_quantity" }
+  },
+  {
+    name: "Fastest growing this week",
+    role: "owner",
+    message: "what is our fastest growing food this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "growth" }
   },
   {
     name: "Fastest growth needs a finite period",

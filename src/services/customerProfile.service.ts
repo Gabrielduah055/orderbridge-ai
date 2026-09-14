@@ -109,6 +109,13 @@ export interface CustomerOwnerView {
   marketingStatus: Exclude<CustomerMarketingStatus, "any">;
 }
 
+export interface CustomerListResult {
+  totalMatched: number;
+  returnedCount: number;
+  truncated: boolean;
+  customers: CustomerOwnerView[];
+}
+
 const normalizeDisplayText = (value: string): string => {
   return value.trim().replace(/\s+/g, " ");
 };
@@ -678,7 +685,7 @@ const maskCustomerPhone = (value: string): string => {
 
 export const listCustomers = async (
   input: ListCustomersInput
-): Promise<CustomerOwnerView[]> => {
+): Promise<CustomerListResult> => {
   ensureValidRestaurantId(input.restaurantId);
   const marketingStatus = input.marketingStatus ?? "any";
   const filter: Record<string, unknown> = { restaurantId: input.restaurantId };
@@ -713,14 +720,18 @@ export const listCustomers = async (
     name: { customerName: 1, lastOrderAt: -1 }
   } as const;
   const sort = sortOptions[input.sortBy ?? "recent_order"];
-  const profiles = await CustomerProfile.find(filter)
-    .select(
-      "customerName customerPhone orderCount lastOrderAt averageOrderValue marketingConsent isOptedOut marketingConsentPromptedAt"
-    )
-    .sort(sort)
-    .limit(Math.min(Math.max(input.limit ?? 25, 1), 50));
+  const limit = Math.min(Math.max(input.limit ?? 25, 1), 50);
+  const [totalMatched, profiles] = await Promise.all([
+    CustomerProfile.countDocuments(filter),
+    CustomerProfile.find(filter)
+      .select(
+        "customerName customerPhone orderCount lastOrderAt averageOrderValue marketingConsent isOptedOut marketingConsentPromptedAt"
+      )
+      .sort(sort)
+      .limit(limit)
+  ]);
 
-  return profiles.map((profile) => {
+  const customers = profiles.map((profile) => {
     const maskedPhone = maskCustomerPhone(profile.customerPhone);
     const savedName = profile.customerName?.trim().replace(/\s+/g, " ");
 
@@ -733,6 +744,13 @@ export const listCustomers = async (
       marketingStatus: getCustomerMarketingStatus(profile)
     };
   });
+
+  return {
+    totalMatched,
+    returnedCount: customers.length,
+    truncated: totalMatched > customers.length,
+    customers
+  };
 };
 
 export const getCustomerProfileStatistics = async (
