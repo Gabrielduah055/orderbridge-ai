@@ -11,6 +11,8 @@ const {
   getItemPerformance
 } = require("../dist/services/itemPerformance.service");
 const {
+  buildOwnerSummaryMetrics,
+  getBusinessReport,
   resolveRequestedBusinessReportPeriod
 } = require("../dist/services/ownerSummary.service");
 const { toolRegistry } = require("../dist/agent-tools/tool.registry");
@@ -112,6 +114,146 @@ test("all-time and custom periods are timezone-safe and tenant scoped", async ()
     }),
     (error) => error.code === "CUSTOM_REPORT_START_DATE_REQUIRED"
   );
+
+  const openEnded = await resolveRequestedBusinessReportPeriod({
+    restaurantId,
+    period: "custom",
+    timezone: "Africa/Accra",
+    startDate: "2026-09-01",
+    now: new Date("2026-09-14T12:34:56.000Z")
+  });
+  assert.equal(openEnded.periodStart.toISOString(), "2026-09-01T00:00:00.000Z");
+  assert.equal(openEnded.periodEnd.toISOString(), "2026-09-14T12:34:56.000Z");
+
+  await assert.rejects(
+    resolveRequestedBusinessReportPeriod({
+      restaurantId,
+      period: "custom",
+      timezone: "Africa/Accra",
+      startDate: "2026-09-15",
+      endDate: "2026-09-14"
+    }),
+    (error) => error.code === "INVALID_REPORT_DATE_RANGE"
+  );
+});
+
+const summaryOrder = (
+  customerPhone,
+  status = "completed",
+  createdAt = "2026-02-01T12:00:00.000Z"
+) => ({
+  status,
+  total: 50,
+  customerPhone,
+  items: [],
+  createdAt: new Date(createdAt)
+});
+
+test("all-time customer semantics classify lifetime repeat customers", () => {
+  const metrics = buildOwnerSummaryMetrics(
+    {
+      restaurantId,
+      periodStart: new Date("2025-01-01T00:00:00.000Z"),
+      periodEnd: new Date("2027-01-01T00:00:00.000Z"),
+      timezone: "Africa/Accra",
+      periodType: "custom",
+      customerSemantics: "lifetime"
+    },
+    [
+      summaryOrder("0551234567"),
+      summaryOrder("+233551234567"),
+      summaryOrder("233551234567"),
+      summaryOrder("0241234567"),
+      summaryOrder("0502223333"),
+      summaryOrder("+233502223333"),
+      summaryOrder("0200000001", "cancelled"),
+      summaryOrder("0200000002", "rejected"),
+      summaryOrder("0200000003", "pending")
+    ],
+    []
+  );
+
+  assert.equal(metrics.uniqueCustomers, 3);
+  assert.equal(metrics.returningCustomers, 2);
+  assert.equal(metrics.newCustomers, 1);
+  assert.equal(metrics.newCustomers + metrics.returningCustomers, metrics.uniqueCustomers);
+});
+
+test("finite-period customer semantics remain based on pre-period history", () => {
+  const metrics = buildOwnerSummaryMetrics(
+    {
+      restaurantId,
+      periodStart: new Date("2026-02-01T00:00:00.000Z"),
+      periodEnd: new Date("2026-03-01T00:00:00.000Z"),
+      timezone: "Africa/Accra",
+      periodType: "custom",
+      customerSemantics: "period_relative"
+    },
+    [
+      summaryOrder("0551234567"),
+      summaryOrder("+233551234567"),
+      summaryOrder("0241234567")
+    ],
+    [summaryOrder("+233241234567")]
+  );
+
+  assert.equal(metrics.uniqueCustomers, 2);
+  assert.equal(metrics.returningCustomers, 1);
+  assert.equal(metrics.newCustomers, 1);
+});
+
+test("formatted all-time reports use lifetime customer semantics and allow no orders", async () => {
+  const lifetimeOrders = [
+    summaryOrder("0551234567"),
+    summaryOrder("+233551234567"),
+    summaryOrder("0241234567"),
+    summaryOrder("0502223333"),
+    summaryOrder("+233502223333")
+  ];
+  const allTimePeriod = {
+    type: "all_time",
+    label: "All time",
+    summaryType: "custom",
+    timezone: "Africa/Accra",
+    periodStart: new Date("2026-01-01T00:00:00.000Z"),
+    periodEnd: new Date("2026-09-14T12:00:00.000Z"),
+    key: "all-time"
+  };
+  const report = await getBusinessReport(
+    {
+      restaurantId,
+      restaurantName: "Golden Grill",
+      period: "all_time"
+    },
+    {
+      resolvePeriod: async () => allTimePeriod,
+      getMetrics: async (input) =>
+        buildOwnerSummaryMetrics(input, lifetimeOrders, [])
+    }
+  );
+
+  assert.match(
+    report.formattedReport,
+    /CUSTOMERS[\s\S]*Unique customers: 3[\s\S]*New customers: 1[\s\S]*Returning customers: 2/
+  );
+
+  const emptyReport = await getBusinessReport(
+    {
+      restaurantId,
+      restaurantName: "Empty Restaurant",
+      period: "all_time"
+    },
+    {
+      resolvePeriod: async () => ({
+        ...allTimePeriod,
+        periodStart: allTimePeriod.periodEnd
+      }),
+      getMetrics: async (input) => buildOwnerSummaryMetrics(input, [], [])
+    }
+  );
+  assert.equal(emptyReport.orders.total, 0);
+  assert.equal(emptyReport.customers.unique, 0);
+  assert.match(emptyReport.formattedReport, /ALL-TIME REPORT/);
 });
 
 test("item demand and fulfilled sales use separate submitted-order metrics", async () => {
@@ -204,6 +346,28 @@ test("growth compares equal finite ranges and never invents a zero-baseline perc
 test("list_customers returns masked, restaurant-scoped opted-in profiles", async () => {
   const originalFind = CustomerProfile.find;
   let observedFilter;
+  const profiles = [
+    {
+      restaurantId,
+      customerName: "Ama Mensah",
+      customerPhone: "+233501231234",
+      orderCount: 4,
+      lastOrderAt: new Date("2026-09-10T10:00:00.000Z"),
+      averageOrderValue: 82.345,
+      marketingConsent: true,
+      isOptedOut: false
+    },
+    {
+      restaurantId: otherRestaurantId,
+      customerName: "Other Tenant Customer",
+      customerPhone: "+233509999999",
+      orderCount: 9,
+      lastOrderAt: new Date("2026-09-11T10:00:00.000Z"),
+      averageOrderValue: 999,
+      marketingConsent: true,
+      isOptedOut: false
+    }
+  ];
 
   try {
     CustomerProfile.find = (filter) => {
@@ -211,17 +375,10 @@ test("list_customers returns masked, restaurant-scoped opted-in profiles", async
       const query = {
         select: () => query,
         sort: () => query,
-        limit: async () => [
-          {
-            customerName: "Ama Mensah",
-            customerPhone: "+233501231234",
-            orderCount: 4,
-            lastOrderAt: new Date("2026-09-10T10:00:00.000Z"),
-            averageOrderValue: 82.345,
-            marketingConsent: true,
-            isOptedOut: false
-          }
-        ]
+        limit: async () =>
+          profiles.filter(
+            (profile) => profile.restaurantId === filter.restaurantId
+          )
       };
       return query;
     };
@@ -246,7 +403,7 @@ test("list_customers returns masked, restaurant-scoped opted-in profiles", async
         marketingStatus: "opted_in"
       }
     ]);
-    assert.equal(JSON.stringify(customers).includes(otherRestaurantId), false);
+    assert.doesNotMatch(JSON.stringify(customers), /Other Tenant Customer/);
   } finally {
     CustomerProfile.find = originalFind;
   }
@@ -402,7 +559,180 @@ test("exact lifetime demand question executes all-time demand analytics and retu
   assert.doesNotMatch(result.message, /today|this week|privacy/i);
 });
 
-test("successful opted-in lookup deterministically overrides an invented privacy refusal", async () => {
+test("multi-turn owner correction overrides growth and finite-period assumptions", async () => {
+  const firstQuestion = "So far, what is the fastest growing food?";
+  const clarification =
+    "Which period should I compare — this week, this month, or a custom range?";
+  const correction =
+    "I'm not talking about today or this week. I'm talking about the entire orders since the beginning of operations. I mean the food customers have ordered the most.";
+  const executed = [];
+  let providerCall = 0;
+  let firstRequestMessages;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "Golden Grill",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: "+233500000000",
+        normalizedPhone: "+233500000000",
+        role: "owner",
+        verified: true
+      },
+      message: correction
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async (request) => {
+          providerCall += 1;
+          if (providerCall === 1) {
+            firstRequestMessages = request.messages.map((message) => ({
+              role: message.role,
+              content: message.content
+            }));
+            return {
+              toolCalls: [
+                {
+                  id: "corrected_item_lookup",
+                  name: "get_item_performance",
+                  arguments: {
+                    period: "all_time",
+                    metric: "demand_quantity",
+                    limit: 1
+                  }
+                }
+              ]
+            };
+          }
+          return {
+            text:
+              "Jollof Rice is the most ordered food overall: 84 portions across 52 orders, according to get_item_performance.",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [
+        { role: "user", content: firstQuestion },
+        { role: "assistant", content: clarification }
+      ],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "Use the latest correction and backend facts.",
+      executeTool: async (toolName, args) => {
+        executed.push({ toolName, args });
+        return {
+          success: true,
+          message: "Item performance retrieved successfully.",
+          data: {
+            items: [
+              {
+                name: "Jollof Rice",
+                demandQuantity: 84,
+                demandOrderCount: 52
+              }
+            ]
+          }
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(
+    firstRequestMessages.slice(1),
+    [
+      { role: "user", content: firstQuestion },
+      { role: "assistant", content: clarification },
+      { role: "user", content: correction }
+    ]
+  );
+  assert.deepEqual(executed, [
+    {
+      toolName: "get_item_performance",
+      args: { period: "all_time", metric: "demand_quantity", limit: 1 }
+    }
+  ]);
+  assert.equal(result.executedTools.some((tool) => tool.name === "get_business_report"), false);
+  assert.match(result.message, /Jollof Rice.*84 portions.*52 orders/i);
+  assert.doesNotMatch(
+    result.message,
+    /growth|which period|historical information is unavailable|get_item_performance/i
+  );
+});
+
+test("multi-turn metric correction changes weekly growth to weekly demand", async () => {
+  let providerCall = 0;
+  const executed = [];
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "Golden Grill",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: "+233500000000",
+        normalizedPhone: "+233500000000",
+        role: "owner",
+        verified: true
+      },
+      message: "No, I mean which food has been ordered the most this week."
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => {
+          providerCall += 1;
+          return providerCall === 1
+            ? {
+                toolCalls: [
+                  {
+                    id: "weekly_demand_correction",
+                    name: "get_item_performance",
+                    arguments: {
+                      period: "this_week",
+                      metric: "demand_quantity",
+                      limit: 1
+                    }
+                  }
+                ]
+              }
+            : {
+                text: "Jollof Rice has the highest demand this week.",
+                toolCalls: []
+              };
+        }
+      },
+      getHistory: async () => [
+        { role: "user", content: "What is growing fastest this week?" },
+        { role: "assistant", content: "Jollof Rice grew fastest this week." }
+      ],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "Use the latest correction.",
+      executeTool: async (toolName, args) => {
+        executed.push({ toolName, args });
+        return {
+          success: true,
+          message: "Item performance retrieved successfully.",
+          data: { items: [{ name: "Jollof Rice", demandQuantity: 20 }] }
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(executed, [
+    {
+      toolName: "get_item_performance",
+      args: { period: "this_week", metric: "demand_quantity", limit: 1 }
+    }
+  ]);
+  assert.doesNotMatch(result.message, /growing|growth|get_business_report/i);
+});
+
+test("successful opted-in lookup replaces hallucinated customer names with backend truth", async () => {
   let call = 0;
   const result = await runAgentOrchestrator(
     {
@@ -436,8 +766,7 @@ test("successful opted-in lookup deterministically overrides an invented privacy
                 ]
               }
             : {
-                text:
-                  "I cannot show individual customers for privacy and data security reasons.",
+                text: "Sarah and John are opted in.",
                 toolCalls: []
               };
         }
@@ -460,7 +789,61 @@ test("successful opted-in lookup deterministically overrides an invented privacy
     result.message,
     "2 customers have opted in:\n1. Ama Mensah\n2. Kojo Asante"
   );
-  assert.doesNotMatch(result.message, /privacy|security|cannot/i);
+  assert.doesNotMatch(result.message, /Sarah|John/i);
+});
+
+test("successful empty opted-in lookup overrides an ungrounded refusal", async () => {
+  let call = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "Golden Grill",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: "+233500000000",
+        normalizedPhone: "+233500000000",
+        role: "owner",
+        verified: true
+      },
+      message: "Who opted in?"
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => {
+          call += 1;
+          return call === 1
+            ? {
+                toolCalls: [
+                  {
+                    id: "call_empty_customers",
+                    name: "list_customers",
+                    arguments: { marketingStatus: "opted_in" }
+                  }
+                ]
+              }
+            : {
+                text: "I can't show that information.",
+                toolCalls: []
+              };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "Use backend facts.",
+      executeTool: async () => ({
+        success: true,
+        message: "There are currently no opted-in customers.",
+        data: []
+      })
+    }
+  );
+
+  assert.equal(result.message, "There are currently no opted-in customers.");
+  assert.doesNotMatch(result.message, /can't show|cannot|privacy|security/i);
 });
 
 test("owner prompt encodes corrections, metric distinctions, campaign safety, and concise answers", async () => {

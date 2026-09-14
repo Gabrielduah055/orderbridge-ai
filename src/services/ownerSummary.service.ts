@@ -135,6 +135,7 @@ export interface GetOwnerSummaryMetricsInput {
   periodEnd: Date;
   timezone?: string;
   periodType?: OwnerSummaryPeriodType;
+  customerSemantics?: "period_relative" | "lifetime";
 }
 
 type SummaryOrder = Pick<
@@ -525,8 +526,14 @@ export const resolveRequestedBusinessReportPeriod = async (
   const periodEnd = input.endDate?.trim()
     ? parseReportDateBoundary(input.endDate, "endDate", timezone)
     : now;
+  const endDateIsLocalCalendarDay = Boolean(
+    input.endDate?.trim().match(/^\d{4}-\d{2}-\d{2}$/)
+  );
 
-  if (periodStart > periodEnd) {
+  if (
+    periodStart > periodEnd ||
+    (endDateIsLocalCalendarDay && periodStart.getTime() === periodEnd.getTime())
+  ) {
     throw new BadRequestError(
       "startDate must not be after endDate.",
       "INVALID_REPORT_DATE_RANGE"
@@ -665,15 +672,40 @@ export const buildOwnerSummaryMetrics = (
     )
     .slice(0, 5);
   const periodCustomers = getNormalizedCustomerPhones(completedOrders);
-  const priorCustomers = getNormalizedCustomerPhones(
-    priorCustomerOrders.filter((order) => order.status === "completed")
-  );
   let returningCustomers = 0;
+  let newCustomers = 0;
 
-  for (const phone of periodCustomers) {
-    if (priorCustomers.has(phone)) {
-      returningCustomers += 1;
+  if (input.customerSemantics === "lifetime") {
+    const completedOrdersByCustomer = new Map<string, number>();
+
+    for (const order of completedOrders) {
+      const phone = normalizeWhatsappRecipient(order.customerPhone);
+      if (phone) {
+        completedOrdersByCustomer.set(
+          phone,
+          (completedOrdersByCustomer.get(phone) ?? 0) + 1
+        );
+      }
     }
+
+    for (const completedOrderCount of completedOrdersByCustomer.values()) {
+      if (completedOrderCount >= 2) {
+        returningCustomers += 1;
+      } else {
+        newCustomers += 1;
+      }
+    }
+  } else {
+    const priorCustomers = getNormalizedCustomerPhones(
+      priorCustomerOrders.filter((order) => order.status === "completed")
+    );
+
+    for (const phone of periodCustomers) {
+      if (priorCustomers.has(phone)) {
+        returningCustomers += 1;
+      }
+    }
+    newCustomers = periodCustomers.size - returningCustomers;
   }
 
   const ordersByDay = new Map<string, OwnerSummaryBusiestDay>();
@@ -717,7 +749,7 @@ export const buildOwnerSummaryMetrics = (
         : 0,
     topSellingItems,
     uniqueCustomers: periodCustomers.size,
-    newCustomers: periodCustomers.size - returningCustomers,
+    newCustomers,
     returningCustomers,
     busiestDay
   };
@@ -746,13 +778,15 @@ export const getOwnerSummaryMetrics = async (
         $lt: input.periodEnd
       }
     }).select("status total customerPhone items createdAt"),
-    Order.find({
-      restaurantId: input.restaurantId,
-      status: "completed",
-      createdAt: {
-        $lt: input.periodStart
-      }
-    }).select("status customerPhone")
+    input.customerSemantics === "lifetime"
+      ? Promise.resolve([])
+      : Order.find({
+          restaurantId: input.restaurantId,
+          status: "completed",
+          createdAt: {
+            $lt: input.periodStart
+          }
+        }).select("status customerPhone")
   ]);
 
   return buildOwnerSummaryMetrics(input, periodOrders, priorCustomerOrders);
@@ -1038,7 +1072,9 @@ export const getBusinessReport = async (
     periodStart: period.periodStart,
     periodEnd: period.periodEnd,
     timezone,
-    periodType: period.summaryType
+    periodType: period.summaryType,
+    customerSemantics:
+      period.type === "all_time" ? "lifetime" : "period_relative"
   });
   let comparison: BusinessReportComparison | null = null;
 
@@ -1049,7 +1085,8 @@ export const getBusinessReport = async (
       periodStart: previousPeriod.periodStart,
       periodEnd: previousPeriod.periodEnd,
       timezone,
-      periodType: previousPeriod.summaryType
+      periodType: previousPeriod.summaryType,
+      customerSemantics: "period_relative"
     });
     comparison = buildBusinessReportComparison(
       period.type,

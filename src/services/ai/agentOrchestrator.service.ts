@@ -118,44 +118,76 @@ export const sanitizeStaffFacingFinalText = (text: string): string => {
     .trim();
 };
 
-const buildGroundedCustomerListCorrection = (
-  message: string,
+const buildGroundedCustomerListAnswer = (
+  modelMessage: string,
+  ownerMessage: string,
   customers: unknown[] | undefined,
   args: Record<string, unknown> | undefined
 ): string | null => {
-  if (
-    !customers ||
-    !/\b(?:privacy|private|data security|security reasons?|regulations?|cannot access|can't access|not allowed to show)\b/i.test(
-      message
-    )
-  ) {
+  if (!customers) {
     return null;
   }
 
   const optedIn = args?.marketingStatus === "opted_in";
+  const directListRequest =
+    /\b(?:who|list|show|which)\b/i.test(ownerMessage) &&
+    /\b(?:customers?|people|opted[ -]?in|returning)\b/i.test(ownerMessage);
+  const ungroundedRefusal =
+    /\b(?:privacy|private|data security|security reasons?|regulations?|cannot access|can't access|can't show|cannot show|not allowed to show)\b/i.test(
+      modelMessage
+    );
+
+  if (!directListRequest && !ungroundedRefusal) {
+    return null;
+  }
+
   if (customers.length === 0) {
     return optedIn
       ? "There are currently no opted-in customers."
       : "No customers matched those filters.";
   }
 
-  const names = customers
-    .map((customer) =>
-      customer && typeof customer === "object"
-        ? (customer as Record<string, unknown>).name
-        : undefined
+  const safeCustomers = customers
+    .filter(
+      (customer): customer is Record<string, unknown> =>
+        Boolean(customer) && typeof customer === "object"
     )
-    .filter((name): name is string => typeof name === "string" && Boolean(name.trim()));
+    .filter(
+      (customer) =>
+        typeof customer.name === "string" && Boolean(customer.name.trim())
+    );
 
-  if (names.length === 0) {
+  if (safeCustomers.length === 0) {
     return `${customers.length} customer${customers.length === 1 ? "" : "s"} matched.`;
   }
+
+  const includeDetails =
+    /\b(?:details?|phone|number|how many orders|order count|average|last order)\b/i.test(
+      ownerMessage
+    );
+  const lines = safeCustomers.map((customer, index) => {
+    const name = String(customer.name);
+    if (!includeDetails) {
+      return `${index + 1}. ${name}`;
+    }
+
+    const details = [
+      typeof customer.orderCount === "number"
+        ? `${customer.orderCount} completed order${customer.orderCount === 1 ? "" : "s"}`
+        : undefined,
+      typeof customer.maskedPhone === "string"
+        ? customer.maskedPhone
+        : undefined
+    ].filter((detail): detail is string => Boolean(detail));
+
+    return `${index + 1}. ${name}${details.length > 0 ? ` — ${details.join(" — ")}` : ""}`;
+  });
 
   return [
     optedIn
       ? `${customers.length} customer${customers.length === 1 ? " has" : "s have"} opted in:`
       : `${customers.length} customer${customers.length === 1 ? "" : "s"} matched:`,
-    ...names.map((name, index) => `${index + 1}. ${name}`)
+    ...lines
   ].join("\n");
 };
 
@@ -852,8 +884,9 @@ export const runAgentOrchestrator = async (
             : imageSafeFinalMessage;
         if (input.sender.role === "owner" || input.sender.role === "manager") {
           finalMessage =
-            buildGroundedCustomerListCorrection(
+            buildGroundedCustomerListAnswer(
               finalMessage,
+              normalizedInputMessage,
               latestCustomerList,
               latestCustomerListArgs
             ) ?? finalMessage;
