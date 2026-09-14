@@ -123,7 +123,7 @@ test("live staff decisions use production role-filtered tool definitions", () =>
   assert.equal(ownerTools.has("update_menu_price"), true);
   assert.equal(managerTools.has("update_menu_price"), false);
   assert.equal(ownerTools.has("get_business_report"), true);
-  assert.equal(managerTools.has("get_business_report"), true);
+  assert.equal(managerTools.has("get_business_report"), false);
 });
 
 test("ordinary live eval scenarios receive normal production staff-state context", async () => {

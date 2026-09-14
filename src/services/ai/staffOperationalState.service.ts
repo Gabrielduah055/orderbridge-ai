@@ -353,7 +353,11 @@ export const buildStaffOperationalState = async (
     : Promise.resolve([]);
   const trustedQuotedContextPromise =
     quotedMessageId && !dependencies.findOrders
-      ? findTrustedQuotedOwnerOrderContext(restaurantId, quotedMessageId)
+      ? findTrustedQuotedOwnerOrderContext(
+          restaurantId,
+          quotedMessageId,
+          input.sender
+        )
       : Promise.resolve(null);
   const quotedOrderPromise = quotedMessageId && dependencies.findOrders
     ? findOrders(

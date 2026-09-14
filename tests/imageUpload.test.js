@@ -555,7 +555,7 @@ test("uploaded Cloudinary metadata is stored outside AI tool arguments", async (
 });
 
 test("AI-facing image workflow schemas cannot accept image URLs", async () => {
-  const definitions = getAgentToolDefinitionsForRole("manager");
+  const definitions = getAgentToolDefinitionsForRole("owner");
   const imageToolNames = [
     "start_menu_item_image_upload",
     "assign_pending_image_to_menu_item",
@@ -583,7 +583,7 @@ test("AI-facing image workflow schemas cannot accept image URLs", async () => {
       sender: {
         phone: senderPhone,
         normalizedPhone: senderPhone,
-        role: "manager",
+        role: "owner",
         verified: true
       }
     }

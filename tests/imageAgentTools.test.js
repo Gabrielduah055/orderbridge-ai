@@ -832,14 +832,14 @@ test("invalid, cross-restaurant, cross-sender, and customer image operations are
         sender: {
           phone: otherSenderPhone,
           normalizedPhone: otherSenderPhone,
-          role: "manager",
+          role: "owner",
           verified: true
         }
       })
     );
     assert.equal(crossSender.code, "PENDING_IMAGE_NOT_FOUND");
     assert.equal(capturedFilter.senderPhone, otherSenderPhone);
-    assert.equal(capturedFilter.senderRole, "manager");
+    assert.equal(capturedFilter.senderRole, "owner");
 
     const customer = await executeAgentTool(
       "start_menu_item_image_upload",
@@ -1021,11 +1021,12 @@ test("image tool definitions expose no media arguments and customer capabilities
     "confirm_pending_image_assignment",
     "cancel_pending_image_assignment"
   ];
+  const ownerDefinitions = getAgentToolDefinitionsForRole("owner");
   const managerDefinitions = getAgentToolDefinitionsForRole("manager");
   const customerDefinitions = getAgentToolDefinitionsForRole("customer");
 
   for (const name of toolNames) {
-    const definition = managerDefinitions.find(
+    const definition = ownerDefinitions.find(
       (candidate) => candidate.function.name === name
     );
     assert.ok(definition, name);
@@ -1035,6 +1036,10 @@ test("image tool definitions expose no media arguments and customer capabilities
     );
     assert.equal(
       customerDefinitions.some((candidate) => candidate.function.name === name),
+      false
+    );
+    assert.equal(
+      managerDefinitions.some((candidate) => candidate.function.name === name),
       false
     );
 

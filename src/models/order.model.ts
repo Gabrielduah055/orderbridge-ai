@@ -111,6 +111,10 @@ export interface IOrder {
   restaurantConfirmedAt?: Date;
   restaurantRejectedAt?: Date;
   restaurantRejectionReason?: string;
+  restaurantDecisionByPhone?: string;
+  restaurantDecisionByRole?: "owner" | "manager";
+  restaurantDecisionByName?: string;
+  restaurantDecisionAt?: Date;
   customerConfirmedNotificationSentAt?: Date;
   rejectionNotificationSentAt?: Date;
   customerNotificationFailedAt?: Date;
@@ -388,6 +392,21 @@ const orderSchema = new Schema<IOrderDocument>(
     restaurantRejectionReason: {
       type: String,
       trim: true
+    },
+    restaurantDecisionByPhone: {
+      type: String,
+      trim: true
+    },
+    restaurantDecisionByRole: {
+      type: String,
+      enum: ["owner", "manager"]
+    },
+    restaurantDecisionByName: {
+      type: String,
+      trim: true
+    },
+    restaurantDecisionAt: {
+      type: Date
     },
     customerConfirmedNotificationSentAt: {
       type: Date

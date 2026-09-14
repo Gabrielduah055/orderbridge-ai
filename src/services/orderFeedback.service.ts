@@ -27,6 +27,10 @@ import {
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { queueMarketingConsentRequestAfterSuccessfulOrder } from "./customerMarketingOnboarding.service";
 import { getCustomerIdentityFilter } from "./customerIdentity.service";
+import {
+  resolveOperationalRecipients,
+  resolveOwnerNotificationRecipient
+} from "./operationalRecipient.service";
 
 export interface FeedbackClassification {
   type: OrderFeedbackType;
@@ -454,9 +458,23 @@ export const notifyOwnerOfOrderFeedback = async (
     "+wasenderApiToken"
   );
 
+  const operationalIssue = new Set<OrderFeedbackType>([
+    "complaint",
+    "delivery_not_received",
+    "mixed"
+  ]).has(feedback.type);
+  const recipients = restaurant
+    ? operationalIssue
+      ? resolveOperationalRecipients(restaurant)
+      : [resolveOwnerNotificationRecipient(restaurant)].filter(
+          (recipient): recipient is NonNullable<typeof recipient> =>
+            Boolean(recipient)
+        )
+    : [];
+
   if (
     !restaurant ||
-    !restaurant.ownerPhone?.trim() ||
+    recipients.length === 0 ||
     !restaurant.wasenderSessionId?.trim() ||
     !restaurant.wasenderApiToken?.trim()
   ) {
@@ -467,7 +485,7 @@ export const notifyOwnerOfOrderFeedback = async (
         $set: {
           ownerNotificationFailedAt: failedAt,
           ownerNotificationFailureReason:
-            "Restaurant owner Wasender credentials are unavailable"
+            "Restaurant staff Wasender credentials are unavailable"
         }
       }
     );
@@ -475,24 +493,34 @@ export const notifyOwnerOfOrderFeedback = async (
   }
 
   try {
-    await enqueueWasenderMessage({
-      restaurantId,
-      sessionId: restaurant.wasenderSessionId,
-      to: normalizeGhanaPhone(restaurant.ownerPhone),
-      type: "text",
-      text: buildOwnerFeedbackNotification(feedback),
-      apiKey: restaurant.wasenderApiToken,
-      idempotencyKey: `order-feedback-owner-notification:${String(feedback._id)}:v1`,
-      metadata: {
-        kind: "order_feedback_owner_notification",
-        restaurantId,
-        orderId: String(feedback.orderId),
-        orderNumber: feedback.orderNumber,
-        feedbackId: String(feedback._id),
-        purpose: "transactional",
-        recipientType: "owner"
-      }
-    });
+    await Promise.all(
+      recipients.map((recipient) =>
+        enqueueWasenderMessage({
+          restaurantId,
+          sessionId: restaurant.wasenderSessionId,
+          to: recipient.recipientPhone,
+          type: "text",
+          text: buildOwnerFeedbackNotification(feedback),
+          apiKey: restaurant.wasenderApiToken,
+          idempotencyKey: `order-feedback-${operationalIssue ? "staff" : "owner"}-notification:${String(feedback._id)}:v1:${recipient.recipientPhone}`,
+          metadata: {
+            kind: operationalIssue
+              ? "order_feedback_staff_notification"
+              : "order_feedback_owner_notification",
+            restaurantId,
+            orderId: String(feedback.orderId),
+            orderNumber: feedback.orderNumber,
+            feedbackId: String(feedback._id),
+            purpose: "transactional",
+            recipientType: recipient.recipientType,
+            recipientPhone: recipient.recipientPhone,
+            ...(recipient.recipientName
+              ? { recipientName: recipient.recipientName }
+              : {})
+          }
+        })
+      )
+    );
   } catch (error) {
     await OrderFeedback.updateOne(
       { _id: feedback._id, restaurantId },
@@ -502,7 +530,7 @@ export const notifyOwnerOfOrderFeedback = async (
           ownerNotificationFailureReason:
             error instanceof Error
               ? error.message
-              : "Owner feedback notification could not be queued"
+              : "Staff feedback notification could not be queued"
         }
       }
     );

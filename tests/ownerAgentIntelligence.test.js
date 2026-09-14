@@ -485,10 +485,10 @@ test("list_customers reports database totals without fetching every match", asyn
   }
 });
 
-test("new owner intelligence tools are staff-only with compact schemas", () => {
+test("new owner intelligence tools are owner-only with compact schemas", () => {
   for (const toolName of ["get_item_performance", "list_customers"]) {
     assert.equal(isToolAllowedForRole(toolName, "owner"), true);
-    assert.equal(isToolAllowedForRole(toolName, "manager"), true);
+    assert.equal(isToolAllowedForRole(toolName, "manager"), false);
     assert.equal(isToolAllowedForRole(toolName, "customer"), false);
   }
   const ownerDefinitions = getAgentToolDefinitionsForRole("owner");

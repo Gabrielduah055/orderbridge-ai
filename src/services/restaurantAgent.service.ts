@@ -1550,7 +1550,8 @@ export const handleRestaurantAgentMessage = async (
         restaurantId,
         sender.normalizedPhone,
         message,
-        sender.role as Extract<SenderRole, "owner" | "manager">
+        sender.role as Extract<SenderRole, "owner" | "manager">,
+        sender.name
       );
       const cancellationResponse: RestaurantAgentResponse = {
         success: cancellationResult.handled && cancellationResult.success,
@@ -2250,7 +2251,8 @@ export const handleRestaurantAgentMessage = async (
       restaurantId,
       sender.normalizedPhone,
       message,
-      sender.role
+      sender.role,
+      sender.name
     );
 
     if (selectionResult.handled) {
@@ -2335,7 +2337,8 @@ export const handleRestaurantAgentMessage = async (
           staffOrderMutationIntent.kind,
           staffOrderMutationIntent.reason,
           sender.normalizedPhone,
-          sender.role
+          sender.role,
+          sender.name
         );
         const result = quotedResult.handled
           ? quotedResult
@@ -2344,7 +2347,8 @@ export const handleRestaurantAgentMessage = async (
               sender.normalizedPhone,
               staffOrderMutationIntent.kind,
               sender.role,
-              staffOrderMutationIntent.reason
+              staffOrderMutationIntent.reason,
+              sender.name
             );
         fallbackResponse = {
           success: result.success,
@@ -2418,7 +2422,8 @@ export const handleRestaurantAgentMessage = async (
       simpleOwnerDecision,
       undefined,
       sender.normalizedPhone,
-      sender.role
+      sender.role,
+      sender.name
     );
     const result = quotedResult.handled
       ? quotedResult
@@ -2426,7 +2431,9 @@ export const handleRestaurantAgentMessage = async (
           restaurantId,
           sender.normalizedPhone,
           simpleOwnerDecision,
-          sender.role
+          sender.role,
+          undefined,
+          sender.name
         );
 
     await saveAgentConversationMessage({

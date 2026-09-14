@@ -89,6 +89,10 @@ const transactionalKinds = new Set([
   "owner_order_cancelled_notification",
   "owner_order_cancellation_request_notification",
   "owner_order_amended_notification",
+  "staff_order_notification",
+  "staff_order_cancelled_notification",
+  "staff_order_cancellation_request_notification",
+  "staff_order_amended_notification",
   "owner_action_reminder",
   "staff_reminder",
   "owner_summary",
@@ -99,6 +103,7 @@ const transactionalKinds = new Set([
   "order_feedback_request",
   "order_feedback_reminder",
   "order_feedback_owner_notification",
+  "order_feedback_staff_notification",
   "marketing_consent_request"
 ]);
 
@@ -121,7 +126,10 @@ export const getQueuedOwnerOrderNotificationStaleReason = async (
   if (
     kind !== "owner_order_notification" &&
     kind !== "owner_order_amended_notification" &&
-    kind !== "owner_order_cancellation_request_notification"
+    kind !== "owner_order_cancellation_request_notification" &&
+    kind !== "staff_order_notification" &&
+    kind !== "staff_order_amended_notification" &&
+    kind !== "staff_order_cancellation_request_notification"
   ) {
     return null;
   }
@@ -140,7 +148,10 @@ export const getQueuedOwnerOrderNotificationStaleReason = async (
     return "order no longer exists";
   }
 
-  if (kind === "owner_order_cancellation_request_notification") {
+  if (
+    kind === "owner_order_cancellation_request_notification" ||
+    kind === "staff_order_cancellation_request_notification"
+  ) {
     return order.customerCancellationRequestStatus === "pending"
       ? null
       : "cancellation request is no longer pending";
@@ -1413,7 +1424,10 @@ export const processNextQueuedWasenderMessage = async (
   if (
     locked.metadata?.kind === "owner_order_notification" ||
     locked.metadata?.kind === "owner_order_amended_notification" ||
-    locked.metadata?.kind === "owner_order_cancellation_request_notification"
+    locked.metadata?.kind === "owner_order_cancellation_request_notification" ||
+    locked.metadata?.kind === "staff_order_notification" ||
+    locked.metadata?.kind === "staff_order_amended_notification" ||
+    locked.metadata?.kind === "staff_order_cancellation_request_notification"
   ) {
     const staleReason = await getQueuedOwnerOrderNotificationStaleReason(
       locked.metadata,
@@ -1422,9 +1436,9 @@ export const processNextQueuedWasenderMessage = async (
 
     if (staleReason) {
       locked.status = "cancelled";
-      locked.lastError = `Stale owner order message: ${staleReason}`;
+      locked.lastError = `Stale staff order message: ${staleReason}`;
       await locked.save();
-      console.info("Stale owner order message cancelled", {
+      console.info("Stale staff order message cancelled", {
         restaurantId: locked.metadata.restaurantId,
         orderId: locked.metadata.orderId,
         queueMessageId: String(locked._id),
