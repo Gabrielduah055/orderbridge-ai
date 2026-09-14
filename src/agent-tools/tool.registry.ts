@@ -32,7 +32,12 @@ import {
   rescheduleStaffReminderSchema
 } from "../services/staffReminder.service";
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
-import { getCustomerProfileStatistics } from "../services/customerProfile.service";
+import {
+  customerListSortOptions,
+  customerMarketingStatuses,
+  getCustomerProfileStatistics,
+  listCustomers
+} from "../services/customerProfile.service";
 import {
   buildMarketingConsentOutreachPreviewMessage,
   executeMarketingConsentOutreach,
@@ -45,6 +50,10 @@ import {
   getPreviousDailySummaryPeriod,
   getOwnerSummaryMetrics
 } from "../services/ownerSummary.service";
+import {
+  getItemPerformance,
+  itemPerformanceMetrics
+} from "../services/itemPerformance.service";
 import {
   buildClarificationCandidate,
   cancelPendingOrderItemClarifications,
@@ -112,7 +121,45 @@ const getSenderCustomerKey = (context: ToolExecutionContext): string | undefined
 const businessReportSchema = z
   .object({
     period: z.enum(businessReportPeriodTypes),
+    startDate: z.string().trim().min(1).optional(),
+    endDate: z.string().trim().min(1).optional(),
     compareWithPrevious: z.boolean().optional()
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.period === "custom" && !args.startDate) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["startDate"],
+        message: "startDate is required for a custom report."
+      });
+    }
+  });
+const itemPerformanceSchema = z
+  .object({
+    period: z.enum(businessReportPeriodTypes),
+    metric: z.enum(itemPerformanceMetrics),
+    startDate: z.string().trim().min(1).optional(),
+    endDate: z.string().trim().min(1).optional(),
+    limit: z.number().int().positive().max(25).optional()
+  })
+  .strict()
+  .superRefine((args, context) => {
+    if (args.period === "custom" && !args.startDate) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["startDate"],
+        message: "startDate is required for a custom period."
+      });
+    }
+  });
+const listCustomersSchema = z
+  .object({
+    marketingStatus: z.enum(customerMarketingStatuses).optional(),
+    hasCompletedOrder: z.boolean().optional(),
+    returningOnly: z.boolean().optional(),
+    limit: z.number().int().positive().max(50).optional(),
+    sortBy: z.enum(customerListSortOptions).optional()
   })
   .strict();
 const orderLookupSchema = z
@@ -1122,9 +1169,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_business_report",
       description:
-        "Owner/manager only. Return authoritative restaurant business facts and a WhatsApp-formatted report for today, yesterday, this week, or last week. Optionally include a backend-calculated comparison with the previous equivalent period.",
+        "Owner/manager only. Return authoritative restaurant business facts and a WhatsApp-formatted report for today, yesterday, this week, last week, all time, or a custom date range. Sales and top-selling figures use completed orders. Optionally include a backend-calculated comparison for finite periods.",
       parameters: {
         period: businessReportPeriodTypes.join(" | "),
+        startDate:
+          "Required when period is custom. Use YYYY-MM-DD in the restaurant timezone or an ISO date-time with an explicit timezone.",
+        endDate:
+          "Optional for custom. YYYY-MM-DD is inclusive; omitted means now.",
         compareWithPrevious:
           "Optional boolean. Compare with the previous equivalent period."
       }
@@ -1138,6 +1189,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           restaurantName: context.restaurant.name,
           timezone: context.restaurant.timezone,
           period: args.period,
+          startDate: args.startDate,
+          endDate: args.endDate,
           compareWithPrevious: args.compareWithPrevious
         }),
         getCustomerProfileStatistics(context.restaurantId)
@@ -1168,6 +1221,75 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           customerMarketing,
           formattedReport: `${report.formattedReport}\n\n${marketingSection}`
         }
+      };
+    }
+  },
+  get_item_performance: {
+    definition: {
+      name: "get_item_performance",
+      description:
+        "Owner/manager only. Rank restaurant items using backend-calculated customer demand, completed-order quantity/revenue, or demand growth. Use demand_quantity for 'most ordered', 'highest demand', or 'most requested'; fulfilled_quantity for 'best seller', 'sold the most', or completed portions; fulfilled_revenue for highest revenue or most money made; and growth for 'fastest growing' only with a finite comparison period.",
+      parameters: {
+        period: businessReportPeriodTypes.join(" | "),
+        metric: itemPerformanceMetrics.join(" | "),
+        startDate: "Required when period is custom; use YYYY-MM-DD or zoned ISO.",
+        endDate: "Optional custom end date; date-only values are inclusive.",
+        limit: "Optional maximum number of ranked items, up to 25."
+      }
+    },
+    roles: toolPermissions.get_item_performance,
+    schema: itemPerformanceSchema,
+    handler: async (args, context) => {
+      const performance = await getItemPerformance({
+        restaurantId: context.restaurantId,
+        timezone: context.restaurant.timezone,
+        period: args.period,
+        metric: args.metric,
+        startDate: args.startDate,
+        endDate: args.endDate,
+        limit: args.limit
+      });
+
+      return {
+        success: true,
+        message:
+          performance.items.length === 0
+            ? "No submitted orders matched that period."
+            : "Item performance retrieved successfully.",
+        data: performance
+      };
+    }
+  },
+  list_customers: {
+    definition: {
+      name: "list_customers",
+      description:
+        "Owner/manager only. List safe restaurant-scoped customer profiles, including opted-in customers, with masked phone numbers, stored completed-order statistics, the exact total match count, and truncation metadata.",
+      parameters: {
+        marketingStatus: customerMarketingStatuses.join(" | "),
+        hasCompletedOrder: "Optional completed-order filter.",
+        returningOnly: "Optional; true means at least two completed orders.",
+        limit: "Optional maximum number of customers, up to 50.",
+        sortBy: customerListSortOptions.join(" | ")
+      }
+    },
+    roles: toolPermissions.list_customers,
+    schema: listCustomersSchema,
+    handler: async (args, context) => {
+      const customers = await listCustomers({
+        restaurantId: context.restaurantId,
+        ...args
+      });
+
+      return {
+        success: true,
+        message:
+          customers.totalMatched === 0
+            ? args.marketingStatus === "opted_in"
+              ? "There are currently no opted-in customers."
+              : "No customers matched those filters."
+            : `${customers.totalMatched} customer${customers.totalMatched === 1 ? "" : "s"} matched${customers.truncated ? `; returning the first ${customers.returnedCount}` : ""}.`,
+        data: customers
       };
     }
   },

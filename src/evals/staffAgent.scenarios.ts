@@ -380,11 +380,70 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
     expectedArguments: { period: "today" }
   },
   {
+    name: "Highest demand this week",
+    role: "owner",
+    message: "what is our highest demand food this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "demand_quantity" }
+  },
+  {
     name: "Best seller this week",
     role: "manager",
     message: "what be our best seller this week?",
-    expectedTool: "get_business_report",
-    expectedArguments: { period: "this_week" }
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "fulfilled_quantity" }
+  },
+  {
+    name: "Most sold this week",
+    role: "owner",
+    message: "which food sold the most this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "fulfilled_quantity" }
+  },
+  {
+    name: "Highest revenue this week",
+    role: "owner",
+    message: "which food generated the highest revenue this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "fulfilled_revenue" }
+  },
+  {
+    name: "Lifetime most ordered food",
+    role: "owner",
+    message: "What is the most ordered food since we started?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "all_time", metric: "demand_quantity" }
+  },
+  {
+    name: "Fastest growing this week",
+    role: "owner",
+    message: "what is our fastest growing food this week?",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "this_week", metric: "growth" }
+  },
+  {
+    name: "Fastest growth needs a finite period",
+    role: "owner",
+    message: "So far, what is the fastest growing food?",
+    expectNoTool: true,
+    forbiddenTools: ["get_business_report", "get_sales_summary"],
+    expectedTextPattern: /period|today|week|date|range/i
+  },
+  {
+    name: "Campaign research uses demand without creating a campaign",
+    role: "owner",
+    message:
+      "I want to run a campaign and I want to know the food in demand. The food customers have been ordering the most.",
+    expectedTool: "get_item_performance",
+    expectedArguments: { period: "all_time", metric: "demand_quantity" },
+    forbiddenTools: ["create_campaign_draft", "approve_campaign"]
+  },
+  {
+    name: "List opted-in customers",
+    role: "owner",
+    message: "Who are the customers that has opted in?",
+    expectedTool: "list_customers",
+    expectedArguments: { marketingStatus: "opted_in" }
   },
   {
     name: "Compare this week",

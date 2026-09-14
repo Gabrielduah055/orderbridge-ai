@@ -74,6 +74,48 @@ export interface CustomerProfileStatistics {
   marketingConsentDeliveryFailedCustomers: number;
 }
 
+export const customerMarketingStatuses = [
+  "opted_in",
+  "opted_out",
+  "awaiting_response",
+  "not_asked",
+  "any"
+] as const;
+export type CustomerMarketingStatus = (typeof customerMarketingStatuses)[number];
+
+export const customerListSortOptions = [
+  "recent_order",
+  "order_count",
+  "average_order_value",
+  "name"
+] as const;
+export type CustomerListSortBy = (typeof customerListSortOptions)[number];
+
+export interface ListCustomersInput {
+  restaurantId: string;
+  marketingStatus?: CustomerMarketingStatus;
+  hasCompletedOrder?: boolean;
+  returningOnly?: boolean;
+  limit?: number;
+  sortBy?: CustomerListSortBy;
+}
+
+export interface CustomerOwnerView {
+  name: string;
+  maskedPhone: string;
+  orderCount: number;
+  lastOrderAt: string | null;
+  averageOrderValue: number;
+  marketingStatus: Exclude<CustomerMarketingStatus, "any">;
+}
+
+export interface CustomerListResult {
+  totalMatched: number;
+  returnedCount: number;
+  truncated: boolean;
+  customers: CustomerOwnerView[];
+}
+
 const normalizeDisplayText = (value: string): string => {
   return value.trim().replace(/\s+/g, " ");
 };
@@ -614,6 +656,101 @@ export const getCustomerProfile = async (
       customerKey
     )
   );
+};
+
+const getCustomerMarketingStatus = (
+  profile: Pick<
+    ICustomerProfileDocument,
+    | "marketingConsent"
+    | "isOptedOut"
+    | "marketingConsentPromptedAt"
+  >
+): Exclude<CustomerMarketingStatus, "any"> => {
+  if (profile.marketingConsent === true && profile.isOptedOut !== true) {
+    return "opted_in";
+  }
+  if (profile.isOptedOut === true || profile.marketingConsent === false) {
+    return "opted_out";
+  }
+  return profile.marketingConsentPromptedAt
+    ? "awaiting_response"
+    : "not_asked";
+};
+
+const maskCustomerPhone = (value: string): string => {
+  const normalized = normalizeWhatsappRecipient(value);
+  const digits = normalized.replace(/\D/g, "");
+  return digits ? `***${digits.slice(-4)}` : "***";
+};
+
+export const listCustomers = async (
+  input: ListCustomersInput
+): Promise<CustomerListResult> => {
+  ensureValidRestaurantId(input.restaurantId);
+  const marketingStatus = input.marketingStatus ?? "any";
+  const filter: Record<string, unknown> = { restaurantId: input.restaurantId };
+
+  if (marketingStatus === "opted_in") {
+    filter.marketingConsent = true;
+    filter.isOptedOut = { $ne: true };
+  } else if (marketingStatus === "opted_out") {
+    filter.$or = [{ isOptedOut: true }, { marketingConsent: false }];
+  } else if (marketingStatus === "awaiting_response") {
+    filter.marketingConsent = null;
+    filter.isOptedOut = { $ne: true };
+    filter.marketingConsentPromptedAt = { $exists: true };
+  } else if (marketingStatus === "not_asked") {
+    filter.marketingConsent = null;
+    filter.isOptedOut = { $ne: true };
+    filter.marketingConsentPromptedAt = { $exists: false };
+  }
+
+  if (input.returningOnly) {
+    filter.orderCount = { $gte: 2 };
+  } else if (input.hasCompletedOrder === true) {
+    filter.orderCount = { $gte: 1 };
+  } else if (input.hasCompletedOrder === false) {
+    filter.orderCount = 0;
+  }
+
+  const sortOptions = {
+    recent_order: { lastOrderAt: -1, customerName: 1 },
+    order_count: { orderCount: -1, lastOrderAt: -1 },
+    average_order_value: { averageOrderValue: -1, lastOrderAt: -1 },
+    name: { customerName: 1, lastOrderAt: -1 }
+  } as const;
+  const sort = sortOptions[input.sortBy ?? "recent_order"];
+  const limit = Math.min(Math.max(input.limit ?? 25, 1), 50);
+  const [totalMatched, profiles] = await Promise.all([
+    CustomerProfile.countDocuments(filter),
+    CustomerProfile.find(filter)
+      .select(
+        "customerName customerPhone orderCount lastOrderAt averageOrderValue marketingConsent isOptedOut marketingConsentPromptedAt"
+      )
+      .sort(sort)
+      .limit(limit)
+  ]);
+
+  const customers = profiles.map((profile) => {
+    const maskedPhone = maskCustomerPhone(profile.customerPhone);
+    const savedName = profile.customerName?.trim().replace(/\s+/g, " ");
+
+    return {
+      name: savedName || `Customer ending ${maskedPhone.slice(-4)}`,
+      maskedPhone,
+      orderCount: profile.orderCount,
+      lastOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+      averageOrderValue: roundCurrency(profile.averageOrderValue),
+      marketingStatus: getCustomerMarketingStatus(profile)
+    };
+  });
+
+  return {
+    totalMatched,
+    returnedCount: customers.length,
+    truncated: totalMatched > customers.length,
+    customers
+  };
 };
 
 export const getCustomerProfileStatistics = async (

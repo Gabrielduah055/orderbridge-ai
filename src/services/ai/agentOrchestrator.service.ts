@@ -25,6 +25,7 @@ import type {
   ToolResult
 } from "../../types/agent.types";
 import type { IOrderDocument } from "../../models/order.model";
+import { toolRegistry } from "../../agent-tools/tool.registry";
 
 const safeFallbackMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
@@ -88,6 +89,157 @@ const trustedArgumentNames = new Set([
 ]);
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
+
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const registeredToolNames = Object.keys(toolRegistry).sort(
+  (first, second) => second.length - first.length
+);
+
+/** Deterministic final-text guard for staff WhatsApp responses. */
+export const sanitizeStaffFacingFinalText = (text: string): string => {
+  let sanitized = text;
+
+  for (const toolName of registeredToolNames) {
+    sanitized = sanitized.replace(
+      new RegExp(
+        `(?:\\b(?:my|the|this|our)\\s+)?\`?${escapeRegExp(toolName)}\`?(?:\\s+(?:tool|function|service))?`,
+        "gi"
+      ),
+      "restaurant system"
+    );
+  }
+
+  return sanitized
+    .replace(/`?\b[a-f0-9]{24}\b`?/gi, "internal reference")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .trim();
+};
+
+interface GroundedCustomerListResult {
+  totalMatched: number;
+  returnedCount: number;
+  truncated: boolean;
+  customers: unknown[];
+}
+
+const parseGroundedCustomerListResult = (
+  value: unknown
+): GroundedCustomerListResult | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const result = value as Record<string, unknown>;
+  if (
+    typeof result.totalMatched !== "number" ||
+    !Number.isInteger(result.totalMatched) ||
+    result.totalMatched < 0 ||
+    typeof result.returnedCount !== "number" ||
+    !Number.isInteger(result.returnedCount) ||
+    result.returnedCount < 0 ||
+    typeof result.truncated !== "boolean" ||
+    !Array.isArray(result.customers)
+  ) {
+    return null;
+  }
+
+  return {
+    totalMatched: result.totalMatched,
+    returnedCount: result.returnedCount,
+    truncated: result.truncated,
+    customers: result.customers
+  };
+};
+
+export const isDirectCustomerListRequest = (message: string): boolean => {
+  const normalized = normalizeText(message).toLowerCase();
+  if (
+    /\b(?:how many|number of|total|count|audience size|why)\b/.test(normalized)
+  ) {
+    return false;
+  }
+
+  const asksForIdentities =
+    /\b(?:who|list|show|name|which)\b/.test(normalized) ||
+    /\b(?:give me|tell me|can i see)\b/.test(normalized);
+  const mentionsCustomerAudience =
+    /\b(?:customers?|people|marketing audience)\b/.test(normalized) ||
+    /\b(?:opted[ -]?in|returning customers?|accepted marketing|agreed to (?:marketing|promotions?))\b/.test(
+      normalized
+    );
+
+  return asksForIdentities && mentionsCustomerAudience;
+};
+
+const buildGroundedCustomerListAnswer = (
+  ownerMessage: string,
+  result: GroundedCustomerListResult | undefined,
+  args: Record<string, unknown> | undefined
+): string | null => {
+  if (!result) {
+    return null;
+  }
+
+  const optedIn = args?.marketingStatus === "opted_in";
+  if (!isDirectCustomerListRequest(ownerMessage)) {
+    return null;
+  }
+
+  if (result.totalMatched === 0) {
+    return optedIn
+      ? "There are currently no opted-in customers."
+      : "No customers matched those filters.";
+  }
+
+  const safeCustomers = result.customers
+    .filter(
+      (customer): customer is Record<string, unknown> =>
+        Boolean(customer) && typeof customer === "object"
+    )
+    .filter(
+      (customer) =>
+        typeof customer.name === "string" && Boolean(customer.name.trim())
+    );
+
+  if (safeCustomers.length === 0) {
+    return `${result.totalMatched} customer${result.totalMatched === 1 ? "" : "s"} matched.`;
+  }
+
+  const includeDetails =
+    /\b(?:details?|phone|number|how many orders|order counts?|average|last order)\b/i.test(
+      ownerMessage
+    );
+  const lines = safeCustomers.map((customer, index) => {
+    const name = String(customer.name);
+    if (!includeDetails) {
+      return `${index + 1}. ${name}`;
+    }
+
+    const details = [
+      typeof customer.orderCount === "number"
+        ? `${customer.orderCount} completed order${customer.orderCount === 1 ? "" : "s"}`
+        : undefined,
+      typeof customer.maskedPhone === "string"
+        ? customer.maskedPhone
+        : undefined
+    ].filter((detail): detail is string => Boolean(detail));
+
+    return `${index + 1}. ${name}${details.length > 0 ? ` — ${details.join(" — ")}` : ""}`;
+  });
+
+  const noun = `${result.totalMatched} customer${result.totalMatched === 1 ? "" : "s"}`;
+  const summary = optedIn
+    ? `${noun} ${result.totalMatched === 1 ? "has" : "have"} opted in`
+    : `${noun} matched`;
+  const header = result.truncated
+    ? `${summary}. Showing the first ${result.returnedCount}:`
+    : `${summary}:`;
+
+  return [header, ...lines].join("\n");
+};
 
 const stripTrustedModelArguments = (
   args: Record<string, unknown>
@@ -707,6 +859,8 @@ export const runAgentOrchestrator = async (
   let customerMediaGroundingRetryUsed = false;
   let customerMenuMediaLookupPerformed = false;
   let completedCustomerWorkflowMutation: CustomerWorkflowMutation | null = null;
+  let latestCustomerList: GroundedCustomerListResult | undefined;
+  let latestCustomerListArgs: Record<string, unknown> | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -770,7 +924,25 @@ export const runAgentOrchestrator = async (
           };
         }
 
-        const finalMessage = sanitizeMenuItemImageResponse(rawFinalMessage, importantData);
+        const imageSafeFinalMessage = sanitizeMenuItemImageResponse(
+          rawFinalMessage,
+          importantData
+        );
+        let finalMessage =
+          input.sender.role === "owner" || input.sender.role === "manager"
+            ? sanitizeStaffFacingFinalText(imageSafeFinalMessage)
+            : imageSafeFinalMessage;
+        if (input.sender.role === "owner" || input.sender.role === "manager") {
+          const groundedCustomerListAnswer =
+            buildGroundedCustomerListAnswer(
+              normalizedInputMessage,
+              latestCustomerList,
+              latestCustomerListArgs
+            );
+          finalMessage = groundedCustomerListAnswer
+            ? sanitizeStaffFacingFinalText(groundedCustomerListAnswer)
+            : finalMessage;
+        }
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
 
@@ -889,6 +1061,17 @@ export const runAgentOrchestrator = async (
                 code: "TOOL_FORBIDDEN",
                 message: "That tool is not available for the current sender role."
               };
+
+        if (
+          result.success &&
+          toolName === "list_customers"
+        ) {
+          const customerList = parseGroundedCustomerListResult(result.data);
+          if (customerList) {
+            latestCustomerList = customerList;
+            latestCustomerListArgs = safeArguments;
+          }
+        }
 
         if (
           input.sender.role === "customer" &&
