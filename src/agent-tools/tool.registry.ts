@@ -110,6 +110,7 @@ import {
   assignPendingImageToMenuItem,
   cancelPendingMenuItemImageConfirmation,
   confirmPendingMenuItemImage,
+  requireOwnerMenuItemImageAdministration,
   startMenuItemImageUpload
 } from "../services/menuItemImageWorkflow.service";
 
@@ -839,7 +840,8 @@ const getExpectedQuotedOrderAmendmentVersion = async (
 
   const quotedContext = await findTrustedQuotedOwnerOrderContext(
     context.restaurantId,
-    context.quotedMessageId
+    context.quotedMessageId,
+    context.sender
   );
   return quotedContext?.action === "order_decision"
     ? quotedContext.expectedAmendmentVersion
@@ -1169,7 +1171,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_business_report",
       description:
-        "Owner/manager only. Return authoritative restaurant business facts and a WhatsApp-formatted report for today, yesterday, this week, last week, all time, or a custom date range. Sales and top-selling figures use completed orders. Optionally include a backend-calculated comparison for finite periods.",
+        "Owner only. Return authoritative restaurant business facts and a WhatsApp-formatted report for today, yesterday, this week, last week, all time, or a custom date range. Sales and top-selling figures use completed orders. Optionally include a backend-calculated comparison for finite periods.",
       parameters: {
         period: businessReportPeriodTypes.join(" | "),
         startDate:
@@ -1228,7 +1230,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_item_performance",
       description:
-        "Owner/manager only. Rank restaurant items using backend-calculated customer demand, completed-order quantity/revenue, or demand growth. Use demand_quantity for 'most ordered', 'highest demand', or 'most requested'; fulfilled_quantity for 'best seller', 'sold the most', or completed portions; fulfilled_revenue for highest revenue or most money made; and growth for 'fastest growing' only with a finite comparison period.",
+        "Owner only. Rank restaurant items using backend-calculated customer demand, completed-order quantity/revenue, or demand growth. Use demand_quantity for 'most ordered', 'highest demand', or 'most requested'; fulfilled_quantity for 'best seller', 'sold the most', or completed portions; fulfilled_revenue for highest revenue or most money made; and growth for 'fastest growing' only with a finite comparison period.",
       parameters: {
         period: businessReportPeriodTypes.join(" | "),
         metric: itemPerformanceMetrics.join(" | "),
@@ -1264,7 +1266,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "list_customers",
       description:
-        "Owner/manager only. List safe restaurant-scoped customer profiles, including opted-in customers, with masked phone numbers, stored completed-order statistics, the exact total match count, and truncation metadata.",
+        "Owner only. List safe restaurant-scoped customer profiles, including opted-in customers, with masked phone numbers, stored completed-order statistics, the exact total match count, and truncation metadata.",
       parameters: {
         marketingStatus: customerMarketingStatuses.join(" | "),
         hasCompletedOrder: "Optional completed-order filter.",
@@ -1632,7 +1634,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "get_business_summary",
       description:
-        "Return a compact business overview for owner or manager, including trusted lifetime CustomerProfile counts, returning customers, and marketing audience preference totals. Use this for questions such as how many customers the restaurant has or how many can receive promotions.",
+        "Owner only. Return a compact business overview including trusted lifetime CustomerProfile counts, returning customers, and marketing audience preference totals. Use this for questions such as how many customers the restaurant has or how many can receive promotions.",
       parameters: {}
     },
     roles: toolPermissions.get_business_summary,
@@ -1674,7 +1676,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "invite_customers_to_marketing",
       description:
-        "Owner/manager only. Preview and, only after explicit confirmation, send the backend-owned one-time marketing preference request to customers whose preference is unknown and who have never been asked. This is consent outreach, not a promotional campaign.",
+        "Owner only. Preview and, only after explicit confirmation, send the backend-owned one-time marketing preference request to customers whose preference is unknown and who have never been asked. This is consent outreach, not a promotional campaign.",
       parameters: {}
     },
     roles: toolPermissions.invite_customers_to_marketing,
@@ -1732,7 +1734,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "create_campaign_draft",
       description:
-        "Owner/manager only. Store a campaign draft with bounded targeting and prepare an approval preview. This never sends customer messages before explicit confirmation.",
+        "Owner only. Store a campaign draft with bounded targeting and prepare an approval preview. This never sends customer messages before explicit confirmation.",
       parameters: {
         name: "Campaign name.",
         message: "Final campaign wording.",
@@ -1750,15 +1752,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     sensitive: true,
     schema: createCustomerCampaignDraftSchema,
     handler: async (args, context) => {
-      if (
-        context.sender.role !== "owner" &&
-        context.sender.role !== "manager"
-      ) {
+      if (context.sender.role !== "owner") {
         return {
           success: false,
           code: "CAMPAIGN_FORBIDDEN",
           message:
-            "Only a verified owner or manager can create a campaign."
+            "Only a verified owner can create a campaign."
         };
       }
 
@@ -1808,7 +1807,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "update_campaign_draft",
       description:
-        "Owner/manager only. Edit a campaign that is still pending approval, recalculate its backend audience preview, and replace its approval confirmation with the new exact version.",
+        "Owner only. Edit a campaign that is still pending approval, recalculate its backend audience preview, and replace its approval confirmation with the new exact version.",
       parameters: {
         campaignId: "Exact internal campaign ID from trusted conversation context or list_campaigns.",
         name: "Optional updated campaign name.",
@@ -1827,15 +1826,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     sensitive: true,
     schema: updateCustomerCampaignDraftSchema,
     handler: async (args, context) => {
-      if (
-        context.sender.role !== "owner" &&
-        context.sender.role !== "manager"
-      ) {
+      if (context.sender.role !== "owner") {
         return {
           success: false,
           code: "CAMPAIGN_FORBIDDEN",
           message:
-            "Only a verified owner or manager can update a campaign."
+            "Only a verified owner can update a campaign."
         };
       }
 
@@ -1884,7 +1880,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "preview_campaign",
       description:
-        "Owner/manager only. Recalculate a campaign preview from bounded backend targeting without sending it.",
+        "Owner only. Recalculate a campaign preview from bounded backend targeting without sending it.",
       parameters: {
         campaignId: "Campaign ID."
       }
@@ -1915,7 +1911,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "approve_campaign",
       description:
-        "Owner/manager only. Prepare or confirm campaign approval. Approval snapshots eligible recipients; delivery remains scheduled through the outbound queue.",
+        "Owner only. Prepare or confirm campaign approval. Approval snapshots eligible recipients; delivery remains scheduled through the outbound queue.",
       parameters: {
         campaignId: "Campaign ID."
       }
@@ -1978,7 +1974,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "cancel_campaign",
       description:
-        "Owner/manager only. Prepare or confirm cancelling a campaign and all unsent recipients.",
+        "Owner only. Prepare or confirm cancelling a campaign and all unsent recipients.",
       parameters: {
         campaignId: "Campaign ID."
       }
@@ -2016,7 +2012,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "list_campaigns",
       description:
-        "Owner/manager only. List this restaurant's campaigns using bounded status/type filters.",
+        "Owner only. List this restaurant's campaigns using bounded status/type filters.",
       parameters: {
         status: "Optional controlled campaign status.",
         campaignType: "Optional controlled campaign type.",
@@ -2456,7 +2452,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "remove_menu_item_image",
       description:
-        "Remove the image from a menu item. Requires owner/manager confirmation.",
+        "Owner only. Remove the image from a menu item. Requires owner confirmation.",
       parameters: {
         itemName: "Menu item name (optional if itemId provided).",
         itemId: "Optional menu item ID."
@@ -2466,6 +2462,14 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     sensitive: true,
     schema: menuItemLookupSchema,
     handler: async (args, context) => {
+      const authorizationError = requireOwnerMenuItemImageAdministration(
+        context.sender.role
+      );
+
+      if (authorizationError) {
+        return authorizationError;
+      }
+
       const item = await findMenuItemForRestaurant(context, args);
 
       if ("success" in item) {
@@ -2523,7 +2527,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       const result = await orderService.confirmRestaurantOrder(
         String(order._id),
         context.restaurantId,
-        await getExpectedQuotedOrderAmendmentVersion(context)
+        await getExpectedQuotedOrderAmendmentVersion(context),
+        {
+          phone: context.sender.normalizedPhone,
+          role: context.sender.role as "owner" | "manager",
+          name: context.sender.name
+        }
       );
       await completeMatchingOwnerOrderSelection(
         context,
@@ -2581,7 +2590,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         String(order._id),
         trustedReason,
         context.restaurantId,
-        await getExpectedQuotedOrderAmendmentVersion(context)
+        await getExpectedQuotedOrderAmendmentVersion(context),
+        {
+          phone: context.sender.normalizedPhone,
+          role: context.sender.role as "owner" | "manager",
+          name: context.sender.name
+        }
       );
       await completeMatchingOwnerOrderSelection(
         context,

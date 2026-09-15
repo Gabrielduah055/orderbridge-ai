@@ -232,7 +232,7 @@ test("accepted orders cannot be amended", async () => {
   }
 });
 
-test("owner cancellation and amendment notifications use idempotent event keys", async () => {
+test("staff cancellation and amendment notifications use recipient-scoped idempotent event keys", async () => {
   const queueService = require("../dist/services/wasenderQueue.service");
   const sideEffectsPath = require.resolve("../dist/services/orderSideEffects.service");
   const originalEnqueue = queueService.enqueueWasenderMessage;
@@ -255,9 +255,9 @@ test("owner cancellation and amendment notifications use idempotent event keys",
       makeOrder({ customerAmendmentVersion: 2 })
     );
 
-    assert.equal(queued[0].idempotencyKey, `owner-order-cancelled:${orderId}`);
-    assert.equal(queued[0].metadata.kind, "owner_order_cancelled_notification");
-    assert.equal(queued[1].idempotencyKey, `owner-order-amended:${orderId}:2`);
+    assert.equal(queued[0].idempotencyKey, `staff-order-cancelled:${orderId}:+233500000001`);
+    assert.equal(queued[0].metadata.kind, "staff_order_cancelled_notification");
+    assert.equal(queued[1].idempotencyKey, `staff-order-amended:${orderId}:v2:+233500000001`);
     assert.equal(queued[1].metadata.amendmentVersion, 2);
   } finally {
     queueService.enqueueWasenderMessage = originalEnqueue;

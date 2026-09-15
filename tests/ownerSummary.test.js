@@ -521,9 +521,9 @@ test("get_business_report supports all periods and remains context scoped", asyn
   );
 });
 
-test("business report permissions allow staff and deny customers", () => {
+test("business report permissions allow owners and deny managers and customers", () => {
   assert.equal(isToolAllowedForRole("get_business_report", "owner"), true);
-  assert.equal(isToolAllowedForRole("get_business_report", "manager"), true);
+  assert.equal(isToolAllowedForRole("get_business_report", "manager"), false);
   assert.equal(isToolAllowedForRole("get_business_report", "customer"), false);
 
   const ownerTools = getAgentToolDefinitionsForRole("owner").map(
@@ -537,7 +537,7 @@ test("business report permissions allow staff and deny customers", () => {
   );
 
   assert.equal(ownerTools.includes("get_business_report"), true);
-  assert.equal(managerTools.includes("get_business_report"), true);
+  assert.equal(managerTools.includes("get_business_report"), false);
   assert.equal(customerTools.includes("get_business_report"), false);
 });
 

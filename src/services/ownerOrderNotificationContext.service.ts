@@ -1,5 +1,7 @@
 import { Order, type IOrderDocument } from "../models/order.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
+import type { ResolvedSender } from "../types/agent.types";
+import { normalizeGhanaPhone } from "../utils/phone.util";
 
 export type QuotedOwnerOrderAction = "order_decision" | "cancellation_request";
 
@@ -14,17 +16,24 @@ export interface TrustedQuotedOwnerOrderContext {
 const actionableKinds = [
   "owner_order_notification",
   "owner_order_amended_notification",
-  "owner_order_cancellation_request_notification"
+  "owner_order_cancellation_request_notification",
+  "staff_order_notification",
+  "staff_order_amended_notification",
+  "staff_order_cancellation_request_notification"
 ] as const;
 
 export const findTrustedQuotedOwnerOrderContext = async (
   restaurantId: string,
-  providerMessageId: string
+  providerMessageId: string,
+  sender?: Pick<ResolvedSender, "normalizedPhone" | "role">
 ): Promise<TrustedQuotedOwnerOrderContext | null> => {
-  const legacyOrder = await Order.findOne({
-    restaurantId,
-    ownerNotificationProviderMessageId: providerMessageId
-  });
+  const legacyOrder =
+    !sender || sender.role === "owner"
+      ? await Order.findOne({
+          restaurantId,
+          ownerNotificationProviderMessageId: providerMessageId
+        })
+      : null;
   if (legacyOrder) {
     const currentAmendmentVersion = legacyOrder.customerAmendmentVersion ?? 0;
     return {
@@ -47,6 +56,24 @@ export const findTrustedQuotedOwnerOrderContext = async (
       ? queuedMessage.metadata.orderId
       : undefined;
 
+  const intendedRecipient =
+    typeof queuedMessage?.metadata?.recipientPhone === "string"
+      ? normalizeGhanaPhone(queuedMessage.metadata.recipientPhone)
+      : "";
+  const senderPhone = sender
+    ? normalizeGhanaPhone(sender.normalizedPhone)
+    : "";
+
+  if (
+    queuedMessage &&
+    sender &&
+    (intendedRecipient
+      ? intendedRecipient !== senderPhone
+      : sender.role !== "owner")
+  ) {
+    return null;
+  }
+
   if (queuedMessage && queuedOrderId) {
     const order = await Order.findOne({ _id: queuedOrderId, restaurantId });
     if (!order) {
@@ -55,7 +82,8 @@ export const findTrustedQuotedOwnerOrderContext = async (
 
     const kind = queuedMessage.metadata?.kind;
     const action: QuotedOwnerOrderAction =
-      kind === "owner_order_cancellation_request_notification"
+      kind === "owner_order_cancellation_request_notification" ||
+      kind === "staff_order_cancellation_request_notification"
         ? "cancellation_request"
         : "order_decision";
     const expectedVersion = Number(queuedMessage.metadata?.amendmentVersion);

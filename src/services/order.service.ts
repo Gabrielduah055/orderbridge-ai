@@ -57,6 +57,41 @@ export interface RestaurantOrderDecisionResult {
   idempotent: boolean;
 }
 
+export interface RestaurantDecisionActor {
+  phone: string;
+  role: "owner" | "manager";
+  name?: string;
+}
+
+const getRestaurantDecisionAudit = (
+  actor: RestaurantDecisionActor | undefined,
+  decisionAt: Date
+): Record<string, unknown> => {
+  if (!actor || (actor.role !== "owner" && actor.role !== "manager")) {
+    return {};
+  }
+
+  const phone = normalizeGhanaPhone(actor.phone);
+  const name = actor.name?.trim().replace(/\s+/g, " ");
+  return {
+    ...(phone ? { restaurantDecisionByPhone: phone } : {}),
+    restaurantDecisionByRole: actor.role,
+    ...(name ? { restaurantDecisionByName: name } : {}),
+    restaurantDecisionAt: decisionAt
+  };
+};
+
+const getRestaurantDecisionActorLabel = (order: IOrderDocument): string => {
+  const name = order.restaurantDecisionByName?.trim();
+  if (name) {
+    return ` by ${name}`;
+  }
+
+  return order.restaurantDecisionByRole
+    ? ` by the ${order.restaurantDecisionByRole}`
+    : "";
+};
+
 export interface AmendCustomerSubmittedOrderInput {
   itemName?: string;
   menuItemId?: string;
@@ -1039,7 +1074,8 @@ export const updateRestaurantOrderStatus = async (
 export const confirmRestaurantOrder = async (
   orderId: string,
   restaurantId?: string,
-  expectedAmendmentVersion?: number
+  expectedAmendmentVersion?: number,
+  actor?: RestaurantDecisionActor
 ): Promise<RestaurantOrderDecisionResult> => {
   const order = await getOrderOrThrow(orderId, restaurantId);
 
@@ -1048,6 +1084,13 @@ export const confirmRestaurantOrder = async (
       order,
       idempotent: true
     };
+  }
+
+  if (order.status === "rejected") {
+    throw new BadRequestError(
+      `This order was already rejected${getRestaurantDecisionActorLabel(order)}.`,
+      "ORDER_ALREADY_ACTIONED"
+    );
   }
 
   if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
@@ -1066,6 +1109,7 @@ export const confirmRestaurantOrder = async (
     );
   }
 
+  const decisionAt = new Date();
   const acceptedOrder = await Order.findOneAndUpdate(
     {
       _id: order._id,
@@ -1085,7 +1129,8 @@ export const confirmRestaurantOrder = async (
     {
       $set: {
         status: "accepted",
-        restaurantConfirmedAt: order.restaurantConfirmedAt ?? new Date()
+        restaurantConfirmedAt: order.restaurantConfirmedAt ?? decisionAt,
+        ...getRestaurantDecisionAudit(actor, decisionAt)
       }
     },
     { new: true }
@@ -1095,6 +1140,12 @@ export const confirmRestaurantOrder = async (
     const currentOrder = await getOrderOrThrow(orderId, restaurantId);
     if (currentOrder.status === "accepted" || currentOrder.status === "confirmed") {
       return { order: currentOrder, idempotent: true };
+    }
+    if (currentOrder.status === "rejected") {
+      throw new BadRequestError(
+        `This order was already rejected${getRestaurantDecisionActorLabel(currentOrder)}.`,
+        "ORDER_ALREADY_ACTIONED"
+      );
     }
     if (
       expectedAmendmentVersion !== undefined &&
@@ -1121,7 +1172,8 @@ export const rejectRestaurantOrder = async (
   orderId: string,
   reason?: string,
   restaurantId?: string,
-  expectedAmendmentVersion?: number
+  expectedAmendmentVersion?: number,
+  actor?: RestaurantDecisionActor
 ): Promise<RestaurantOrderDecisionResult> => {
   const normalizedReason = normalizeRestaurantRejectionReason(reason);
   const order = await getOrderOrThrow(orderId, restaurantId);
@@ -1131,6 +1183,13 @@ export const rejectRestaurantOrder = async (
       order,
       idempotent: true
     };
+  }
+
+  if (order.status === "accepted" || order.status === "confirmed") {
+    throw new BadRequestError(
+      `This order was already accepted${getRestaurantDecisionActorLabel(order)}.`,
+      "ORDER_ALREADY_ACTIONED"
+    );
   }
 
   if (order.status !== "awaiting_restaurant_confirmation" && order.status !== "pending") {
@@ -1149,6 +1208,7 @@ export const rejectRestaurantOrder = async (
     );
   }
 
+  const decisionAt = new Date();
   const rejectedOrder = await Order.findOneAndUpdate(
     {
       _id: order._id,
@@ -1169,8 +1229,9 @@ export const rejectRestaurantOrder = async (
       $set: {
         status: "rejected",
         feedbackFollowUpStatus: "cancelled",
-        restaurantRejectedAt: order.restaurantRejectedAt ?? new Date(),
-        restaurantRejectionReason: normalizedReason
+        restaurantRejectedAt: order.restaurantRejectedAt ?? decisionAt,
+        restaurantRejectionReason: normalizedReason,
+        ...getRestaurantDecisionAudit(actor, decisionAt)
       }
     },
     { new: true }
@@ -1183,6 +1244,15 @@ export const rejectRestaurantOrder = async (
       currentOrder.restaurantRejectedAt
     ) {
       return { order: currentOrder, idempotent: true };
+    }
+    if (
+      currentOrder.status === "accepted" ||
+      currentOrder.status === "confirmed"
+    ) {
+      throw new BadRequestError(
+        `This order was already accepted${getRestaurantDecisionActorLabel(currentOrder)}.`,
+        "ORDER_ALREADY_ACTIONED"
+      );
     }
     if (
       expectedAmendmentVersion !== undefined &&

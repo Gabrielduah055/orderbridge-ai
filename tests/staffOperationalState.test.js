@@ -186,6 +186,14 @@ test("manager pending state uses the manager phone and role scope", async () => 
           senderRole: "manager",
           toolName: "set_item_availability"
         }),
+        pendingAction({
+          _id: "old-manager-image-action",
+          senderPhone: managerPhone,
+          senderRole: "manager",
+          action: "IMAGE_ASSIGNMENT",
+          data: { stage: "awaiting_confirmation", itemName: "Chicken Salad" },
+          selectedMenuItemId: "64b000000000000000000301"
+        }),
         pendingAction({ _id: "owner-action" })
       ]
     })
@@ -199,6 +207,7 @@ test("manager pending state uses the manager phone and role scope", async () => 
   );
   assert.equal(state.permissions.includes("set_item_availability"), true);
   assert.equal(state.permissions.includes("update_menu_price"), false);
+  assert.equal(state.imageWorkflow, null);
 });
 
 test("a version-bound pending campaign approval becomes trusted follow-up context", async () => {

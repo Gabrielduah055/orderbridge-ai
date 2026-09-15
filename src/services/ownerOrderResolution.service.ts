@@ -321,6 +321,7 @@ const applyDecision = async (
   restaurantId: string,
   orderId: string,
   decision: OwnerOrderDecision,
+  actor: orderService.RestaurantDecisionActor,
   reason?: string,
   expectedAmendmentVersion?: number
 ): Promise<Awaited<ReturnType<typeof orderService.confirmRestaurantOrder>>> => {
@@ -328,13 +329,15 @@ const applyDecision = async (
     ? orderService.confirmRestaurantOrder(
         orderId,
         restaurantId,
-        expectedAmendmentVersion
+        expectedAmendmentVersion,
+        actor
       )
     : orderService.rejectRestaurantOrder(
         orderId,
         reason,
         restaurantId,
-        expectedAmendmentVersion
+        expectedAmendmentVersion,
+        actor
       );
 };
 
@@ -360,7 +363,8 @@ export const resolveQuotedOwnerOrderDecision = async (
   decision: OwnerOrderDecision,
   reason?: string,
   senderPhone?: string,
-  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner"
+  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner",
+  senderName?: string
 ): Promise<OwnerOrderResolutionResult> => {
   if (!quotedMessageId) {
     return { handled: false, success: false, message: "" };
@@ -368,7 +372,13 @@ export const resolveQuotedOwnerOrderDecision = async (
 
   const quotedContext = await findTrustedQuotedOwnerOrderContext(
     restaurantId,
-    quotedMessageId
+    quotedMessageId,
+    senderPhone
+      ? {
+          normalizedPhone: senderPhone,
+          role: senderRole
+        }
+      : undefined
   );
 
   if (!quotedContext || quotedContext.action !== "order_decision") {
@@ -408,6 +418,11 @@ export const resolveQuotedOwnerOrderDecision = async (
     restaurantId,
     String(order._id),
     decision,
+    {
+      phone: senderPhone ?? "",
+      role: senderRole,
+      name: senderName
+    },
     reason,
     quotedContext.expectedAmendmentVersion
   );
@@ -430,7 +445,8 @@ export const handleSavedOwnerSelectionReply = async (
   restaurantId: string,
   senderPhone: string,
   message: string,
-  senderRole?: Extract<SenderRole, "owner" | "manager">
+  senderRole: Extract<SenderRole, "owner" | "manager"> = "owner",
+  senderName?: string
 ): Promise<OwnerOrderResolutionResult> => {
   const pendingSelection = await findPendingSelection(
     restaurantId,
@@ -516,6 +532,11 @@ export const handleSavedOwnerSelectionReply = async (
         restaurantId,
         orderId,
         decision,
+        {
+          phone: senderPhone,
+          role: senderRole,
+          name: senderName
+        },
         typeof pendingSelection.data.reason === "string"
           ? pendingSelection.data.reason
           : undefined
@@ -556,7 +577,8 @@ export const handleUnquotedOwnerOrderDecision = async (
   senderPhone: string,
   decision: OwnerOrderDecision,
   senderRole: Extract<SenderRole, "owner" | "manager"> = "owner",
-  reason?: string
+  reason?: string,
+  senderName?: string
 ): Promise<OwnerOrderResolutionResult> => {
   const freshOrders = await getFreshPendingOrders(restaurantId);
 
@@ -593,6 +615,11 @@ export const handleUnquotedOwnerOrderDecision = async (
       restaurantId,
       String(freshOrders[0]._id),
       decision,
+      {
+        phone: senderPhone,
+        role: senderRole,
+        name: senderName
+      },
       reason
     );
 

@@ -353,7 +353,11 @@ export const buildStaffOperationalState = async (
     : Promise.resolve([]);
   const trustedQuotedContextPromise =
     quotedMessageId && !dependencies.findOrders
-      ? findTrustedQuotedOwnerOrderContext(restaurantId, quotedMessageId)
+      ? findTrustedQuotedOwnerOrderContext(
+          restaurantId,
+          quotedMessageId,
+          input.sender
+        )
       : Promise.resolve(null);
   const quotedOrderPromise = quotedMessageId && dependencies.findOrders
     ? findOrders(
@@ -381,7 +385,8 @@ export const buildStaffOperationalState = async (
       trustedQuotedContextPromise
     ]);
 
-  const imageWorkflow = getImageWorkflow(pendingActions);
+  const imageWorkflow =
+    input.sender.role === "owner" ? getImageWorkflow(pendingActions) : null;
   const visiblePendingActions = pendingActions
     .filter((action) => !imageActionTypes.has(action.action))
     .slice(0, staffOperationalStateLimits.pendingActions)

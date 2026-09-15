@@ -465,7 +465,10 @@ export const applyOrderFeedbackProviderResult = async (
     return;
   }
 
-  if (kind === "order_feedback_owner_notification") {
+  if (
+    kind === "order_feedback_owner_notification" ||
+    kind === "order_feedback_staff_notification"
+  ) {
     const feedbackId = getMetadataString(message.metadata, "feedbackId");
 
     if (!Types.ObjectId.isValid(feedbackId)) {

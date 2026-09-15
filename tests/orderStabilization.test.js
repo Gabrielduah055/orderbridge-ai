@@ -283,7 +283,7 @@ test("cancellation request and resolution notifications are idempotently queued"
         customerCancellationRequestStatus: "approved"
       })
     );
-    assert.equal(queued[0].metadata.kind, "owner_order_cancellation_request_notification");
+    assert.equal(queued[0].metadata.kind, "staff_order_cancellation_request_notification");
     assert.match(queued[0].text, /CANCELLATION REQUEST/);
     assert.equal(queued[1].metadata.kind, "customer_order_cancellation_resolution_notification");
     assert.match(queued[1].text, /approved/i);

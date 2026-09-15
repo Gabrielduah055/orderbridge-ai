@@ -74,7 +74,7 @@ test("staff outreach preview derives a mixed audience without exposing phones", 
   assert.match(buildMarketingConsentOutreachPreviewMessage(preview), /Eligible to ask now: 1/);
 });
 
-test("confirmed staff outreach isolates queue failures and manager is allowed", async () => {
+test("confirmed owner outreach isolates queue failures and managers are denied", async () => {
   const profiles = [
     { customerPhone: "+233500000021", marketingConsent: null, isOptedOut: false },
     { customerPhone: "+233500000022", marketingConsent: null, isOptedOut: false }
@@ -82,7 +82,7 @@ test("confirmed staff outreach isolates queue failures and manager is allowed", 
   const queued = [];
   const result = await executeMarketingConsentOutreach(
     restaurantId,
-    managerPhone,
+    ownerPhone,
     dependenciesFor(profiles, async (input) => {
       queued.push(input);
       if (input.customerPhone.endsWith("22")) throw new Error("queue down");
@@ -91,13 +91,13 @@ test("confirmed staff outreach isolates queue failures and manager is allowed", 
   );
 
   assert.equal(isToolAllowedForRole("invite_customers_to_marketing", "owner"), true);
-  assert.equal(isToolAllowedForRole("invite_customers_to_marketing", "manager"), true);
+  assert.equal(isToolAllowedForRole("invite_customers_to_marketing", "manager"), false);
   assert.equal(isToolAllowedForRole("invite_customers_to_marketing", "customer"), false);
   assert.equal(result.eligible, 2);
   assert.equal(result.queued, 1);
   assert.equal(result.failedToQueue, 1);
   assert.equal(queued[0].source, "staff_outreach");
-  assert.equal(queued[0].requestedByPhone, managerPhone);
+  assert.equal(queued[0].requestedByPhone, ownerPhone);
 });
 
 test("staff tool creates a backend preview confirmation without queueing invitations", async () => {

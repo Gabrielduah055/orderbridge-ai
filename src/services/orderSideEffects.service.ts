@@ -8,6 +8,10 @@ import {
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { queueMarketingConsentRequest } from "./customerMarketingOnboarding.service";
 import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
+import {
+  resolveOperationalRecipients,
+  type StaffNotificationRecipient
+} from "./operationalRecipient.service";
 
 /** Delay in milliseconds before sending the marketing opt-in message after receipt delivery. */
 const MARKETING_CONSENT_DELAY_MS = 2 * 60 * 1_000; // 2 minutes
@@ -15,11 +19,73 @@ const MARKETING_CONSENT_DELAY_MS = 2 * 60 * 1_000; // 2 minutes
 export type SideEffectStepStatus = "success" | "queued" | "failed" | "skipped" | "not_attempted";
 
 export interface OrderSideEffectResult {
+  staffNotification?: SideEffectStepStatus;
+  /** @deprecated Kept for existing side-effect callers. */
   ownerNotification?: SideEffectStepStatus;
   customerNotification?: SideEffectStepStatus;
   receiptGeneration?: SideEffectStepStatus;
   receiptDelivery?: SideEffectStepStatus;
 }
+
+type OperationalOrderNotificationKind =
+  | "staff_order_notification"
+  | "staff_order_cancelled_notification"
+  | "staff_order_cancellation_request_notification"
+  | "staff_order_amended_notification";
+
+const queueOperationalOrderNotification = async (input: {
+  restaurant: IRestaurantDocument;
+  order: IOrderDocument;
+  recipients: StaffNotificationRecipient[];
+  kind: OperationalOrderNotificationKind;
+  text: string;
+  idempotencyPrefix: string;
+  amendmentVersion?: number;
+}): Promise<OrderSideEffectResult> => {
+  if (input.recipients.length === 0) {
+    return { staffNotification: "failed", ownerNotification: "failed" };
+  }
+
+  await Promise.all(
+    input.recipients.map(async (recipient) => {
+      const queued = await enqueueWasenderMessage({
+        restaurantId: String(input.restaurant._id),
+        sessionId: input.restaurant.wasenderSessionId,
+        to: recipient.recipientPhone,
+        type: "text",
+        text: input.text,
+        apiKey: input.restaurant.wasenderApiToken,
+        idempotencyKey: `${input.idempotencyPrefix}:${recipient.recipientPhone}`,
+        metadata: {
+          kind: input.kind,
+          restaurantId: String(input.restaurant._id),
+          orderId: String(input.order._id),
+          orderNumber: input.order.orderNumber,
+          ...(input.amendmentVersion === undefined
+            ? {}
+            : { amendmentVersion: input.amendmentVersion }),
+          recipientType: recipient.recipientType,
+          recipientPhone: recipient.recipientPhone,
+          ...(recipient.recipientName
+            ? { recipientName: recipient.recipientName }
+            : {})
+        }
+      });
+
+      console.info("Staff order notification queued", {
+        restaurantId: String(input.restaurant._id),
+        orderId: String(input.order._id),
+        orderNumber: input.order.orderNumber,
+        queueMessageId: String(queued._id),
+        recipientType: recipient.recipientType,
+        recipientPhone: recipient.recipientPhone,
+        kind: input.kind
+      });
+    })
+  );
+
+  return { staffNotification: "queued", ownerNotification: "queued" };
+};
 
 const getErrorMessage = (error: unknown): string => {
   if (error instanceof Error) {
@@ -247,104 +313,71 @@ export const notifyOwnerOfSubmittedOrder = async (
   restaurant: IRestaurantDocument,
   order: IOrderDocument
 ): Promise<OrderSideEffectResult> => {
-  if (order.ownerNotifiedAt) {
-    console.info("Owner order notification skipped", {
-      restaurantId: String(restaurant._id),
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      reason: "already_sent"
-    });
-
-    return {
-      ownerNotification: "skipped"
-    };
+  const recipients = resolveOperationalRecipients(restaurant);
+  if (
+    recipients.length === 1 &&
+    recipients[0].recipientType === "owner" &&
+    order.ownerNotifiedAt
+  ) {
+    return { staffNotification: "skipped", ownerNotification: "skipped" };
   }
 
-  const queued = await enqueueWasenderMessage({
-    restaurantId: String(restaurant._id),
-    sessionId: restaurant.wasenderSessionId,
-    to: restaurant.ownerPhone,
-    type: "text",
+  return queueOperationalOrderNotification({
+    restaurant,
+    order,
+    recipients,
+    kind: "staff_order_notification",
     text: buildOwnerNewOrderNotification(restaurant, order),
-    apiKey: restaurant.wasenderApiToken,
-    idempotencyKey: `owner-order-notification:${String(order._id)}`,
-    metadata: {
-      kind: "owner_order_notification",
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      amendmentVersion: 0,
-      recipientType: "owner"
-    }
+    idempotencyPrefix: `staff-order-notification:${String(order._id)}:v0`,
+    amendmentVersion: 0
   });
-
-  console.info("Owner order notification queued", {
-    restaurantId: String(restaurant._id),
-    orderId: String(order._id),
-    orderNumber: order.orderNumber,
-    queueMessageId: String(queued._id),
-    recipientType: "owner"
-  });
-
-  return {
-    ownerNotification: "queued"
-  };
 };
 
 export const notifyOwnerOfCustomerCancellation = async (
   restaurant: IRestaurantDocument,
   order: IOrderDocument
 ): Promise<OrderSideEffectResult> => {
-  if (order.ownerCancellationNotifiedAt) {
-    return { ownerNotification: "skipped" };
+  const recipients = resolveOperationalRecipients(restaurant);
+  if (
+    recipients.length === 1 &&
+    recipients[0].recipientType === "owner" &&
+    order.ownerCancellationNotifiedAt
+  ) {
+    return { staffNotification: "skipped", ownerNotification: "skipped" };
   }
 
-  await enqueueWasenderMessage({
-    restaurantId: String(restaurant._id),
-    sessionId: restaurant.wasenderSessionId,
-    to: restaurant.ownerPhone,
-    type: "text",
+  return queueOperationalOrderNotification({
+    restaurant,
+    order,
+    recipients,
+    kind: "staff_order_cancelled_notification",
     text: buildOwnerCustomerCancellationNotification(restaurant, order),
-    apiKey: restaurant.wasenderApiToken,
-    idempotencyKey: `owner-order-cancelled:${String(order._id)}`,
-    metadata: {
-      kind: "owner_order_cancelled_notification",
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      recipientType: "owner"
-    }
+    idempotencyPrefix: `staff-order-cancelled:${String(order._id)}`
   });
-
-  return { ownerNotification: "queued" };
 };
 
 export const notifyOwnerOfCustomerCancellationRequest = async (
   restaurant: IRestaurantDocument,
   order: IOrderDocument
 ): Promise<OrderSideEffectResult> => {
+  const recipients = resolveOperationalRecipients(restaurant);
   if (
     order.customerCancellationRequestStatus !== "pending" ||
-    order.ownerCancellationRequestNotifiedAt
+    (recipients.length === 1 &&
+      recipients[0].recipientType === "owner" &&
+      order.ownerCancellationRequestNotifiedAt)
   ) {
-    return { ownerNotification: "skipped" };
+    return { staffNotification: "skipped", ownerNotification: "skipped" };
   }
 
-  await enqueueWasenderMessage({
-    restaurantId: String(restaurant._id),
-    sessionId: restaurant.wasenderSessionId,
-    to: restaurant.ownerPhone,
-    type: "text",
+  return queueOperationalOrderNotification({
+    restaurant,
+    order,
+    recipients,
+    kind: "staff_order_cancellation_request_notification",
     text: buildOwnerCustomerCancellationRequestNotification(restaurant, order),
-    apiKey: restaurant.wasenderApiToken,
-    idempotencyKey: `owner-order-cancellation-request:${String(order._id)}`,
-    metadata: {
-      kind: "owner_order_cancellation_request_notification",
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      recipientType: "owner"
-    }
+    idempotencyPrefix: `staff-order-cancellation-request:${String(order._id)}`
   });
-
-  return { ownerNotification: "queued" };
 };
 
 export const notifyCustomerOfCancellationResolution = async (
@@ -401,32 +434,26 @@ export const notifyOwnerOfCustomerAmendment = async (
   order: IOrderDocument
 ): Promise<OrderSideEffectResult> => {
   const amendmentVersion = order.customerAmendmentVersion ?? 0;
+  const recipients = resolveOperationalRecipients(restaurant);
 
   if (
     amendmentVersion < 1 ||
-    (order.ownerAmendmentNotifiedVersion ?? 0) >= amendmentVersion
+    (recipients.length === 1 &&
+      recipients[0].recipientType === "owner" &&
+      (order.ownerAmendmentNotifiedVersion ?? 0) >= amendmentVersion)
   ) {
-    return { ownerNotification: "skipped" };
+    return { staffNotification: "skipped", ownerNotification: "skipped" };
   }
 
-  await enqueueWasenderMessage({
-    restaurantId: String(restaurant._id),
-    sessionId: restaurant.wasenderSessionId,
-    to: restaurant.ownerPhone,
-    type: "text",
+  return queueOperationalOrderNotification({
+    restaurant,
+    order,
+    recipients,
+    kind: "staff_order_amended_notification",
     text: buildOwnerOrderAmendedNotification(restaurant, order),
-    apiKey: restaurant.wasenderApiToken,
-    idempotencyKey: `owner-order-amended:${String(order._id)}:${amendmentVersion}`,
-    metadata: {
-      kind: "owner_order_amended_notification",
-      orderId: String(order._id),
-      orderNumber: order.orderNumber,
-      amendmentVersion,
-      recipientType: "owner"
-    }
+    idempotencyPrefix: `staff-order-amended:${String(order._id)}:v${amendmentVersion}`,
+    amendmentVersion
   });
-
-  return { ownerNotification: "queued" };
 };
 
 export const notifyCustomerOfRejectedOrder = async (

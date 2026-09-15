@@ -688,7 +688,7 @@ test("campaign permissions and schemas reject customers and injected scope", () 
   ]) {
     assert.equal(isToolAllowedForRole(toolName, "customer"), false);
     assert.equal(isToolAllowedForRole(toolName, "owner"), true);
-    assert.equal(isToolAllowedForRole(toolName, "manager"), true);
+    assert.equal(isToolAllowedForRole(toolName, "manager"), false);
   }
 
   const validDraft = {
@@ -795,7 +795,7 @@ test("campaign creation creates a version-bound approval action and no outbound 
         restaurantId,
         restaurant: makeRestaurant(),
         sender: {
-          role: "manager",
+          role: "owner",
           verified: true,
           normalizedPhone: "+233241234567",
           phone: "+233241234567"

@@ -160,13 +160,13 @@ test("owner text reaches the orchestrator before owner order parsing", async () 
   });
 });
 
-test("manager text reaches the orchestrator before deterministic image reply handling", async () => {
+test("owner text reaches the orchestrator before deterministic image reply handling", async () => {
   await runWithRoutingHarness(async () => {
     const events = [];
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
-        senderPhone: managerPhone,
+        senderPhone: ownerPhone,
         message: "yeah, use it for Chicken Salad"
       },
       {
@@ -637,13 +637,13 @@ test("quoted provider message ID is passed to the staff state builder", async ()
   });
 });
 
-test("OpenRouter failure preserves the deterministic image-intent text fallback", async () => {
+test("OpenRouter failure preserves the owner deterministic image-intent text fallback", async () => {
   await runWithRoutingHarness(async ({ logs }) => {
     const events = [];
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
-        senderPhone: managerPhone,
+        senderPhone: ownerPhone,
         message: "Add an image to Check Check Fried Rice"
       },
       {
@@ -675,6 +675,79 @@ test("OpenRouter failure preserves the deterministic image-intent text fallback"
       ),
       true
     );
+  });
+});
+
+test("manager image-intent text cannot reach deterministic image workflow helpers", async () => {
+  await runWithRoutingHarness(async () => {
+    const events = [];
+    const shouldNotRun = () => {
+      throw new Error("manager reached a deterministic image workflow helper");
+    };
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: managerPhone,
+        message: "Add an image to Check Check Fried Rice"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: buildEmptyStaffState,
+        runOrchestrator: async () => {
+          events.push("ai");
+          return makeAgentResult({
+            success: false,
+            errorCode: "OPENROUTER_HTTP_ERROR"
+          });
+        },
+        handlePendingImageReply: shouldNotRun,
+        rememberImageRequest: shouldNotRun
+      })
+    );
+
+    assert.deepEqual(events, ["ai"]);
+    assert.equal(response.success, false);
+    assert.equal(response.source, "openrouter_agent");
+  });
+});
+
+test("manager cannot continue an old pending image workflow through fallback", async () => {
+  await runWithRoutingHarness(async () => {
+    let receivedImageWorkflow = "not-observed";
+    const shouldNotRun = () => {
+      throw new Error("manager continued an old pending image workflow");
+    };
+    const response = await handleRestaurantAgentMessage(
+      {
+        restaurant: makeRestaurant(),
+        senderPhone: managerPhone,
+        message: "yes, use it"
+      },
+      makeOrderSafetyDependencies({
+        buildStaffState: async () =>
+          makeStaffState({
+            imageWorkflow: {
+              active: true,
+              type: "menu_item_image",
+              stage: "awaiting_confirmation",
+              imageUploaded: true,
+              itemName: "Chicken Salad",
+              pendingActionId: "old-manager-image-action"
+            }
+          }),
+        runOrchestrator: async (input) => {
+          receivedImageWorkflow = input.staffState.imageWorkflow;
+          return makeAgentResult({
+            success: false,
+            errorCode: "OPENROUTER_HTTP_ERROR"
+          });
+        },
+        handlePendingImageReply: shouldNotRun,
+        rememberImageRequest: shouldNotRun
+      })
+    );
+
+    assert.equal(receivedImageWorkflow, null);
+    assert.equal(response.success, false);
   });
 });
 
@@ -1262,7 +1335,7 @@ test("awaiting image confirmation bypasses AI and uses the exact workflow", asyn
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
-        senderPhone: managerPhone,
+        senderPhone: ownerPhone,
         message: "yes"
       },
       {
@@ -1313,7 +1386,7 @@ test("awaiting image cancellation bypasses AI and uses the exact workflow", asyn
     const response = await handleRestaurantAgentMessage(
       {
         restaurant: makeRestaurant(),
-        senderPhone: managerPhone,
+        senderPhone: ownerPhone,
         message: "no, cancel it"
       },
       {
