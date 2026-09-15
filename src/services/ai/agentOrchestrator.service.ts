@@ -143,6 +143,8 @@ interface GroundedCustomerInsightsResult {
     preferredOrderType: "pickup" | "delivery" | null;
     returning: boolean;
     marketingStatus: string;
+    marketingEligibility: string;
+    canReceivePromotions: boolean;
     frequentlyOrderedItems: Array<{
       name: string;
       orderCount: number;
@@ -164,7 +166,12 @@ interface GroundedCustomerSegmentResult {
     endDate?: string;
   };
   totalCustomers?: number;
+  customersWithCompletedOrders?: number;
+  totalCompletedOrderCount?: number;
   marketingEligibleCustomers?: number;
+  excludedNoConsent?: number;
+  excludedOptOut?: number;
+  excludedInvalidPhone?: number;
   historicalTopItems?: Array<{
     name: string;
     customerCount: number;
@@ -176,6 +183,18 @@ interface GroundedCustomerSegmentResult {
     delivery: number;
     unknown: number;
   };
+  memberTotalMatched?: number;
+  returnedMemberCount?: number;
+  membersTruncated?: boolean;
+  memberMarketingEligibleOnly?: boolean;
+  customers?: Array<{
+    name: string;
+    maskedPhone: string;
+    completedOrderCount: number;
+    lastCompletedOrderAt: string | null;
+    marketingStatus: string;
+    marketingEligibility: string;
+  }>;
 }
 
 const parseGroundedCustomerInsightsResult = (
@@ -194,6 +213,11 @@ const parseGroundedCustomerInsightsResult = (
       typeof customer.name !== "string" ||
       typeof customer.maskedPhone !== "string" ||
       typeof customer.completedOrderCount !== "number" ||
+      typeof customer.averageCompletedOrderValue !== "number" ||
+      typeof customer.returning !== "boolean" ||
+      typeof customer.marketingStatus !== "string" ||
+      typeof customer.marketingEligibility !== "string" ||
+      typeof customer.canReceivePromotions !== "boolean" ||
       !Array.isArray(customer.frequentlyOrderedItems)
     ) {
       return null;
@@ -226,8 +250,20 @@ const buildGroundedCustomerInsightsAnswer = (
 
   const customer = result.customer as NonNullable<GroundedCustomerInsightsResult["customer"]>;
   const message = ownerMessage.toLowerCase();
-  if (/\b(?:how many times|how many orders|order count)\b/.test(message)) {
+  if (
+    /\bhow many\b.*\borders?\b|\b(?:completed order count|order count)\b/.test(
+      message
+    )
+  ) {
     return `${customer.name} has completed ${customer.completedOrderCount} order${customer.completedOrderCount === 1 ? "" : "s"}.`;
+  }
+  if (/\breturning customer\b/.test(message)) {
+    return customer.returning
+      ? `Yes, ${customer.name} is a returning customer.`
+      : `No, ${customer.name} is not a returning customer.`;
+  }
+  if (/\baverage\b.*\b(?:order|value|spend)|\baverage order value\b/.test(message)) {
+    return `${customer.name}'s average completed order value is GHS ${customer.averageCompletedOrderValue.toFixed(2)}.`;
   }
   if (/\b(?:usually|normally|frequently|often)\b.*\b(?:order|buy)|\bwhat\b.*\b(?:order|buy)/.test(message)) {
     const items = customer.frequentlyOrderedItems.slice(0, 5);
@@ -245,14 +281,25 @@ const buildGroundedCustomerInsightsAnswer = (
       ? `${customer.name} usually uses ${customer.preferredOrderType}.`
       : `${customer.name} does not have a preferred order type yet.`;
   }
-  if (/\b(?:marketing|promotion|promotions|opted)\b/.test(message)) {
+  if (/\b(?:can|eligible)\b.*\b(?:receive )?(?:promotion|promotions|marketing)\b/.test(message)) {
     const labels: Record<string, string> = {
-      opted_in: "can currently receive promotions",
+      eligible: "can currently receive promotions",
+      no_consent:
+        "cannot currently receive promotions because marketing consent has not been confirmed",
       opted_out: "is opted out and cannot receive promotions",
-      awaiting_response: "has not yet responded to the marketing invitation",
-      not_asked: "has not yet been asked for marketing consent"
+      invalid_recipient:
+        "cannot currently receive promotions because there is no valid promotional WhatsApp recipient"
     };
-    return `${customer.name} ${labels[customer.marketingStatus] ?? "does not currently have confirmed marketing eligibility"}.`;
+    return `${customer.name} ${labels[customer.marketingEligibility] ?? "cannot currently receive promotions"}.`;
+  }
+  if (/\b(?:marketing status|consent status|marketing consent|opted)\b/.test(message)) {
+    const labels: Record<string, string> = {
+      opted_in: "opted in",
+      opted_out: "opted out",
+      awaiting_response: "awaiting a response",
+      not_asked: "not yet asked"
+    };
+    return `${customer.name}'s marketing consent status is ${labels[customer.marketingStatus] ?? customer.marketingStatus.replace(/_/g, " ")}.`;
   }
 
   const itemSummary = customer.frequentlyOrderedItems.length > 0
@@ -264,7 +311,7 @@ const buildGroundedCustomerInsightsAnswer = (
   return [
     `${customer.name} (${customer.maskedPhone}) has completed ${customer.completedOrderCount} order${customer.completedOrderCount === 1 ? "" : "s"}, averaging GHS ${customer.averageCompletedOrderValue.toFixed(2)}.`,
     `Last completed order: ${customer.lastCompletedOrderAt ?? "none"}; preferred order type: ${customer.preferredOrderType ?? "not established"}.`,
-    `Historical frequent items: ${itemSummary}. Marketing status: ${customer.marketingStatus.replace(/_/g, " ")}.`
+    `Historical frequent items: ${itemSummary}. Marketing consent: ${customer.marketingStatus.replace(/_/g, " ")}; promotional eligibility: ${customer.marketingEligibility.replace(/_/g, " ")}.`
   ].join("\n");
 };
 
@@ -283,9 +330,26 @@ const parseGroundedCustomerSegmentResult = (
   if (
     result.status === "ok" &&
     (typeof result.totalCustomers !== "number" ||
+      typeof result.customersWithCompletedOrders !== "number" ||
+      typeof result.totalCompletedOrderCount !== "number" ||
       typeof result.marketingEligibleCustomers !== "number" ||
+      typeof result.excludedNoConsent !== "number" ||
+      typeof result.excludedOptOut !== "number" ||
+      typeof result.excludedInvalidPhone !== "number" ||
       !result.segment ||
-      !Array.isArray(result.historicalTopItems))
+      !Array.isArray(result.historicalTopItems) ||
+      !result.preferredOrderTypeDistribution)
+  ) {
+    return null;
+  }
+  if (
+    result.status === "ok" &&
+    result.customers !== undefined &&
+    (typeof result.memberTotalMatched !== "number" ||
+      typeof result.returnedMemberCount !== "number" ||
+      typeof result.membersTruncated !== "boolean" ||
+      typeof result.memberMarketingEligibleOnly !== "boolean" ||
+      !Array.isArray(result.customers))
   ) {
     return null;
   }
@@ -318,6 +382,68 @@ const buildGroundedCustomerSegmentAnswer = (
             ? `customers whose last completed order was from ${segment.startDate} to ${segment.endDate}`
             : "customers";
   const message = ownerMessage.toLowerCase();
+
+  if (Array.isArray(result.customers)) {
+    const customers = result.customers.filter(
+      (customer) =>
+        customer &&
+        typeof customer.name === "string" &&
+        typeof customer.maskedPhone === "string" &&
+        typeof customer.completedOrderCount === "number"
+    );
+    const memberTotal = result.memberTotalMatched as number;
+    const returned = result.returnedMemberCount as number;
+    const eligibleLabel = result.memberMarketingEligibleOnly
+      ? " eligible"
+      : "";
+    if (memberTotal === 0) {
+      return `No${eligibleLabel} ${segmentLabel} matched.`;
+    }
+    const header = result.membersTruncated
+      ? `Showing ${returned} of ${memberTotal}${eligibleLabel} ${segmentLabel}:`
+      : `${memberTotal}${eligibleLabel} ${segmentLabel} matched:`;
+    return `${header}\n${customers.map((customer, index) => `${index + 1}. ${customer.name} — ${customer.maskedPhone} — ${customer.completedOrderCount} completed order${customer.completedOrderCount === 1 ? "" : "s"}`).join("\n")}`;
+  }
+
+  if (/\bopted[ -]?out\b/.test(message)) {
+    return `${result.excludedOptOut} of ${total} ${segmentLabel} are opted out.`;
+  }
+  if (
+    /\b(?:haven't|have not|without|no)\b.*\bconsent\b|\bconsent not confirmed\b/.test(
+      message
+    )
+  ) {
+    return `${result.excludedNoConsent} of ${total} ${segmentLabel} do not have confirmed marketing consent.`;
+  }
+  if (
+    /\b(?:invalid|valid|without|don't have|do not have)\b.*\b(?:whatsapp|recipient)\b/.test(
+      message
+    )
+  ) {
+    return `${result.excludedInvalidPhone} of ${total} ${segmentLabel} do not have a valid promotional WhatsApp recipient.`;
+  }
+  if (
+    /\bhow many\b.*\b(?:customers?|them)\b.*\b(?:have|with)\b.*\bcompleted orders?\b/.test(
+      message
+    )
+  ) {
+    return `${result.customersWithCompletedOrders} of ${total} ${segmentLabel} have completed orders.`;
+  }
+  if (
+    /\b(?:how many|total)\b.*\bcompleted orders?\b.*\b(?:represent|altogether|in total)\b|\btotal completed orders?\b/.test(
+      message
+    )
+  ) {
+    return `Those ${segmentLabel} represent ${result.totalCompletedOrderCount} completed order${result.totalCompletedOrderCount === 1 ? "" : "s"}.`;
+  }
+  if (
+    /\b(?:delivery or pickup|pickup or delivery|normally use|usually use|order type)\b/.test(
+      message
+    )
+  ) {
+    const distribution = result.preferredOrderTypeDistribution as NonNullable<GroundedCustomerSegmentResult["preferredOrderTypeDistribution"]>;
+    return `Preferred order types for those ${segmentLabel}: delivery ${distribution.delivery}, pickup ${distribution.pickup}, not established ${distribution.unknown}.`;
+  }
 
   if (/\b(?:normally order|usually order|normally buy|usually buy|what do .* order|what do .* buy)\b/.test(message)) {
     const items = (result.historicalTopItems ?? []).slice(0, 5);

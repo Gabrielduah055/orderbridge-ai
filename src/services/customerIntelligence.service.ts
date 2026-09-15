@@ -50,7 +50,10 @@ export const customerSegmentInsightsSchema = z
     inactiveDays: z.number().int().min(1).max(3650).optional(),
     menuItemName: z.string().trim().min(1).max(160).optional(),
     startDate: z.string().trim().min(1).optional(),
-    endDate: z.string().trim().min(1).optional()
+    endDate: z.string().trim().min(1).optional(),
+    includeCustomers: z.boolean().optional(),
+    marketingEligibleOnly: z.boolean().optional(),
+    limit: z.number().int().min(1).max(25).optional()
   })
   .strict()
   .superRefine((value, context) => {
@@ -99,6 +102,20 @@ export const customerSegmentInsightsSchema = z
         code: z.ZodIssueCode.custom,
         path: ["startDate"],
         message: "startDate and endDate are required"
+      });
+    }
+    if (value.marketingEligibleOnly === true && value.includeCustomers !== true) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["marketingEligibleOnly"],
+        message: "marketingEligibleOnly requires includeCustomers=true"
+      });
+    }
+    if (value.limit !== undefined && value.includeCustomers !== true) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["limit"],
+        message: "limit requires includeCustomers=true"
       });
     }
   });
@@ -195,6 +212,8 @@ export type CustomerInsightsResult =
         preferredOrderType: "pickup" | "delivery" | null;
         returning: boolean;
         marketingStatus: ReturnType<typeof getCustomerMarketingStatus>;
+        marketingEligibility: CustomerMarketingEligibility;
+        canReceivePromotions: boolean;
         frequentlyOrderedItems: Array<{
           name: string;
           orderCount: number;
@@ -206,26 +225,34 @@ export type CustomerInsightsResult =
 
 const buildCustomerInsights = (
   profile: IntelligenceProfile
-): CustomerInsightsResult => ({
-  status: "found",
-  found: true,
-  customer: {
-    name: customerDisplayName(profile),
-    maskedPhone: maskCustomerPhone(profile.customerPhone),
-    completedOrderCount: profile.orderCount,
-    lastCompletedOrderAt: profile.lastOrderAt?.toISOString() ?? null,
-    averageCompletedOrderValue: roundCurrency(profile.averageOrderValue),
-    preferredOrderType: profile.preferredOrderType ?? null,
-    returning: profile.orderCount >= 2,
-    marketingStatus: getCustomerMarketingStatus(profile),
-    frequentlyOrderedItems: (profile.frequentlyOrderedItems ?? []).map((item) => ({
-      name: normalizeDisplayText(item.name),
-      orderCount: item.orderCount,
-      totalQuantity: item.totalQuantity,
-      lastOrderedAt: item.lastOrderedAt.toISOString()
-    }))
-  }
-});
+): CustomerInsightsResult => {
+  const marketingEligibility = classifyCustomerMarketingEligibility(profile);
+
+  return {
+    status: "found",
+    found: true,
+    customer: {
+      name: customerDisplayName(profile),
+      maskedPhone: maskCustomerPhone(profile.customerPhone),
+      completedOrderCount: profile.orderCount,
+      lastCompletedOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+      averageCompletedOrderValue: roundCurrency(profile.averageOrderValue),
+      preferredOrderType: profile.preferredOrderType ?? null,
+      returning: profile.orderCount >= 2,
+      marketingStatus: getCustomerMarketingStatus(profile),
+      marketingEligibility,
+      canReceivePromotions: marketingEligibility === "eligible",
+      frequentlyOrderedItems: (profile.frequentlyOrderedItems ?? []).map(
+        (item) => ({
+          name: normalizeDisplayText(item.name),
+          orderCount: item.orderCount,
+          totalQuantity: item.totalQuantity,
+          lastOrderedAt: item.lastOrderedAt.toISOString()
+        })
+      )
+    }
+  };
+};
 
 export const getCustomerInsights = async (input: {
   restaurantId: string;
@@ -390,6 +417,15 @@ interface TopItemAggregate {
   totalQuantity: number;
 }
 
+interface SafeSegmentCustomer {
+  name: string;
+  maskedPhone: string;
+  completedOrderCount: number;
+  lastCompletedOrderAt: string | null;
+  marketingStatus: ReturnType<typeof getCustomerMarketingStatus>;
+  marketingEligibility: CustomerMarketingEligibility;
+}
+
 type WorkingTopItemAggregate = TopItemAggregate & {
   latestNameAt: number;
 };
@@ -461,6 +497,62 @@ const eligibilityCounts = (profiles: IntelligenceProfile[]) => {
   return counts;
 };
 
+const compareRepresentativeProfiles = (
+  left: IntelligenceProfile,
+  right: IntelligenceProfile
+): number =>
+  right.orderCount - left.orderCount ||
+  (right.lastOrderAt?.getTime() ?? 0) - (left.lastOrderAt?.getTime() ?? 0) ||
+  customerDisplayName(left).localeCompare(customerDisplayName(right)) ||
+  left.customerPhone.localeCompare(right.customerPhone);
+
+const getSafeSegmentMembers = (
+  profiles: IntelligenceProfile[],
+  marketingEligibleOnly: boolean,
+  limit: number
+): {
+  memberTotalMatched: number;
+  returnedMemberCount: number;
+  membersTruncated: boolean;
+  customers: SafeSegmentCustomer[];
+} => {
+  let memberProfiles: IntelligenceProfile[];
+
+  if (marketingEligibleOnly) {
+    const representatives = new Map<string, IntelligenceProfile>();
+    for (const profile of profiles) {
+      if (classifyCustomerMarketingEligibility(profile) !== "eligible") {
+        continue;
+      }
+      const recipient = normalizeWhatsappRecipient(profile.customerPhone);
+      const current = representatives.get(recipient);
+      if (!current || compareRepresentativeProfiles(profile, current) < 0) {
+        representatives.set(recipient, profile);
+      }
+    }
+    memberProfiles = Array.from(representatives.values());
+  } else {
+    memberProfiles = [...profiles];
+  }
+
+  memberProfiles.sort(compareRepresentativeProfiles);
+  const customers = memberProfiles.slice(0, limit).map((profile) => ({
+    name: customerDisplayName(profile),
+    maskedPhone: maskCustomerPhone(profile.customerPhone),
+    completedOrderCount: profile.orderCount,
+    lastCompletedOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+    marketingStatus: getCustomerMarketingStatus(profile),
+    marketingEligibility: classifyCustomerMarketingEligibility(profile)
+  }));
+
+  return {
+    memberTotalMatched: memberProfiles.length,
+    returnedMemberCount: customers.length,
+    membersTruncated: memberProfiles.length > customers.length,
+    customers
+  };
+};
+
 export type CustomerSegmentInsightsResult =
   | {
       status: "menu_item_not_found";
@@ -495,6 +587,11 @@ export type CustomerSegmentInsightsResult =
         delivery: number;
         unknown: number;
       };
+      memberTotalMatched?: number;
+      returnedMemberCount?: number;
+      membersTruncated?: boolean;
+      memberMarketingEligibleOnly?: boolean;
+      customers?: SafeSegmentCustomer[];
     };
 
 export const getCustomerSegmentInsights = async (input: {
@@ -505,6 +602,9 @@ export const getCustomerSegmentInsights = async (input: {
   menuItemName?: string;
   startDate?: string;
   endDate?: string;
+  includeCustomers?: boolean;
+  marketingEligibleOnly?: boolean;
+  limit?: number;
   now?: Date;
 }): Promise<CustomerSegmentInsightsResult> => {
   ensureRestaurantId(input.restaurantId);
@@ -513,7 +613,10 @@ export const getCustomerSegmentInsights = async (input: {
     inactiveDays: input.inactiveDays,
     menuItemName: input.menuItemName,
     startDate: input.startDate,
-    endDate: input.endDate
+    endDate: input.endDate,
+    includeCustomers: input.includeCustomers,
+    marketingEligibleOnly: input.marketingEligibleOnly,
+    limit: input.limit
   });
   const filter: Record<string, unknown> = { restaurantId: input.restaurantId };
   let menuItem: { id: string; name: string } | undefined;
@@ -581,6 +684,13 @@ export const getCustomerSegmentInsights = async (input: {
       preferredOrderTypeDistribution.unknown += 1;
     }
   }
+  const members = parsed.includeCustomers
+    ? getSafeSegmentMembers(
+        profiles,
+        parsed.marketingEligibleOnly === true,
+        parsed.limit ?? 10
+      )
+    : undefined;
 
   return {
     status: "ok",
@@ -604,6 +714,13 @@ export const getCustomerSegmentInsights = async (input: {
     excludedOptOut: eligibility.opted_out,
     excludedInvalidPhone: eligibility.invalid_recipient,
     historicalTopItems: aggregateTopItems(profiles),
-    preferredOrderTypeDistribution
+    preferredOrderTypeDistribution,
+    ...(members
+      ? {
+          ...members,
+          memberMarketingEligibleOnly:
+            parsed.marketingEligibleOnly === true
+        }
+      : {})
   };
 };

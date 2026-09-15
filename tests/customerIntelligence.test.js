@@ -30,6 +30,13 @@ const {
 const {
   runAgentOrchestrator
 } = require("../dist/services/ai/agentOrchestrator.service");
+const { PendingAgentAction } = require("../dist/models/pendingAgentAction.model");
+const {
+  executeConfirmedPendingToolAction
+} = require("../dist/agent-tools/tool.executor");
+const {
+  isPendingActionConfirmationMessage
+} = require("../dist/services/restaurantAgent.service");
 
 const restaurantId = "64b000000000000000000001";
 const otherRestaurantId = "64b000000000000000000002";
@@ -156,6 +163,8 @@ test("exact customer name lookup is tenant-scoped, whitespace-normalized, and pr
       preferredOrderType: "delivery",
       returning: true,
       marketingStatus: "opted_in",
+      marketingEligibility: "eligible",
+      canReceivePromotions: true,
       frequentlyOrderedItems: [
         {
           name: "Chicken Jollof",
@@ -199,6 +208,70 @@ test("exact phone lookup normalizes the phone, remains tenant-scoped, and return
     assert.doesNotMatch(JSON.stringify(result), /\+233501112043/);
   } finally {
     CustomerProfile.findOne = originalFindOne;
+  }
+});
+
+test("individual insights separate consent status from actual promotional eligibility", async () => {
+  const originals = {
+    countDocuments: CustomerProfile.countDocuments,
+    find: CustomerProfile.find
+  };
+  let currentProfile;
+  try {
+    CustomerProfile.countDocuments = async () => 1;
+    CustomerProfile.find = () => query([currentProfile]);
+
+    const scenarios = [
+      {
+        profile: profile(),
+        marketingStatus: "opted_in",
+        marketingEligibility: "eligible",
+        canReceivePromotions: true
+      },
+      {
+        profile: profile({ customerPhone: "invalid" }),
+        marketingStatus: "opted_in",
+        marketingEligibility: "invalid_recipient",
+        canReceivePromotions: false
+      },
+      {
+        profile: profile({ marketingConsent: true, isOptedOut: true }),
+        marketingStatus: "opted_out",
+        marketingEligibility: "opted_out",
+        canReceivePromotions: false
+      },
+      {
+        profile: profile({
+          marketingConsent: null,
+          isOptedOut: false,
+          marketingConsentPromptedAt: undefined
+        }),
+        marketingStatus: "not_asked",
+        marketingEligibility: "no_consent",
+        canReceivePromotions: false
+      }
+    ];
+
+    for (const scenario of scenarios) {
+      currentProfile = scenario.profile;
+      const result = await getCustomerInsights({
+        restaurantId,
+        customerName: "Ama Mensah"
+      });
+      assert.equal(result.customer.marketingStatus, scenario.marketingStatus);
+      assert.equal(
+        result.customer.marketingEligibility,
+        scenario.marketingEligibility
+      );
+      assert.equal(
+        result.customer.canReceivePromotions,
+        scenario.canReceivePromotions
+      );
+      assert.doesNotMatch(JSON.stringify(result), /\+233501112043/);
+    }
+  } finally {
+    CustomerProfile.countDocuments = originals.countDocuments;
+    CustomerProfile.find = originals.find;
   }
 });
 
@@ -310,6 +383,8 @@ test("all-customer segment distinguishes membership from current marketing eligi
     assert.equal(result.excludedNoConsent, 1);
     assert.equal(result.excludedOptOut, 1);
     assert.equal(result.excludedInvalidPhone, 1);
+    assert.equal(Object.hasOwn(result, "customers"), false);
+    assert.equal(Object.hasOwn(result, "memberTotalMatched"), false);
     assert.deepEqual(result.preferredOrderTypeDistribution, {
       pickup: 1,
       delivery: 1,
@@ -328,11 +403,13 @@ test("inactive segment requires completed orders and uses a strict requested-day
       filter = input;
       return query([profile()]);
     };
-    await getCustomerSegmentInsights({
+    const result = await getCustomerSegmentInsights({
       restaurantId,
       timezone: "Africa/Accra",
       segmentType: "inactive_customers",
       inactiveDays: 30,
+      includeCustomers: true,
+      marketingEligibleOnly: true,
       now: new Date("2026-09-15T12:00:00.000Z")
     });
     assert.deepEqual(filter.orderCount, { $gte: 1 });
@@ -340,6 +417,8 @@ test("inactive segment requires completed orders and uses a strict requested-day
       filter.lastOrderAt.$lt.toISOString(),
       "2026-08-16T12:00:00.000Z"
     );
+    assert.equal(result.memberTotalMatched, 1);
+    assert.equal(result.customers[0].marketingEligibility, "eligible");
   } finally {
     CustomerProfile.find = originalFind;
   }
@@ -356,10 +435,14 @@ test("returning segment deterministically means at least two completed orders", 
     const result = await getCustomerSegmentInsights({
       restaurantId,
       timezone: "Africa/Accra",
-      segmentType: "returning_customers"
+      segmentType: "returning_customers",
+      includeCustomers: true,
+      marketingEligibleOnly: true
     });
     assert.deepEqual(filter.orderCount, { $gte: 2 });
     assert.equal(result.totalCustomers, 1);
+    assert.equal(result.memberTotalMatched, 1);
+    assert.equal(result.customers[0].marketingEligibility, "eligible");
   } finally {
     CustomerProfile.find = originalFind;
   }
@@ -389,7 +472,9 @@ test("ordered-menu-item segment resolves a restaurant item and completed-order p
       restaurantId,
       timezone: "Africa/Accra",
       segmentType: "ordered_menu_item",
-      menuItemName: "chicken jollof"
+      menuItemName: "chicken jollof",
+      includeCustomers: true,
+      marketingEligibleOnly: true
     });
     assert.equal(filters.menu.restaurantId, restaurantId);
     assert.equal(filters.order.restaurantId, restaurantId);
@@ -398,6 +483,8 @@ test("ordered-menu-item segment resolves a restaurant item and completed-order p
       $in: ["+233501112043"]
     });
     assert.equal(result.segment.menuItemName, "Chicken Jollof");
+    assert.equal(result.memberTotalMatched, 1);
+    assert.equal(result.customers[0].marketingEligibility, "eligible");
     assert.doesNotMatch(JSON.stringify(result), /64b000000000000000000101/);
   } finally {
     MenuItem.find = originals.menuFind;
@@ -673,14 +760,16 @@ const runOwnerAgentScenario = async ({
   toolResult,
   modelText,
   history = [],
-  executeTool
+  executeTool,
+  staffState
 }) => {
   let call = 0;
   return runAgentOrchestrator(
     {
       restaurant: context("owner").restaurant,
       sender: context("owner").sender,
-      message
+      message,
+      staffState
     },
     {
       provider: {
@@ -750,7 +839,12 @@ test("inactive segment follow-up conversations reuse the read-only tool and pres
       status: "ok",
       segment: { type: "inactive_customers", inactiveDays: 30 },
       totalCustomers: 43,
+      customersWithCompletedOrders: 40,
+      totalCompletedOrderCount: 85,
       marketingEligibleCustomers: 29,
+      excludedNoConsent: 8,
+      excludedOptOut: 4,
+      excludedInvalidPhone: 2,
       historicalTopItems: [
         {
           name: "Chicken Jollof",
@@ -770,7 +864,12 @@ test("inactive segment follow-up conversations reuse the read-only tool and pres
           status: "ok",
           segment: { type: "inactive_customers", inactiveDays: 30 },
           totalCustomers: 43,
+          customersWithCompletedOrders: 40,
+          totalCompletedOrderCount: 85,
           marketingEligibleCustomers: 29,
+          excludedNoConsent: 8,
+          excludedOptOut: 4,
+          excludedInvalidPhone: 2,
           historicalTopItems: [
             {
               name: "Chicken Jollof",
@@ -846,4 +945,448 @@ test("explicit promotion creation still enters the existing draft workflow witho
   assert.equal(executed[0].args.targeting.inactiveDays, 30);
   assert.match(result.message, /ready for your approval/i);
   assert.doesNotMatch(result.message, /sent|delivered/i);
+});
+
+const groundedCustomerToolResult = (overrides = {}) => ({
+  status: "found",
+  found: true,
+  customer: {
+    name: "Ama Mensah",
+    maskedPhone: "***2043",
+    completedOrderCount: 3,
+    lastCompletedOrderAt: "2026-08-01T12:00:00.000Z",
+    averageCompletedOrderValue: 82.5,
+    preferredOrderType: "delivery",
+    returning: true,
+    marketingStatus: "opted_in",
+    marketingEligibility: "eligible",
+    canReceivePromotions: true,
+    frequentlyOrderedItems: [
+      { name: "Chicken Jollof", orderCount: 2, totalQuantity: 4 }
+    ],
+    ...overrides
+  }
+});
+
+for (const scenario of [
+  {
+    name: "completed-order count",
+    message: "How many orders has Ama completed?",
+    expected: "Ama Mensah has completed 3 orders."
+  },
+  {
+    name: "returning-customer yes",
+    message: "Is Ama a returning customer?",
+    expected: "Yes, Ama Mensah is a returning customer."
+  },
+  {
+    name: "returning-customer no",
+    message: "Is Ama a returning customer?",
+    overrides: { returning: false, completedOrderCount: 1 },
+    expected: "No, Ama Mensah is not a returning customer."
+  },
+  {
+    name: "average completed order value",
+    message: "What's Ama's average order value?",
+    expected: "Ama Mensah's average completed order value is GHS 82.50."
+  },
+  {
+    name: "frequently ordered items",
+    message: "What does Ama normally order?",
+    expected:
+      "Ama Mensah's historical completed-order preferences are Chicken Jollof (4 portions across 2 orders)."
+  },
+  {
+    name: "last completed order",
+    message: "When did Ama last order?",
+    expected:
+      "Ama Mensah's last completed order was 2026-08-01T12:00:00.000Z."
+  },
+  {
+    name: "preferred order type",
+    message: "Does Ama normally use delivery or pickup?",
+    expected: "Ama Mensah usually uses delivery."
+  },
+  {
+    name: "marketing consent status",
+    message: "What's Ama's marketing status?",
+    expected: "Ama Mensah's marketing consent status is opted in."
+  },
+  {
+    name: "actual marketing eligibility",
+    message: "Can Ama receive promotions?",
+    overrides: {
+      marketingStatus: "opted_in",
+      marketingEligibility: "invalid_recipient",
+      canReceivePromotions: false
+    },
+    expected:
+      "Ama Mensah cannot currently receive promotions because there is no valid promotional WhatsApp recipient."
+  }
+]) {
+  test(`deterministic customer answer uses backend ${scenario.name}`, async () => {
+    const result = await runOwnerAgentScenario({
+      message: scenario.message,
+      toolName: "get_customer_insights",
+      toolArguments: { customerName: "Ama" },
+      modelText: "Invented answer: 999, pickup, and fully eligible.",
+      toolResult: groundedCustomerToolResult(scenario.overrides)
+    });
+    assert.equal(result.message, scenario.expected);
+    assert.doesNotMatch(result.message, /999|Invented/);
+  });
+}
+
+const groundedSegmentToolResult = (overrides = {}) => ({
+  status: "ok",
+  segment: { type: "inactive_customers", inactiveDays: 30 },
+  totalCustomers: 43,
+  customersWithCompletedOrders: 40,
+  totalCompletedOrderCount: 85,
+  marketingEligibleCustomers: 29,
+  excludedNoConsent: 8,
+  excludedOptOut: 4,
+  excludedInvalidPhone: 2,
+  historicalTopItems: [
+    {
+      name: "Chicken Jollof",
+      customerCount: 22,
+      orderCount: 31,
+      totalQuantity: 41
+    }
+  ],
+  preferredOrderTypeDistribution: { pickup: 10, delivery: 20, unknown: 13 },
+  ...overrides
+});
+
+for (const scenario of [
+  {
+    name: "opted-out count",
+    message: "How many of them opted out?",
+    expected: "4 of 43 customers inactive for more than 30 days are opted out."
+  },
+  {
+    name: "no-consent count",
+    message: "How many haven't given consent?",
+    expected:
+      "8 of 43 customers inactive for more than 30 days do not have confirmed marketing consent."
+  },
+  {
+    name: "invalid-recipient count",
+    message: "How many don't have a valid WhatsApp recipient?",
+    expected:
+      "2 of 43 customers inactive for more than 30 days do not have a valid promotional WhatsApp recipient."
+  },
+  {
+    name: "customers-with-completed-orders count",
+    message: "How many of them have completed orders?",
+    expected:
+      "40 of 43 customers inactive for more than 30 days have completed orders."
+  },
+  {
+    name: "total completed-order count",
+    message: "How many completed orders do those customers represent?",
+    expected:
+      "Those customers inactive for more than 30 days represent 85 completed orders."
+  },
+  {
+    name: "preferred order-type distribution",
+    message: "Do they normally use delivery or pickup?",
+    expected:
+      "Preferred order types for those customers inactive for more than 30 days: delivery 20, pickup 10, not established 13."
+  },
+  {
+    name: "historical top items",
+    message: "What do they normally order?",
+    expected:
+      "Historical completed-order preferences for those customers inactive for more than 30 days:\n1. Chicken Jollof — 22 customers, 31 orders, 41 portions"
+  },
+  {
+    name: "eligible count",
+    message: "How many can receive promotions?",
+    expected:
+      "29 of 43 customers inactive for more than 30 days can currently receive promotions."
+  }
+]) {
+  test(`deterministic segment answer uses backend ${scenario.name}`, async () => {
+    const result = await runOwnerAgentScenario({
+      message: scenario.message,
+      toolName: "get_customer_segment_insights",
+      toolArguments: { segmentType: "inactive_customers", inactiveDays: 30 },
+      modelText: "Invented segment answer: 999 customers.",
+      toolResult: groundedSegmentToolResult()
+    });
+    assert.equal(result.message, scenario.expected);
+    assert.doesNotMatch(result.message, /999|Invented/);
+  });
+}
+
+test("segment member listing defaults to 10, supports 25, and returns only safe bounded fields", async () => {
+  const originalFind = CustomerProfile.find;
+  const profiles = Array.from({ length: 27 }, (_, index) =>
+    profile({
+      _id: new Types.ObjectId(),
+      customerKey: `private-key-${index}`,
+      customerPhone: `+23350${String(index).padStart(7, "0")}`,
+      customerName: `Customer ${index + 1}`,
+      commonDeliveryAddresses: [
+        { address: `Private address ${index}`, orderCount: 1, lastUsedAt: new Date() }
+      ],
+      orderCount: 27 - index,
+      lastOrderAt: new Date(`2026-08-${String(Math.min(index + 1, 27)).padStart(2, "0")}T12:00:00.000Z`)
+    })
+  );
+  try {
+    CustomerProfile.find = (filter) => {
+      assert.equal(filter.restaurantId, restaurantId);
+      return query(profiles);
+    };
+    const defaultResult = await getCustomerSegmentInsights({
+      restaurantId,
+      timezone: "Africa/Accra",
+      segmentType: "all_customers",
+      includeCustomers: true
+    });
+    assert.equal(defaultResult.memberTotalMatched, 27);
+    assert.equal(defaultResult.returnedMemberCount, 10);
+    assert.equal(defaultResult.membersTruncated, true);
+    assert.equal(defaultResult.customers.length, 10);
+
+    const maxResult = await getCustomerSegmentInsights({
+      restaurantId,
+      timezone: "Africa/Accra",
+      segmentType: "all_customers",
+      includeCustomers: true,
+      limit: 25
+    });
+    assert.equal(maxResult.returnedMemberCount, 25);
+    assert.equal(maxResult.membersTruncated, true);
+    for (const customer of maxResult.customers) {
+      assert.deepEqual(Object.keys(customer).sort(), [
+        "completedOrderCount",
+        "lastCompletedOrderAt",
+        "marketingEligibility",
+        "marketingStatus",
+        "maskedPhone",
+        "name"
+      ]);
+    }
+    const serialized = JSON.stringify(maxResult.customers);
+    assert.doesNotMatch(serialized, /\+233/);
+    assert.doesNotMatch(serialized, /private-key|Private address/);
+    assert.doesNotMatch(serialized, /64b000000000000000000/);
+    assert.throws(
+      () =>
+        toolRegistry.get_customer_segment_insights.schema.parse({
+          segmentType: "all_customers",
+          includeCustomers: true,
+          limit: 26
+        }),
+      /less than or equal to 25/i
+    );
+  } finally {
+    CustomerProfile.find = originalFind;
+  }
+});
+
+test("marketing-eligible segment members exclude ineligible profiles and deduplicate recipients", async () => {
+  const originalFind = CustomerProfile.find;
+  try {
+    CustomerProfile.find = () =>
+      query([
+        profile(),
+        profile({
+          customerKey: "duplicate",
+          customerName: "Older duplicate",
+          orderCount: 1
+        }),
+        profile({
+          customerPhone: "+233501112044",
+          marketingConsent: null,
+          isOptedOut: false
+        }),
+        profile({
+          customerPhone: "+233501112045",
+          marketingConsent: true,
+          isOptedOut: true
+        }),
+        profile({ customerPhone: "invalid", marketingConsent: true })
+      ]);
+    const result = await getCustomerSegmentInsights({
+      restaurantId,
+      timezone: "Africa/Accra",
+      segmentType: "all_customers",
+      includeCustomers: true,
+      marketingEligibleOnly: true
+    });
+    assert.equal(result.memberTotalMatched, 1);
+    assert.equal(result.returnedMemberCount, 1);
+    assert.equal(result.membersTruncated, false);
+    assert.equal(result.memberMarketingEligibleOnly, true);
+    assert.equal(result.customers[0].name, "Ama Mensah");
+    assert.equal(result.customers[0].marketingEligibility, "eligible");
+  } finally {
+    CustomerProfile.find = originalFind;
+  }
+});
+
+test("grounded eligible segment member answers use exact totals and backend customer names", async () => {
+  const result = await runOwnerAgentScenario({
+    message: "Which inactive customers can receive promotions?",
+    toolName: "get_customer_segment_insights",
+    toolArguments: {
+      segmentType: "inactive_customers",
+      inactiveDays: 30,
+      includeCustomers: true,
+      marketingEligibleOnly: true,
+      limit: 10
+    },
+    modelText: "Sarah and 999 other customers are eligible.",
+    toolResult: groundedSegmentToolResult({
+      memberTotalMatched: 24,
+      returnedMemberCount: 2,
+      membersTruncated: true,
+      memberMarketingEligibleOnly: true,
+      customers: [
+        {
+          name: "Ama Mensah",
+          maskedPhone: "***2043",
+          completedOrderCount: 7,
+          lastCompletedOrderAt: "2026-08-01T12:00:00.000Z",
+          marketingStatus: "opted_in",
+          marketingEligibility: "eligible"
+        },
+        {
+          name: "Kojo Asante",
+          maskedPhone: "***7712",
+          completedOrderCount: 4,
+          lastCompletedOrderAt: "2026-07-01T12:00:00.000Z",
+          marketingStatus: "opted_in",
+          marketingEligibility: "eligible"
+        }
+      ]
+    })
+  });
+  assert.match(result.message, /^Showing 2 of 24 eligible customers inactive/);
+  assert.match(result.message, /Ama Mensah.*\*\*\*2043.*7 completed orders/);
+  assert.match(result.message, /Kojo Asante.*\*\*\*7712.*4 completed orders/);
+  assert.doesNotMatch(result.message, /Sarah|999/);
+});
+
+test("consent outreach and campaign approval pending actions still execute on owner yes", async () => {
+  const originalFindOne = PendingAgentAction.findOne;
+  assert.equal(isPendingActionConfirmationMessage("yes"), true);
+
+  try {
+    for (const pending of [
+      {
+        toolName: "invite_customers_to_marketing",
+        arguments: {}
+      },
+      {
+        toolName: "approve_campaign",
+        arguments: {
+          campaignId: "64b000000000000000000b11",
+          expectedCampaignVersion: 2
+        }
+      }
+    ]) {
+      const originalHandler = toolRegistry[pending.toolName].handler;
+      let confirmed = false;
+      const pendingAction = {
+        toolName: pending.toolName,
+        arguments: pending.arguments,
+        status: "pending",
+        save: async () => {}
+      };
+      try {
+        PendingAgentAction.findOne = async (filter) => {
+          assert.equal(filter.restaurantId, restaurantId);
+          assert.equal(filter.senderRole, "owner");
+          assert.equal(filter.toolName, pending.toolName);
+          return pendingAction;
+        };
+        toolRegistry[pending.toolName].handler = async (_args, executionContext) => {
+          confirmed = executionContext.confirmed === true;
+          return { success: true, message: `${pending.toolName} confirmed.` };
+        };
+
+        const result = await executeConfirmedPendingToolAction(
+          "64b000000000000000000c01",
+          context("owner"),
+          pending.toolName
+        );
+        assert.equal(result.success, true);
+        assert.equal(confirmed, true);
+        assert.equal(pendingAction.status, "completed");
+      } finally {
+        toolRegistry[pending.toolName].handler = originalHandler;
+      }
+    }
+  } finally {
+    PendingAgentAction.findOne = originalFindOne;
+  }
+});
+
+test("campaign approval, cancellation, and update intent guards still allow explicit owner actions", async () => {
+  const campaignState = {
+    pendingActions: [],
+    imageWorkflow: null,
+    orders: { freshPending: [], recentActive: [] },
+    recentReferences: {
+      campaign: {
+        id: "64b000000000000000000b11",
+        campaignVersion: 2,
+        pendingActionId: "64b000000000000000000c01",
+        status: "pending_approval"
+      }
+    },
+    permissions: [
+      "approve_campaign",
+      "cancel_campaign",
+      "update_campaign_draft"
+    ]
+  };
+  const scenarios = [
+    {
+      message: "yes",
+      toolName: "approve_campaign",
+      toolArguments: {
+        campaignId: "64b000000000000000000b11",
+        expectedCampaignVersion: 2
+      },
+      modelText: "Campaign approved."
+    },
+    {
+      message: "Cancel that campaign.",
+      toolName: "cancel_campaign",
+      toolArguments: { campaignId: "64b000000000000000000b11" },
+      modelText: "Campaign cancellation prepared."
+    },
+    {
+      message: "Make that campaign message shorter.",
+      toolName: "update_campaign_draft",
+      toolArguments: {
+        campaignId: "64b000000000000000000b11",
+        message: "Short offer"
+      },
+      modelText: "Campaign updated."
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const executed = [];
+    const result = await runOwnerAgentScenario({
+      ...scenario,
+      staffState: campaignState,
+      executeTool: async (toolName, args) => {
+        executed.push({ toolName, args });
+        return { success: true, message: scenario.modelText };
+      }
+    });
+    assert.equal(result.success, true, scenario.toolName);
+    assert.deepEqual(executed, [
+      { toolName: scenario.toolName, args: scenario.toolArguments }
+    ]);
+  }
 });

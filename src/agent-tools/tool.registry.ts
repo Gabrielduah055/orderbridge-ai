@@ -1346,7 +1346,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         startDate:
           "Required for last_order_date_range; YYYY-MM-DD in the restaurant timezone or a zoned ISO date-time.",
         endDate:
-          "Required for last_order_date_range; date-only values include the whole restaurant-local day."
+          "Required for last_order_date_range; date-only values include the whole restaurant-local day.",
+        includeCustomers:
+          "Optional boolean. Set true only when the owner explicitly asks which customers or requests a customer list.",
+        marketingEligibleOnly:
+          "Optional boolean requiring includeCustomers=true. Set true when the requested member list must contain only customers currently eligible for promotions.",
+        limit:
+          "Optional member-list limit requiring includeCustomers=true; defaults to 10 and cannot exceed 25."
       }
     },
     roles: toolPermissions.get_customer_segment_insights,
