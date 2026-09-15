@@ -88,6 +88,29 @@ export const isCustomerEligibleForMarketing = (
 ): boolean =>
   profile.marketingConsent === true && profile.isOptedOut !== true;
 
+export type CustomerMarketingEligibility =
+  | "eligible"
+  | "no_consent"
+  | "opted_out"
+  | "invalid_recipient";
+
+export const classifyCustomerMarketingEligibility = (
+  profile: Pick<
+    ICustomerProfile,
+    "customerPhone" | "marketingConsent" | "isOptedOut"
+  >
+): CustomerMarketingEligibility => {
+  if (!isValidWhatsappRecipient(profile.customerPhone)) {
+    return "invalid_recipient";
+  }
+
+  if (profile.isOptedOut === true) {
+    return "opted_out";
+  }
+
+  return isCustomerEligibleForMarketing(profile) ? "eligible" : "no_consent";
+};
+
 export const cancelQueuedCustomerMarketingMessages = async (
   restaurantId: string,
   customerPhone: string,

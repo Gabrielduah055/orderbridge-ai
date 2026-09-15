@@ -658,7 +658,7 @@ export const getCustomerProfile = async (
   );
 };
 
-const getCustomerMarketingStatus = (
+export const getCustomerMarketingStatus = (
   profile: Pick<
     ICustomerProfileDocument,
     | "marketingConsent"
@@ -677,7 +677,7 @@ const getCustomerMarketingStatus = (
     : "not_asked";
 };
 
-const maskCustomerPhone = (value: string): string => {
+export const maskCustomerPhone = (value: string): string => {
   const normalized = normalizeWhatsappRecipient(value);
   const digits = normalized.replace(/\D/g, "");
   return digits ? `***${digits.slice(-4)}` : "***";

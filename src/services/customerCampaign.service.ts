@@ -35,7 +35,7 @@ import {
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
 import { resolveZonedDateTime } from "../utils/zonedDateTime.util";
-import { isCustomerEligibleForMarketing } from "./customerMarketingPreference.service";
+import { classifyCustomerMarketingEligibility } from "./customerMarketingPreference.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 
 const campaignTargetingBaseSchema = z
@@ -344,7 +344,7 @@ const getTargetingDescription = (
   }
 };
 
-const loadCompletedOrderPhonesForMenuItem = async (
+export const loadCompletedOrderPhonesForMenuItem = async (
   restaurantId: string,
   menuItemId: string
 ): Promise<Set<string>> => {
@@ -452,25 +452,22 @@ export const selectCustomerCampaignAudience = async (
 
     targetedProfiles += 1;
 
-    if (!isValidMarketingPhone(normalizedPhone)) {
+    const eligibility = classifyCustomerMarketingEligibility(profile);
+
+    if (eligibility === "invalid_recipient") {
       excludedInvalidPhone += 1;
       continue;
     }
-
-    if (profile.isOptedOut === true) {
+    if (eligibility === "opted_out") {
       excludedOptOut += 1;
       continue;
     }
-
-    if (profile.marketingConsent !== true) {
+    if (eligibility === "no_consent") {
       excludedNoConsent += 1;
       continue;
     }
 
-    if (
-      isCustomerEligibleForMarketing(profile) &&
-      !recipientsByPhone.has(normalizedPhone)
-    ) {
+    if (!recipientsByPhone.has(normalizedPhone)) {
       recipientsByPhone.set(normalizedPhone, {
         customerProfileId: String(profile._id),
         ...(profile.customerKey ? { customerKey: profile.customerKey } : {}),
