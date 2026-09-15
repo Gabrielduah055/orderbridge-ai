@@ -125,6 +125,212 @@ interface GroundedCustomerListResult {
   customers: unknown[];
 }
 
+interface GroundedCustomerInsightsResult {
+  status: "found" | "not_found" | "ambiguous";
+  found: boolean;
+  matchCount?: number;
+  candidates?: Array<{
+    name: string;
+    maskedPhone: string;
+    orderCount: number;
+  }>;
+  customer?: {
+    name: string;
+    maskedPhone: string;
+    completedOrderCount: number;
+    lastCompletedOrderAt: string | null;
+    averageCompletedOrderValue: number;
+    preferredOrderType: "pickup" | "delivery" | null;
+    returning: boolean;
+    marketingStatus: string;
+    frequentlyOrderedItems: Array<{
+      name: string;
+      orderCount: number;
+      totalQuantity: number;
+    }>;
+  };
+}
+
+interface GroundedCustomerSegmentResult {
+  status: "ok" | "menu_item_not_found" | "ambiguous_menu_item";
+  segmentType?: string;
+  menuItemName?: string;
+  candidates?: string[];
+  segment?: {
+    type: string;
+    inactiveDays?: number;
+    menuItemName?: string;
+    startDate?: string;
+    endDate?: string;
+  };
+  totalCustomers?: number;
+  marketingEligibleCustomers?: number;
+  historicalTopItems?: Array<{
+    name: string;
+    customerCount: number;
+    orderCount: number;
+    totalQuantity: number;
+  }>;
+  preferredOrderTypeDistribution?: {
+    pickup: number;
+    delivery: number;
+    unknown: number;
+  };
+}
+
+const parseGroundedCustomerInsightsResult = (
+  value: unknown
+): GroundedCustomerInsightsResult | null => {
+  if (!value || typeof value !== "object") return null;
+  const result = value as GroundedCustomerInsightsResult;
+  if (!["found", "not_found", "ambiguous"].includes(result.status)) {
+    return null;
+  }
+  if (result.status === "found") {
+    const customer = result.customer;
+    if (
+      result.found !== true ||
+      !customer ||
+      typeof customer.name !== "string" ||
+      typeof customer.maskedPhone !== "string" ||
+      typeof customer.completedOrderCount !== "number" ||
+      !Array.isArray(customer.frequentlyOrderedItems)
+    ) {
+      return null;
+    }
+  }
+  if (
+    result.status === "ambiguous" &&
+    (typeof result.matchCount !== "number" || !Array.isArray(result.candidates))
+  ) {
+    return null;
+  }
+  return result;
+};
+
+const buildGroundedCustomerInsightsAnswer = (
+  ownerMessage: string,
+  result: GroundedCustomerInsightsResult | undefined
+): string | null => {
+  if (!result) return null;
+  if (result.status === "not_found") {
+    return "No customer matched that exact name or phone number.";
+  }
+  if (result.status === "ambiguous") {
+    const candidates = (result.candidates ?? []).map(
+      (candidate, index) =>
+        `${index + 1}. ${candidate.name} — ${candidate.maskedPhone} — ${candidate.orderCount} completed order${candidate.orderCount === 1 ? "" : "s"}`
+    );
+    return `I found ${result.matchCount} customers with that name. Which one do you mean?${candidates.length > 0 ? `\n${candidates.join("\n")}` : ""}`;
+  }
+
+  const customer = result.customer as NonNullable<GroundedCustomerInsightsResult["customer"]>;
+  const message = ownerMessage.toLowerCase();
+  if (/\b(?:how many times|how many orders|order count)\b/.test(message)) {
+    return `${customer.name} has completed ${customer.completedOrderCount} order${customer.completedOrderCount === 1 ? "" : "s"}.`;
+  }
+  if (/\b(?:usually|normally|frequently|often)\b.*\b(?:order|buy)|\bwhat\b.*\b(?:order|buy)/.test(message)) {
+    const items = customer.frequentlyOrderedItems.slice(0, 5);
+    return items.length === 0
+      ? `${customer.name} has no completed-order item history yet.`
+      : `${customer.name}'s historical completed-order preferences are ${items.map((item) => `${item.name} (${item.totalQuantity} portion${item.totalQuantity === 1 ? "" : "s"} across ${item.orderCount} order${item.orderCount === 1 ? "" : "s"})`).join(", ")}.`;
+  }
+  if (/\b(?:last order|last ordered|when did)\b/.test(message)) {
+    return customer.lastCompletedOrderAt
+      ? `${customer.name}'s last completed order was ${customer.lastCompletedOrderAt}.`
+      : `${customer.name} has no completed order date.`;
+  }
+  if (/\b(?:delivery|pickup|order type)\b/.test(message)) {
+    return customer.preferredOrderType
+      ? `${customer.name} usually uses ${customer.preferredOrderType}.`
+      : `${customer.name} does not have a preferred order type yet.`;
+  }
+  if (/\b(?:marketing|promotion|promotions|opted)\b/.test(message)) {
+    const labels: Record<string, string> = {
+      opted_in: "can currently receive promotions",
+      opted_out: "is opted out and cannot receive promotions",
+      awaiting_response: "has not yet responded to the marketing invitation",
+      not_asked: "has not yet been asked for marketing consent"
+    };
+    return `${customer.name} ${labels[customer.marketingStatus] ?? "does not currently have confirmed marketing eligibility"}.`;
+  }
+
+  const itemSummary = customer.frequentlyOrderedItems.length > 0
+    ? customer.frequentlyOrderedItems
+        .slice(0, 3)
+        .map((item) => item.name)
+        .join(", ")
+    : "none yet";
+  return [
+    `${customer.name} (${customer.maskedPhone}) has completed ${customer.completedOrderCount} order${customer.completedOrderCount === 1 ? "" : "s"}, averaging GHS ${customer.averageCompletedOrderValue.toFixed(2)}.`,
+    `Last completed order: ${customer.lastCompletedOrderAt ?? "none"}; preferred order type: ${customer.preferredOrderType ?? "not established"}.`,
+    `Historical frequent items: ${itemSummary}. Marketing status: ${customer.marketingStatus.replace(/_/g, " ")}.`
+  ].join("\n");
+};
+
+const parseGroundedCustomerSegmentResult = (
+  value: unknown
+): GroundedCustomerSegmentResult | null => {
+  if (!value || typeof value !== "object") return null;
+  const result = value as GroundedCustomerSegmentResult;
+  if (
+    !["ok", "menu_item_not_found", "ambiguous_menu_item"].includes(
+      result.status
+    )
+  ) {
+    return null;
+  }
+  if (
+    result.status === "ok" &&
+    (typeof result.totalCustomers !== "number" ||
+      typeof result.marketingEligibleCustomers !== "number" ||
+      !result.segment ||
+      !Array.isArray(result.historicalTopItems))
+  ) {
+    return null;
+  }
+  return result;
+};
+
+const buildGroundedCustomerSegmentAnswer = (
+  ownerMessage: string,
+  result: GroundedCustomerSegmentResult | undefined
+): string | null => {
+  if (!result) return null;
+  if (result.status === "menu_item_not_found") {
+    return `No restaurant menu item matched ${result.menuItemName ?? "that name"}.`;
+  }
+  if (result.status === "ambiguous_menu_item") {
+    return `I found multiple matching menu items. Which one do you mean?${(result.candidates ?? []).map((name, index) => `\n${index + 1}. ${name}`).join("")}`;
+  }
+
+  const total = result.totalCustomers as number;
+  const eligible = result.marketingEligibleCustomers as number;
+  const segment = result.segment as NonNullable<GroundedCustomerSegmentResult["segment"]>;
+  const segmentLabel =
+    segment.type === "inactive_customers"
+      ? `customers inactive for more than ${segment.inactiveDays} days`
+      : segment.type === "returning_customers"
+        ? "returning customers"
+        : segment.type === "ordered_menu_item"
+          ? `customers who completed an order containing ${segment.menuItemName}`
+          : segment.type === "last_order_date_range"
+            ? `customers whose last completed order was from ${segment.startDate} to ${segment.endDate}`
+            : "customers";
+  const message = ownerMessage.toLowerCase();
+
+  if (/\b(?:normally order|usually order|normally buy|usually buy|what do .* order|what do .* buy)\b/.test(message)) {
+    const items = (result.historicalTopItems ?? []).slice(0, 5);
+    return items.length === 0
+      ? `Those ${segmentLabel} have no completed-order item history.`
+      : `Historical completed-order preferences for those ${segmentLabel}:\n${items.map((item, index) => `${index + 1}. ${item.name} — ${item.customerCount} customer${item.customerCount === 1 ? "" : "s"}, ${item.orderCount} order${item.orderCount === 1 ? "" : "s"}, ${item.totalQuantity} portion${item.totalQuantity === 1 ? "" : "s"}`).join("\n")}`;
+  }
+  if (/\b(?:can receive|eligible|eligibility|promotions?|marketing)\b/.test(message)) {
+    return `${eligible} of ${total} ${segmentLabel} can currently receive promotions.`;
+  }
+  return `${total} ${segmentLabel} matched. ${eligible} can currently receive promotions.`;
+};
+
 const parseGroundedCustomerListResult = (
   value: unknown
 ): GroundedCustomerListResult | null => {
@@ -626,6 +832,93 @@ interface RequiredOperationalTool {
   safeMessage: string;
 }
 
+const getCustomerMarketingMutationIntentGuard = (
+  input: AgentOrchestratorInput,
+  toolName: string
+): ToolResult | null => {
+  const message = normalizeText(input.message).toLowerCase();
+  const hasCampaignReference = Boolean(
+    input.staffState?.recentReferences.campaign
+  );
+  const mentionsCampaign =
+    /\b(?:campaign|promotion|promo|offer|announcement)s?\b/.test(message);
+
+  if (toolName === "create_campaign_draft") {
+    const explicitCreation =
+      mentionsCampaign &&
+      /\b(?:create|draft|start|make|prepare|set up|launch|send|write)\b/.test(
+        message
+      );
+    return explicitCreation
+      ? null
+      : {
+          success: false,
+          code: "CAMPAIGN_INTENT_REQUIRED",
+          message:
+            "That was a read-only customer intelligence question. No campaign draft was created."
+        };
+  }
+
+  if (toolName === "update_campaign_draft") {
+    const explicitUpdate =
+      (mentionsCampaign || hasCampaignReference) &&
+      /\b(?:change|edit|update|rewrite|shorten|lengthen|reschedule|move|make)\b/.test(
+        message
+      );
+    return explicitUpdate
+      ? null
+      : {
+          success: false,
+          code: "CAMPAIGN_INTENT_REQUIRED",
+          message: "No campaign was changed because the owner did not request an edit."
+        };
+  }
+
+  if (toolName === "approve_campaign") {
+    const explicitApproval =
+      (mentionsCampaign || hasCampaignReference) &&
+      /\b(?:approve|confirm|yes|okay|ok|go ahead|send it)\b/.test(message);
+    return explicitApproval
+      ? null
+      : {
+          success: false,
+          code: "CAMPAIGN_INTENT_REQUIRED",
+          message:
+            "No campaign was approved because the owner did not explicitly approve it."
+        };
+  }
+
+  if (toolName === "cancel_campaign") {
+    const explicitCancellation =
+      (mentionsCampaign || hasCampaignReference) &&
+      /\b(?:cancel|discard|delete|stop)\b/.test(message);
+    return explicitCancellation
+      ? null
+      : {
+          success: false,
+          code: "CAMPAIGN_INTENT_REQUIRED",
+          message:
+            "No campaign was cancelled because the owner did not request cancellation."
+        };
+  }
+
+  if (toolName === "invite_customers_to_marketing") {
+    const explicitOutreach =
+      /\b(?:invite|ask|contact|message|reach out|send)\b/.test(message) &&
+      /\b(?:customers?|marketing|promotions?|consent|opt in)\b/.test(message);
+    return explicitOutreach
+      ? null
+      : {
+          success: false,
+          code: "MARKETING_OUTREACH_INTENT_REQUIRED",
+          message:
+            "That was a read-only customer intelligence question. No marketing invitation was created or sent."
+        };
+  }
+
+  return null;
+};
+
 const getRequiredCampaignOrReminderTool = (
   input: AgentOrchestratorInput
 ): RequiredOperationalTool | null => {
@@ -861,6 +1154,8 @@ export const runAgentOrchestrator = async (
   let completedCustomerWorkflowMutation: CustomerWorkflowMutation | null = null;
   let latestCustomerList: GroundedCustomerListResult | undefined;
   let latestCustomerListArgs: Record<string, unknown> | undefined;
+  let latestCustomerInsights: GroundedCustomerInsightsResult | undefined;
+  let latestCustomerSegment: GroundedCustomerSegmentResult | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -939,8 +1234,22 @@ export const runAgentOrchestrator = async (
               latestCustomerList,
               latestCustomerListArgs
             );
-          finalMessage = groundedCustomerListAnswer
-            ? sanitizeStaffFacingFinalText(groundedCustomerListAnswer)
+          const groundedCustomerInsightsAnswer =
+            buildGroundedCustomerInsightsAnswer(
+              normalizedInputMessage,
+              latestCustomerInsights
+            );
+          const groundedCustomerSegmentAnswer =
+            buildGroundedCustomerSegmentAnswer(
+              normalizedInputMessage,
+              latestCustomerSegment
+            );
+          const groundedAnswer =
+            groundedCustomerInsightsAnswer ??
+            groundedCustomerSegmentAnswer ??
+            groundedCustomerListAnswer;
+          finalMessage = groundedAnswer
+            ? sanitizeStaffFacingFinalText(groundedAnswer)
             : finalMessage;
         }
 
@@ -1041,6 +1350,8 @@ export const runAgentOrchestrator = async (
           toolName,
           safeArguments
         );
+        const marketingMutationGuardResult =
+          getCustomerMarketingMutationIntentGuard(input, toolName);
         const result = toolCall.invalidArguments
           ? {
               success: false,
@@ -1051,6 +1362,7 @@ export const runAgentOrchestrator = async (
           : permittedToolNames.has(toolName)
             ? workflowConflictResult ??
               trustedReferenceGuardResult ??
+              marketingMutationGuardResult ??
               (await executeTool(
                 toolName,
                 safeArguments,
@@ -1071,6 +1383,16 @@ export const runAgentOrchestrator = async (
             latestCustomerList = customerList;
             latestCustomerListArgs = safeArguments;
           }
+        }
+
+        if (result.success && toolName === "get_customer_insights") {
+          latestCustomerInsights =
+            parseGroundedCustomerInsightsResult(result.data) ?? undefined;
+        }
+
+        if (result.success && toolName === "get_customer_segment_insights") {
+          latestCustomerSegment =
+            parseGroundedCustomerSegmentResult(result.data) ?? undefined;
         }
 
         if (

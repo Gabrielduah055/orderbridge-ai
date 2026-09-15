@@ -13,6 +13,8 @@ export const toolPermissions = {
   get_business_report: ["owner"],
   get_item_performance: ["owner"],
   list_customers: ["owner"],
+  get_customer_insights: ["owner"],
+  get_customer_segment_insights: ["owner"],
   get_latest_customer_order: ["customer"],
   respond_to_order_check_in: ["customer"],
   get_customer_recommendations: ["customer"],

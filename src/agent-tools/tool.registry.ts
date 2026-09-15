@@ -39,6 +39,13 @@ import {
   listCustomers
 } from "../services/customerProfile.service";
 import {
+  customerInsightsSchema,
+  customerSegmentInsightsSchema,
+  customerSegmentTypes,
+  getCustomerInsights,
+  getCustomerSegmentInsights
+} from "../services/customerIntelligence.service";
+import {
   buildMarketingConsentOutreachPreviewMessage,
   executeMarketingConsentOutreach,
   previewMarketingConsentOutreach
@@ -1292,6 +1299,74 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
               : "No customers matched those filters."
             : `${customers.totalMatched} customer${customers.totalMatched === 1 ? "" : "s"} matched${customers.truncated ? `; returning the first ${customers.returnedCount}` : ""}.`,
         data: customers
+      };
+    }
+  },
+  get_customer_insights: {
+    definition: {
+      name: "get_customer_insights",
+      description:
+        "Owner only. Return deterministic, privacy-safe completed-order and marketing intelligence for one restaurant customer. Look up by an exact customer name or exact phone number. Same-name matches return masked clarification candidates instead of guessing.",
+      parameters: {
+        customerName: "Exact customer name. Provide this or customerPhone.",
+        customerPhone: "Exact customer phone. Provide this or customerName."
+      }
+    },
+    roles: toolPermissions.get_customer_insights,
+    schema: customerInsightsSchema,
+    handler: async (args, context) => {
+      const result = await getCustomerInsights({
+        restaurantId: context.restaurantId,
+        ...args
+      });
+
+      return {
+        success: true,
+        message:
+          result.status === "found"
+            ? `Customer insights retrieved for ${result.customer.name}.`
+            : result.status === "ambiguous"
+              ? `${result.matchCount} customers have that exact name. Ask the owner to clarify using a masked phone ending.`
+              : "No customer matched that exact name or phone number.",
+        data: result
+      };
+    }
+  },
+  get_customer_segment_insights: {
+    definition: {
+      name: "get_customer_segment_insights",
+      description:
+        "Owner only. Return deterministic read-only customer-segment counts, current marketing eligibility, historical completed-order item preferences, and preferred order-type distribution. This never creates or sends a campaign. Preserve the same segment arguments for conversational follow-ups.",
+      parameters: {
+        segmentType: customerSegmentTypes.join(" | "),
+        inactiveDays:
+          "Required for inactive_customers; customers must have a completed order and lastOrderAt must be older than this many days.",
+        menuItemName:
+          "Required for ordered_menu_item; use the conversational menu name, never an internal ID.",
+        startDate:
+          "Required for last_order_date_range; YYYY-MM-DD in the restaurant timezone or a zoned ISO date-time.",
+        endDate:
+          "Required for last_order_date_range; date-only values include the whole restaurant-local day."
+      }
+    },
+    roles: toolPermissions.get_customer_segment_insights,
+    schema: customerSegmentInsightsSchema,
+    handler: async (args, context) => {
+      const result = await getCustomerSegmentInsights({
+        restaurantId: context.restaurantId,
+        timezone: context.restaurant.timezone,
+        ...args
+      });
+
+      return {
+        success: true,
+        message:
+          result.status === "ok"
+            ? `${result.totalCustomers} customer${result.totalCustomers === 1 ? "" : "s"} matched; ${result.marketingEligibleCustomers} can currently receive promotions.`
+            : result.status === "ambiguous_menu_item"
+              ? "More than one menu item matched. Ask the owner which item they mean."
+              : "No restaurant menu item matched that name.",
+        data: result
       };
     }
   },
