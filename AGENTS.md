@@ -59,7 +59,7 @@ Before changing WhatsApp routing or agent behavior, inspect `src/controllers/was
 16. Revalidate queued messages at send time when recipient identity, restaurant/staff status, order/amendment state, campaign version/consent, reminder state, or conversation version may have changed. Cancel stale work; retry temporary provider-verification failures safely.
 17. Provider failure must fail safely. Never tell a user an operation succeeded unless the trusted tool mutation succeeded, and return customer-safe errors rather than raw provider or database details.
 18. Preserve configured provider and rollback boundaries. Do not silently fall back from OpenRouter to Hermes, and never replay a customer or staff mutation through a legacy path after a successful tool mutation.
-19. Never expose API keys, Firebase credentials, Wasender tokens, MCP secrets, private keys, sensitive URLs, full internal identifiers, or raw internal errors in code, tests, logs, prompts, tool results, or documentation.
+19. Never expose API keys, Firebase credentials, Wasender tokens, MCP secrets, private keys, raw internal errors, or sensitive URLs. Internal identifiers may appear in trusted backend code, tenant-scoped tool results, tests, queue metadata, and structured operational logs when necessary, but must not be unnecessarily exposed to customers or unauthorized callers.
 
 ## Agent and tool changes
 
