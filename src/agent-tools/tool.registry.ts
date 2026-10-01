@@ -1488,7 +1488,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         message:
           orders.totalMatched === 0
             ? "No orders matched those filters."
-            : `${orders.totalMatched} order${orders.totalMatched === 1 ? "" : "s"} matched${orders.truncated ? `; returning ${orders.returnedCount} from offset ${orders.offset}` : ""}.`,
+            : `${orders.totalMatched} order${orders.totalMatched === 1 ? "" : "s"} matched${orders.truncated ? `; returning ${orders.returnedCount} on this page` : ""}.`,
         data: orders
       };
     }

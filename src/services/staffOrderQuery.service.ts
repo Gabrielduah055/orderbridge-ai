@@ -1,3 +1,4 @@
+import { Types } from "mongoose";
 import { Order, orderStatuses, type OrderStatus } from "../models/order.model";
 import { StaffOrderQueryContext } from "../models/staffQueryContext.model";
 import type { SenderRole } from "../types/agent.types";
@@ -98,6 +99,13 @@ export const formatRestaurantDateTime = (
 const isFollowUpMessage = (message?: string): boolean => {
   if (!message) return false;
   const normalized = normalizeDisplayText(message).toLowerCase();
+  if (
+    /\b(?:remaining records?|next page|show more|more results?|continue)\b/.test(
+      normalized
+    )
+  ) {
+    return true;
+  }
   return (
     /\b(?:who|which customers?|what time|when|what date|those|these|them|they|orders?|placed|made)\b/.test(
       normalized
@@ -109,7 +117,10 @@ const isFollowUpMessage = (message?: string): boolean => {
 };
 
 const loadRetainedContext = async (input: ListStaffOrdersInput) => {
-  if (!isFollowUpMessage(input.originalMessage)) return null;
+  const isPaginationRequest = (input.offset ?? 0) > 0;
+  if (!isPaginationRequest && !isFollowUpMessage(input.originalMessage)) {
+    return null;
+  }
 
   return StaffOrderQueryContext.findOne({
     restaurantId: input.restaurantId,
@@ -138,14 +149,18 @@ const resolveCustomerFilter = async (input: {
   }
 
   if (!input.customerName) return {};
+  if (!Types.ObjectId.isValid(input.restaurantId)) {
+    throw new BadRequestError("Invalid restaurantId");
+  }
   const customerName = normalizeDisplayText(input.customerName);
+  const restaurantObjectId = new Types.ObjectId(input.restaurantId);
   const matchingCustomers = await Order.aggregate<{
     _id: string;
     names: string[];
   }>([
     {
       $match: {
-        restaurantId: input.restaurantId,
+        restaurantId: restaurantObjectId,
         customerName: {
           $regex: `^${escapeRegExp(customerName)}$`,
           $options: "i"

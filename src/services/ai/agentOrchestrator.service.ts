@@ -134,6 +134,7 @@ interface GroundedOrderListResult {
   orders: Array<{
     orderReference: string;
     customerName: string;
+    customerPhone?: string;
     placedAtFormatted: string;
   }>;
 }
@@ -179,47 +180,85 @@ const buildGroundedOrderListAnswer = (
   if (!result) return null;
   const message = ownerMessage.toLowerCase();
   const asksWho = /\b(?:who|which customers?|customer names?|who placed|who made)\b/.test(message);
-  const asksWhen = /\b(?:what time|what date|when|date and time|placed|made the orders?)\b/.test(message);
-  if (!asksWho && !asksWhen) return null;
+  const asksWhen = /\b(?:what time|what date|when|date and time)\b/.test(message);
+  const asksForPage =
+    /\b(?:remaining records?|next page|show more|more results?|continue)\b/.test(
+      message
+    );
+  if (!asksWho && !asksWhen && !asksForPage) return null;
   if (result.totalMatched === 0) {
     return `No orders matched ${result.period.label.toLowerCase()}.`;
   }
-
-  const customerCounts = new Map<string, number>();
-  for (const order of result.orders) {
-    customerCounts.set(
-      order.customerName,
-      (customerCounts.get(order.customerName) ?? 0) + 1
-    );
+  if (result.returnedCount === 0 || result.orders.length === 0) {
+    return `There are no more matching orders to show for ${result.period.label.toLowerCase()}.`;
   }
+
+  const customerCounts = new Map<
+    string,
+    { name: string; phone?: string; count: number }
+  >();
+  for (const [index, order] of result.orders.entries()) {
+    const phone = order.customerPhone?.trim();
+    const identity = phone || `unknown-customer:${index}`;
+    const current = customerCounts.get(identity);
+    customerCounts.set(identity, {
+      name: order.customerName,
+      phone,
+      count: (current?.count ?? 0) + 1
+    });
+  }
+  const nameOccurrences = new Map<string, number>();
+  for (const customer of customerCounts.values()) {
+    const nameKey = customer.name.trim().toLowerCase();
+    nameOccurrences.set(nameKey, (nameOccurrences.get(nameKey) ?? 0) + 1);
+  }
+  const getCustomerLabel = (customer: {
+    name: string;
+    phone?: string;
+  }): string => {
+    const duplicateName =
+      (nameOccurrences.get(customer.name.trim().toLowerCase()) ?? 0) > 1;
+    if (!duplicateName || !customer.phone) return customer.name;
+    const digits = customer.phone.replace(/\D/g, "");
+    return digits
+      ? `${customer.name} (phone ending ${digits.slice(-4)})`
+      : customer.name;
+  };
+  const completeResult =
+    !result.truncated &&
+    result.returnedCount === result.totalMatched &&
+    result.orders.length === result.totalMatched;
+  const pageHeader = `Showing ${result.returnedCount} of ${result.totalMatched} matching orders.`;
+  const continuation = result.nextOffset !== null
+    ? "Ask to see the next page for more matching orders."
+    : null;
 
   if (asksWho && !asksWhen) {
-    const lines = Array.from(customerCounts.entries()).map(
-      ([name, count], index) =>
-        `${index + 1}. ${name} — ${count} order${count === 1 ? "" : "s"}`
+    const lines = Array.from(customerCounts.values()).map(
+      (customer, index) =>
+        `${index + 1}. ${getCustomerLabel(customer)} — ${customer.count} order${customer.count === 1 ? "" : "s"}`
     );
-    const header = result.truncated
-      ? `Showing customers from ${result.returnedCount} of ${result.totalMatched} matching orders:`
-      : `${customerCounts.size} customer${customerCounts.size === 1 ? "" : "s"} placed the ${result.totalMatched} matching order${result.totalMatched === 1 ? "" : "s"}:`;
-    return [header, ...lines].join("\n");
+    const header = `${customerCounts.size} customer${customerCounts.size === 1 ? "" : "s"} placed the ${result.totalMatched} matching order${result.totalMatched === 1 ? "" : "s"}:`;
+    return [completeResult ? header : pageHeader, ...lines, continuation]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
   }
 
-  const onlyCustomer = customerCounts.size === 1
-    ? Array.from(customerCounts.keys())[0]
+  const onlyCustomer = completeResult && customerCounts.size === 1
+    ? Array.from(customerCounts.values())[0]
     : undefined;
   const header = onlyCustomer
-    ? `${onlyCustomer} placed ${result.totalMatched === 2 ? "both" : result.totalMatched} order${result.totalMatched === 1 ? "" : "s"}:`
-    : `Matching orders for ${result.period.label.toLowerCase()}:`;
+    ? `${getCustomerLabel(onlyCustomer)} placed ${result.totalMatched === 2 ? "both" : result.totalMatched} order${result.totalMatched === 1 ? "" : "s"}:`
+    : completeResult
+      ? `Matching orders for ${result.period.label.toLowerCase()}:`
+      : pageHeader;
   const lines = result.orders.map(
     (order, index) =>
-      `${index + 1}. ${order.orderReference} — ${order.placedAtFormatted}${onlyCustomer ? "" : ` — ${order.customerName}`}`
+      `${index + 1}. ${order.orderReference} — ${order.placedAtFormatted}${onlyCustomer ? "" : ` — ${getCustomerLabel({ name: order.customerName, phone: order.customerPhone })}`}`
   );
-  if (result.truncated) {
-    lines.push(
-      `Showing ${result.returnedCount} of ${result.totalMatched}. Ask for the remaining records to continue from offset ${result.nextOffset}.`
-    );
-  }
-  return [header, ...lines].join("\n");
+  return [header, ...lines, continuation]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 };
 
 const parseGroundedBusinessReportResult = (
