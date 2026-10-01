@@ -442,6 +442,83 @@ test("an ordinary ordinal order query replaces pending customer clarification", 
   }
 });
 
+test("years and four-digit values inside ordinary order queries are not customer selections", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const store = createStaffQueryContextStore();
+  const now = new Date("2026-10-01T12:00:00.000Z");
+  const makeContext = () => ({
+    restaurantId,
+    senderPhone,
+    senderRole: "owner",
+    periodType: "all_time",
+    periodLabel: "All time",
+    periodStart: new Date("2020-01-01T00:00:00.000Z"),
+    periodEnd: now,
+    timezone: "Africa/Accra",
+    customerName: "Gabriel",
+    customerClarification: {
+      customerName: "Gabriel",
+      candidates: [
+        { customerName: "Gabriel", customerPhone: "+233555001111" },
+        { customerName: "Gabriel", customerPhone: "+233555002222" }
+      ],
+      expiresAt: new Date(now.getTime() + 5 * 60_000)
+    },
+    expiresAt: new Date(now.getTime() + 20 * 60_000)
+  });
+  let orderFilter;
+  try {
+    StaffOrderQueryContext.findOne = store.findOne;
+    StaffOrderQueryContext.findOneAndUpdate = store.findOneAndUpdate;
+    Order.countDocuments = async (filter) => {
+      orderFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      orderFilter = filter;
+      return orderQuery([]);
+    };
+
+    for (const originalMessage of [
+      "Show 2024 orders today",
+      "Show orders with a reference ending 2222 today"
+    ]) {
+      store.context = makeContext();
+      orderFilter = undefined;
+
+      const result = await listStaffOrders({
+        restaurantId,
+        senderPhone,
+        senderRole: "owner",
+        originalMessage,
+        timezone: "Africa/Accra",
+        period: "today",
+        limit: 10,
+        now
+      });
+
+      assert.equal(result.kind, "order_list", originalMessage);
+      assert.equal(orderFilter.customerPhone, undefined, originalMessage);
+      assert.equal(orderFilter.customerName, undefined, originalMessage);
+      assert.equal(store.context.customerClarification, undefined, originalMessage);
+    }
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
 test("an explicit new customer query containing an ordinal replaces pending clarification", async () => {
   const originals = {
     contextFindOne: StaffOrderQueryContext.findOne,
@@ -701,6 +778,85 @@ test("phone-ending clarification re-queries actual orders with the retained peri
   }
 });
 
+test("standalone phone-ending shorthand resolves only against active persisted candidates", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const store = createStaffQueryContextStore();
+  const now = new Date("2026-10-01T12:00:00.000Z");
+  const makeContext = () => ({
+    restaurantId,
+    senderPhone,
+    senderRole: "owner",
+    periodType: "custom",
+    periodLabel: "September 2026",
+    periodStart: new Date("2026-09-01T00:00:00.000Z"),
+    periodEnd: new Date("2026-10-01T00:00:00.000Z"),
+    timezone: "Africa/Accra",
+    status: "completed",
+    customerName: "Gabriel",
+    customerClarification: {
+      customerName: "Gabriel",
+      candidates: [
+        { customerName: "Gabriel", customerPhone: "+233555001111" },
+        { customerName: "Gabriel", customerPhone: "+233555002222" }
+      ],
+      expiresAt: new Date(now.getTime() + 5 * 60_000)
+    },
+    expiresAt: new Date(now.getTime() + 20 * 60_000)
+  });
+  let selectedFilter;
+  try {
+    StaffOrderQueryContext.findOne = store.findOne;
+    StaffOrderQueryContext.findOneAndUpdate = store.findOneAndUpdate;
+    Order.countDocuments = async (filter) => {
+      selectedFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      selectedFilter = filter;
+      return orderQuery([]);
+    };
+
+    for (const originalMessage of [
+      "ending 2222",
+      "phone ending 2222",
+      "ends with 2222",
+      "2222",
+      "the one ending 2222"
+    ]) {
+      store.context = makeContext();
+      selectedFilter = undefined;
+
+      const result = await listStaffOrders({
+        restaurantId,
+        senderPhone,
+        senderRole: "owner",
+        originalMessage,
+        timezone: "Africa/Accra",
+        now
+      });
+
+      assert.equal(result.kind, "order_list", originalMessage);
+      assert.equal(selectedFilter.customerPhone, "+233555002222", originalMessage);
+      assert.equal(selectedFilter.status, "completed", originalMessage);
+      assert.equal(store.context.customerClarification, undefined, originalMessage);
+    }
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
 test("candidate-number clarification selects the persisted backend identity", async () => {
   const originals = {
     contextFindOne: StaffOrderQueryContext.findOne,
@@ -887,7 +1043,15 @@ test("duplicate phone endings and invalid selections keep clarification pending"
       restaurantId,
       senderPhone,
       senderRole: "owner",
-      originalMessage: "The one ending 1234.",
+      originalMessage: "ending 1234",
+      timezone: "Africa/Accra",
+      now
+    });
+    const unknownEnding = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "phone ending 9999",
       timezone: "Africa/Accra",
       now
     });
@@ -904,6 +1068,7 @@ test("duplicate phone endings and invalid selections keep clarification pending"
       duplicateEnding.code,
       "CUSTOMER_CLARIFICATION_AMBIGUOUS"
     );
+    assert.equal(unknownEnding.code, "CUSTOMER_CLARIFICATION_INVALID");
     assert.equal(invalidNumber.code, "CUSTOMER_CLARIFICATION_INVALID");
     assert.equal(duplicateEnding.candidates.length, 2);
     assert.equal(store.context.customerClarification.candidates.length, 2);
@@ -962,7 +1127,7 @@ test("clarification expiry and scope prevent cross-restaurant, sender, or role r
     ]) {
       const result = await listStaffOrders({
         ...scope,
-        originalMessage: "Option 1.",
+        originalMessage: "phone ending 1111",
         timezone: "Africa/Accra",
         now
       });
@@ -974,11 +1139,23 @@ test("clarification expiry and scope prevent cross-restaurant, sender, or role r
       restaurantId,
       senderPhone,
       senderRole: "owner",
-      originalMessage: "The one ending 1111.",
+      originalMessage: "ends with 1111",
       timezone: "Africa/Accra",
       now
     });
     assert.equal(expired.code, "CUSTOMER_CLARIFICATION_EXPIRED");
+    assert.equal(store.context.customerClarification, undefined);
+
+    store.context = makeContext(new Date(now.getTime() - 1));
+    const expiredBareEnding = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "1111",
+      timezone: "Africa/Accra",
+      now
+    });
+    assert.equal(expiredBareEnding.code, "CUSTOMER_CLARIFICATION_EXPIRED");
     assert.equal(store.context.customerClarification, undefined);
   } finally {
     restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);

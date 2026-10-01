@@ -117,6 +117,11 @@ type CustomerClarificationSelection =
   | { type: "phone_ending"; value: string }
   | { type: "candidate_number"; value: number };
 
+interface ContextualPhoneEndingSelection {
+  selection: CustomerClarificationSelection;
+  isLabeled: boolean;
+}
+
 const ordinalSelections = new Map([
   ["first", 1],
   ["second", 2],
@@ -166,8 +171,36 @@ const parseCustomerClarificationSelection = (
     : null;
 };
 
+const parseContextualPhoneEndingSelection = (
+  message?: string
+): ContextualPhoneEndingSelection | null => {
+  if (!message) return null;
+  const normalized = normalizeDisplayText(message).toLowerCase();
+  const labeledEndingMatch =
+    /^(?:(?:phone\s+)?ending|ends?\s+with)\s+(\d{4})[.!?]?$/.exec(
+      normalized
+    );
+  if (labeledEndingMatch) {
+    return {
+      selection: { type: "phone_ending", value: labeledEndingMatch[1] },
+      isLabeled: true
+    };
+  }
+
+  const bareEndingMatch = /^(\d{4})[.!?]?$/.exec(normalized);
+  return bareEndingMatch
+    ? {
+        selection: { type: "phone_ending", value: bareEndingMatch[1] },
+        isLabeled: false
+      }
+    : null;
+};
+
 const isCustomerClarificationSelectionMessage = (message?: string): boolean => {
-  return parseCustomerClarificationSelection(message) !== null;
+  return (
+    parseCustomerClarificationSelection(message) !== null ||
+    parseContextualPhoneEndingSelection(message)?.isLabeled === true
+  );
 };
 
 const isExplicitOrderQueryMessage = (message?: string): boolean => {
@@ -434,9 +467,12 @@ export const listStaffOrders = async (
   const timezone = input.timezone || DEFAULT_TIMEZONE;
   const hasExplicitCustomerFilter =
     input.customerName !== undefined || input.customerPhone !== undefined;
-  const clarificationSelection = hasExplicitCustomerFilter
+  const directClarificationSelection = hasExplicitCustomerFilter
     ? null
     : parseCustomerClarificationSelection(input.originalMessage);
+  const contextualPhoneEndingSelection = hasExplicitCustomerFilter
+    ? null
+    : parseContextualPhoneEndingSelection(input.originalMessage);
   const hasExplicitOrderQuery =
     Boolean(
       input.period ||
@@ -448,10 +484,17 @@ export const listStaffOrders = async (
     ) || isExplicitOrderQueryMessage(input.originalMessage);
   const shouldInspectClarification =
     !hasExplicitCustomerFilter &&
-    (clarificationSelection !== null || !hasExplicitOrderQuery);
+    (directClarificationSelection !== null ||
+      contextualPhoneEndingSelection !== null ||
+      !hasExplicitOrderQuery);
   const clarificationContext = shouldInspectClarification
     ? await loadCustomerClarificationContext(input)
     : null;
+  const clarificationSelection =
+    directClarificationSelection ??
+    (clarificationContext?.customerClarification
+      ? contextualPhoneEndingSelection?.selection ?? null
+      : null);
   const clarificationSelectionRequested =
     !hasExplicitCustomerFilter &&
     (isCustomerClarificationSelectionMessage(input.originalMessage) ||
