@@ -1,6 +1,10 @@
 import { Types } from "mongoose";
 import { Order, orderStatuses, type OrderStatus } from "../models/order.model";
-import { StaffOrderQueryContext } from "../models/staffQueryContext.model";
+import {
+  StaffOrderQueryContext,
+  type IStaffOrderCustomerClarificationCandidate,
+  type IStaffOrderQueryContextDocument
+} from "../models/staffQueryContext.model";
 import type { SenderRole } from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
@@ -12,6 +16,7 @@ import {
 
 const DEFAULT_TIMEZONE = "Africa/Accra";
 const CONTEXT_TTL_MS = 30 * 60_000;
+const CUSTOMER_CLARIFICATION_TTL_MS = 10 * 60_000;
 
 export const orderListPeriodTypes = businessReportPeriodTypes;
 
@@ -37,7 +42,8 @@ export interface StaffOrderListItem {
   orderReference: string;
   status: OrderStatus;
   customerName: string;
-  customerPhone: string;
+  customerIdentity: string;
+  phoneEnding: string;
   placedAt: string;
   placedAtFormatted: string;
   completedAt: string | null;
@@ -46,6 +52,7 @@ export interface StaffOrderListItem {
 }
 
 export interface StaffOrderListResult {
+  kind: "order_list";
   period: {
     type: string;
     label: string;
@@ -57,7 +64,6 @@ export interface StaffOrderListResult {
   filters: {
     status?: OrderStatus;
     customerName?: string;
-    customerPhone?: string;
   };
   totalMatched: number;
   returnedCount: number;
@@ -67,11 +73,103 @@ export interface StaffOrderListResult {
   orders: StaffOrderListItem[];
 }
 
+export interface StaffOrderCustomerClarificationCandidate {
+  number: number;
+  customerName: string;
+  phoneEnding: string;
+}
+
+export interface StaffOrderCustomerClarificationResult {
+  kind: "customer_clarification";
+  code:
+    | "CUSTOMER_CLARIFICATION_REQUIRED"
+    | "CUSTOMER_CLARIFICATION_INVALID"
+    | "CUSTOMER_CLARIFICATION_AMBIGUOUS"
+    | "CUSTOMER_CLARIFICATION_EXPIRED";
+  message: string;
+  customerName?: string;
+  candidates: StaffOrderCustomerClarificationCandidate[];
+}
+
+export type StaffOrderQueryResult =
+  | StaffOrderListResult
+  | StaffOrderCustomerClarificationResult;
+
 const normalizeDisplayText = (value: string): string =>
   value.trim().replace(/\s+/g, " ");
 
 const escapeRegExp = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const getPhoneEnding = (value: string): string =>
+  value.replace(/\D/g, "").slice(-4);
+
+const toSafeClarificationCandidates = (
+  candidates: IStaffOrderCustomerClarificationCandidate[]
+): StaffOrderCustomerClarificationCandidate[] =>
+  candidates.map((candidate, index) => ({
+    number: index + 1,
+    customerName: candidate.customerName,
+    phoneEnding: getPhoneEnding(candidate.customerPhone)
+  }));
+
+type CustomerClarificationSelection =
+  | { type: "phone_ending"; value: string }
+  | { type: "candidate_number"; value: number };
+
+const ordinalSelections = new Map([
+  ["first", 1],
+  ["second", 2],
+  ["third", 3],
+  ["fourth", 4],
+  ["fifth", 5],
+  ["sixth", 6],
+  ["seventh", 7],
+  ["eighth", 8],
+  ["ninth", 9],
+  ["tenth", 10]
+]);
+
+const parseCustomerClarificationSelection = (
+  message?: string
+): CustomerClarificationSelection | null => {
+  if (!message) return null;
+  const normalized = normalizeDisplayText(message).toLowerCase();
+  const endingMatch = /\b(?:ending|ends?\s+(?:in|with))\s*(\d{4})\b/.exec(
+    normalized
+  );
+  if (endingMatch) {
+    return { type: "phone_ending", value: endingMatch[1] };
+  }
+
+  const numberedMatch = /^(?:the\s+)?(?:(?:one\s+)?(?:number|option|customer)\s*)?#?(\d{1,3})(?:st|nd|rd|th)?(?:\s+(?:one|customer))?[.!?]?$/.exec(
+    normalized
+  );
+  if (numberedMatch) {
+    return { type: "candidate_number", value: Number(numberedMatch[1]) };
+  }
+
+  const ordinalMatch = /^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+(?:one|customer|option))?[.!?]?$/.exec(
+    normalized
+  );
+  return ordinalMatch
+    ? {
+        type: "candidate_number",
+        value: ordinalSelections.get(ordinalMatch[1]) as number
+      }
+    : null;
+};
+
+const isCustomerClarificationSelectionMessage = (message?: string): boolean => {
+  if (!message) return false;
+  const normalized = normalizeDisplayText(message).toLowerCase();
+  return (
+    parseCustomerClarificationSelection(message) !== null ||
+    /\b(?:ending|option|customer number|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/.test(
+      normalized
+    )
+  );
+};
 
 export const formatRestaurantDateTime = (
   value: Date,
@@ -130,25 +228,66 @@ const loadRetainedContext = async (input: ListStaffOrdersInput) => {
   });
 };
 
+const loadCustomerClarificationContext = async (
+  input: ListStaffOrdersInput
+): Promise<IStaffOrderQueryContextDocument | null> => {
+  if (!isCustomerClarificationSelectionMessage(input.originalMessage)) {
+    return null;
+  }
+
+  return StaffOrderQueryContext.findOne({
+    restaurantId: input.restaurantId,
+    senderPhone: input.senderPhone,
+    senderRole: input.senderRole
+  });
+};
+
+const clearCustomerClarification = async (input: {
+  restaurantId: string;
+  senderPhone: string;
+  senderRole: Extract<SenderRole, "owner" | "manager">;
+}): Promise<void> => {
+  await StaffOrderQueryContext.findOneAndUpdate(
+    {
+      restaurantId: input.restaurantId,
+      senderPhone: input.senderPhone,
+      senderRole: input.senderRole
+    },
+    { $unset: { customerClarification: "" } }
+  );
+};
+
+type ResolvedCustomerFilter = {
+  status: "resolved";
+  customerName?: string;
+  customerPhone?: string;
+};
+
+type AmbiguousCustomerFilter = {
+  status: "ambiguous";
+  customerName: string;
+  candidates: IStaffOrderCustomerClarificationCandidate[];
+};
+
 const resolveCustomerFilter = async (input: {
   restaurantId: string;
   customerName?: string;
   customerPhone?: string;
-}): Promise<{ customerName?: string; customerPhone?: string }> => {
+}): Promise<ResolvedCustomerFilter | AmbiguousCustomerFilter> => {
   if (input.customerPhone) {
     const customerPhone = normalizeWhatsappRecipient(input.customerPhone);
     if (!customerPhone) {
       throw new BadRequestError("The customer phone is invalid.", "INVALID_CUSTOMER_IDENTITY");
     }
 
-    const exists = await Order.exists({
+    await Order.exists({
       restaurantId: input.restaurantId,
       customerPhone
     });
-    return exists ? { customerPhone } : { customerPhone };
+    return { status: "resolved", customerPhone };
   }
 
-  if (!input.customerName) return {};
+  if (!input.customerName) return { status: "resolved" };
   if (!Types.ObjectId.isValid(input.restaurantId)) {
     throw new BadRequestError("Invalid restaurantId");
   }
@@ -172,23 +311,41 @@ const resolveCustomerFilter = async (input: {
         _id: "$customerPhone",
         names: { $addToSet: "$customerName" }
       }
-    },
-    { $limit: 3 }
+    }
   ]);
 
-  if (matchingCustomers.length > 1) {
-    throw new BadRequestError(
-      `More than one customer is saved as ${customerName}. Please clarify with the masked phone ending.`,
-      "AMBIGUOUS_CUSTOMER"
-    );
+  const uniqueCustomers = Array.from(
+    matchingCustomers.reduce((customers, match) => {
+      const customerPhone = normalizeWhatsappRecipient(match._id);
+      if (customerPhone && !customers.has(customerPhone)) {
+        customers.set(customerPhone, {
+          customerName: normalizeDisplayText(match.names[0] || customerName),
+          customerPhone
+        });
+      }
+      return customers;
+    }, new Map<string, IStaffOrderCustomerClarificationCandidate>()).values()
+  );
+
+  if (uniqueCustomers.length > 1) {
+    return {
+      status: "ambiguous",
+      customerName,
+      candidates: uniqueCustomers
+    };
   }
 
-  return matchingCustomers[0]
+  return uniqueCustomers[0]
     ? {
+        status: "resolved",
         customerName,
-        customerPhone: normalizeWhatsappRecipient(matchingCustomers[0]._id)
+        customerPhone: uniqueCustomers[0].customerPhone
       }
-    : { customerName, customerPhone: "__no_match__" };
+    : {
+        status: "resolved",
+        customerName,
+        customerPhone: "__no_match__"
+      };
 };
 
 export const rememberStaffOrderQueryContext = async (input: {
@@ -203,6 +360,10 @@ export const rememberStaffOrderQueryContext = async (input: {
   status?: OrderStatus;
   customerName?: string;
   customerPhone?: string;
+  customerClarification?: {
+    customerName: string;
+    candidates: IStaffOrderCustomerClarificationCandidate[];
+  };
   now?: Date;
 }): Promise<void> => {
   const now = input.now ?? new Date();
@@ -222,18 +383,36 @@ export const rememberStaffOrderQueryContext = async (input: {
         ...(input.status ? { status: input.status } : {}),
         ...(input.customerName ? { customerName: input.customerName } : {}),
         ...(input.customerPhone ? { customerPhone: input.customerPhone } : {}),
+        ...(input.customerClarification
+          ? {
+              customerClarification: {
+                ...input.customerClarification,
+                expiresAt: new Date(
+                  now.getTime() + CUSTOMER_CLARIFICATION_TTL_MS
+                )
+              }
+            }
+          : {}),
         expiresAt: new Date(now.getTime() + CONTEXT_TTL_MS)
       },
       $setOnInsert: { restaurantId: input.restaurantId, senderPhone: input.senderPhone },
-      ...(!input.status || !input.customerName || !input.customerPhone
-        ? {
-            $unset: {
-              ...(!input.status ? { status: "" } : {}),
-              ...(!input.customerName ? { customerName: "" } : {}),
-              ...(!input.customerPhone ? { customerPhone: "" } : {})
+      ...(
+        !input.status ||
+        !input.customerName ||
+        !input.customerPhone ||
+        !input.customerClarification
+          ? {
+              $unset: {
+                ...(!input.status ? { status: "" } : {}),
+                ...(!input.customerName ? { customerName: "" } : {}),
+                ...(!input.customerPhone ? { customerPhone: "" } : {}),
+                ...(!input.customerClarification
+                  ? { customerClarification: "" }
+                  : {})
+              }
             }
-          }
-        : {})
+          : {}
+      )
     },
     { upsert: true, runValidators: true }
   );
@@ -241,10 +420,89 @@ export const rememberStaffOrderQueryContext = async (input: {
 
 export const listStaffOrders = async (
   input: ListStaffOrdersInput
-): Promise<StaffOrderListResult> => {
+): Promise<StaffOrderQueryResult> => {
   const now = input.now ?? new Date();
   const timezone = input.timezone || DEFAULT_TIMEZONE;
-  const retained = await loadRetainedContext(input);
+  const clarificationSelectionRequested =
+    isCustomerClarificationSelectionMessage(input.originalMessage);
+  const clarificationContext = clarificationSelectionRequested
+    ? await loadCustomerClarificationContext(input)
+    : null;
+  const retained = clarificationSelectionRequested
+    ? clarificationContext
+    : await loadRetainedContext(input);
+  let selectedCustomer:
+    | IStaffOrderCustomerClarificationCandidate
+    | undefined;
+
+  if (clarificationSelectionRequested) {
+    const clarification = clarificationContext?.customerClarification;
+    const contextExpiresAt = clarificationContext?.expiresAt?.getTime();
+    const clarificationExpiresAt = clarification?.expiresAt?.getTime();
+    const clarificationExpired =
+      !clarification ||
+      !contextExpiresAt ||
+      contextExpiresAt <= now.getTime() ||
+      !clarificationExpiresAt ||
+      clarificationExpiresAt <= now.getTime();
+
+    if (clarificationExpired) {
+      if (clarificationContext?.customerClarification) {
+        await clearCustomerClarification(input);
+      }
+      return {
+        kind: "customer_clarification",
+        code: "CUSTOMER_CLARIFICATION_EXPIRED",
+        message:
+          "That customer choice is no longer active. Please repeat the customer name and order filters.",
+        candidates: []
+      };
+    }
+
+    const selection = parseCustomerClarificationSelection(input.originalMessage);
+    const candidates = clarification.candidates;
+    if (!selection) {
+      return {
+        kind: "customer_clarification",
+        code: "CUSTOMER_CLARIFICATION_INVALID",
+        message:
+          "I could not match that choice. Please reply with a candidate number or one of the displayed phone endings.",
+        customerName: clarification.customerName,
+        candidates: toSafeClarificationCandidates(candidates)
+      };
+    }
+
+    if (selection.type === "candidate_number") {
+      selectedCustomer = candidates[selection.value - 1];
+    } else {
+      const endingMatches = candidates.filter(
+        (candidate) => getPhoneEnding(candidate.customerPhone) === selection.value
+      );
+      if (endingMatches.length > 1) {
+        return {
+          kind: "customer_clarification",
+          code: "CUSTOMER_CLARIFICATION_AMBIGUOUS",
+          message:
+            "That phone ending matches more than one customer. Please choose a candidate number.",
+          customerName: clarification.customerName,
+          candidates: toSafeClarificationCandidates(candidates)
+        };
+      }
+      selectedCustomer = endingMatches[0];
+    }
+
+    if (!selectedCustomer) {
+      return {
+        kind: "customer_clarification",
+        code: "CUSTOMER_CLARIFICATION_INVALID",
+        message:
+          "That selection does not match the available customers. Please reply with a listed candidate number or phone ending.",
+        customerName: clarification.customerName,
+        candidates: toSafeClarificationCandidates(candidates)
+      };
+    }
+  }
+
   const hasExplicitPeriod = Boolean(input.period || input.startDate || input.endDate);
   const period = hasExplicitPeriod
     ? await resolveRequestedBusinessReportPeriod({
@@ -277,15 +535,49 @@ export const listStaffOrders = async (
   }
   const hasExplicitCustomerFilter =
     input.customerName !== undefined || input.customerPhone !== undefined;
-  const customer = await resolveCustomerFilter({
-    restaurantId: input.restaurantId,
-    customerName: hasExplicitCustomerFilter
-      ? input.customerName
-      : retained?.customerName,
-    customerPhone: hasExplicitCustomerFilter
-      ? input.customerPhone
-      : retained?.customerPhone
-  });
+  const customer = selectedCustomer
+    ? {
+        status: "resolved" as const,
+        customerName: selectedCustomer.customerName,
+        customerPhone: selectedCustomer.customerPhone
+      }
+    : await resolveCustomerFilter({
+        restaurantId: input.restaurantId,
+        customerName: hasExplicitCustomerFilter
+          ? input.customerName
+          : retained?.customerName,
+        customerPhone: hasExplicitCustomerFilter
+          ? input.customerPhone
+          : retained?.customerPhone
+      });
+
+  if (customer.status === "ambiguous") {
+    await rememberStaffOrderQueryContext({
+      restaurantId: input.restaurantId,
+      senderPhone: input.senderPhone,
+      senderRole: input.senderRole,
+      periodType: String(period.type),
+      periodLabel: period.label,
+      periodStart: period.periodStart,
+      periodEnd: period.periodEnd,
+      timezone: period.timezone,
+      status,
+      customerName: customer.customerName,
+      customerClarification: {
+        customerName: customer.customerName,
+        candidates: customer.candidates
+      },
+      now
+    });
+    return {
+      kind: "customer_clarification",
+      code: "CUSTOMER_CLARIFICATION_REQUIRED",
+      message: `More than one customer is saved as ${customer.customerName}. Please choose a candidate number or phone ending.`,
+      customerName: customer.customerName,
+      candidates: toSafeClarificationCandidates(customer.candidates)
+    };
+  }
+
   const query = {
     restaurantId: input.restaurantId,
     createdAt: { $gte: period.periodStart, $lt: period.periodEnd },
@@ -331,8 +623,19 @@ export const listStaffOrders = async (
   const nextOffset = offset + returnedCount < totalMatched
     ? offset + returnedCount
     : null;
+  const customerIdentities = new Map<string, string>();
+  for (const order of orders) {
+    const customerPhone = normalizeWhatsappRecipient(order.customerPhone);
+    if (customerPhone && !customerIdentities.has(customerPhone)) {
+      customerIdentities.set(
+        customerPhone,
+        `customer-${customerIdentities.size + 1}`
+      );
+    }
+  }
 
   return {
+    kind: "order_list",
     period: {
       type: String(period.type),
       label: period.label,
@@ -343,21 +646,22 @@ export const listStaffOrders = async (
     },
     filters: {
       status,
-      customerName: customer.customerName,
-      customerPhone:
-        customer.customerPhone === "__no_match__" ? undefined : customer.customerPhone
+      customerName: customer.customerName
     },
     totalMatched,
     returnedCount,
     offset,
     truncated: nextOffset !== null,
     nextOffset,
-    orders: orders.map((order) => ({
+    orders: orders.map((order, index) => ({
       id: String(order._id),
       orderReference: order.orderNumber || String(order._id),
       status: order.status,
       customerName: order.customerName || "Unknown customer",
-      customerPhone: order.customerPhone,
+      customerIdentity:
+        customerIdentities.get(normalizeWhatsappRecipient(order.customerPhone)) ??
+        `customer-${offset + index + 1}`,
+      phoneEnding: getPhoneEnding(order.customerPhone),
       placedAt: order.createdAt.toISOString(),
       placedAtFormatted: formatRestaurantDateTime(order.createdAt, period.timezone),
       completedAt: order.completedAt?.toISOString() ?? null,

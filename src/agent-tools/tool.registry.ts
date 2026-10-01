@@ -200,7 +200,6 @@ const listOrdersSchema = z
     startDate: z.string().trim().min(1).optional(),
     endDate: z.string().trim().min(1).optional(),
     customerName: z.string().trim().min(1).max(160).optional(),
-    customerPhone: z.string().trim().min(1).max(80).optional(),
     limit: z.number().int().positive().max(50).optional(),
     offset: z.number().int().min(0).optional()
   })
@@ -1451,7 +1450,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "list_orders",
       description:
-        "Owner/manager. Re-query authoritative restaurant orders for today, yesterday, a week, all time, or a custom period, optionally filtered by status or one safely resolved customer. On direct follow-ups such as who placed those orders or when they were placed, omit unchanged filters so the backend reuses the bounded trusted filter context. Explicit new filters override retained filters.",
+        "Owner/manager. Re-query authoritative restaurant orders for today, yesterday, a week, all time, or a custom period, optionally filtered by status or one safely resolved customer. Same-name customer choices are resolved by the backend from the owner's natural reply; never provide or reconstruct a customer phone. On direct follow-ups, omit unchanged filters so the backend reuses the bounded trusted filter context. Explicit new filters override retained filters.",
       parameters: {
         status: orderStatuses.join(" | "),
         date: "Legacy optional today/yesterday shortcut.",
@@ -1459,7 +1458,6 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         startDate: "Required for a custom period; YYYY-MM-DD or zoned ISO.",
         endDate: "Optional custom end date; date-only values are inclusive.",
         customerName: "Optional exact customer name. Same-name customers must be clarified.",
-        customerPhone: "Optional exact saved customer phone supplied during safe clarification; arbitrary external recipients never match.",
         limit: "Optional page size, up to 50.",
         offset: "Optional zero-based offset for retrieving the next page."
       }
@@ -1478,17 +1476,20 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         endDate: args.endDate,
         status: args.status,
         customerName: args.customerName,
-        customerPhone: args.customerPhone,
         limit: args.limit,
         offset: args.offset
       });
 
       return {
         success: true,
+        code:
+          orders.kind === "customer_clarification" ? orders.code : undefined,
         message:
-          orders.totalMatched === 0
-            ? "No orders matched those filters."
-            : `${orders.totalMatched} order${orders.totalMatched === 1 ? "" : "s"} matched${orders.truncated ? `; returning ${orders.returnedCount} on this page` : ""}.`,
+          orders.kind === "customer_clarification"
+            ? orders.message
+            : orders.totalMatched === 0
+              ? "No orders matched those filters."
+              : `${orders.totalMatched} order${orders.totalMatched === 1 ? "" : "s"} matched${orders.truncated ? `; returning ${orders.returnedCount} on this page` : ""}.`,
         data: orders
       };
     }

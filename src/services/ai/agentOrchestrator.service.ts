@@ -126,6 +126,7 @@ interface GroundedCustomerListResult {
 }
 
 interface GroundedOrderListResult {
+  kind?: "order_list";
   period: { label: string; timezone: string };
   totalMatched: number;
   returnedCount: number;
@@ -134,10 +135,31 @@ interface GroundedOrderListResult {
   orders: Array<{
     orderReference: string;
     customerName: string;
-    customerPhone?: string;
+    customerIdentity?: string;
+    phoneEnding?: string;
     placedAtFormatted: string;
   }>;
 }
+
+interface GroundedOrderClarificationResult {
+  kind: "customer_clarification";
+  code:
+    | "CUSTOMER_CLARIFICATION_REQUIRED"
+    | "CUSTOMER_CLARIFICATION_INVALID"
+    | "CUSTOMER_CLARIFICATION_AMBIGUOUS"
+    | "CUSTOMER_CLARIFICATION_EXPIRED";
+  message: string;
+  customerName?: string;
+  candidates: Array<{
+    number: number;
+    customerName: string;
+    phoneEnding: string;
+  }>;
+}
+
+type GroundedOrderQueryResult =
+  | GroundedOrderListResult
+  | GroundedOrderClarificationResult;
 
 interface GroundedBusinessReportResult {
   period: { type: string; label: string; timezone: string };
@@ -157,8 +179,27 @@ interface GroundedBusinessReportResult {
 
 const parseGroundedOrderListResult = (
   value: unknown
-): GroundedOrderListResult | null => {
+): GroundedOrderQueryResult | null => {
   if (!value || typeof value !== "object") return null;
+  const possibleClarification = value as GroundedOrderClarificationResult;
+  if (possibleClarification.kind === "customer_clarification") {
+    if (
+      typeof possibleClarification.code !== "string" ||
+      typeof possibleClarification.message !== "string" ||
+      !Array.isArray(possibleClarification.candidates) ||
+      possibleClarification.candidates.some(
+        (candidate) =>
+          !candidate ||
+          typeof candidate.number !== "number" ||
+          typeof candidate.customerName !== "string" ||
+          typeof candidate.phoneEnding !== "string"
+      )
+    ) {
+      return null;
+    }
+    return possibleClarification;
+  }
+
   const result = value as GroundedOrderListResult;
   if (
     !result.period ||
@@ -175,9 +216,19 @@ const parseGroundedOrderListResult = (
 
 const buildGroundedOrderListAnswer = (
   ownerMessage: string,
-  result: GroundedOrderListResult | undefined
+  result: GroundedOrderQueryResult | undefined
 ): string | null => {
   if (!result) return null;
+  if (result.kind === "customer_clarification") {
+    if (result.code === "CUSTOMER_CLARIFICATION_EXPIRED") {
+      return result.message;
+    }
+    const choices = result.candidates.map(
+      (candidate) =>
+        `${candidate.number}. ${candidate.customerName} — phone ending ${candidate.phoneEnding}`
+    );
+    return [result.message, ...choices].join("\n");
+  }
   const message = ownerMessage.toLowerCase();
   const asksWho = /\b(?:who|which customers?|customer names?|who placed|who made)\b/.test(message);
   const asksWhen = /\b(?:what time|what date|when|date and time)\b/.test(message);
@@ -195,15 +246,15 @@ const buildGroundedOrderListAnswer = (
 
   const customerCounts = new Map<
     string,
-    { name: string; phone?: string; count: number }
+    { name: string; phoneEnding?: string; count: number }
   >();
   for (const [index, order] of result.orders.entries()) {
-    const phone = order.customerPhone?.trim();
-    const identity = phone || `unknown-customer:${index}`;
+    const identity =
+      order.customerIdentity || `unknown-customer:${index}`;
     const current = customerCounts.get(identity);
     customerCounts.set(identity, {
       name: order.customerName,
-      phone,
+      phoneEnding: order.phoneEnding,
       count: (current?.count ?? 0) + 1
     });
   }
@@ -214,15 +265,12 @@ const buildGroundedOrderListAnswer = (
   }
   const getCustomerLabel = (customer: {
     name: string;
-    phone?: string;
+    phoneEnding?: string;
   }): string => {
     const duplicateName =
       (nameOccurrences.get(customer.name.trim().toLowerCase()) ?? 0) > 1;
-    if (!duplicateName || !customer.phone) return customer.name;
-    const digits = customer.phone.replace(/\D/g, "");
-    return digits
-      ? `${customer.name} (phone ending ${digits.slice(-4)})`
-      : customer.name;
+    if (!duplicateName || !customer.phoneEnding) return customer.name;
+    return `${customer.name} (phone ending ${customer.phoneEnding})`;
   };
   const completeResult =
     !result.truncated &&
@@ -254,7 +302,7 @@ const buildGroundedOrderListAnswer = (
       : pageHeader;
   const lines = result.orders.map(
     (order, index) =>
-      `${index + 1}. ${order.orderReference} — ${order.placedAtFormatted}${onlyCustomer ? "" : ` — ${getCustomerLabel({ name: order.customerName, phone: order.customerPhone })}`}`
+      `${index + 1}. ${order.orderReference} — ${order.placedAtFormatted}${onlyCustomer ? "" : ` — ${getCustomerLabel({ name: order.customerName, phoneEnding: order.phoneEnding })}`}`
   );
   return [header, ...lines, continuation]
     .filter((line): line is string => Boolean(line))
@@ -1523,7 +1571,7 @@ export const runAgentOrchestrator = async (
   let latestCustomerListArgs: Record<string, unknown> | undefined;
   let latestCustomerInsights: GroundedCustomerInsightsResult | undefined;
   let latestCustomerSegment: GroundedCustomerSegmentResult | undefined;
-  let latestOrderList: GroundedOrderListResult | undefined;
+  let latestOrderList: GroundedOrderQueryResult | undefined;
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;

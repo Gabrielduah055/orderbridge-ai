@@ -1,6 +1,11 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 import type { OrderStatus } from "./order.model";
 
+export interface IStaffOrderCustomerClarificationCandidate {
+  customerName: string;
+  customerPhone: string;
+}
+
 export interface IStaffOrderQueryContext {
   restaurantId: Types.ObjectId;
   senderPhone: string;
@@ -13,6 +18,11 @@ export interface IStaffOrderQueryContext {
   status?: OrderStatus;
   customerPhone?: string;
   customerName?: string;
+  customerClarification?: {
+    customerName: string;
+    candidates: IStaffOrderCustomerClarificationCandidate[];
+    expiresAt: Date;
+  };
   expiresAt: Date;
 }
 
@@ -45,6 +55,28 @@ const staffOrderQueryContextSchema =
       status: { type: String, trim: true },
       customerPhone: { type: String, trim: true },
       customerName: { type: String, trim: true },
+      customerClarification: {
+        type: new Schema(
+          {
+            customerName: { type: String, required: true, trim: true },
+            candidates: {
+              type: [
+                new Schema(
+                  {
+                    customerName: { type: String, required: true, trim: true },
+                    customerPhone: { type: String, required: true, trim: true }
+                  },
+                  { _id: false }
+                )
+              ],
+              required: true
+            },
+            expiresAt: { type: Date, required: true }
+          },
+          { _id: false }
+        ),
+        required: false
+      },
       expiresAt: { type: Date, required: true, index: true }
     },
     { timestamps: true }
