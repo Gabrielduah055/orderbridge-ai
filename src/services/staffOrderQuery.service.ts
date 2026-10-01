@@ -135,23 +135,29 @@ const parseCustomerClarificationSelection = (
 ): CustomerClarificationSelection | null => {
   if (!message) return null;
   const normalized = normalizeDisplayText(message).toLowerCase();
-  const endingMatch = /\b(?:ending|ends?\s+(?:in|with))\s*(\d{4})\b/.exec(
+  const endingMatch = /\b(?:the\s+)?one\s+ending(?:\s+(?:in|with))?\s*(\d{4})\b/.exec(
     normalized
   );
   if (endingMatch) {
     return { type: "phone_ending", value: endingMatch[1] };
   }
 
-  const numberedMatch = /^(?:the\s+)?(?:(?:one\s+)?(?:number|option|customer)\s*)?#?(\d{1,3})(?:st|nd|rd|th)?(?:\s+(?:one|customer))?[.!?]?$/.exec(
-    normalized
-  );
+  const numberedMatch =
+    /^#?(\d{1,3})(?:st|nd|rd|th)?[.!?]?$/.exec(normalized) ??
+    /^(?:the\s+)?(?:(?:one\s+)?(?:number|option|customer))\s*#?(\d{1,3})(?:st|nd|rd|th)?(?:\s+(?:one|customer))?\b/.exec(
+      normalized
+    );
   if (numberedMatch) {
     return { type: "candidate_number", value: Number(numberedMatch[1]) };
   }
 
-  const ordinalMatch = /^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)(?:\s+(?:one|customer|option))?[.!?]?$/.exec(
-    normalized
-  );
+  const ordinalMatch =
+    /^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)[.!?]?$/.exec(
+      normalized
+    ) ??
+    /^(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:one|customer|option)\b/.exec(
+      normalized
+    );
   return ordinalMatch
     ? {
         type: "candidate_number",
@@ -161,11 +167,18 @@ const parseCustomerClarificationSelection = (
 };
 
 const isCustomerClarificationSelectionMessage = (message?: string): boolean => {
+  return parseCustomerClarificationSelection(message) !== null;
+};
+
+const isExplicitOrderQueryMessage = (message?: string): boolean => {
   if (!message) return false;
   const normalized = normalizeDisplayText(message).toLowerCase();
   return (
-    parseCustomerClarificationSelection(message) !== null ||
-    /\b(?:ending|option|customer number|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/.test(
+    /\b(?:remaining records?|next page|show more|more results?|continue)\b/.test(
+      normalized
+    ) ||
+    /\b(?:show|list|find|get|display|give me)\b.*\borders?\b/.test(normalized) ||
+    /\borders?\b.*\b(?:today|yesterday|this week|last week|all time|since|between|from)\b/.test(
       normalized
     )
   );
@@ -231,10 +244,6 @@ const loadRetainedContext = async (input: ListStaffOrdersInput) => {
 const loadCustomerClarificationContext = async (
   input: ListStaffOrdersInput
 ): Promise<IStaffOrderQueryContextDocument | null> => {
-  if (!isCustomerClarificationSelectionMessage(input.originalMessage)) {
-    return null;
-  }
-
   return StaffOrderQueryContext.findOne({
     restaurantId: input.restaurantId,
     senderPhone: input.senderPhone,
@@ -423,11 +432,30 @@ export const listStaffOrders = async (
 ): Promise<StaffOrderQueryResult> => {
   const now = input.now ?? new Date();
   const timezone = input.timezone || DEFAULT_TIMEZONE;
-  const clarificationSelectionRequested =
-    isCustomerClarificationSelectionMessage(input.originalMessage);
-  const clarificationContext = clarificationSelectionRequested
+  const hasExplicitCustomerFilter =
+    input.customerName !== undefined || input.customerPhone !== undefined;
+  const clarificationSelection = hasExplicitCustomerFilter
+    ? null
+    : parseCustomerClarificationSelection(input.originalMessage);
+  const hasExplicitOrderQuery =
+    Boolean(
+      input.period ||
+      input.startDate ||
+      input.endDate ||
+      input.status ||
+      input.limit !== undefined ||
+      input.offset !== undefined
+    ) || isExplicitOrderQueryMessage(input.originalMessage);
+  const shouldInspectClarification =
+    !hasExplicitCustomerFilter &&
+    (clarificationSelection !== null || !hasExplicitOrderQuery);
+  const clarificationContext = shouldInspectClarification
     ? await loadCustomerClarificationContext(input)
     : null;
+  const clarificationSelectionRequested =
+    !hasExplicitCustomerFilter &&
+    (isCustomerClarificationSelectionMessage(input.originalMessage) ||
+      Boolean(clarificationContext?.customerClarification));
   const retained = clarificationSelectionRequested
     ? clarificationContext
     : await loadRetainedContext(input);
@@ -459,7 +487,7 @@ export const listStaffOrders = async (
       };
     }
 
-    const selection = parseCustomerClarificationSelection(input.originalMessage);
+    const selection = clarificationSelection;
     const candidates = clarification.candidates;
     if (!selection) {
       return {
@@ -533,8 +561,6 @@ export const listStaffOrders = async (
   if (status && !orderStatuses.includes(status)) {
     throw new BadRequestError("The order status filter is invalid.");
   }
-  const hasExplicitCustomerFilter =
-    input.customerName !== undefined || input.customerPhone !== undefined;
   const customer = selectedCustomer
     ? {
         status: "resolved" as const,

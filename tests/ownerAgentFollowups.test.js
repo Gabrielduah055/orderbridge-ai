@@ -319,6 +319,207 @@ test("customer-name aggregation rejects an invalid restaurant identifier", async
   }
 });
 
+test("an ordinal embedded in an order query is not a customer selection without pending context", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const queryState = {};
+  let orderFilter;
+  let contextRead = false;
+  try {
+    StaffOrderQueryContext.findOne = async () => {
+      contextRead = true;
+      return null;
+    };
+    StaffOrderQueryContext.findOneAndUpdate = async () => {};
+    Order.countDocuments = async (filter) => {
+      orderFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      orderFilter = filter;
+      return orderQuery([], queryState);
+    };
+
+    const result = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "Show the first 10 orders today",
+      timezone: "Africa/Accra",
+      period: "today",
+      limit: 10,
+      now: new Date("2026-10-01T12:00:00.000Z")
+    });
+
+    assert.equal(result.kind, "order_list");
+    assert.equal(result.period.type, "today");
+    assert.equal(queryState.limit, 10);
+    assert.equal(orderFilter.customerPhone, undefined);
+    assert.equal(contextRead, false);
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
+test("an ordinary ordinal order query replaces pending customer clarification", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const store = createStaffQueryContextStore();
+  const now = new Date("2026-10-01T12:00:00.000Z");
+  let orderFilter;
+  store.context = {
+    restaurantId,
+    senderPhone,
+    senderRole: "owner",
+    periodType: "all_time",
+    periodLabel: "All time",
+    periodStart: new Date("2020-01-01T00:00:00.000Z"),
+    periodEnd: now,
+    timezone: "Africa/Accra",
+    customerName: "Gabriel",
+    customerClarification: {
+      customerName: "Gabriel",
+      candidates: [
+        { customerName: "Gabriel", customerPhone: "+233555001111" },
+        { customerName: "Gabriel", customerPhone: "+233555002222" }
+      ],
+      expiresAt: new Date(now.getTime() + 5 * 60_000)
+    },
+    expiresAt: new Date(now.getTime() + 20 * 60_000)
+  };
+  try {
+    StaffOrderQueryContext.findOne = store.findOne;
+    StaffOrderQueryContext.findOneAndUpdate = store.findOneAndUpdate;
+    Order.countDocuments = async (filter) => {
+      orderFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      orderFilter = filter;
+      return orderQuery([]);
+    };
+
+    const result = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "Show the first 10 orders today",
+      timezone: "Africa/Accra",
+      period: "today",
+      limit: 10,
+      now
+    });
+
+    assert.equal(result.kind, "order_list");
+    assert.equal(orderFilter.customerPhone, undefined);
+    assert.equal(orderFilter.customerName, undefined);
+    assert.equal(store.context.customerClarification, undefined);
+    assert.equal(store.context.customerName, undefined);
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
+test("an explicit new customer query containing an ordinal replaces pending clarification", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    aggregate: Order.aggregate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const store = createStaffQueryContextStore();
+  const now = new Date("2026-10-01T12:00:00.000Z");
+  let orderFilter;
+  store.context = {
+    restaurantId,
+    senderPhone,
+    senderRole: "owner",
+    periodType: "all_time",
+    periodLabel: "All time",
+    periodStart: new Date("2020-01-01T00:00:00.000Z"),
+    periodEnd: now,
+    timezone: "Africa/Accra",
+    customerName: "Gabriel",
+    customerClarification: {
+      customerName: "Gabriel",
+      candidates: [
+        { customerName: "Gabriel", customerPhone: "+233555001111" },
+        { customerName: "Gabriel", customerPhone: "+233555002222" }
+      ],
+      expiresAt: new Date(now.getTime() + 5 * 60_000)
+    },
+    expiresAt: new Date(now.getTime() + 20 * 60_000)
+  };
+  try {
+    StaffOrderQueryContext.findOne = store.findOne;
+    StaffOrderQueryContext.findOneAndUpdate = store.findOneAndUpdate;
+    Order.aggregate = async (pipeline) => {
+      assert.deepEqual(pipeline[0].$match.customerName, {
+        $regex: "^Lady Ruth$",
+        $options: "i"
+      });
+      return [{ _id: "+233555009999", names: ["Lady Ruth"] }];
+    };
+    Order.countDocuments = async (filter) => {
+      orderFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      orderFilter = filter;
+      return orderQuery([]);
+    };
+
+    const result = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "First, show Lady Ruth's orders today.",
+      timezone: "Africa/Accra",
+      period: "today",
+      customerName: "Lady Ruth",
+      now
+    });
+
+    assert.equal(result.kind, "order_list");
+    assert.equal(orderFilter.customerPhone, "+233555009999");
+    assert.equal(store.context.customerName, "Lady Ruth");
+    assert.equal(store.context.customerClarification, undefined);
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "aggregate", originals.aggregate);
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
 test("duplicate customer names return every safe candidate and persist scoped clarification", async () => {
   const originals = {
     contextFindOne: StaffOrderQueryContext.findOne,
@@ -547,14 +748,92 @@ test("candidate-number clarification selects the persisted backend identity", as
       restaurantId,
       senderPhone,
       senderRole: "manager",
-      originalMessage: "Option 2.",
+      originalMessage: "1",
       timezone: "Africa/Accra",
       now
     });
 
     assert.equal(result.kind, "order_list");
-    assert.equal(selectedFilter.customerPhone, "+233555002222");
+    assert.equal(selectedFilter.customerPhone, "+233555001111");
     assert.equal(selectedFilter.status, "accepted");
+  } finally {
+    restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
+    restore(
+      StaffOrderQueryContext,
+      "findOneAndUpdate",
+      originals.contextFindOneAndUpdate
+    );
+    restore(Order, "countDocuments", originals.countDocuments);
+    restore(Order, "find", originals.find);
+  }
+});
+
+test("ordinal clarification keeps explicit period and status overrides", async () => {
+  const originals = {
+    contextFindOne: StaffOrderQueryContext.findOne,
+    contextFindOneAndUpdate: StaffOrderQueryContext.findOneAndUpdate,
+    countDocuments: Order.countDocuments,
+    find: Order.find
+  };
+  const store = createStaffQueryContextStore();
+  const now = new Date("2026-10-01T12:00:00.000Z");
+  let selectedFilter;
+  store.context = {
+    restaurantId,
+    senderPhone,
+    senderRole: "owner",
+    periodType: "all_time",
+    periodLabel: "All time",
+    periodStart: new Date("2020-01-01T00:00:00.000Z"),
+    periodEnd: now,
+    timezone: "Africa/Accra",
+    status: "rejected",
+    customerName: "Gabriel",
+    customerClarification: {
+      customerName: "Gabriel",
+      candidates: [
+        { customerName: "Gabriel", customerPhone: "+233555001111" },
+        { customerName: "Gabriel", customerPhone: "+233555002222" }
+      ],
+      expiresAt: new Date(now.getTime() + 5 * 60_000)
+    },
+    expiresAt: new Date(now.getTime() + 20 * 60_000)
+  };
+  try {
+    StaffOrderQueryContext.findOne = store.findOne;
+    StaffOrderQueryContext.findOneAndUpdate = store.findOneAndUpdate;
+    Order.countDocuments = async (filter) => {
+      selectedFilter = filter;
+      return 0;
+    };
+    Order.find = (filter) => {
+      selectedFilter = filter;
+      return orderQuery([]);
+    };
+
+    const result = await listStaffOrders({
+      restaurantId,
+      senderPhone,
+      senderRole: "owner",
+      originalMessage: "The second one, but show completed orders today.",
+      timezone: "Africa/Accra",
+      period: "today",
+      status: "completed",
+      now
+    });
+
+    assert.equal(result.kind, "order_list");
+    assert.equal(selectedFilter.customerPhone, "+233555002222");
+    assert.equal(selectedFilter.status, "completed");
+    assert.equal(
+      selectedFilter.createdAt.$gte.toISOString(),
+      "2026-10-01T00:00:00.000Z"
+    );
+    assert.equal(
+      selectedFilter.createdAt.$lt.toISOString(),
+      "2026-10-01T12:00:00.000Z"
+    );
+    assert.equal(store.context.customerClarification, undefined);
   } finally {
     restore(StaffOrderQueryContext, "findOne", originals.contextFindOne);
     restore(
