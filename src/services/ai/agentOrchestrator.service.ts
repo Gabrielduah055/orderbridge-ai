@@ -125,6 +125,255 @@ interface GroundedCustomerListResult {
   customers: unknown[];
 }
 
+interface GroundedOrderListResult {
+  kind?: "order_list";
+  period: { label: string; timezone: string };
+  totalMatched: number;
+  returnedCount: number;
+  truncated: boolean;
+  nextOffset: number | null;
+  orders: Array<{
+    orderReference: string;
+    customerName: string;
+    customerIdentity?: string;
+    phoneEnding?: string;
+    placedAtFormatted: string;
+  }>;
+}
+
+interface GroundedOrderClarificationResult {
+  kind: "customer_clarification";
+  code:
+    | "CUSTOMER_CLARIFICATION_REQUIRED"
+    | "CUSTOMER_CLARIFICATION_INVALID"
+    | "CUSTOMER_CLARIFICATION_AMBIGUOUS"
+    | "CUSTOMER_CLARIFICATION_EXPIRED";
+  message: string;
+  customerName?: string;
+  candidates: Array<{
+    number: number;
+    customerName: string;
+    phoneEnding: string;
+  }>;
+}
+
+type GroundedOrderQueryResult =
+  | GroundedOrderListResult
+  | GroundedOrderClarificationResult;
+
+interface GroundedBusinessReportResult {
+  period: { type: string; label: string; timezone: string };
+  orders: { total: number };
+  busiestDates: Array<{
+    date: string;
+    day: string;
+    totalOrders: number;
+  }>;
+  busiestWeekdays: Array<{
+    day: string;
+    totalOrders: number;
+    occurrences: number;
+    averageOrdersPerOccurrence: number;
+  }>;
+}
+
+const parseGroundedOrderListResult = (
+  value: unknown
+): GroundedOrderQueryResult | null => {
+  if (!value || typeof value !== "object") return null;
+  const possibleClarification = value as GroundedOrderClarificationResult;
+  if (possibleClarification.kind === "customer_clarification") {
+    if (
+      typeof possibleClarification.code !== "string" ||
+      typeof possibleClarification.message !== "string" ||
+      !Array.isArray(possibleClarification.candidates) ||
+      possibleClarification.candidates.some(
+        (candidate) =>
+          !candidate ||
+          typeof candidate.number !== "number" ||
+          typeof candidate.customerName !== "string" ||
+          typeof candidate.phoneEnding !== "string"
+      )
+    ) {
+      return null;
+    }
+    return possibleClarification;
+  }
+
+  const result = value as GroundedOrderListResult;
+  if (
+    !result.period ||
+    typeof result.period.label !== "string" ||
+    typeof result.totalMatched !== "number" ||
+    typeof result.returnedCount !== "number" ||
+    typeof result.truncated !== "boolean" ||
+    !Array.isArray(result.orders)
+  ) {
+    return null;
+  }
+  return result;
+};
+
+const buildGroundedOrderListAnswer = (
+  ownerMessage: string,
+  result: GroundedOrderQueryResult | undefined
+): string | null => {
+  if (!result) return null;
+  if (result.kind === "customer_clarification") {
+    if (result.code === "CUSTOMER_CLARIFICATION_EXPIRED") {
+      return result.message;
+    }
+    const choices = result.candidates.map(
+      (candidate) =>
+        `${candidate.number}. ${candidate.customerName} — phone ending ${candidate.phoneEnding}`
+    );
+    return [result.message, ...choices].join("\n");
+  }
+  const message = ownerMessage.toLowerCase();
+  const asksWho = /\b(?:who|which customers?|customer names?|who placed|who made)\b/.test(message);
+  const asksWhen = /\b(?:what time|what date|when|date and time)\b/.test(message);
+  const asksForPage =
+    /\b(?:remaining records?|next page|show more|more results?|continue)\b/.test(
+      message
+    );
+  if (!asksWho && !asksWhen && !asksForPage) return null;
+  if (result.totalMatched === 0) {
+    return `No orders matched ${result.period.label.toLowerCase()}.`;
+  }
+  if (result.returnedCount === 0 || result.orders.length === 0) {
+    return `There are no more matching orders to show for ${result.period.label.toLowerCase()}.`;
+  }
+
+  const customerCounts = new Map<
+    string,
+    { name: string; phoneEnding?: string; count: number }
+  >();
+  for (const [index, order] of result.orders.entries()) {
+    const identity =
+      order.customerIdentity || `unknown-customer:${index}`;
+    const current = customerCounts.get(identity);
+    customerCounts.set(identity, {
+      name: order.customerName,
+      phoneEnding: order.phoneEnding,
+      count: (current?.count ?? 0) + 1
+    });
+  }
+  const nameOccurrences = new Map<string, number>();
+  for (const customer of customerCounts.values()) {
+    const nameKey = customer.name.trim().toLowerCase();
+    nameOccurrences.set(nameKey, (nameOccurrences.get(nameKey) ?? 0) + 1);
+  }
+  const getCustomerLabel = (customer: {
+    name: string;
+    phoneEnding?: string;
+  }): string => {
+    const duplicateName =
+      (nameOccurrences.get(customer.name.trim().toLowerCase()) ?? 0) > 1;
+    if (!duplicateName || !customer.phoneEnding) return customer.name;
+    return `${customer.name} (phone ending ${customer.phoneEnding})`;
+  };
+  const completeResult =
+    !result.truncated &&
+    result.returnedCount === result.totalMatched &&
+    result.orders.length === result.totalMatched;
+  const pageHeader = `Showing ${result.returnedCount} of ${result.totalMatched} matching orders.`;
+  const continuation = result.nextOffset !== null
+    ? "Ask to see the next page for more matching orders."
+    : null;
+
+  if (asksWho && !asksWhen) {
+    const lines = Array.from(customerCounts.values()).map(
+      (customer, index) =>
+        `${index + 1}. ${getCustomerLabel(customer)} — ${customer.count} order${customer.count === 1 ? "" : "s"}`
+    );
+    const header = `${customerCounts.size} customer${customerCounts.size === 1 ? "" : "s"} placed the ${result.totalMatched} matching order${result.totalMatched === 1 ? "" : "s"}:`;
+    return [completeResult ? header : pageHeader, ...lines, continuation]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
+  }
+
+  const onlyCustomer = completeResult && customerCounts.size === 1
+    ? Array.from(customerCounts.values())[0]
+    : undefined;
+  const header = onlyCustomer
+    ? `${getCustomerLabel(onlyCustomer)} placed ${result.totalMatched === 2 ? "both" : result.totalMatched} order${result.totalMatched === 1 ? "" : "s"}:`
+    : completeResult
+      ? `Matching orders for ${result.period.label.toLowerCase()}:`
+      : pageHeader;
+  const lines = result.orders.map(
+    (order, index) =>
+      `${index + 1}. ${order.orderReference} — ${order.placedAtFormatted}${onlyCustomer ? "" : ` — ${getCustomerLabel({ name: order.customerName, phoneEnding: order.phoneEnding })}`}`
+  );
+  return [header, ...lines, continuation]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+};
+
+const parseGroundedBusinessReportResult = (
+  value: unknown
+): GroundedBusinessReportResult | null => {
+  if (!value || typeof value !== "object") return null;
+  const result = value as GroundedBusinessReportResult;
+  return result.period && result.orders && Array.isArray(result.busiestDates) &&
+    Array.isArray(result.busiestWeekdays)
+    ? result
+    : null;
+};
+
+const capitalize = (value: string): string =>
+  value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : value;
+
+const formatGroundedCalendarDate = (value: string): string => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return value;
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "UTC",
+    day: "numeric",
+    month: "long",
+    year: "numeric"
+  }).format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))));
+};
+
+const buildGroundedBusiestAnswer = (
+  ownerMessage: string,
+  result: GroundedBusinessReportResult | undefined
+): string | null => {
+  if (!result) return null;
+  const message = ownerMessage.toLowerCase();
+  const asksWeekday = /\b(?:weekday|day of the week|usually busiest|normally busiest)\b/.test(message);
+  const asksDate = /\b(?:busiest date|which date|calendar date)\b/.test(message);
+  if (!asksWeekday && !asksDate) return null;
+  const scope = result.period.type === "all_time"
+    ? "across all recorded activity"
+    : `for ${result.period.label.toLowerCase()}`;
+  if (result.orders.total === 0) {
+    return `There are no recorded orders ${scope}, so there is no busiest ${asksWeekday ? "weekday" : "date"}.`;
+  }
+  if (asksWeekday) {
+    const entries = result.busiestWeekdays;
+    const lead = entries.length > 1
+      ? `There is a tie for busiest weekday ${scope}:`
+      : `The busiest weekday ${scope} is ${capitalize(entries[0].day)}.`;
+    const details = entries.map((entry, index) =>
+      `${entries.length > 1 ? `${index + 1}. ` : ""}${capitalize(entry.day)} — ${entry.totalOrders} total order${entry.totalOrders === 1 ? "" : "s"} across ${entry.occurrences} occurrence${entry.occurrences === 1 ? "" : "s"}; ${entry.averageOrdersPerOccurrence.toFixed(2)} per occurrence on average.`
+    );
+    if (result.orders.total < 7) {
+      details.push("This is a small recorded sample, so it does not yet establish a reliable recurring pattern.");
+    }
+    return [lead, ...details].join("\n");
+  }
+  const entries = result.busiestDates;
+  const lead = entries.length > 1
+    ? `There is a tie for busiest calendar date ${scope}:`
+    : `The busiest calendar date ${scope} was:`;
+  return [
+    lead,
+    ...entries.map((entry, index) =>
+      `${index + 1}. ${formatGroundedCalendarDate(entry.date)} (${capitalize(entry.day)}) — ${entry.totalOrders} order${entry.totalOrders === 1 ? "" : "s"}`
+    )
+  ].join("\n");
+};
+
 interface GroundedCustomerInsightsResult {
   status: "found" | "not_found" | "ambiguous";
   found: boolean;
@@ -285,7 +534,7 @@ const buildGroundedCustomerInsightsAnswer = (
     const labels: Record<string, string> = {
       eligible: "can currently receive promotions",
       no_consent:
-        "cannot currently receive promotions because marketing consent has not been confirmed",
+        "cannot currently receive promotions because they explicitly declined them",
       opted_out: "is opted out and cannot receive promotions",
       invalid_recipient:
         "cannot currently receive promotions because there is no valid promotional WhatsApp recipient"
@@ -413,7 +662,7 @@ const buildGroundedCustomerSegmentAnswer = (
       message
     )
   ) {
-    return `${result.excludedNoConsent} of ${total} ${segmentLabel} do not have confirmed marketing consent.`;
+    return `${result.excludedNoConsent} of ${total} ${segmentLabel} explicitly declined promotions.`;
   }
   if (
     /\b(?:invalid|valid|without|don't have|do not have)\b.*\b(?:whatsapp|recipient)\b/.test(
@@ -958,6 +1207,31 @@ interface RequiredOperationalTool {
   safeMessage: string;
 }
 
+const isNaturalCampaignCreationRequest = (message: string): boolean => {
+  const normalized = normalizeText(message).toLowerCase();
+  const asksToCommunicate =
+    /\b(?:send|message|tell|notify|announce|invite|wish|greet|reach out)\b/.test(
+      normalized
+    );
+  const targetsCustomers =
+    /\b(?:all\s+(?:the\s+)?customers?|customers?|everyone|patrons?|clients?)\b/.test(
+      normalized
+    ) ||
+    /\b(?:send|message|tell|notify|invite|wish|greet)\b.+\bto\b.+/.test(
+      normalized
+    );
+  const marketingContent =
+    /\b(?:campaign|promotion|promo|offer|announcement|happy new month|happy new year|holiday|festive|we(?:'re| are) (?:open|active|back)|reopen(?:ed|ing)?|place (?:an |your )?order|bring (?:an |your )?orders?)\b/.test(
+      normalized
+    );
+  const readOnly =
+    /\b(?:how many|which|who|what|report|statistics?|insights?|eligible|can receive|audience size|show|list)\b/.test(
+      normalized
+    ) && !asksToCommunicate;
+
+  return !readOnly && asksToCommunicate && targetsCustomers && marketingContent;
+};
+
 const getCustomerMarketingMutationIntentGuard = (
   input: AgentOrchestratorInput,
   toolName: string
@@ -971,10 +1245,11 @@ const getCustomerMarketingMutationIntentGuard = (
 
   if (toolName === "create_campaign_draft") {
     const explicitCreation =
-      mentionsCampaign &&
-      /\b(?:create|draft|start|make|prepare|set up|launch|send|write)\b/.test(
-        message
-      );
+      (mentionsCampaign &&
+        /\b(?:create|draft|start|make|prepare|set up|launch|send|write)\b/.test(
+          message
+        )) ||
+      isNaturalCampaignCreationRequest(message);
     return explicitCreation
       ? null
       : {
@@ -1050,6 +1325,7 @@ const getRequiredCampaignOrReminderTool = (
 ): RequiredOperationalTool | null => {
   const message = input.message.toLowerCase();
   const mentionsCampaign = /\bcampaigns?\b/.test(message);
+  const naturalCampaignRequest = isNaturalCampaignCreationRequest(message);
   const trustedCampaignReference =
     input.staffState?.recentReferences.campaign;
   const hasCompetingCampaignContext = Boolean(
@@ -1068,6 +1344,18 @@ const getRequiredCampaignOrReminderTool = (
     trustedCampaignReference && !hasCompetingCampaignContext
   );
   const mentionsReminder = /\breminders?\b/.test(message);
+
+  if (
+    (mentionsCampaign || hasUnambiguousCampaignFollowUp) &&
+    /\b(?:add|attach|upload|use|set)\b/.test(message) &&
+    /\b(?:image|photo|picture)\b/.test(message)
+  ) {
+    return {
+      toolName: "start_campaign_image_upload",
+      safeMessage:
+        "I haven't started a campaign image upload. Please identify the pending campaign whose preview should receive the image."
+    };
+  }
 
   if (
     (mentionsCampaign || hasUnambiguousCampaignFollowUp) &&
@@ -1108,8 +1396,9 @@ const getRequiredCampaignOrReminderTool = (
   }
 
   if (
-    mentionsCampaign &&
-    /\b(create|start|draft|make|set up|launch)\b/.test(message)
+    naturalCampaignRequest ||
+    (mentionsCampaign &&
+      /\b(create|start|draft|make|set up|launch|send|write)\b/.test(message))
   ) {
     return {
       toolName: "create_campaign_draft",
@@ -1282,6 +1571,8 @@ export const runAgentOrchestrator = async (
   let latestCustomerListArgs: Record<string, unknown> | undefined;
   let latestCustomerInsights: GroundedCustomerInsightsResult | undefined;
   let latestCustomerSegment: GroundedCustomerSegmentResult | undefined;
+  let latestOrderList: GroundedOrderQueryResult | undefined;
+  let latestBusinessReport: GroundedBusinessReportResult | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -1370,7 +1661,17 @@ export const runAgentOrchestrator = async (
               normalizedInputMessage,
               latestCustomerSegment
             );
+          const groundedOrderListAnswer = buildGroundedOrderListAnswer(
+            normalizedInputMessage,
+            latestOrderList
+          );
+          const groundedBusiestAnswer = buildGroundedBusiestAnswer(
+            normalizedInputMessage,
+            latestBusinessReport
+          );
           const groundedAnswer =
+            groundedOrderListAnswer ??
+            groundedBusiestAnswer ??
             groundedCustomerInsightsAnswer ??
             groundedCustomerSegmentAnswer ??
             groundedCustomerListAnswer;
@@ -1519,6 +1820,16 @@ export const runAgentOrchestrator = async (
         if (result.success && toolName === "get_customer_segment_insights") {
           latestCustomerSegment =
             parseGroundedCustomerSegmentResult(result.data) ?? undefined;
+        }
+
+        if (result.success && toolName === "list_orders") {
+          latestOrderList =
+            parseGroundedOrderListResult(result.data) ?? undefined;
+        }
+
+        if (result.success && toolName === "get_business_report") {
+          latestBusinessReport =
+            parseGroundedBusinessReportResult(result.data) ?? undefined;
         }
 
         if (

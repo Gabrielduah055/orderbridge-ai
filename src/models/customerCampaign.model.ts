@@ -25,6 +25,7 @@ export const customerCampaignTargetingTypes = [
   "all_eligible_customers",
   "inactive_customers",
   "returning_customers",
+  "selected_customer",
   "ordered_menu_item",
   "last_order_date_range"
 ] as const;
@@ -36,10 +37,16 @@ export type CustomerCampaignType =
 export type CustomerCampaignTargetingType =
   (typeof customerCampaignTargetingTypes)[number];
 
+export const customerCampaignAttachmentTypes = ["menu_item", "upload"] as const;
+export type CustomerCampaignAttachmentType =
+  (typeof customerCampaignAttachmentTypes)[number];
+
 export interface CustomerCampaignTargetingRule {
   type: CustomerCampaignTargetingType;
   inactiveDays?: number;
   menuItemId?: Types.ObjectId;
+  customerProfileId?: Types.ObjectId;
+  customerName?: string;
   startDate?: Date;
   endDate?: Date;
 }
@@ -54,6 +61,11 @@ export interface ICustomerCampaign {
   status: CustomerCampaignStatus;
   campaignVersion: number;
   referencedMenuItemId?: Types.ObjectId;
+  attachmentType?: CustomerCampaignAttachmentType;
+  imageUrl?: string;
+  imagePublicId?: string;
+  imageMenuItemId?: Types.ObjectId;
+  imageLabel?: string;
   createdByPhone: string;
   createdByRole: Extract<SenderRole, "owner" | "manager">;
   approvedByPhone?: string;
@@ -97,6 +109,15 @@ const targetingSchema = new Schema<CustomerCampaignTargetingRule>(
     menuItemId: {
       type: Schema.Types.ObjectId,
       ref: "MenuItem"
+    },
+    customerProfileId: {
+      type: Schema.Types.ObjectId,
+      ref: "CustomerProfile"
+    },
+    customerName: {
+      type: String,
+      trim: true,
+      maxlength: 160
     },
     startDate: {
       type: Date
@@ -174,6 +195,27 @@ const customerCampaignSchema = new Schema<ICustomerCampaignDocument>(
     referencedMenuItemId: {
       type: Schema.Types.ObjectId,
       ref: "MenuItem"
+    },
+    attachmentType: {
+      type: String,
+      enum: customerCampaignAttachmentTypes
+    },
+    imageUrl: {
+      type: String,
+      trim: true
+    },
+    imagePublicId: {
+      type: String,
+      trim: true
+    },
+    imageMenuItemId: {
+      type: Schema.Types.ObjectId,
+      ref: "MenuItem"
+    },
+    imageLabel: {
+      type: String,
+      trim: true,
+      maxlength: 200
     },
     createdByPhone: {
       type: String,
@@ -269,7 +311,12 @@ const versionedCampaignFields = [
   "targeting",
   "timezone",
   "scheduledAt",
-  "referencedMenuItemId"
+  "referencedMenuItemId",
+  "attachmentType",
+  "imageUrl",
+  "imagePublicId",
+  "imageMenuItemId",
+  "imageLabel"
 ];
 
 customerCampaignSchema.pre("save", function incrementCampaignVersion(next) {

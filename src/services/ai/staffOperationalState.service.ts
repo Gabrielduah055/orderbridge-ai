@@ -23,6 +23,7 @@ const activeOrderStatuses = [
 ] as const;
 const imageActionTypes = new Set([
   "MENU_ITEM_IMAGE_CONTEXT",
+  "CAMPAIGN_IMAGE_CONTEXT",
   "IMAGE_ASSIGNMENT"
 ]);
 

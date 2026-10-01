@@ -45,6 +45,10 @@ import {
   menuItemImageOwnerOnlyMessage,
   prepareUploadedMenuItemImage
 } from "../services/menuItemImageWorkflow.service";
+import {
+  hasPendingCampaignImageUpload,
+  prepareUploadedCampaignImage
+} from "../services/campaignImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
 
 const customerConversationQueues = new Map<string, Promise<void>>();
@@ -359,6 +363,8 @@ interface ProcessInboundStaffMenuImageDependencies {
   decryptMedia: typeof decryptWasenderMedia;
   uploadTrustedImage: typeof uploadTrustedDecryptedImageFromUrl;
   prepareImage: typeof prepareUploadedMenuItemImage;
+  hasPendingCampaignUpload: typeof hasPendingCampaignImageUpload;
+  prepareCampaignImage: typeof prepareUploadedCampaignImage;
   enqueueText: typeof enqueueTextMessageOrThrow;
 }
 
@@ -408,17 +414,42 @@ export const processInboundStaffMenuImage = async (
     const decryptedPublicUrl = await (
       dependencies.decryptMedia ?? decryptWasenderMedia
     )(input.rawMessage, { apiKey: input.apiKey });
+    const campaignUploadPending = dependencies.hasPendingCampaignUpload
+      ? await dependencies.hasPendingCampaignUpload({
+          restaurantId: input.restaurantId,
+          senderPhone: input.senderPhone,
+          senderRole: input.senderRole
+        })
+      : dependencies.prepareImage
+        ? false
+        : await hasPendingCampaignImageUpload({
+            restaurantId: input.restaurantId,
+            senderPhone: input.senderPhone,
+            senderRole: input.senderRole
+          });
     const trustedImage = await (
       dependencies.uploadTrustedImage ?? uploadTrustedDecryptedImageFromUrl
-    )(decryptedPublicUrl);
-    const workflowResult = await (
-      dependencies.prepareImage ?? prepareUploadedMenuItemImage
-    )({
-      restaurantId: input.restaurantId,
-      senderPhone: input.senderPhone,
-      senderRole: input.senderRole,
-      image: trustedImage
-    });
+    )(
+      decryptedPublicUrl,
+      campaignUploadPending ? "campaigns" : "menu-items"
+    );
+    const workflowResult = campaignUploadPending
+      ? await (
+          dependencies.prepareCampaignImage ?? prepareUploadedCampaignImage
+        )({
+          restaurantId: input.restaurantId,
+          senderPhone: input.senderPhone,
+          senderRole: input.senderRole,
+          image: trustedImage
+        })
+      : await (
+          dependencies.prepareImage ?? prepareUploadedMenuItemImage
+        )({
+          restaurantId: input.restaurantId,
+          senderPhone: input.senderPhone,
+          senderRole: input.senderRole,
+          image: trustedImage
+        });
 
     await enqueueText(
       input.sessionId,

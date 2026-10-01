@@ -416,6 +416,12 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       filters.push(filter);
       if (filter.orderCount?.$gte === 2) return 2;
       if (filter.orderCount?.$gte === 1) return 6;
+      if (
+        filter.marketingConsent?.$ne === false &&
+        filter.isOptedOut?.$ne === true
+      ) {
+        return 6;
+      }
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
       if (filter.marketingConsentPromptedAt) return 8;
@@ -445,8 +451,8 @@ test("lifetime customer statistics are exact and restaurant scoped", async () =>
       totalCustomers: 8,
       customersWithCompletedOrders: 6,
       returningCustomers: 2,
-      marketingEligibleCustomers: 5,
-      marketingNotOptedInCustomers: 1,
+      marketingEligibleCustomers: 6,
+      marketingNotOptedInCustomers: 0,
       marketingOptedOutCustomers: 2,
       marketingConsentQueuedCustomers: 0,
       marketingConsentInvitedCustomers: 7,
@@ -529,6 +535,12 @@ test("get_business_summary returns lifetime profile totals even with zero orders
     CustomerProfile.countDocuments = async (filter) => {
       if (filter.orderCount?.$gte === 2) return 2;
       if (filter.orderCount?.$gte === 1) return 6;
+      if (
+        filter.marketingConsent?.$ne === false &&
+        filter.isOptedOut?.$ne === true
+      ) {
+        return 6;
+      }
       if (filter.marketingConsent === true) return 5;
       if (filter.isOptedOut === true) return 2;
       if (filter.marketingConsentPromptedAt) return 8;
@@ -568,9 +580,9 @@ test("get_business_summary returns lifetime profile totals even with zero orders
 
     assert.equal(result.data.todayOrderCount, 0);
     assert.equal(result.data.totalCustomers, 8);
-    assert.equal(result.data.marketingEligibleCustomers, 5);
+    assert.equal(result.data.marketingEligibleCustomers, 6);
     assert.equal(result.data.marketingOptedOutCustomers, 2);
-    assert.equal(result.data.marketingNotOptedInCustomers, 1);
+    assert.equal(result.data.marketingNotOptedInCustomers, 0);
     assert.equal(result.data.marketingConsentInvitedCustomers, 7);
     assert.equal(result.data.marketingConsentDeliveryFailedCustomers, 1);
     assert.equal(result.data.marketingConsentAwaitingResponseCustomers, 1);
@@ -608,7 +620,7 @@ test("campaign preview uses human-friendly backend audience counts", () => {
   assert.match(message, /Campaign Preview: Chicken Salad Promotion/);
   assert.match(message, /Customers in audience: 8/);
   assert.match(message, /Can receive promotions: 5/);
-  assert.match(message, /Not opted in yet: 1/);
+  assert.match(message, /Explicitly declined promotions: 1/);
   assert.match(message, /Opted out: 2/);
   assert.match(message, /sent to 5 customers/);
   assert.match(message, /Send: As soon as approved/);

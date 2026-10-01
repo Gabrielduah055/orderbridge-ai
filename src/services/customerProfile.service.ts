@@ -782,7 +782,7 @@ export const getCustomerProfileStatistics = async (
     }),
     CustomerProfile.countDocuments({
       ...scope,
-      marketingConsent: true,
+      marketingConsent: { $ne: false },
       isOptedOut: { $ne: true }
     }),
     CustomerProfile.countDocuments({

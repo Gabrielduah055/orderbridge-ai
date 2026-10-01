@@ -86,7 +86,7 @@ export const parseCustomerMarketingPreferenceCommand = (
 export const isCustomerEligibleForMarketing = (
   profile: Pick<ICustomerProfile, "marketingConsent" | "isOptedOut">
 ): boolean =>
-  profile.marketingConsent === true && profile.isOptedOut !== true;
+  profile.marketingConsent !== false && profile.isOptedOut !== true;
 
 export type CustomerMarketingEligibility =
   | "eligible"

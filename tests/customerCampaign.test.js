@@ -1451,11 +1451,12 @@ test("audience selection deduplicates phones and reports consent exclusions", as
     );
 
     assert.equal(profileFilter.restaurantId, restaurantId);
-    assert.equal(preview.estimatedEligibleRecipients, 1);
-    assert.equal(preview.excludedNoConsent, 1);
+    assert.equal(preview.estimatedEligibleRecipients, 2);
+    assert.equal(preview.excludedNoConsent, 0);
     assert.equal(preview.excludedOptOut, 1);
     assert.equal(preview.excludedInvalidPhone, 1);
     assert.equal(preview.recipients[0].customerPhone, customerPhone);
+    assert.equal(preview.recipients[1].customerPhone, "+233500000001");
   } finally {
     CustomerProfile.find = originalProfileFind;
   }
