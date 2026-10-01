@@ -37,12 +37,16 @@ import {
 import { resolveZonedDateTime } from "../utils/zonedDateTime.util";
 import { classifyCustomerMarketingEligibility } from "./customerMarketingPreference.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
+import { validateTrustedCloudinaryImage } from "./cloudinary.service";
+import { maskCustomerPhone } from "./customerProfile.service";
 
 const campaignTargetingBaseSchema = z
   .object({
     type: z.enum(customerCampaignTargetingTypes),
     inactiveDays: z.number().int().min(1).max(3650).optional(),
     menuItemId: z.string().trim().min(1).optional(),
+    customerName: z.string().trim().min(1).max(160).optional(),
+    customerPhone: z.string().trim().min(1).max(80).optional(),
     startDate: z.string().datetime({ offset: true }).optional(),
     endDate: z.string().datetime({ offset: true }).optional()
   })
@@ -57,12 +61,15 @@ export const customerCampaignTargetingSchema =
       all_eligible_customers: [],
       inactive_customers: ["inactiveDays"],
       returning_customers: [],
+      selected_customer: ["customerName", "customerPhone"],
       ordered_menu_item: ["menuItemId"],
       last_order_date_range: ["startDate", "endDate"]
     };
     const optionalTargetingFields = [
       "inactiveDays",
       "menuItemId",
+      "customerName",
+      "customerPhone",
       "startDate",
       "endDate"
     ] as const;
@@ -97,6 +104,18 @@ export const customerCampaignTargetingSchema =
     }
 
     if (
+      value.type === "selected_customer" &&
+      !value.customerName &&
+      !value.customerPhone
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["customerName"],
+        message: "customerName or customerPhone is required"
+      });
+    }
+
+    if (
       value.type === "last_order_date_range" &&
       (!value.startDate || !value.endDate)
     ) {
@@ -127,7 +146,8 @@ export const createCustomerCampaignDraftSchema = z
     campaignType: z.enum(customerCampaignTypes),
     targeting: customerCampaignTargetingSchema,
     scheduledAt: z.string().trim().min(1).optional(),
-    referencedMenuItemId: z.string().trim().min(1).optional()
+    referencedMenuItemId: z.string().trim().min(1).optional(),
+    imageMenuItemName: z.string().trim().min(1).max(160).optional()
   })
   .strict();
 
@@ -139,7 +159,8 @@ export const updateCustomerCampaignDraftSchema = z
     campaignType: z.enum(customerCampaignTypes).optional(),
     targeting: customerCampaignTargetingSchema.optional(),
     scheduledAt: z.string().trim().min(1).nullable().optional(),
-    referencedMenuItemId: z.string().trim().min(1).nullable().optional()
+    referencedMenuItemId: z.string().trim().min(1).nullable().optional(),
+    imageMenuItemName: z.string().trim().min(1).max(160).nullable().optional()
   })
   .strict()
   .refine(
@@ -210,6 +231,7 @@ type CampaignProfile = Pick<
   | "_id"
   | "customerKey"
   | "customerPhone"
+  | "customerName"
   | "orderCount"
   | "lastOrderAt"
   | "marketingConsent"
@@ -279,11 +301,72 @@ const normalizeTargetingRule = (
   ...(targeting.menuItemId
     ? { menuItemId: new Types.ObjectId(targeting.menuItemId) }
     : {}),
+  ...(targeting.customerName
+    ? { customerName: targeting.customerName.trim().replace(/\s+/g, " ") }
+    : {}),
   ...(targeting.startDate
     ? { startDate: new Date(targeting.startDate) }
     : {}),
   ...(targeting.endDate ? { endDate: new Date(targeting.endDate) } : {})
 });
+
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const resolveSelectedCustomerTargeting = async (
+  restaurantId: string,
+  targeting: z.infer<typeof customerCampaignTargetingSchema>
+): Promise<CustomerCampaignTargetingRule> => {
+  const customerPhone = targeting.customerPhone
+    ? normalizeWhatsappRecipient(targeting.customerPhone)
+    : "";
+  const customerName = targeting.customerName?.trim().replace(/\s+/g, " ");
+
+  if (targeting.customerPhone && !isValidWhatsappRecipient(customerPhone)) {
+    throw new BadRequestError(
+      "That customer does not have a valid saved WhatsApp identity.",
+      "CAMPAIGN_CUSTOMER_NOT_FOUND"
+    );
+  }
+
+  const profiles = await CustomerProfile.find({
+    restaurantId,
+    ...(customerPhone
+      ? { customerPhone }
+      : {
+          customerName: {
+            $regex: `^${escapeRegExp(customerName as string)}$`,
+            $options: "i"
+          }
+        })
+  })
+    .select("_id customerName customerPhone")
+    .limit(3);
+
+  if (profiles.length === 0) {
+    throw new BadRequestError(
+      "No customer in this restaurant matched that name or saved phone.",
+      "CAMPAIGN_CUSTOMER_NOT_FOUND"
+    );
+  }
+  if (profiles.length > 1) {
+    const candidates = profiles
+      .map((profile) => maskCustomerPhone(profile.customerPhone))
+      .join(", ");
+    throw new BadRequestError(
+      `More than one customer is saved as ${customerName}. Please clarify using one of these masked phones: ${candidates}.`,
+      "CAMPAIGN_CUSTOMER_AMBIGUOUS"
+    );
+  }
+
+  const profile = profiles[0];
+  return {
+    type: "selected_customer",
+    customerProfileId: profile._id,
+    customerName:
+      profile.customerName?.trim() || customerName || "Selected customer"
+  };
+};
 
 const getTargetingMenuItem = async (
   restaurantId: string,
@@ -326,6 +409,102 @@ export const validateCustomerCampaignReferencedItem = async (
   }
 };
 
+const resolveCampaignMenuImage = async (
+  restaurantId: string,
+  itemName: string
+): Promise<{ itemId: Types.ObjectId; imageUrl: string; label: string }> => {
+  const normalized = itemName.trim().replace(/\s+/g, " ");
+  const matches = await MenuItem.find({
+    restaurantId,
+    name: { $regex: `^${escapeRegExp(normalized)}$`, $options: "i" }
+  })
+    .select("_id name imageUrl isAvailable")
+    .limit(3);
+
+  if (matches.length === 0) {
+    throw new BadRequestError(
+      `No menu item named ${normalized} was found in this restaurant.`,
+      "CAMPAIGN_IMAGE_ITEM_NOT_FOUND"
+    );
+  }
+  if (matches.length > 1) {
+    throw new BadRequestError(
+      `More than one menu item is named ${normalized}. Please clarify the item.`,
+      "CAMPAIGN_IMAGE_ITEM_AMBIGUOUS"
+    );
+  }
+  const item = matches[0];
+  if (!item.imageUrl?.trim()) {
+    throw new BadRequestError(
+      `${item.name} does not have a saved menu image.`,
+      "CAMPAIGN_IMAGE_MISSING"
+    );
+  }
+  return {
+    itemId: item._id,
+    imageUrl: item.imageUrl,
+    label: `Menu image: ${item.name}`
+  };
+};
+
+export const validateCustomerCampaignMedia = async (
+  restaurantId: string,
+  campaign: Pick<
+    ICustomerCampaignDocument,
+    | "attachmentType"
+    | "imageUrl"
+    | "imagePublicId"
+    | "imageMenuItemId"
+    | "imageLabel"
+  >
+): Promise<{ type: "image"; imageUrl: string; label: string } | null> => {
+  if (!campaign.attachmentType) return null;
+  if (!campaign.imageUrl?.trim()) {
+    throw new BadRequestError("The campaign image is missing.", "CAMPAIGN_IMAGE_STALE");
+  }
+
+  if (campaign.attachmentType === "menu_item") {
+    if (!campaign.imageMenuItemId) {
+      throw new BadRequestError("The campaign menu image reference is missing.", "CAMPAIGN_IMAGE_STALE");
+    }
+    const item = await MenuItem.findOne({
+      _id: campaign.imageMenuItemId,
+      restaurantId,
+      imageUrl: campaign.imageUrl
+    }).select("name imageUrl");
+    if (!item) {
+      throw new BadRequestError(
+        "The selected menu image was removed or changed. Update the campaign and approve it again.",
+        "CAMPAIGN_IMAGE_STALE"
+      );
+    }
+    return {
+      type: "image",
+      imageUrl: campaign.imageUrl,
+      label: campaign.imageLabel || `Menu image: ${item.name}`
+    };
+  }
+
+  if (
+    !campaign.imagePublicId ||
+    !validateTrustedCloudinaryImage({
+      secureUrl: campaign.imageUrl,
+      publicId: campaign.imagePublicId
+    })
+  ) {
+    throw new BadRequestError(
+      "The uploaded campaign image is no longer valid. Upload it again and approve the new version.",
+      "CAMPAIGN_IMAGE_STALE"
+    );
+  }
+
+  return {
+    type: "image",
+    imageUrl: campaign.imageUrl,
+    label: campaign.imageLabel || "Owner-uploaded campaign image"
+  };
+};
+
 const getTargetingDescription = (
   targeting: CustomerCampaignTargetingRule,
   menuItemName?: string
@@ -337,6 +516,8 @@ const getTargetingDescription = (
       return `Customers whose last completed order was at least ${targeting.inactiveDays} days ago`;
     case "returning_customers":
       return "Customers with at least two completed orders";
+    case "selected_customer":
+      return `Selected customer: ${targeting.customerName ?? "saved customer"}`;
     case "ordered_menu_item":
       return `Customers who completed an order containing ${menuItemName ?? "the selected menu item"}`;
     case "last_order_date_range":
@@ -394,7 +575,7 @@ export const selectCustomerCampaignAudience = async (
   const profiles = (await CustomerProfile.find({
     restaurantId
   }).select(
-    "customerKey customerPhone orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
+    "customerKey customerPhone customerName orderCount lastOrderAt marketingConsent isOptedOut marketingPreferenceUpdatedAt updatedAt"
   )) as CampaignProfile[];
   const recipientsByPhone = new Map<
     string,
@@ -411,7 +592,7 @@ export const selectCustomerCampaignAudience = async (
 
     switch (targeting.type) {
       case "all_eligible_customers":
-        qualificationReason = "explicit marketing consent";
+        qualificationReason = "existing customer who has not declined promotions";
         break;
       case "inactive_customers": {
         const cutoff = new Date(
@@ -427,6 +608,13 @@ export const selectCustomerCampaignAudience = async (
         qualificationReason =
           profile.orderCount >= 2
             ? "at least two completed orders"
+            : null;
+        break;
+      case "selected_customer":
+        qualificationReason =
+          targeting.customerProfileId &&
+          String(profile._id) === String(targeting.customerProfileId)
+            ? "owner-selected saved customer"
             : null;
         break;
       case "ordered_menu_item":
@@ -458,6 +646,7 @@ export const selectCustomerCampaignAudience = async (
       excludedInvalidPhone += 1;
       continue;
     }
+
     if (eligibility === "opted_out") {
       excludedOptOut += 1;
       continue;
@@ -510,7 +699,8 @@ export const createCustomerCampaignDraft = async (
     campaignType: input.campaignType,
     targeting: input.targeting,
     scheduledAt: input.scheduledAt,
-    referencedMenuItemId: input.referencedMenuItemId
+    referencedMenuItemId: input.referencedMenuItemId,
+    imageMenuItemName: input.imageMenuItemName
   });
   const staff = await loadCurrentCampaignStaff(
     input.restaurantId,
@@ -537,7 +727,19 @@ export const createCustomerCampaignDraft = async (
     throw new BadRequestError("scheduledAt cannot be in the past");
   }
 
-  const targeting = normalizeTargetingRule(parsed.targeting);
+  const targeting =
+    parsed.targeting.type === "selected_customer"
+      ? await resolveSelectedCustomerTargeting(
+          input.restaurantId,
+          parsed.targeting
+        )
+      : normalizeTargetingRule(parsed.targeting);
+  const campaignImage = parsed.imageMenuItemName
+    ? await resolveCampaignMenuImage(
+        input.restaurantId,
+        parsed.imageMenuItemName
+      )
+    : undefined;
   const preview = await selectCustomerCampaignAudience(
     input.restaurantId,
     targeting,
@@ -553,6 +755,14 @@ export const createCustomerCampaignDraft = async (
     status: "pending_approval",
     campaignVersion: 1,
     referencedMenuItemId: parsed.referencedMenuItemId,
+    ...(campaignImage
+      ? {
+          attachmentType: "menu_item",
+          imageUrl: campaignImage.imageUrl,
+          imageMenuItemId: campaignImage.itemId,
+          imageLabel: campaignImage.label
+        }
+      : {}),
     createdByPhone: staff.phone,
     createdByRole: staff.role,
     scheduledAt,
@@ -582,7 +792,8 @@ export const updateCustomerCampaignDraft = async (
     campaignType: input.campaignType,
     targeting: input.targeting,
     scheduledAt: input.scheduledAt,
-    referencedMenuItemId: input.referencedMenuItemId
+    referencedMenuItemId: input.referencedMenuItemId,
+    imageMenuItemName: input.imageMenuItemName
   });
   const staff = await loadCurrentCampaignStaff(
     input.restaurantId,
@@ -616,8 +827,19 @@ export const updateCustomerCampaignDraft = async (
   }
 
   const targeting = parsed.targeting
-    ? normalizeTargetingRule(parsed.targeting)
+    ? parsed.targeting.type === "selected_customer"
+      ? await resolveSelectedCustomerTargeting(
+          input.restaurantId,
+          parsed.targeting
+        )
+      : normalizeTargetingRule(parsed.targeting)
     : campaign.targeting;
+  const campaignImage = parsed.imageMenuItemName
+    ? await resolveCampaignMenuImage(
+        input.restaurantId,
+        parsed.imageMenuItemName
+      )
+    : undefined;
   const scheduledAt =
     parsed.scheduledAt === undefined
       ? campaign.scheduledAt
@@ -649,6 +871,21 @@ export const updateCustomerCampaignDraft = async (
     campaign.referencedMenuItemId = parsed.referencedMenuItemId
       ? new Types.ObjectId(parsed.referencedMenuItemId)
       : undefined;
+  }
+  if (parsed.imageMenuItemName !== undefined) {
+    if (parsed.imageMenuItemName === null) {
+      campaign.attachmentType = undefined;
+      campaign.imageUrl = undefined;
+      campaign.imagePublicId = undefined;
+      campaign.imageMenuItemId = undefined;
+      campaign.imageLabel = undefined;
+    } else if (campaignImage) {
+      campaign.attachmentType = "menu_item";
+      campaign.imageUrl = campaignImage.imageUrl;
+      campaign.imagePublicId = undefined;
+      campaign.imageMenuItemId = campaignImage.itemId;
+      campaign.imageLabel = campaignImage.label;
+    }
   }
   campaign.timezone = staff.restaurant.timezone || campaign.timezone;
   campaign.estimatedRecipientCount = preview.estimatedEligibleRecipients;
@@ -755,7 +992,12 @@ const formatCampaignPreviewSendTime = (
 export const buildCustomerCampaignPreviewMessage = (
   campaign: Pick<
     ICustomerCampaignDocument,
-    "name" | "message" | "scheduledAt" | "timezone"
+    | "name"
+    | "message"
+    | "scheduledAt"
+    | "timezone"
+    | "attachmentType"
+    | "imageLabel"
   >,
   preview: CustomerCampaignAudiencePreview
 ): string => {
@@ -764,11 +1006,13 @@ export const buildCustomerCampaignPreviewMessage = (
     "",
     campaign.message,
     "",
+    `Attachment: ${campaign.attachmentType ? campaign.imageLabel || "Campaign image" : "None"}`,
+    "",
     `Audience: ${preview.targetingDescription}`,
     "",
     `Customers in audience: ${preview.targetedProfiles}`,
     `Can receive promotions: ${preview.estimatedEligibleRecipients}`,
-    `Not opted in yet: ${preview.excludedNoConsent}`,
+    `Explicitly declined promotions: ${preview.excludedNoConsent}`,
     `Opted out: ${preview.excludedOptOut}`
   ];
 
@@ -842,6 +1086,7 @@ export const approveCustomerCampaign = async (
       ? String(campaign.referencedMenuItemId)
       : undefined
   );
+  await validateCustomerCampaignMedia(restaurantId, campaign);
   const preview = await selectCustomerCampaignAudience(
     restaurantId,
     campaign.targeting,

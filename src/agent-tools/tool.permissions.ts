@@ -28,6 +28,7 @@ export const toolPermissions = {
   approve_campaign: ["owner"],
   cancel_campaign: ["owner"],
   list_campaigns: ["owner"],
+  start_campaign_image_upload: ["owner"],
   create_staff_reminder: ["owner", "manager"],
   list_staff_reminders: ["owner", "manager"],
   reschedule_staff_reminder: ["owner", "manager"],

@@ -35,6 +35,16 @@ The restaurant agent saves inbound user messages before orchestration. The OpenR
 
 For customers, active order drafts and pending clarification records are included as trusted context. Transactional state comes from MongoDB-backed draft and clarification records, not from chat history alone.
 
+For verified staff, order/report follow-up filters are stored separately in a bounded restaurant-and-sender-scoped context record. The retained record contains only filters and date boundaries; every follow-up re-queries orders. The final-answer guard formats narrow order placement and busiest-period answers from tool results so a correct order query cannot be replaced by an unrelated customer-profile summary.
+
+## Campaign intent, eligibility, and media
+
+Natural requests to send customer greetings, reopening announcements, or invitations to order are treated as campaign draft requests even when the word “campaign” is absent. Read-only customer analytics remain mutation-free. One-customer marketing uses a tenant-scoped saved-customer resolution and the standard campaign approval and delivery workflow.
+
+Campaign eligibility is opt-out based for existing customers: valid messaging identities qualify unless the saved preference is an explicit decline or the profile is opted out. Unknown preferences remain unknown. Eligibility is recalculated during preview, approval, scheduling, and send-time checks.
+
+Campaign media is always backend-trusted. A saved menu image is resolved by restaurant item name. A custom image must arrive through the owner WhatsApp upload workflow, pass Wasender metadata limits and Cloudinary validation, and be persisted on a versioned campaign. Media edits invalidate prior approval. The queue sends the approved message as the image caption and revalidates exact campaign version, recipient eligibility, and media identity immediately before delivery.
+
 ## Risks And Mitigations
 
 - Model fabrication: mitigated by system rules and real backend tools for operational facts.

@@ -247,8 +247,8 @@ test("individual insights separate consent status from actual promotional eligib
           marketingConsentPromptedAt: undefined
         }),
         marketingStatus: "not_asked",
-        marketingEligibility: "no_consent",
-        canReceivePromotions: false
+        marketingEligibility: "eligible",
+        canReceivePromotions: true
       }
     ];
 
@@ -379,8 +379,8 @@ test("all-customer segment distinguishes membership from current marketing eligi
     assert.equal(result.totalCustomers, 4);
     assert.equal(result.customersWithCompletedOrders, 2);
     assert.equal(result.totalCompletedOrderCount, 4);
-    assert.equal(result.marketingEligibleCustomers, 1);
-    assert.equal(result.excludedNoConsent, 1);
+    assert.equal(result.marketingEligibleCustomers, 2);
+    assert.equal(result.excludedNoConsent, 0);
     assert.equal(result.excludedOptOut, 1);
     assert.equal(result.excludedInvalidPhone, 1);
     assert.equal(Object.hasOwn(result, "customers"), false);
@@ -1069,7 +1069,7 @@ for (const scenario of [
     name: "no-consent count",
     message: "How many haven't given consent?",
     expected:
-      "8 of 43 customers inactive for more than 30 days do not have confirmed marketing consent."
+      "8 of 43 customers inactive for more than 30 days explicitly declined promotions."
   },
   {
     name: "invalid-recipient count",
@@ -1189,7 +1189,7 @@ test("segment member listing defaults to 10, supports 25, and returns only safe 
   }
 });
 
-test("marketing-eligible segment members exclude ineligible profiles and deduplicate recipients", async () => {
+test("marketing-eligible segment members include unknown preferences, exclude opt-outs, and deduplicate recipients", async () => {
   const originalFind = CustomerProfile.find;
   try {
     CustomerProfile.find = () =>
@@ -1219,8 +1219,8 @@ test("marketing-eligible segment members exclude ineligible profiles and dedupli
       includeCustomers: true,
       marketingEligibleOnly: true
     });
-    assert.equal(result.memberTotalMatched, 1);
-    assert.equal(result.returnedMemberCount, 1);
+    assert.equal(result.memberTotalMatched, 2);
+    assert.equal(result.returnedMemberCount, 2);
     assert.equal(result.membersTruncated, false);
     assert.equal(result.memberMarketingEligibleOnly, true);
     assert.equal(result.customers[0].name, "Ama Mensah");

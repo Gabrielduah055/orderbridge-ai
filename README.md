@@ -83,6 +83,20 @@ Receipt PDFs are generated only after restaurant acceptance. If receipt generati
 
 After the accepted-order text or receipt is successfully sent by Wasender, the backend schedules one transactional post-order feedback request. A customer confirmation or delivery-confirming feedback completes the order; a non-delivery report keeps it open and alerts the owner. If the request receives no response, the order is automatically completed after the configured timeout unless a non-delivery issue is unresolved. Receipt generation, receipt delivery, payment state, and completion remain independent.
 
+## Owner order follow-ups and reports
+
+Owner/manager order-list filters are retained for a short, restaurant-and-staff-scoped window so direct follow-ups such as “who placed those orders?” and “when were they placed?” re-query the same authoritative order period. Chat history is never used as the order record, and an explicit new period or filter replaces the retained one. Placement timestamps are formatted in the restaurant timezone (default `Africa/Accra`) and remain separate from completion timestamps.
+
+Owner business reports expose busiest calendar dates and weekday aggregates for weekly, custom, and all-time periods. Weekday totals and per-occurrence averages are backend-calculated, ties are preserved, and an unqualified “usually busiest weekday” uses all recorded activity.
+
+## Customer campaigns
+
+Existing restaurant customers with a valid current WhatsApp identity are campaign-eligible unless `marketingConsent === false` or `isOptedOut === true`. An unknown preference remains unknown; campaign eligibility does not rewrite it as consent. STOP handling immediately cancels pending promotional delivery. Provider or deployment-specific messaging restrictions may still apply independently.
+
+Campaign drafts support all eligible customers, behavioural segments, and one safely resolved saved customer. Same-name customers require masked-phone clarification, and arbitrary external recipients are not accepted. Greetings, reopening announcements, and invitations to order use the same draft, preview, explicit approval, snapshot, idempotent queue, and send-time revalidation workflow as other campaigns.
+
+A campaign may attach an existing saved menu-item image or a trusted owner-uploaded JPG, PNG, or WEBP up to 5 MB. Custom uploads use the existing Wasender decryption and Cloudinary validation path. Any message, audience, schedule, or media change increments the campaign version and requires renewed approval. Delivery sends the approved text as the image caption and cancels stale work when the campaign version, recipient eligibility, restaurant credentials, or referenced media changes.
+
 ## Firebase Setup
 
 1. Create or open a Firebase project.

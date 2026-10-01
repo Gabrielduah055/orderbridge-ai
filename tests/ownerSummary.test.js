@@ -7,6 +7,9 @@ const { MenuItem } = require("../dist/models/MenuItem");
 const { CustomerProfile } = require("../dist/models/customerProfile.model");
 const { OutboundMessage } = require("../dist/models/outboundMessage.model");
 const {
+  StaffOrderQueryContext
+} = require("../dist/models/staffQueryContext.model");
+const {
   createRestaurantSchema
 } = require("../dist/middleware/validateRequest");
 const ownerSummaryService = require("../dist/services/ownerSummary.service");
@@ -239,7 +242,7 @@ test("owner summary revenue, average, status counts, and top items use completed
       },
       metrics
     ),
-    /BUSIEST DAY[\s\S]*Wednesday — 2 orders/
+    /BUSIEST DATE[\s\S]*22 July 2026 \(Wednesday\) — 2 orders[\s\S]*23 July 2026 \(Thursday\) — 2 orders/
   );
 });
 
@@ -463,6 +466,7 @@ test("get_business_report supports all periods and remains context scoped", asyn
   const originalCustomerCountDocuments = CustomerProfile.countDocuments;
   const originalCustomerDistinct = CustomerProfile.distinct;
   const originalOutboundDistinct = OutboundMessage.distinct;
+  const originalContextFindOneAndUpdate = StaffOrderQueryContext.findOneAndUpdate;
   const filters = [];
   const context = {
     restaurantId,
@@ -481,6 +485,7 @@ test("get_business_report supports all periods and remains context scoped", asyn
     CustomerProfile.countDocuments = async () => 0;
     CustomerProfile.distinct = async () => [];
     OutboundMessage.distinct = async () => [];
+    StaffOrderQueryContext.findOneAndUpdate = async () => ({ _id: "query-context" });
 
     for (const period of [
       "today",
@@ -506,6 +511,7 @@ test("get_business_report supports all periods and remains context scoped", asyn
     CustomerProfile.countDocuments = originalCustomerCountDocuments;
     CustomerProfile.distinct = originalCustomerDistinct;
     OutboundMessage.distinct = originalOutboundDistinct;
+    StaffOrderQueryContext.findOneAndUpdate = originalContextFindOneAndUpdate;
   }
 
   assert.equal(filters.length, 8);
@@ -691,7 +697,7 @@ test("daily WhatsApp report contains detailed sales, orders, top items, and cust
   assert.equal(formatGhsCurrency(4280), "GHS 4,280.00");
 });
 
-test("weekly formatter includes busiest day and shows at most five top items", async () => {
+test("weekly formatter includes busiest date and weekday and shows at most five top items", async () => {
   const topSellingItems = Array.from({ length: 6 }, (_, index) => ({
     name: `Item ${index + 1}`,
     quantity: 10 - index,
@@ -719,8 +725,9 @@ test("weekly formatter includes busiest day and shows at most five top items", a
   );
 
   assert.equal(report.topSellingItems.length, 5);
-  assert.match(report.formattedReport, /📅 BUSIEST DAY/);
-  assert.match(report.formattedReport, /Friday — 24 orders/);
+  assert.match(report.formattedReport, /📅 BUSIEST DATE/);
+  assert.match(report.formattedReport, /7 August 2026 \(Friday\) — 24 orders/);
+  assert.match(report.formattedReport, /🗓️ BUSIEST WEEKDAY/);
   assert.match(report.formattedReport, /5\. Item 5/);
   assert.doesNotMatch(report.formattedReport, /Item 6/);
 });

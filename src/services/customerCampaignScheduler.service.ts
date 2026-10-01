@@ -14,7 +14,8 @@ import {
 import {
   formatCustomerCampaignMessage,
   updateCustomerCampaignAggregate,
-  validateCustomerCampaignReferencedItem
+  validateCustomerCampaignReferencedItem,
+  validateCustomerCampaignMedia
 } from "./customerCampaign.service";
 import {
   enqueueWasenderMessage,
@@ -73,6 +74,7 @@ export interface CustomerCampaignSchedulerDependencies {
     restaurantId: string,
     referencedMenuItemId?: string
   ) => Promise<void>;
+  validateMedia?: typeof validateCustomerCampaignMedia;
   cancelInvalidCampaign?: (
     restaurantId: string,
     campaignId: string,
@@ -116,7 +118,8 @@ const loadDueCampaigns = async (
     ]
   })
     .sort({ scheduledAt: 1, approvedAt: 1 })
-    .limit(50);
+    .limit(50)
+    .select("+imageUrl +imagePublicId");
 };
 
 const loadActiveRestaurants = async (): Promise<
@@ -294,6 +297,8 @@ export const runCustomerCampaignSchedulerPass = async (
   const validateReferencedItem =
     dependencies.validateReferencedItem ??
     validateCustomerCampaignReferencedItem;
+  const validateMedia =
+    dependencies.validateMedia ?? validateCustomerCampaignMedia;
   const cancelCampaign =
     dependencies.cancelInvalidCampaign ?? cancelInvalidCampaign;
   const updateAggregate =
@@ -379,6 +384,7 @@ export const runCustomerCampaignSchedulerPass = async (
             ? String(campaign.referencedMenuItemId)
             : undefined
         );
+        await validateMedia(restaurantId, campaign);
       } catch (error) {
         const reason =
           error instanceof Error
@@ -457,15 +463,19 @@ export const runCustomerCampaignSchedulerPass = async (
             });
             continue;
           }
+          const campaignMessage = formatCustomerCampaignMessage(
+            restaurant.name,
+            campaign.message
+          );
+          const media = await validateMedia(restaurantId, campaign);
           const queued = await enqueueMessage({
             restaurantId,
             sessionId: restaurant.wasenderSessionId,
             to: currentRecipient,
-            type: "text",
-            text: formatCustomerCampaignMessage(
-              restaurant.name,
-              campaign.message
-            ),
+            type: media ? "image" : "text",
+            ...(media
+              ? { imageUrl: media.imageUrl, caption: campaignMessage }
+              : { text: campaignMessage }),
             apiKey: restaurant.wasenderApiToken,
             idempotencyKey,
             metadata: {

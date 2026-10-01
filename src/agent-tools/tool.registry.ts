@@ -58,6 +58,11 @@ import {
   getOwnerSummaryMetrics
 } from "../services/ownerSummary.service";
 import {
+  listStaffOrders,
+  orderListPeriodTypes,
+  rememberStaffOrderQueryContext
+} from "../services/staffOrderQuery.service";
+import {
   getItemPerformance,
   itemPerformanceMetrics
 } from "../services/itemPerformance.service";
@@ -120,6 +125,7 @@ import {
   requireOwnerMenuItemImageAdministration,
   startMenuItemImageUpload
 } from "../services/menuItemImageWorkflow.service";
+import { startCampaignImageUpload } from "../services/campaignImageWorkflow.service";
 
 const emptySchema = z.object({}).strict();
 const getSenderRecipient = (context: ToolExecutionContext): string =>
@@ -190,9 +196,31 @@ const listOrdersSchema = z
   .object({
     status: z.enum(orderStatuses).optional(),
     date: z.enum(["today", "yesterday"]).optional(),
-    limit: z.number().int().positive().max(25).optional()
+    period: z.enum(orderListPeriodTypes).optional(),
+    startDate: z.string().trim().min(1).optional(),
+    endDate: z.string().trim().min(1).optional(),
+    customerName: z.string().trim().min(1).max(160).optional(),
+    customerPhone: z.string().trim().min(1).max(80).optional(),
+    limit: z.number().int().positive().max(50).optional(),
+    offset: z.number().int().min(0).optional()
   })
-  .strict();
+  .strict()
+  .superRefine((args, context) => {
+    if (args.period === "custom" && !args.startDate) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["startDate"],
+        message: "startDate is required for a custom order period."
+      });
+    }
+    if (args.date && args.period) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["period"],
+        message: "Use either date or period, not both."
+      });
+    }
+  });
 const listCustomerFeedbackSchema = z
   .object({
     type: z.enum(orderFeedbackTypes).optional(),
@@ -1204,6 +1232,16 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         }),
         getCustomerProfileStatistics(context.restaurantId)
       ]);
+      await rememberStaffOrderQueryContext({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        senderRole: "owner",
+        periodType: report.period.type,
+        periodLabel: report.period.label,
+        periodStart: new Date(report.period.start),
+        periodEnd: new Date(report.period.end),
+        timezone: report.period.timezone
+      });
       const marketingSection = [
         "CUSTOMER MARKETING (CURRENT SNAPSHOT)",
         `Total customers: ${customerMarketing.totalCustomers}`,
@@ -1413,36 +1451,45 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     definition: {
       name: "list_orders",
       description:
-        "Owner/manager. List recent orders for this restaurant, optionally filtered by status and today's/yesterday's date.",
+        "Owner/manager. Re-query authoritative restaurant orders for today, yesterday, a week, all time, or a custom period, optionally filtered by status or one safely resolved customer. On direct follow-ups such as who placed those orders or when they were placed, omit unchanged filters so the backend reuses the bounded trusted filter context. Explicit new filters override retained filters.",
       parameters: {
         status: orderStatuses.join(" | "),
-        date: "Optional. Use today or yesterday to limit the list.",
-        limit: "Optional max number of orders, up to 25."
+        date: "Legacy optional today/yesterday shortcut.",
+        period: orderListPeriodTypes.join(" | "),
+        startDate: "Required for a custom period; YYYY-MM-DD or zoned ISO.",
+        endDate: "Optional custom end date; date-only values are inclusive.",
+        customerName: "Optional exact customer name. Same-name customers must be clarified.",
+        customerPhone: "Optional exact saved customer phone supplied during safe clarification; arbitrary external recipients never match.",
+        limit: "Optional page size, up to 50.",
+        offset: "Optional zero-based offset for retrieving the next page."
       }
     },
     roles: toolPermissions.list_orders,
     schema: listOrdersSchema,
     handler: async (args, context) => {
-      const dateFilter: Record<string, unknown> = {};
-
-      if (args.date === "today") {
-        dateFilter.createdAt = { $gte: startOfToday() };
-      } else if (args.date === "yesterday") {
-        dateFilter.createdAt = { $gte: startOfYesterday(), $lt: endOfYesterday() };
-      }
-
-      const orders = await Order.find({
+      const orders = await listStaffOrders({
         restaurantId: context.restaurantId,
-        ...(args.status ? { status: args.status } : {}),
-        ...dateFilter
-      })
-        .sort({ createdAt: -1 })
-        .limit(args.limit ?? 10);
+        senderPhone: context.sender.normalizedPhone,
+        senderRole: context.sender.role as "owner" | "manager",
+        originalMessage: context.originalMessage,
+        timezone: context.restaurant.timezone,
+        period: args.period ?? args.date,
+        startDate: args.startDate,
+        endDate: args.endDate,
+        status: args.status,
+        customerName: args.customerName,
+        customerPhone: args.customerPhone,
+        limit: args.limit,
+        offset: args.offset
+      });
 
       return {
         success: true,
-        message: "Orders retrieved successfully.",
-        data: orders.map((order) => safeOrderView(order, true))
+        message:
+          orders.totalMatched === 0
+            ? "No orders matched those filters."
+            : `${orders.totalMatched} order${orders.totalMatched === 1 ? "" : "s"} matched${orders.truncated ? `; returning ${orders.returnedCount} from offset ${orders.offset}` : ""}.`,
+        data: orders
       };
     }
   },
@@ -1822,11 +1869,13 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         campaignType:
           "promotion | inactivity_reengagement | holiday | announcement",
         targeting:
-          "Strict targeting rule: all_eligible_customers, inactive_customers, returning_customers, ordered_menu_item, or last_order_date_range.",
+          "Strict targeting rule: all_eligible_customers, inactive_customers, returning_customers, selected_customer, ordered_menu_item, or last_order_date_range.",
         scheduledAt:
           "Optional ISO or restaurant-local date-time.",
         referencedMenuItemId:
-          "Optional restaurant menu item explicitly referenced by the campaign message."
+          "Optional restaurant menu item explicitly referenced by the campaign message.",
+        imageMenuItemName:
+          "Optional exact restaurant menu item name whose saved image should be attached. Never provide an image URL."
       }
     },
     roles: toolPermissions.create_campaign_draft,
@@ -1900,7 +1949,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         scheduledAt:
           "Optional ISO or restaurant-local date-time; null removes the scheduled time.",
         referencedMenuItemId:
-          "Optional restaurant menu item reference; null removes it."
+          "Optional restaurant menu item reference; null removes it.",
+        imageMenuItemName:
+          "Optional exact menu item name whose saved image should be attached; null removes the campaign image."
       }
     },
     roles: toolPermissions.update_campaign_draft,
@@ -2129,6 +2180,26 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         }))
       };
     }
+  },
+  start_campaign_image_upload: {
+    definition: {
+      name: "start_campaign_image_upload",
+      description:
+        "Owner only. Start a trusted WhatsApp image upload for one exact pending-approval campaign. The tool accepts no URL. After this succeeds, instruct the owner to send a JPG, PNG, or WEBP image up to 5 MB; the backend attaches it, increments the campaign version, and creates a renewed approval preview.",
+      parameters: {
+        campaignId:
+          "Exact campaign ID from trusted campaign context or list_campaigns."
+      }
+    },
+    roles: toolPermissions.start_campaign_image_upload,
+    schema: campaignIdSchema,
+    handler: async (args, context) =>
+      startCampaignImageUpload({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        senderRole: context.sender.role,
+        campaignId: args.campaignId
+      })
   },
   create_staff_reminder: {
     definition: {

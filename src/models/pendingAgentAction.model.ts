@@ -16,6 +16,7 @@ export const ownerAgentActions = [
   "MARK_ITEM_AVAILABLE",
   "OWNER_ORDER_SELECTION",
   "MENU_ITEM_IMAGE_CONTEXT",
+  "CAMPAIGN_IMAGE_CONTEXT",
   "IMAGE_ASSIGNMENT",
   "TOOL_CALL"
 ] as const;

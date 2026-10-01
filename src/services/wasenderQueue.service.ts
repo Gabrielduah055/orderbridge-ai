@@ -24,7 +24,10 @@ import {
   type WasenderSendResult
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
-import { updateCustomerCampaignAggregate } from "./customerCampaign.service";
+import {
+  updateCustomerCampaignAggregate,
+  validateCustomerCampaignMedia
+} from "./customerCampaign.service";
 import {
   isValidWhatsappRecipient,
   normalizeGhanaPhone,
@@ -398,7 +401,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     _id: campaignId,
     restaurantId
   }).select(
-    "status campaignVersion scheduledAt referencedMenuItemId"
+    "status campaignVersion scheduledAt referencedMenuItemId attachmentType imageMenuItemId imageLabel +imageUrl +imagePublicId"
   );
 
   if (!campaign) {
@@ -429,6 +432,12 @@ export const getQueuedCustomerCampaignStaleReason = async (
     if (!availableItem) {
       return "campaign_referenced_item_unavailable";
     }
+  }
+
+  try {
+    await validateCustomerCampaignMedia(restaurantId, campaign);
+  } catch {
+    return "campaign_image_stale";
   }
 
   const recipient = await CustomerCampaignRecipient.findOne({
@@ -475,7 +484,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "customer_profile_phone_changed";
   }
 
-  if (profile.marketingConsent !== true) {
+  if (profile.marketingConsent === false) {
     return "marketing_consent_revoked";
   }
 

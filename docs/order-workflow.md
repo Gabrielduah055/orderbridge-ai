@@ -67,3 +67,7 @@ The Wasender webhook sends the normal agent reply first, then consumes structure
 - `rejected` triggers customer rejection notification.
 
 The webhook does not parse AI text to decide whether an order exists or was accepted.
+
+## Staff order-query follow-ups
+
+Read-only staff follow-ups retain only the previous order/report filters for a short period, scoped by trusted `restaurantId` and verified staff phone. A question such as “who placed those orders?” or “when were they placed?” uses `list_orders` to reload the matching saved orders. The retained context is not transactional truth, explicit new filters override it, and order placement (`createdAt`) is never substituted with completion time.

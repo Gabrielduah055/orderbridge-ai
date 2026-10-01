@@ -41,6 +41,13 @@ export interface OwnerSummaryBusiestDay {
   totalOrders: number;
 }
 
+export interface OwnerSummaryWeekdayActivity {
+  day: OwnerSummaryWeekday;
+  totalOrders: number;
+  occurrences: number;
+  averageOrdersPerOccurrence: number;
+}
+
 export interface OwnerSummaryMetrics {
   restaurantId: string;
   periodType: OwnerSummaryPeriodType;
@@ -58,6 +65,9 @@ export interface OwnerSummaryMetrics {
   newCustomers: number;
   returningCustomers: number;
   busiestDay: OwnerSummaryBusiestDay | null;
+  busiestDates: OwnerSummaryBusiestDay[];
+  weekdayActivity: OwnerSummaryWeekdayActivity[];
+  busiestWeekdays: OwnerSummaryWeekdayActivity[];
 }
 
 export interface BusinessReportPeriod {
@@ -114,6 +124,9 @@ export interface BusinessReportData {
     returning: number;
   };
   busiestDay: OwnerSummaryBusiestDay | null;
+  busiestDates: OwnerSummaryBusiestDay[];
+  weekdayActivity: OwnerSummaryWeekdayActivity[];
+  busiestWeekdays: OwnerSummaryWeekdayActivity[];
   comparison: BusinessReportComparison | null;
   formattedReport: string;
 }
@@ -709,28 +722,73 @@ export const buildOwnerSummaryMetrics = (
   }
 
   const ordersByDay = new Map<string, OwnerSummaryBusiestDay>();
+  for (const order of periodOrders) {
+    const localDate = getZonedDateTimeParts(order.createdAt, timezone);
+    const date = localDateKey(localDate);
+    const current = ordersByDay.get(date) ?? {
+      date,
+      day: getWeekday(localDate),
+      totalOrders: 0
+    };
 
-  if (periodType === "weekly") {
-    for (const order of periodOrders) {
-      const localDate = getZonedDateTimeParts(order.createdAt, timezone);
-      const date = localDateKey(localDate);
-      const current = ordersByDay.get(date) ?? {
-        date,
-        day: getWeekday(localDate),
-        totalOrders: 0
-      };
-
-      current.totalOrders += 1;
-      ordersByDay.set(date, current);
-    }
+    current.totalOrders += 1;
+    ordersByDay.set(date, current);
   }
 
-  const busiestDay =
-    Array.from(ordersByDay.values()).sort(
+  const rankedDates = Array.from(ordersByDay.values()).sort(
       (first, second) =>
         second.totalOrders - first.totalOrders ||
         first.date.localeCompare(second.date)
-    )[0] ?? null;
+    );
+  const busiestDay = rankedDates[0] ?? null;
+  const busiestDates = busiestDay
+    ? rankedDates.filter((entry) => entry.totalOrders === busiestDay.totalOrders)
+    : [];
+  const weekdayTotals = new Map<OwnerSummaryWeekday, number>(
+    ownerSummaryWeekdays.map((day) => [day, 0])
+  );
+  for (const entry of ordersByDay.values()) {
+    weekdayTotals.set(
+      entry.day,
+      (weekdayTotals.get(entry.day) ?? 0) + entry.totalOrders
+    );
+  }
+  const weekdayOccurrences = new Map<OwnerSummaryWeekday, number>(
+    ownerSummaryWeekdays.map((day) => [day, 0])
+  );
+  if (input.periodEnd > input.periodStart) {
+    let cursor = getLocalDate(input.periodStart, timezone);
+    const finalDate = getLocalDate(
+      new Date(input.periodEnd.getTime() - 1),
+      timezone
+    );
+    while (localDateKey(cursor) <= localDateKey(finalDate)) {
+      const weekday = getWeekday(cursor);
+      weekdayOccurrences.set(
+        weekday,
+        (weekdayOccurrences.get(weekday) ?? 0) + 1
+      );
+      cursor = shiftLocalDate(cursor, 1);
+    }
+  }
+  const weekdayActivity = ownerSummaryWeekdays.map((day) => {
+    const totalOrders = weekdayTotals.get(day) ?? 0;
+    const occurrences = weekdayOccurrences.get(day) ?? 0;
+    return {
+      day,
+      totalOrders,
+      occurrences,
+      averageOrdersPerOccurrence:
+        occurrences > 0 ? Math.round((totalOrders / occurrences) * 100) / 100 : 0
+    };
+  });
+  const highestWeekdayTotal = Math.max(
+    0,
+    ...weekdayActivity.map((entry) => entry.totalOrders)
+  );
+  const busiestWeekdays = highestWeekdayTotal > 0
+    ? weekdayActivity.filter((entry) => entry.totalOrders === highestWeekdayTotal)
+    : [];
 
   return {
     restaurantId: input.restaurantId,
@@ -751,7 +809,10 @@ export const buildOwnerSummaryMetrics = (
     uniqueCustomers: periodCustomers.size,
     newCustomers,
     returningCustomers,
-    busiestDay
+    busiestDay,
+    busiestDates,
+    weekdayActivity,
+    busiestWeekdays
   };
 };
 
@@ -878,7 +939,24 @@ const buildBusinessReportFacts = (
   period: BusinessReportPeriod,
   metrics: OwnerSummaryMetrics,
   comparison: BusinessReportComparison | null
-): BusinessReportFacts => ({
+): BusinessReportFacts => {
+  const busiestDates =
+    metrics.busiestDates ?? (metrics.busiestDay ? [metrics.busiestDay] : []);
+  const legacyBusiestWeekday = metrics.busiestDay
+    ? {
+        day: metrics.busiestDay.day,
+        totalOrders: metrics.busiestDay.totalOrders,
+        occurrences: 1,
+        averageOrdersPerOccurrence: metrics.busiestDay.totalOrders
+      }
+    : null;
+  const weekdayActivity =
+    metrics.weekdayActivity ?? (legacyBusiestWeekday ? [legacyBusiestWeekday] : []);
+  const busiestWeekdays =
+    metrics.busiestWeekdays ??
+    (legacyBusiestWeekday ? [legacyBusiestWeekday] : []);
+
+  return {
   period: {
     type: period.type,
     label: period.label,
@@ -909,8 +987,12 @@ const buildBusinessReportFacts = (
     returning: metrics.returningCustomers
   },
   busiestDay: metrics.busiestDay,
+  busiestDates,
+  weekdayActivity,
+  busiestWeekdays,
   comparison
-});
+  };
+};
 
 const formatBusinessPeriodLabel = (period: {
   periodStart: Date;
@@ -930,6 +1012,17 @@ const formatBusinessPeriodLabel = (period: {
   const end = formatter.format(endInclusive);
 
   return start === end ? start : `${start} – ${end}`;
+};
+
+const formatCalendarDateKey = (value: string): string => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return value;
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "UTC",
+    day: "numeric",
+    month: "long",
+    year: "numeric"
+  }).format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))));
 };
 
 const formatComparisonChange = (
@@ -1018,16 +1111,24 @@ export const formatBusinessReportMessage = (
     );
   }
 
-  if (period.summaryType === "weekly" && report.busiestDay) {
-    const day =
-      report.busiestDay.day.charAt(0).toUpperCase() +
-      report.busiestDay.day.slice(1);
+  if (report.busiestDates.length > 0) {
     sections.push(
       [
-        "📅 BUSIEST DAY",
-        `${day} — ${report.busiestDay.totalOrders} order${
-          report.busiestDay.totalOrders === 1 ? "" : "s"
-        }`
+        "📅 BUSIEST DATE",
+        ...report.busiestDates.map((entry) =>
+          `${formatCalendarDateKey(entry.date)} (${entry.day.charAt(0).toUpperCase()}${entry.day.slice(1)}) — ${entry.totalOrders} order${entry.totalOrders === 1 ? "" : "s"}`
+        )
+      ].join("\n")
+    );
+  }
+
+  if (report.busiestWeekdays.length > 0) {
+    sections.push(
+      [
+        "🗓️ BUSIEST WEEKDAY",
+        ...report.busiestWeekdays.map((entry) =>
+          `${entry.day.charAt(0).toUpperCase()}${entry.day.slice(1)} — ${entry.totalOrders} total order${entry.totalOrders === 1 ? "" : "s"} across ${entry.occurrences} occurrence${entry.occurrences === 1 ? "" : "s"} (${entry.averageOrdersPerOccurrence.toFixed(2)} average per occurrence)`
+        )
       ].join("\n")
     );
   }
