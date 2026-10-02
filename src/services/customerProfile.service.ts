@@ -14,6 +14,7 @@ import {
   type OrderType
 } from "../models/order.model";
 import { BadRequestError } from "../utils/httpErrors";
+import { formatDisplayDate } from "../utils/formatDisplay.util";
 import {
   getCustomerIdentityFilter,
   normalizeCustomerKey
@@ -93,6 +94,7 @@ export type CustomerListSortBy = (typeof customerListSortOptions)[number];
 
 export interface ListCustomersInput {
   restaurantId: string;
+  timezone?: string;
   marketingStatus?: CustomerMarketingStatus;
   hasCompletedOrder?: boolean;
   returningOnly?: boolean;
@@ -739,7 +741,9 @@ export const listCustomers = async (
       name: savedName || `Customer ending ${maskedPhone.slice(-4)}`,
       maskedPhone,
       orderCount: profile.orderCount,
-      lastOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+      lastOrderAt: profile.lastOrderAt
+        ? formatDisplayDate(profile.lastOrderAt, input.timezone)
+        : null,
       averageOrderValue: roundCurrency(profile.averageOrderValue),
       marketingStatus: getCustomerMarketingStatus(profile)
     };

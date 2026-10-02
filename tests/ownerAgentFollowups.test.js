@@ -210,7 +210,7 @@ test("order follow-up reuses only trusted scoped filters and re-queries matching
       $lt: periodEnd
     });
     assert.equal(result.totalMatched, 2);
-    assert.equal(result.orders[0].placedAtFormatted, "6 September 2026 at 9:53 a.m.");
+    assert.equal(result.orders[0].placedAtFormatted, "6 September 2026 at 09:53");
     assert.notEqual(result.orders[0].placedAt, result.orders[0].completedAt);
     assert.equal(savedContext.filter.restaurantId, restaurantId);
     assert.equal(savedContext.filter.senderPhone, senderPhone);
@@ -226,20 +226,20 @@ test("order follow-up reuses only trusted scoped filters and re-queries matching
   }
 });
 
-test("restaurant date formatter applies timezone boundaries and readable meridiem", () => {
+test("restaurant date formatter applies timezone boundaries with a 24-hour clock", () => {
   assert.equal(
     formatRestaurantDateTime(
       new Date("2026-09-05T23:53:00.000Z"),
       "Africa/Accra"
     ),
-    "5 September 2026 at 11:53 p.m."
+    "5 September 2026 at 23:53"
   );
   assert.equal(
     formatRestaurantDateTime(
       new Date("2026-09-06T00:53:00.000Z"),
       "Africa/Lagos"
     ),
-    "6 September 2026 at 1:53 a.m."
+    "6 September 2026 at 01:53"
   );
 });
 
@@ -1710,14 +1710,14 @@ test("deterministic final answer lists exact order references and placement time
           customerName: "Gabriel",
           customerIdentity: "customer-1",
           phoneEnding: "0001",
-          placedAtFormatted: "6 September 2026 at 9:53 a.m."
+          placedAtFormatted: "6 September 2026 at 09:53"
         },
         {
           orderReference: "ORD-102",
           customerName: "Gabriel",
           customerIdentity: "customer-1",
           phoneEnding: "0001",
-          placedAtFormatted: "20 September 2026 at 6:15 p.m."
+          placedAtFormatted: "20 September 2026 at 18:15"
         }
       ]
     })
@@ -1725,7 +1725,7 @@ test("deterministic final answer lists exact order references and placement time
 
   assert.equal(
     message,
-    "Gabriel placed both orders:\n1. ORD-101 — 6 September 2026 at 9:53 a.m.\n2. ORD-102 — 20 September 2026 at 6:15 p.m."
+    "Gabriel placed both orders:\n1. ORD-101 — 6 September 2026 at 09:53\n2. ORD-102 — 20 September 2026 at 18:15"
   );
 });
 
@@ -1735,7 +1735,7 @@ test("truncated order page describes only returned records", async () => {
     customerName: "Gabriel",
     customerIdentity: "customer-1",
     phoneEnding: "0001",
-    placedAtFormatted: `${index + 1} September 2026 at 9:00 a.m.`
+    placedAtFormatted: `${index + 1} September 2026 at 09:00`
   }));
   const message = await runGroundedOrderAnswer(
     "What time and date were the orders placed?",
@@ -1749,8 +1749,8 @@ test("truncated order page describes only returned records", async () => {
   );
 
   assert.match(message, /^Showing 10 of 20 matching orders\./);
-  assert.match(message, /1\. ORD-001 — 1 September 2026 at 9:00 a\.m\. — Gabriel/);
-  assert.match(message, /10\. ORD-010 — 10 September 2026 at 9:00 a\.m\. — Gabriel/);
+  assert.match(message, /1\. ORD-001 — 1 September 2026 at 09:00 — Gabriel/);
+  assert.match(message, /10\. ORD-010 — 10 September 2026 at 09:00 — Gabriel/);
   assert.match(message, /Ask to see the next page for more matching orders\.$/);
   assert.doesNotMatch(message, /Gabriel placed 20 orders/);
   assert.doesNotMatch(message, /offset/i);
@@ -1767,7 +1767,7 @@ test("complete order result attributes the full count to one established custome
         customerName: "Lady Ruth",
         customerIdentity: "customer-1",
         phoneEnding: "0009",
-        placedAtFormatted: `${number} October 2026 at 1:00 p.m.`
+        placedAtFormatted: `${number} October 2026 at 13:00`
       }))
     })
   );
@@ -1787,14 +1787,14 @@ test("same display name with distinct identities is not merged", async () => {
           customerName: "Gabriel",
           customerIdentity: "customer-1",
           phoneEnding: "0001",
-          placedAtFormatted: "1 October 2026 at 9:00 a.m."
+          placedAtFormatted: "1 October 2026 at 09:00"
         },
         {
           orderReference: "ORD-302",
           customerName: "Gabriel",
           customerIdentity: "customer-2",
           phoneEnding: "0002",
-          placedAtFormatted: "1 October 2026 at 10:00 a.m."
+          placedAtFormatted: "1 October 2026 at 10:00"
         }
       ]
     })
@@ -1820,14 +1820,14 @@ test("later final page remains partial and does not expose offset details", asyn
           customerName: "Lady Ruth",
           customerIdentity: "customer-1",
           phoneEnding: "0009",
-          placedAtFormatted: "3 October 2026 at 1:00 p.m."
+          placedAtFormatted: "3 October 2026 at 13:00"
         },
         {
           orderReference: "ORD-404",
           customerName: "Lady Ruth",
           customerIdentity: "customer-1",
           phoneEnding: "0009",
-          placedAtFormatted: "4 October 2026 at 1:00 p.m."
+          placedAtFormatted: "4 October 2026 at 13:00"
         }
       ]
     })

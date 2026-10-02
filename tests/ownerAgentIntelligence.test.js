@@ -422,7 +422,7 @@ test("list_customers returns masked, restaurant-scoped opted-in profiles", async
           name: "Ama Mensah",
           maskedPhone: "***1234",
           orderCount: 4,
-          lastOrderAt: "2026-09-10T10:00:00.000Z",
+          lastOrderAt: "10 September 2026",
           averageOrderValue: 82.35,
           marketingStatus: "opted_in"
         }

@@ -19,7 +19,8 @@ import {
   listCustomerCampaignsSchema,
   previewCustomerCampaign,
   updateCustomerCampaignDraft,
-  updateCustomerCampaignDraftSchema
+  updateCustomerCampaignDraftSchema,
+  type CustomerCampaignAudiencePreview
 } from "../services/customerCampaign.service";
 import {
   cancelStaffReminder,
@@ -29,7 +30,8 @@ import {
   listStaffReminders,
   listStaffRemindersSchema,
   rescheduleStaffReminder,
-  rescheduleStaffReminderSchema
+  rescheduleStaffReminderSchema,
+  type StaffReminderView
 } from "../services/staffReminder.service";
 import { getCustomerMarketingPreference } from "../services/customerMarketingPreference.service";
 import {
@@ -97,6 +99,7 @@ import {
 } from "../services/orderDraft.service";
 import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
+import { formatDisplayDateTime } from "../utils/formatDisplay.util";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import {
   getCustomerIdentityFilter,
@@ -409,7 +412,17 @@ const menuItemView = (
   return view;
 };
 
-const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
+const optionalDisplayDateTime = (
+  value: Date | null | undefined,
+  timezone: string
+): string | null | undefined =>
+  value ? formatDisplayDateTime(value, timezone) : value;
+
+const safeOrderView = (
+  order: IOrderDocument,
+  timezone: string,
+  includeCustomer = false
+) => ({
   id: String(order._id),
   orderNumber: order.orderNumber,
   status: order.status,
@@ -419,11 +432,20 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
   deliveryFeePending: order.deliveryFeePending,
   deliveryFeeSource: order.deliveryFeeSource,
   total: order.total,
-  createdAt: order.createdAt,
-  customerConfirmedAt: order.customerConfirmedAt,
-  ownerNotifiedAt: order.ownerNotifiedAt,
-  restaurantConfirmedAt: order.restaurantConfirmedAt,
-  restaurantRejectedAt: order.restaurantRejectedAt,
+  createdAt: formatDisplayDateTime(order.createdAt, timezone),
+  customerConfirmedAt: optionalDisplayDateTime(
+    order.customerConfirmedAt,
+    timezone
+  ),
+  ownerNotifiedAt: optionalDisplayDateTime(order.ownerNotifiedAt, timezone),
+  restaurantConfirmedAt: optionalDisplayDateTime(
+    order.restaurantConfirmedAt,
+    timezone
+  ),
+  restaurantRejectedAt: optionalDisplayDateTime(
+    order.restaurantRejectedAt,
+    timezone
+  ),
   restaurantRejectionReason:
     order.status === "rejected"
       ? orderService.getTrustedRestaurantRejectionReason(
@@ -431,15 +453,24 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
         )
       : undefined,
   receiptUrl: includeCustomer ? order.receiptUrl : undefined,
-  receiptGeneratedAt: order.receiptGeneratedAt,
-  receiptSentAt: order.receiptSentAt,
-  completedAt: order.completedAt,
+  receiptGeneratedAt: optionalDisplayDateTime(order.receiptGeneratedAt, timezone),
+  receiptSentAt: optionalDisplayDateTime(order.receiptSentAt, timezone),
+  completedAt: optionalDisplayDateTime(order.completedAt, timezone),
   completionSource: order.completionSource,
   completionConfirmedByCustomer: order.completionConfirmedByCustomer,
-  customerConfirmedReceiptAt: order.customerConfirmedReceiptAt,
+  customerConfirmedReceiptAt: optionalDisplayDateTime(
+    order.customerConfirmedReceiptAt,
+    timezone
+  ),
   feedbackFollowUpStatus: order.feedbackFollowUpStatus,
-  feedbackRequestSentAt: order.feedbackRequestSentAt,
-  feedbackReceivedAt: order.feedbackReceivedAt,
+  feedbackRequestSentAt: optionalDisplayDateTime(
+    order.feedbackRequestSentAt,
+    timezone
+  ),
+  feedbackReceivedAt: optionalDisplayDateTime(
+    order.feedbackReceivedAt,
+    timezone
+  ),
   items: order.items.map((item) => ({
     name: item.name,
     quantity: item.quantity,
@@ -457,7 +488,10 @@ const safeOrderView = (order: IOrderDocument, includeCustomer = false) => ({
     : {})
 });
 
-const safeFeedbackView = (feedback: IOrderFeedbackDocument) => ({
+const safeFeedbackView = (
+  feedback: IOrderFeedbackDocument,
+  timezone: string
+) => ({
   id: String(feedback._id),
   orderId: String(feedback.orderId),
   orderNumber: feedback.orderNumber,
@@ -469,11 +503,46 @@ const safeFeedbackView = (feedback: IOrderFeedbackDocument) => ({
   sentiment: feedback.sentiment,
   rating: feedback.rating,
   requiresOwnerAttention: feedback.requiresOwnerAttention,
-  ownerNotifiedAt: feedback.ownerNotifiedAt,
-  ownerNotificationFailedAt: feedback.ownerNotificationFailedAt,
-  resolvedAt: feedback.resolvedAt,
+  ownerNotifiedAt: optionalDisplayDateTime(feedback.ownerNotifiedAt, timezone),
+  ownerNotificationFailedAt: optionalDisplayDateTime(
+    feedback.ownerNotificationFailedAt,
+    timezone
+  ),
+  resolvedAt: optionalDisplayDateTime(feedback.resolvedAt, timezone),
   resolvedByPhone: feedback.resolvedByPhone,
-  createdAt: feedback.createdAt
+  createdAt: formatDisplayDateTime(feedback.createdAt, timezone)
+});
+
+const staffReminderView = (
+  reminder: StaffReminderView,
+  timezone: string
+) => ({
+  ...reminder,
+  scheduledFor: formatDisplayDateTime(reminder.scheduledFor, timezone),
+  createdAt: formatDisplayDateTime(reminder.createdAt, timezone),
+  sentAt: optionalDisplayDateTime(reminder.sentAt, timezone)
+});
+
+const customerCampaignPreviewView = (
+  preview: CustomerCampaignAudiencePreview,
+  timezone: string
+) => ({
+  ...preview,
+  recipients: preview.recipients.map((recipient) => ({
+    ...recipient,
+    consentSnapshotUpdatedAt: formatDisplayDateTime(
+      recipient.consentSnapshotUpdatedAt,
+      timezone
+    )
+  }))
+});
+
+const ownerSummaryMetricsView = (
+  metrics: Awaited<ReturnType<typeof getOwnerSummaryMetrics>>
+) => ({
+  ...metrics,
+  periodStart: formatDisplayDateTime(metrics.periodStart, metrics.timezone),
+  periodEnd: formatDisplayDateTime(metrics.periodEnd, metrics.timezone)
 });
 
 const normalizeComparableText = (value: string): string => {
@@ -1158,15 +1227,25 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     },
     roles: toolPermissions.get_marketing_preference,
     schema: emptySchema,
-    handler: async (_args, context) => ({
-      success: true,
-      message: "Marketing preference retrieved.",
-      data: await getCustomerMarketingPreference(
+    handler: async (_args, context) => {
+      const preference = await getCustomerMarketingPreference(
         context.restaurantId,
         getSenderRecipient(context),
         getSenderCustomerKey(context)
-      )
-    })
+      );
+
+      return {
+        success: true,
+        message: "Marketing preference retrieved.",
+        data: {
+          ...preference,
+          updatedAt: optionalDisplayDateTime(
+            preference.updatedAt,
+            context.restaurant.timezone
+          )
+        }
+      };
+    }
   },
   get_today_orders: {
     definition: {
@@ -1194,7 +1273,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Today's orders retrieved successfully.",
         data: {
-          ...metrics,
+          ...ownerSummaryMetricsView(metrics),
           revenue: metrics.completedRevenue,
           statuses: metrics.countsByStatus
         }
@@ -1264,6 +1343,17 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         message: "Business report retrieved successfully.",
         data: {
           ...report,
+          period: {
+            ...report.period,
+            start: formatDisplayDateTime(
+              new Date(report.period.start),
+              report.period.timezone
+            ),
+            end: formatDisplayDateTime(
+              new Date(report.period.end),
+              report.period.timezone
+            )
+          },
           customerMarketing,
           formattedReport: `${report.formattedReport}\n\n${marketingSection}`
         }
@@ -1302,7 +1392,34 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           performance.items.length === 0
             ? "No submitted orders matched that period."
             : "Item performance retrieved successfully.",
-        data: performance
+        data: {
+          ...performance,
+          period: {
+            ...performance.period,
+            start: formatDisplayDateTime(
+              new Date(performance.period.start),
+              performance.period.timezone
+            ),
+            end: formatDisplayDateTime(
+              new Date(performance.period.end),
+              performance.period.timezone
+            )
+          },
+          ...(performance.comparisonPeriod
+            ? {
+                comparisonPeriod: {
+                  start: formatDisplayDateTime(
+                    new Date(performance.comparisonPeriod.start),
+                    performance.period.timezone
+                  ),
+                  end: formatDisplayDateTime(
+                    new Date(performance.comparisonPeriod.end),
+                    performance.period.timezone
+                  )
+                }
+              }
+            : {})
+        }
       };
     }
   },
@@ -1324,6 +1441,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (args, context) => {
       const customers = await listCustomers({
         restaurantId: context.restaurantId,
+        timezone: context.restaurant.timezone,
         ...args
       });
 
@@ -1354,6 +1472,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
     handler: async (args, context) => {
       const result = await getCustomerInsights({
         restaurantId: context.restaurantId,
+        timezone: context.restaurant.timezone,
         ...args
       });
 
@@ -1439,7 +1558,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Yesterday's orders retrieved successfully.",
         data: {
-          ...metrics,
+          ...ownerSummaryMetricsView(metrics),
           revenue: metrics.completedRevenue,
           statuses: metrics.countsByStatus
         }
@@ -1516,7 +1635,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           feedback.length === 0
             ? "No customer feedback matched those filters."
             : `${feedback.length} customer feedback record${feedback.length === 1 ? "" : "s"} retrieved.`,
-        data: feedback.map(safeFeedbackView)
+        data: feedback.map((entry) =>
+          safeFeedbackView(entry, context.restaurant.timezone)
+        )
       };
     }
   },
@@ -1558,7 +1679,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         return {
           success: true,
           message: "That feedback was already resolved.",
-          data: safeFeedbackView(feedback)
+          data: safeFeedbackView(feedback, context.restaurant.timezone)
         };
       }
 
@@ -1582,7 +1703,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         message: resolved.idempotent
           ? "That feedback was already resolved."
           : "Customer feedback marked as resolved.",
-        data: safeFeedbackView(resolved.feedback)
+        data: safeFeedbackView(
+          resolved.feedback,
+          context.restaurant.timezone
+        )
       };
     }
   },
@@ -1612,7 +1736,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Sales summary retrieved successfully.",
         data: {
-          ...metrics,
+          ...ownerSummaryMetricsView(metrics),
           revenue: metrics.completedRevenue,
           bestSellingItem: metrics.topSellingItems[0]
         }
@@ -1648,7 +1772,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: "Latest order retrieved successfully.",
-        data: safeOrderView(order)
+        data: safeOrderView(order, context.restaurant.timezone)
       };
     }
   },
@@ -1755,7 +1879,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: "Order details retrieved successfully.",
-        data: safeOrderView(order, !isCustomer)
+        data: safeOrderView(
+          order,
+          context.restaurant.timezone,
+          !isCustomer
+        )
       };
     }
   },
@@ -1927,7 +2055,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             excludedOptOut: preview.excludedOptOut,
             excludedInvalidPhone: preview.excludedInvalidPhone,
             plannedSend:
-              campaign.scheduledAt?.toISOString() ?? null,
+              campaign.scheduledAt
+                ? formatDisplayDateTime(
+                    campaign.scheduledAt,
+                    campaign.timezone
+                  )
+                : null,
             timezone: campaign.timezone
           }
         }
@@ -2002,7 +2135,12 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             excludedNoConsent: preview.excludedNoConsent,
             excludedOptOut: preview.excludedOptOut,
             excludedInvalidPhone: preview.excludedInvalidPhone,
-            plannedSend: campaign.scheduledAt?.toISOString() ?? null,
+            plannedSend: campaign.scheduledAt
+              ? formatDisplayDateTime(
+                  campaign.scheduledAt,
+                  campaign.timezone
+                )
+              : null,
             timezone: campaign.timezone
           }
         }
@@ -2035,7 +2173,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         data: {
           campaignId: String(campaign._id),
           status: campaign.status,
-          preview
+          preview: customerCampaignPreviewView(preview, campaign.timezone)
         }
       };
     }
@@ -2098,7 +2236,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           campaignId: String(campaign._id),
           status: campaign.status,
           totalRecipientCount: campaign.totalRecipientCount,
-          scheduledAt: campaign.scheduledAt
+          scheduledAt: optionalDisplayDateTime(
+            campaign.scheduledAt,
+            campaign.timezone
+          )
         }
       };
     }
@@ -2169,7 +2310,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           name: campaign.name,
           campaignType: campaign.campaignType,
           status: campaign.status,
-          scheduledAt: campaign.scheduledAt,
+          scheduledAt: optionalDisplayDateTime(
+            campaign.scheduledAt,
+            campaign.timezone
+          ),
           estimatedRecipientCount:
             campaign.estimatedRecipientCount,
           totalRecipientCount: campaign.totalRecipientCount,
@@ -2177,7 +2321,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           failedRecipientCount: campaign.failedRecipientCount,
           cancelledRecipientCount:
             campaign.cancelledRecipientCount,
-          createdAt: campaign.createdAt
+          createdAt: formatDisplayDateTime(
+            campaign.createdAt,
+            campaign.timezone
+          )
         }))
       };
     }
@@ -2225,8 +2372,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       return {
         success: true,
-        message: `Reminder scheduled for ${reminder.scheduledFor.toISOString()}.`,
-        data: reminder
+        message: `Reminder scheduled for ${formatDisplayDateTime(reminder.scheduledFor, context.restaurant.timezone)}.`,
+        data: staffReminderView(reminder, context.restaurant.timezone)
       };
     }
   },
@@ -2252,7 +2399,9 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: "Personal reminders retrieved.",
-        data: reminders
+        data: reminders.map((reminder) =>
+          staffReminderView(reminder, context.restaurant.timezone)
+        )
       };
     }
   },
@@ -2278,8 +2427,8 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
 
       return {
         success: true,
-        message: `Reminder rescheduled for ${reminder.scheduledFor.toISOString()}.`,
-        data: reminder
+        message: `Reminder rescheduled for ${formatDisplayDateTime(reminder.scheduledFor, context.restaurant.timezone)}.`,
+        data: staffReminderView(reminder, context.restaurant.timezone)
       };
     }
   },
@@ -2304,7 +2453,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
       return {
         success: true,
         message: "Reminder cancelled.",
-        data: reminder
+        data: staffReminderView(reminder, context.restaurant.timezone)
       };
     }
   },
@@ -2699,7 +2848,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           ? "Order was already confirmed."
           : "Order confirmed successfully. The customer will be notified.",
         data: {
-          order: safeOrderView(result.order, true),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone,
+            true
+          ),
           orderEvent: "confirmed",
           notifyCustomer: true,
           receiptRequired: true,
@@ -2762,7 +2915,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           ? "Order was already rejected."
           : "Order rejected. The customer will be notified.",
         data: {
-          order: safeOrderView(result.order, true),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone,
+            true
+          ),
           orderEvent: "rejected",
           notifyCustomer: true,
           receiptRequired: false,
@@ -2815,7 +2972,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
             ? `Cancellation approved for ${order.orderNumber ?? String(order._id)}. The customer will be notified.`
             : `Cancellation declined for ${order.orderNumber ?? String(order._id)}. The customer will be notified.`,
         data: {
-          order: safeOrderView(result.order, true),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone,
+            true
+          ),
           orderEvent: "cancellation_resolved",
           notifyCustomer: true,
           cancellationDecision: result.decision,
@@ -2857,7 +3018,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: `Order status updated to ${result.order.status}.`,
         data: {
-          order: safeOrderView(result.order, true),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone,
+            true
+          ),
           idempotent: result.idempotent ?? false
         }
       };
@@ -2902,7 +3067,7 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Order submitted to the restaurant for confirmation.",
         data: {
-          order: safeOrderView(order),
+          order: safeOrderView(order, context.restaurant.timezone),
           orderEvent: "submitted",
           notifyOwner: true,
           receiptRequired: false
@@ -3504,7 +3669,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           success: true,
           message: "Your order has already been submitted to the restaurant for confirmation.",
           data: {
-            order: safeOrderView(result.order),
+            order: safeOrderView(
+              result.order,
+              context.restaurant.timezone
+            ),
             orderEvent: "submitted",
             orderSubmitted: true,
             notifyOwner: true,
@@ -3553,7 +3721,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: "Your order has been submitted to the restaurant for confirmation.",
         data: {
-          order: safeOrderView(result.order),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone
+          ),
           orderEvent: "submitted",
           orderSubmitted: true,
           notifyOwner: true,
@@ -3753,7 +3924,10 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
         success: true,
         message: `Order ${result.order.orderNumber ?? String(result.order._id)} updated successfully. The restaurant owner will be notified.`,
         data: {
-          order: safeOrderView(result.order),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone
+          ),
           orderEvent: "amended",
           notifyOwner: true,
           amendmentVersion: result.amendmentVersion,
@@ -3830,7 +4004,11 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
                 ? `I've sent a cancellation request for ${order.orderNumber ?? String(order._id)} to ${context.restaurant.name}. The restaurant will confirm whether it can still be cancelled.`
             : "Order cancelled successfully.",
         data: {
-          order: safeOrderView(result.order, context.sender.role !== "customer"),
+          order: safeOrderView(
+            result.order,
+            context.restaurant.timezone,
+            context.sender.role !== "customer"
+          ),
           orderEvent:
             customerCancelled && "mode" in result && result.mode === "requested"
               ? "cancellation_requested"

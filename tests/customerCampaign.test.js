@@ -1462,6 +1462,52 @@ test("audience selection deduplicates phones and reports consent exclusions", as
   }
 });
 
+test("campaign audience descriptions format dates in the restaurant timezone", async () => {
+  const originalProfileFind = CustomerProfile.find;
+  try {
+    CustomerProfile.find = () =>
+      resolvedQuery([
+        {
+          _id: profileId,
+          customerPhone,
+          orderCount: 1,
+          lastOrderAt: new Date("2026-08-02T12:00:00.000Z"),
+          marketingConsent: true,
+          isOptedOut: false,
+          updatedAt: now
+        }
+      ]);
+
+    const dateRangePreview = await selectCustomerCampaignAudience(
+      restaurantId,
+      {
+        type: "last_order_date_range",
+        startDate: "2026-08-01T23:30:00.000Z",
+        endDate: "2026-08-03T23:30:00.000Z"
+      },
+      now,
+      "Africa/Lagos"
+    );
+    assert.equal(
+      dateRangePreview.targetingDescription,
+      "Customers whose last completed order was between 2 August 2026 and 4 August 2026"
+    );
+
+    const inactivePreview = await selectCustomerCampaignAudience(
+      restaurantId,
+      { type: "inactive_customers", inactiveDays: 1 },
+      new Date("2026-08-03T23:30:00.000Z"),
+      "Africa/Lagos"
+    );
+    assert.equal(
+      inactivePreview.recipients[0].qualificationReason,
+      "last completed order before 3 August 2026"
+    );
+  } finally {
+    CustomerProfile.find = originalProfileFind;
+  }
+});
+
 test("behavioural targeting uses completed tenant-scoped orders and owned menu items", async () => {
   const originalProfileFind = CustomerProfile.find;
   const originalOrderFind = Order.find;
