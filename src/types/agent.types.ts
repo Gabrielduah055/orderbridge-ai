@@ -124,6 +124,8 @@ export interface ToolExecutionContext {
   originalMessage?: string;
   quotedMessageId?: string;
   confirmed?: boolean;
+  pendingActionId?: string;
+  trustedPendingActionData?: Record<string, unknown>;
   trustedStaffOrderSelection?: {
     decision: "accept" | "reject";
     awaitingReason: boolean;

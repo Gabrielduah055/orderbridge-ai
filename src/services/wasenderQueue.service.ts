@@ -25,6 +25,7 @@ import {
 } from "./wasender.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
+  campaignTypeAllowsNoConsent,
   updateCustomerCampaignAggregate,
   validateCustomerCampaignMedia
 } from "./customerCampaign.service";
@@ -35,6 +36,7 @@ import {
 } from "../utils/phone.util";
 import {
   getCustomerIdentityFilter,
+  normalizeCustomerKey,
   resolveCurrentWhatsappRecipientResult
 } from "./customerIdentity.service";
 import { redactUrls } from "../utils/error.util";
@@ -107,7 +109,8 @@ const transactionalKinds = new Set([
   "order_feedback_reminder",
   "order_feedback_owner_notification",
   "order_feedback_staff_notification",
-  "marketing_consent_request"
+  "marketing_consent_request",
+  "staff_direct_message"
 ]);
 
 export const recoverableRecipientCancellationReasons = new Set([
@@ -401,7 +404,7 @@ export const getQueuedCustomerCampaignStaleReason = async (
     _id: campaignId,
     restaurantId
   }).select(
-    "status campaignVersion scheduledAt referencedMenuItemId attachmentType imageMenuItemId imageLabel +imageUrl +imagePublicId"
+    "status campaignVersion campaignType scheduledAt referencedMenuItemId attachmentType imageMenuItemId imageLabel +imageUrl +imagePublicId"
   );
 
   if (!campaign) {
@@ -484,7 +487,10 @@ export const getQueuedCustomerCampaignStaleReason = async (
     return "customer_profile_phone_changed";
   }
 
-  if (profile.marketingConsent === false) {
+  if (
+    profile.marketingConsent === false &&
+    !campaignTypeAllowsNoConsent(campaign.campaignType)
+  ) {
     return "marketing_consent_revoked";
   }
 
@@ -518,6 +524,129 @@ export const getQueuedCustomerCampaignStaleReason = async (
   if (
     queuedApiKey &&
     restaurant.wasenderApiToken !== queuedApiKey
+  ) {
+    return "restaurant_wasender_token_changed";
+  }
+
+  return null;
+};
+
+export const getQueuedStaffDirectMessageStaleReason = async (
+  metadata: Record<string, unknown> | undefined,
+  queuedRecipientPhone?: string,
+  queuedSessionId?: string,
+  queuedApiKey?: string,
+  queuedRestaurantId?: string
+): Promise<string | null> => {
+  if (metadata?.kind !== "staff_direct_message") {
+    return null;
+  }
+
+  const restaurantId =
+    typeof metadata.restaurantId === "string"
+      ? metadata.restaurantId
+      : queuedRestaurantId ?? "";
+  const customerProfileId =
+    typeof metadata.customerProfileId === "string"
+      ? metadata.customerProfileId
+      : "";
+  const customerPhone =
+    typeof metadata.customerPhone === "string"
+      ? normalizeWhatsappRecipient(metadata.customerPhone)
+      : "";
+  const customerKey =
+    typeof metadata.customerKey === "string"
+      ? normalizeCustomerKey(metadata.customerKey, customerPhone)
+      : "";
+  const createdByPhone =
+    typeof metadata.createdByPhone === "string"
+      ? normalizeGhanaPhone(metadata.createdByPhone)
+      : "";
+
+  if (
+    !Types.ObjectId.isValid(restaurantId) ||
+    !Types.ObjectId.isValid(customerProfileId) ||
+    !isValidWhatsappRecipient(customerPhone) ||
+    !createdByPhone ||
+    (typeof metadata.customerKey === "string" && !customerKey)
+  ) {
+    return "invalid_metadata";
+  }
+
+  if (queuedRestaurantId && queuedRestaurantId !== restaurantId) {
+    return "queued_restaurant_changed";
+  }
+
+  const profile = await CustomerProfile.findOne({
+    _id: customerProfileId,
+    restaurantId
+  }).select("customerKey customerPhone isOptedOut");
+
+  if (!profile) {
+    return "customer_profile_missing";
+  }
+
+  const currentPhone = normalizeWhatsappRecipient(profile.customerPhone);
+  const currentKey = normalizeCustomerKey(
+    profile.customerKey,
+    currentPhone
+  );
+  if (
+    customerKey
+      ? currentKey !== customerKey
+      : currentPhone !== customerPhone
+  ) {
+    return "customer_identity_changed";
+  }
+
+  if (profile.isOptedOut === true) {
+    return "customer_opted_out";
+  }
+
+  if (
+    !customerKey &&
+    queuedRecipientPhone &&
+    normalizeWhatsappRecipient(queuedRecipientPhone) !== customerPhone
+  ) {
+    return "queued_recipient_changed";
+  }
+
+  const restaurant = await Restaurant.findOne({
+    _id: restaurantId,
+    status: { $in: ["trial", "active"] }
+  }).select(
+    "+wasenderApiToken ownerName ownerPhone managerPhones managerContacts status wasenderSessionId"
+  );
+
+  if (!restaurant) {
+    return "restaurant_inactive_or_missing";
+  }
+
+  const sender = resolveSenderIdentity(restaurant, createdByPhone);
+  if (
+    !sender.verified ||
+    (sender.role !== "owner" && sender.role !== "manager")
+  ) {
+    return "staff_no_longer_authorized";
+  }
+
+  if (
+    !restaurant.wasenderSessionId?.trim() ||
+    !restaurant.wasenderApiToken?.trim()
+  ) {
+    return "restaurant_wasender_credentials_missing";
+  }
+
+  if (
+    queuedSessionId &&
+    queuedSessionId !== restaurant.wasenderSessionId
+  ) {
+    return "restaurant_wasender_session_changed";
+  }
+
+  if (
+    queuedApiKey &&
+    queuedApiKey !== restaurant.wasenderApiToken
   ) {
     return "restaurant_wasender_token_changed";
   }
@@ -1540,6 +1669,27 @@ export const processNextQueuedWasenderMessage = async (
       await locked.save();
       console.info("Stale staff reminder cancelled", {
         restaurantId: locked.metadata.restaurantId,
+        queueMessageId: String(locked._id),
+        staleReason
+      });
+      return true;
+    }
+  } else if (locked.metadata?.kind === "staff_direct_message") {
+    const staleReason = await getQueuedStaffDirectMessageStaleReason(
+      locked.metadata,
+      locked.to,
+      locked.sessionId,
+      locked.apiKey,
+      locked.restaurantId ? String(locked.restaurantId) : undefined
+    );
+
+    if (staleReason) {
+      locked.status = "cancelled";
+      locked.lastError = `Stale staff direct message: ${staleReason}`;
+      await locked.save();
+      console.info("Stale staff direct message cancelled", {
+        restaurantId: locked.metadata.restaurantId,
+        customerProfileId: locked.metadata.customerProfileId,
         queueMessageId: String(locked._id),
         staleReason
       });

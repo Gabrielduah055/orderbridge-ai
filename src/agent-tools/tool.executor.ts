@@ -144,7 +144,9 @@ export const executeConfirmedPendingToolAction = async (
     pendingAction.arguments ?? pendingAction.data,
     {
       ...context,
-      confirmed: true
+      confirmed: true,
+      pendingActionId: String(pendingAction._id),
+      trustedPendingActionData: pendingAction.data
     }
   );
 
