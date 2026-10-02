@@ -23,18 +23,39 @@ export interface StaffAgentEvalResult {
 const normalizeComparableString = (value: string): string =>
   value.trim().toLowerCase().replace(/\s+/g, " ");
 
+const valuesMatch = (actual: unknown, expected: unknown): boolean => {
+  if (typeof actual === "string" && typeof expected === "string") {
+    return normalizeComparableString(actual) === normalizeComparableString(expected);
+  }
+
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      expected.every((value, index) => valuesMatch(actual[index], value))
+    );
+  }
+
+  if (expected && typeof expected === "object") {
+    if (!actual || typeof actual !== "object" || Array.isArray(actual)) {
+      return false;
+    }
+
+    const actualRecord = actual as Record<string, unknown>;
+    return Object.entries(expected as Record<string, unknown>).every(
+      ([key, value]) => valuesMatch(actualRecord[key], value)
+    );
+  }
+
+  return Object.is(actual, expected);
+};
+
 const hasExpectedArgument = (
   actual: Record<string, unknown>,
   key: string,
   expected: unknown
 ): boolean => {
-  const actualValue = actual[key];
-
-  if (typeof actualValue === "string" && typeof expected === "string") {
-    return normalizeComparableString(actualValue) === normalizeComparableString(expected);
-  }
-
-  return Object.is(actualValue, expected);
+  return valuesMatch(actual[key], expected);
 };
 
 const findExpectedToolCall = (

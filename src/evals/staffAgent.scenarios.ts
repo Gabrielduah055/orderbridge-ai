@@ -271,9 +271,61 @@ export const staffAgentScenarios: StaffAgentEvalScenario[] = [
   },
   {
     name: "Create campaign draft",
-    role: "manager",
+    role: "owner",
     message: "create a campaign called Friday Special saying Get 10% off Friday for all eligible customers",
-    expectedTool: "create_campaign_draft"
+    expectedTool: "create_campaign_draft",
+    expectedArguments: {
+      campaignType: "promotion",
+      targeting: { type: "all_eligible_customers" }
+    }
+  },
+  {
+    name: "Casual happy new month campaign",
+    role: "owner",
+    message: "send a happy new month message to all customers",
+    expectedTool: "create_campaign_draft",
+    expectedArguments: {
+      campaignType: "holiday",
+      targeting: { type: "all_eligible_customers" }
+    }
+  },
+  {
+    name: "Casual holiday wish campaign",
+    role: "owner",
+    message: "wish our customers happy holidays",
+    expectedTool: "create_campaign_draft",
+    expectedArguments: {
+      campaignType: "holiday",
+      targeting: { type: "all_eligible_customers" }
+    }
+  },
+  {
+    name: "Implicit-audience new year greeting campaign",
+    role: "owner",
+    message: "send new year greetings",
+    expectedTool: "create_campaign_draft",
+    expectedArguments: {
+      campaignType: "holiday",
+      targeting: { type: "all_eligible_customers" }
+    }
+  },
+  {
+    name: "Casual reopening announcement campaign",
+    role: "owner",
+    message: "tell everyone we're back and accepting orders",
+    expectedTool: "create_campaign_draft",
+    expectedArguments: {
+      campaignType: "announcement",
+      targeting: { type: "all_eligible_customers" }
+    }
+  },
+  {
+    name: "Inactive campaign needs duration",
+    role: "owner",
+    message: "send a promo to inactive customers",
+    expectNoTool: true,
+    forbiddenTools: ["create_campaign_draft"],
+    expectedTextPattern: /inactive.*days?|days?.*inactive|how (?:long|many)/i
   },
   {
     name: "Update campaign draft",

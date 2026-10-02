@@ -93,6 +93,7 @@ test("selected-customer campaign targeting remains tenant-scoped and excludes ot
 test("natural greeting and invitation request can create a campaign draft without the campaign keyword", async () => {
   let round = 0;
   let executed = false;
+  let executedArguments;
   const result = await runAgentOrchestrator(
     {
       restaurant: {
@@ -125,8 +126,9 @@ test("natural greeting and invitation request can create a campaign draft withou
                     name: "create_campaign_draft",
                     arguments: {
                       name: "Happy new month",
-                      message: "Happy new month! We are active today; place your order.",
-                      campaignType: "announcement",
+                      message:
+                        "Happy new month! We wish you a wonderful month and warmly invite you to place an order.",
+                      campaignType: "holiday",
                       targeting: { type: "all_eligible_customers" }
                     }
                   }
@@ -138,8 +140,9 @@ test("natural greeting and invitation request can create a campaign draft withou
       getHistory: async () => [],
       saveMessage: async () => {},
       buildSystemPrompt: async () => "test",
-      executeTool: async () => {
+      executeTool: async (_toolName, args) => {
         executed = true;
+        executedArguments = args;
         return {
           success: true,
           message: "Authoritative preview",
@@ -150,8 +153,157 @@ test("natural greeting and invitation request can create a campaign draft withou
   );
 
   assert.equal(executed, true);
+  assert.equal(round, 1);
+  assert.equal(executedArguments.campaignType, "holiday");
+  assert.deepEqual(executedArguments.targeting, {
+    type: "all_eligible_customers"
+  });
   assert.equal(result.success, true);
-  assert.match(result.message, /draft created/i);
+  assert.equal(result.message, "Authoritative preview");
+  assert.equal(result.executedTools[0].requiresConfirmation, true);
+});
+
+test("inactive-customer campaign asks for a duration instead of inventing one", async () => {
+  let round = 0;
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "OrderBridge Kitchen",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: senderPhone,
+        normalizedAddress: senderPhone,
+        normalizedPhone: senderPhone,
+        role: "owner",
+        verified: true
+      },
+      message: "send a promo to inactive customers"
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => {
+          round += 1;
+          return round === 1
+            ? {
+                text: null,
+                toolCalls: [
+                  {
+                    id: "inactive-campaign-call",
+                    name: "create_campaign_draft",
+                    arguments: {
+                      name: "We miss you",
+                      message: "We miss you! Come back and order from us.",
+                      campaignType: "inactivity_reengagement",
+                      targeting: {
+                        type: "inactive_customers",
+                        inactiveDays: 30
+                      }
+                    }
+                  }
+                ]
+              }
+            : {
+                text: "How many days should a customer have been inactive?",
+                toolCalls: []
+              };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "test",
+      executeTool: async () => {
+        executionCount += 1;
+        throw new Error("untrusted inactivity threshold reached the tool");
+      }
+    }
+  );
+
+  assert.equal(executionCount, 0);
+  assert.equal(result.success, true);
+  assert.match(result.message, /how many days/i);
+  assert.equal(
+    result.executedTools[0].code,
+    "CAMPAIGN_INACTIVE_DAYS_REQUIRED"
+  );
+});
+
+test("inactive-customer duration clarification can complete the original draft request", async () => {
+  let executionCount = 0;
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: {
+        _id: restaurantId,
+        name: "OrderBridge Kitchen",
+        timezone: "Africa/Accra"
+      },
+      sender: {
+        phone: senderPhone,
+        normalizedAddress: senderPhone,
+        normalizedPhone: senderPhone,
+        role: "owner",
+        verified: true
+      },
+      message: "30 days"
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "test-model",
+        complete: async () => ({
+          text: null,
+          toolCalls: [
+            {
+              id: "inactive-campaign-follow-up",
+              name: "create_campaign_draft",
+              arguments: {
+                name: "We miss you",
+                message: "We miss you! Come back and order from us.",
+                campaignType: "inactivity_reengagement",
+                targeting: {
+                  type: "inactive_customers",
+                  inactiveDays: 30
+                }
+              }
+            }
+          ]
+        })
+      },
+      getHistory: async () => [
+        {
+          role: "user",
+          content: "send a promo to inactive customers"
+        },
+        {
+          role: "assistant",
+          content: "How many days should a customer have been inactive?"
+        },
+        {
+          role: "user",
+          content: "30 days"
+        }
+      ],
+      saveMessage: async () => {},
+      buildSystemPrompt: async () => "test",
+      executeTool: async (_toolName, args) => {
+        executionCount += 1;
+        assert.equal(args.targeting.inactiveDays, 30);
+        return {
+          success: true,
+          message: "Inactive campaign preview",
+          requiresConfirmation: true
+        };
+      }
+    }
+  );
+
+  assert.equal(executionCount, 1);
+  assert.equal(result.success, true);
+  assert.equal(result.message, "Inactive campaign preview");
 });
 
 test("owner-uploaded campaign image changes the version and creates renewed approval", async () => {
