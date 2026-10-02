@@ -30,6 +30,7 @@ import {
   ForbiddenError,
   NotFoundError
 } from "../utils/httpErrors";
+import { formatDisplayDate } from "../utils/formatDisplay.util";
 import {
   isValidWhatsappRecipient,
   normalizeWhatsappRecipient
@@ -507,7 +508,8 @@ export const validateCustomerCampaignMedia = async (
 
 const getTargetingDescription = (
   targeting: CustomerCampaignTargetingRule,
-  menuItemName?: string
+  menuItemName?: string,
+  timezone?: string
 ): string => {
   switch (targeting.type) {
     case "all_eligible_customers":
@@ -520,8 +522,12 @@ const getTargetingDescription = (
       return `Selected customer: ${targeting.customerName ?? "saved customer"}`;
     case "ordered_menu_item":
       return `Customers who completed an order containing ${menuItemName ?? "the selected menu item"}`;
-    case "last_order_date_range":
-      return `Customers whose last completed order was between ${targeting.startDate?.toISOString()} and ${targeting.endDate?.toISOString()}`;
+    case "last_order_date_range": {
+      if (!targeting.startDate || !targeting.endDate) {
+        return "Customers in the selected completed-order date range";
+      }
+      return `Customers whose last completed order was between ${formatDisplayDate(targeting.startDate, timezone)} and ${formatDisplayDate(targeting.endDate, timezone)}`;
+    }
   }
 };
 
@@ -547,7 +553,8 @@ export const selectCustomerCampaignAudience = async (
   targetingInput:
     | CustomerCampaignTargetingRule
     | z.infer<typeof customerCampaignTargetingSchema>,
-  now = new Date()
+  now = new Date(),
+  timezone?: string
 ): Promise<CustomerCampaignAudiencePreview> => {
   ensureObjectId(restaurantId, "restaurantId");
   const targeting =
@@ -600,7 +607,7 @@ export const selectCustomerCampaignAudience = async (
         );
         qualificationReason =
           profile.lastOrderAt && profile.lastOrderAt < cutoff
-            ? `last completed order before ${cutoff.toISOString()}`
+            ? `last completed order before ${formatDisplayDate(cutoff, timezone)}`
             : null;
         break;
       }
@@ -675,7 +682,8 @@ export const selectCustomerCampaignAudience = async (
   return {
     targetingDescription: getTargetingDescription(
       targeting,
-      menuItemName
+      menuItemName,
+      timezone
     ),
     targetedProfiles,
     estimatedEligibleRecipients: recipients.length,
@@ -743,7 +751,8 @@ export const createCustomerCampaignDraft = async (
   const preview = await selectCustomerCampaignAudience(
     input.restaurantId,
     targeting,
-    now
+    now,
+    staff.restaurant.timezone
   );
   const campaign = await CustomerCampaign.create({
     restaurantId: input.restaurantId,
@@ -857,7 +866,8 @@ export const updateCustomerCampaignDraft = async (
   const preview = await selectCustomerCampaignAudience(
     input.restaurantId,
     targeting,
-    now
+    now,
+    staff.restaurant.timezone || campaign.timezone
   );
 
   if (parsed.name !== undefined) campaign.name = parsed.name;
@@ -954,7 +964,8 @@ export const previewCustomerCampaign = async (
   const preview = await selectCustomerCampaignAudience(
     restaurantId,
     campaign.targeting,
-    now
+    now,
+    campaign.timezone
   );
 
   return {
@@ -1090,7 +1101,8 @@ export const approveCustomerCampaign = async (
   const preview = await selectCustomerCampaignAudience(
     restaurantId,
     campaign.targeting,
-    now
+    now,
+    campaign.timezone
   );
   const restaurantObjectId = new Types.ObjectId(restaurantId);
   const session = await (

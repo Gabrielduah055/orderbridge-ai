@@ -7,6 +7,7 @@ import {
 } from "../models/staffQueryContext.model";
 import type { SenderRole } from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
+import { formatDisplayDateTime } from "../utils/formatDisplay.util";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
 import {
   businessReportPeriodTypes,
@@ -217,28 +218,7 @@ const isExplicitOrderQueryMessage = (message?: string): boolean => {
   );
 };
 
-export const formatRestaurantDateTime = (
-  value: Date,
-  timezone = DEFAULT_TIMEZONE
-): string => {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true
-  }).formatToParts(value);
-  const values = Object.fromEntries(
-    parts
-      .filter((part) => part.type !== "literal")
-      .map((part) => [part.type, part.value])
-  ) as Record<string, string>;
-  const dayPeriod = values.dayPeriod?.toLowerCase().replace("am", "a.m.").replace("pm", "p.m.");
-
-  return `${values.day} ${values.month} ${values.year} at ${values.hour}:${values.minute} ${dayPeriod}`;
-};
+export const formatRestaurantDateTime = formatDisplayDateTime;
 
 const isFollowUpMessage = (message?: string): boolean => {
   if (!message) return false;
@@ -708,8 +688,8 @@ export const listStaffOrders = async (
     period: {
       type: String(period.type),
       label: period.label,
-      start: period.periodStart.toISOString(),
-      end: period.periodEnd.toISOString(),
+      start: formatDisplayDateTime(period.periodStart, period.timezone),
+      end: formatDisplayDateTime(period.periodEnd, period.timezone),
       timezone: period.timezone,
       retained: !hasExplicitPeriod && Boolean(retained)
     },
@@ -731,9 +711,14 @@ export const listStaffOrders = async (
         customerIdentities.get(normalizeWhatsappRecipient(order.customerPhone)) ??
         `customer-${offset + index + 1}`,
       phoneEnding: getPhoneEnding(order.customerPhone),
-      placedAt: order.createdAt.toISOString(),
-      placedAtFormatted: formatRestaurantDateTime(order.createdAt, period.timezone),
-      completedAt: order.completedAt?.toISOString() ?? null,
+      placedAt: formatRestaurantDateTime(order.createdAt, period.timezone),
+      placedAtFormatted: formatRestaurantDateTime(
+        order.createdAt,
+        period.timezone
+      ),
+      completedAt: order.completedAt
+        ? formatRestaurantDateTime(order.completedAt, period.timezone)
+        : null,
       completedAtFormatted: order.completedAt
         ? formatRestaurantDateTime(order.completedAt, period.timezone)
         : null,

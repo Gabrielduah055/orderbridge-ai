@@ -158,7 +158,7 @@ test("exact customer name lookup is tenant-scoped, whitespace-normalized, and pr
       name: "Ama Mensah",
       maskedPhone: "***2043",
       completedOrderCount: 3,
-      lastCompletedOrderAt: "2026-08-01T12:00:00.000Z",
+      lastCompletedOrderAt: "1 August 2026",
       averageCompletedOrderValue: 82.5,
       preferredOrderType: "delivery",
       returning: true,
@@ -170,7 +170,7 @@ test("exact customer name lookup is tenant-scoped, whitespace-normalized, and pr
           name: "Chicken Jollof",
           orderCount: 2,
           totalQuantity: 4,
-          lastOrderedAt: "2026-08-01T12:00:00.000Z"
+          lastOrderedAt: "1 August 2026"
         }
       ]
     });
@@ -540,7 +540,7 @@ test("same-day last-order ranges use inclusive restaurant-local boundaries and i
       filter = input;
       return query([]);
     };
-    await getCustomerSegmentInsights({
+    const accraResult = await getCustomerSegmentInsights({
       restaurantId,
       timezone: "Africa/Accra",
       segmentType: "last_order_date_range",
@@ -549,8 +549,10 @@ test("same-day last-order ranges use inclusive restaurant-local boundaries and i
     });
     assert.equal(filter.lastOrderAt.$gte.toISOString(), "2026-09-14T00:00:00.000Z");
     assert.equal(filter.lastOrderAt.$lte.toISOString(), "2026-09-14T23:59:59.999Z");
+    assert.equal(accraResult.segment.startDate, "14 September 2026");
+    assert.equal(accraResult.segment.endDate, "14 September 2026");
 
-    await getCustomerSegmentInsights({
+    const lagosResult = await getCustomerSegmentInsights({
       restaurantId,
       timezone: "Africa/Lagos",
       segmentType: "last_order_date_range",
@@ -559,6 +561,8 @@ test("same-day last-order ranges use inclusive restaurant-local boundaries and i
     });
     assert.equal(filter.lastOrderAt.$gte.toISOString(), "2026-09-13T23:00:00.000Z");
     assert.equal(filter.lastOrderAt.$lte.toISOString(), "2026-09-14T22:59:59.999Z");
+    assert.equal(lagosResult.segment.startDate, "14 September 2026");
+    assert.equal(lagosResult.segment.endDate, "14 September 2026");
 
     await assert.rejects(
       getCustomerSegmentInsights({
@@ -954,7 +958,7 @@ const groundedCustomerToolResult = (overrides = {}) => ({
     name: "Ama Mensah",
     maskedPhone: "***2043",
     completedOrderCount: 3,
-    lastCompletedOrderAt: "2026-08-01T12:00:00.000Z",
+    lastCompletedOrderAt: "1 August 2026",
     averageCompletedOrderValue: 82.5,
     preferredOrderType: "delivery",
     returning: true,
@@ -1000,7 +1004,7 @@ for (const scenario of [
     name: "last completed order",
     message: "When did Ama last order?",
     expected:
-      "Ama Mensah's last completed order was 2026-08-01T12:00:00.000Z."
+      "Ama Mensah's last completed order was 1 August 2026."
   },
   {
     name: "preferred order type",
@@ -1252,7 +1256,7 @@ test("grounded eligible segment member answers use exact totals and backend cust
           name: "Ama Mensah",
           maskedPhone: "***2043",
           completedOrderCount: 7,
-          lastCompletedOrderAt: "2026-08-01T12:00:00.000Z",
+          lastCompletedOrderAt: "1 August 2026",
           marketingStatus: "opted_in",
           marketingEligibility: "eligible"
         },
@@ -1260,7 +1264,7 @@ test("grounded eligible segment member answers use exact totals and backend cust
           name: "Kojo Asante",
           maskedPhone: "***7712",
           completedOrderCount: 4,
-          lastCompletedOrderAt: "2026-07-01T12:00:00.000Z",
+          lastCompletedOrderAt: "1 July 2026",
           marketingStatus: "opted_in",
           marketingEligibility: "eligible"
         }

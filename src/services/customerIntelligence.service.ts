@@ -7,6 +7,7 @@ import {
   type IFrequentlyOrderedItem
 } from "../models/customerProfile.model";
 import { BadRequestError } from "../utils/httpErrors";
+import { formatDisplayDate } from "../utils/formatDisplay.util";
 import {
   isWhatsappPhoneAddress,
   normalizeGhanaPhone,
@@ -224,7 +225,8 @@ export type CustomerInsightsResult =
     };
 
 const buildCustomerInsights = (
-  profile: IntelligenceProfile
+  profile: IntelligenceProfile,
+  timezone?: string
 ): CustomerInsightsResult => {
   const marketingEligibility = classifyCustomerMarketingEligibility(profile);
 
@@ -235,7 +237,9 @@ const buildCustomerInsights = (
       name: customerDisplayName(profile),
       maskedPhone: maskCustomerPhone(profile.customerPhone),
       completedOrderCount: profile.orderCount,
-      lastCompletedOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+      lastCompletedOrderAt: profile.lastOrderAt
+        ? formatDisplayDate(profile.lastOrderAt, timezone)
+        : null,
       averageCompletedOrderValue: roundCurrency(profile.averageOrderValue),
       preferredOrderType: profile.preferredOrderType ?? null,
       returning: profile.orderCount >= 2,
@@ -247,7 +251,7 @@ const buildCustomerInsights = (
           name: normalizeDisplayText(item.name),
           orderCount: item.orderCount,
           totalQuantity: item.totalQuantity,
-          lastOrderedAt: item.lastOrderedAt.toISOString()
+          lastOrderedAt: formatDisplayDate(item.lastOrderedAt, timezone)
         })
       )
     }
@@ -258,6 +262,7 @@ export const getCustomerInsights = async (input: {
   restaurantId: string;
   customerName?: string;
   customerPhone?: string;
+  timezone?: string;
 }): Promise<CustomerInsightsResult> => {
   ensureRestaurantId(input.restaurantId);
   const parsed = customerInsightsSchema.parse({
@@ -285,7 +290,7 @@ export const getCustomerInsights = async (input: {
       return { status: "not_found", found: false };
     }
 
-    return buildCustomerInsights(profile);
+    return buildCustomerInsights(profile, input.timezone);
   }
 
   const nameFilter = {
@@ -314,7 +319,7 @@ export const getCustomerInsights = async (input: {
     };
   }
 
-  return buildCustomerInsights(profiles[0] as IntelligenceProfile);
+  return buildCustomerInsights(profiles[0] as IntelligenceProfile, input.timezone);
 };
 
 type DateRange = { start: Date; end: Date };
@@ -509,7 +514,8 @@ const compareRepresentativeProfiles = (
 const getSafeSegmentMembers = (
   profiles: IntelligenceProfile[],
   marketingEligibleOnly: boolean,
-  limit: number
+  limit: number,
+  timezone?: string
 ): {
   memberTotalMatched: number;
   returnedMemberCount: number;
@@ -540,7 +546,9 @@ const getSafeSegmentMembers = (
     name: customerDisplayName(profile),
     maskedPhone: maskCustomerPhone(profile.customerPhone),
     completedOrderCount: profile.orderCount,
-    lastCompletedOrderAt: profile.lastOrderAt?.toISOString() ?? null,
+    lastCompletedOrderAt: profile.lastOrderAt
+      ? formatDisplayDate(profile.lastOrderAt, timezone)
+      : null,
     marketingStatus: getCustomerMarketingStatus(profile),
     marketingEligibility: classifyCustomerMarketingEligibility(profile)
   }));
@@ -620,6 +628,7 @@ export const getCustomerSegmentInsights = async (input: {
   });
   const filter: Record<string, unknown> = { restaurantId: input.restaurantId };
   let menuItem: { id: string; name: string } | undefined;
+  let resolvedDateRange: DateRange | undefined;
 
   if (parsed.segmentType === "inactive_customers") {
     filter.orderCount = { $gte: 1 };
@@ -632,12 +641,15 @@ export const getCustomerSegmentInsights = async (input: {
   } else if (parsed.segmentType === "returning_customers") {
     filter.orderCount = { $gte: 2 };
   } else if (parsed.segmentType === "last_order_date_range") {
-    const range = resolveDateRange(
+    resolvedDateRange = resolveDateRange(
       parsed.startDate as string,
       parsed.endDate as string,
       input.timezone
     );
-    filter.lastOrderAt = { $gte: range.start, $lte: range.end };
+    filter.lastOrderAt = {
+      $gte: resolvedDateRange.start,
+      $lte: resolvedDateRange.end
+    };
   } else if (parsed.segmentType === "ordered_menu_item") {
     const resolution = await resolveMenuItemByName(
       input.restaurantId,
@@ -688,7 +700,8 @@ export const getCustomerSegmentInsights = async (input: {
     ? getSafeSegmentMembers(
         profiles,
         parsed.marketingEligibleOnly === true,
-        parsed.limit ?? 10
+        parsed.limit ?? 10,
+        input.timezone
       )
     : undefined;
 
@@ -700,8 +713,18 @@ export const getCustomerSegmentInsights = async (input: {
         ? { inactiveDays: parsed.inactiveDays }
         : {}),
       ...(menuItem ? { menuItemName: menuItem.name } : {}),
-      ...(parsed.startDate ? { startDate: parsed.startDate } : {}),
-      ...(parsed.endDate ? { endDate: parsed.endDate } : {})
+      ...(resolvedDateRange
+        ? {
+            startDate: formatDisplayDate(
+              resolvedDateRange.start,
+              input.timezone
+            ),
+            endDate: formatDisplayDate(
+              resolvedDateRange.end,
+              input.timezone
+            )
+          }
+        : {})
     },
     totalCustomers: profiles.length,
     customersWithCompletedOrders: profiles.filter((profile) => profile.orderCount >= 1).length,
