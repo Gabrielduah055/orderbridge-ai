@@ -37,7 +37,7 @@ const mockedDecisionFor = (scenario) => {
   if (scenario.expectNoTool) {
     return {
       text: scenario.expectedTextPattern
-        ? "That order was updated. Please review the latest order message. Which period or date range should I use?"
+        ? "That order was updated. Please review the latest order message. Which period, date range, or number of inactive days should I use?"
         : "I need a little more detail before I can safely do that.",
       toolCalls: []
     };
@@ -94,6 +94,44 @@ test("staff evaluator catches wrong tools and unsafe arguments", () => {
   assert.equal(reasons.some((reason) => reason.includes("compareWithPrevious")), true);
 });
 
+test("staff evaluator compares nested targeting arguments by value", () => {
+  const scenario = staffAgentScenarios.find(
+    (entry) => entry.name === "Casual happy new month campaign"
+  );
+  assert.ok(scenario);
+
+  const matchingReasons = evaluateStaffAgentDecision(scenario, {
+    toolCalls: [
+      {
+        id: "matching-campaign",
+        name: "create_campaign_draft",
+        arguments: {
+          campaignType: "holiday",
+          targeting: { type: "all_eligible_customers" }
+        }
+      }
+    ]
+  });
+  const mismatchingReasons = evaluateStaffAgentDecision(scenario, {
+    toolCalls: [
+      {
+        id: "wrong-campaign-target",
+        name: "create_campaign_draft",
+        arguments: {
+          campaignType: "holiday",
+          targeting: { type: "inactive_customers", inactiveDays: 30 }
+        }
+      }
+    ]
+  });
+
+  assert.equal(matchingReasons.length, 0);
+  assert.equal(
+    mismatchingReasons.some((reason) => reason.includes("targeting")),
+    true
+  );
+});
+
 test("staff evaluator rejects mutations for ordinary conversation", () => {
   const scenario = staffAgentScenarios.find((entry) => entry.name === "Thanks");
   assert.ok(scenario);
@@ -143,6 +181,22 @@ test("ordinary live eval scenarios receive normal production staff-state context
   assert.match(prompt, /"recentReferences":\{\}/);
   assert.match(prompt, /"permissions":\[/);
   assert.match(prompt, /<\/staff_state>/);
+});
+
+test("owner prompt maps casual campaign language without inventing targeting facts", async () => {
+  const campaignScenario = staffAgentScenarios.find(
+    (scenario) => scenario.name === "Casual happy new month campaign"
+  );
+
+  assert.ok(campaignScenario);
+  const prompt = await buildLiveStaffEvalSystemPrompt(campaignScenario);
+
+  assert.match(prompt, /happy new month/i);
+  assert.match(prompt, /seasonal wishes to holiday/i);
+  assert.match(prompt, /all_eligible_customers/i);
+  assert.match(prompt, /number of inactive days/i);
+  assert.match(prompt, /never invent an inactivity threshold/i);
+  assert.match(prompt, /menu highlights only when/i);
 });
 
 test("failed backend mutation cannot be represented as successful eval evidence", () => {

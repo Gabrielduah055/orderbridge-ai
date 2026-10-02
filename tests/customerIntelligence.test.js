@@ -924,7 +924,7 @@ test("read-only analytics intent blocks accidental campaign creation before exec
 test("explicit promotion creation still enters the existing draft workflow without claiming delivery", async () => {
   const executed = [];
   const result = await runOwnerAgentScenario({
-    message: "Create a promotion for those inactive customers.",
+    message: "Create a promotion for customers inactive for 30 days.",
     toolName: "create_campaign_draft",
     toolArguments: {
       name: "Come back",
@@ -947,7 +947,7 @@ test("explicit promotion creation still enters the existing draft workflow witho
   assert.equal(executed.length, 1);
   assert.equal(executed[0].toolName, "create_campaign_draft");
   assert.equal(executed[0].args.targeting.inactiveDays, 30);
-  assert.match(result.message, /ready for your approval/i);
+  assert.match(result.message, /ready for (?:your )?approval/i);
   assert.doesNotMatch(result.message, /sent|delivered/i);
 });
 

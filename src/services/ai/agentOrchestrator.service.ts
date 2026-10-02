@@ -38,7 +38,17 @@ const recoverableToolCodes = new Set([
   "ORDER_DRAFT_INCOMPLETE",
   "CUSTOMER_NAME_REQUIRED",
   "ORDER_REJECTION_REASON_REQUIRED",
-  "CUSTOMER_WORKFLOW_CONFLICT"
+  "CUSTOMER_WORKFLOW_CONFLICT",
+  "CAMPAIGN_INACTIVE_DAYS_REQUIRED",
+  "CAMPAIGN_INACTIVE_DAYS_MISMATCH",
+  "CAMPAIGN_TARGETING_MISMATCH",
+  "CAMPAIGN_TYPE_MISMATCH"
+]);
+const campaignConfirmationPreviewToolNames = new Set([
+  "create_campaign_draft",
+  "update_campaign_draft",
+  "approve_campaign",
+  "cancel_campaign"
 ]);
 
 const classifyOrchestratorError = (error: unknown): string => {
@@ -1207,6 +1217,11 @@ interface RequiredOperationalTool {
   safeMessage: string;
 }
 
+const isImplicitAllCustomerGreeting = (message: string): boolean =>
+  /^(?:please\s+)?(?:send|wish|greet)\s+(?:a\s+)?(?:happy\s+)?(?:new year|new month|holidays?|seasonal)(?:\s+(?:message|greetings?|wishes?))?[.!]?$/i.test(
+    normalizeText(message)
+  );
+
 const isNaturalCampaignCreationRequest = (message: string): boolean => {
   const normalized = normalizeText(message).toLowerCase();
   const asksToCommunicate =
@@ -1219,7 +1234,8 @@ const isNaturalCampaignCreationRequest = (message: string): boolean => {
     ) ||
     /\b(?:send|message|tell|notify|invite|wish|greet)\b.+\bto\b.+/.test(
       normalized
-    );
+    ) ||
+    isImplicitAllCustomerGreeting(normalized);
   const marketingContent =
     /\b(?:campaign|promotion|promo|offer|announcement|happy new month|happy new year|holiday|festive|we(?:'re| are) (?:open|active|back)|reopen(?:ed|ing)?|place (?:an |your )?order|bring (?:an |your )?orders?)\b/.test(
       normalized
@@ -1232,9 +1248,131 @@ const isNaturalCampaignCreationRequest = (message: string): boolean => {
   return !readOnly && asksToCommunicate && targetsCustomers && marketingContent;
 };
 
+const mentionsInactiveCustomerAudience = (message: string): boolean =>
+  /\binactive\s+(?:customers?|patrons?|clients?)\b|\b(?:customers?|patrons?|clients?)\s+inactive\b/i.test(
+    normalizeText(message)
+  );
+
+const getRecentInactiveCampaignRequest = (
+  history: Array<{ role: string; content: string }>,
+  currentMessage: string
+): string | null => {
+  const latest = history[history.length - 1];
+  const priorHistory =
+    latest?.role === "user" &&
+    normalizeText(latest.content) === normalizeText(currentMessage)
+      ? history.slice(0, -1)
+      : history;
+  let assistantIndex = -1;
+
+  for (let index = priorHistory.length - 1; index >= 0; index -= 1) {
+    if (priorHistory[index]?.role === "assistant") {
+      assistantIndex = index;
+      break;
+    }
+  }
+
+  if (assistantIndex < 0) {
+    return null;
+  }
+
+  const assistantMessage = normalizeText(
+    priorHistory[assistantIndex]?.content ?? ""
+  ).toLowerCase();
+  const requestedInactiveDays =
+    /\b(?:inactive|inactivity)\b.*\b(?:days?|period|threshold|how long)\b/.test(
+      assistantMessage
+    ) ||
+    /\b(?:how many days?|how long)\b.*\b(?:inactive|inactivity)\b/.test(
+      assistantMessage
+    );
+
+  if (!requestedInactiveDays) {
+    return null;
+  }
+
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    const candidate = priorHistory[index];
+    if (candidate?.role !== "user") {
+      continue;
+    }
+
+    const candidateMessage = normalizeText(candidate.content).toLowerCase();
+    return isNaturalCampaignCreationRequest(candidateMessage) &&
+      mentionsInactiveCustomerAudience(candidateMessage)
+      ? candidateMessage
+      : null;
+  }
+
+  return null;
+};
+
+const getExplicitInactiveDays = (
+  message: string,
+  isClarificationReply: boolean
+): number | null => {
+  const normalized = normalizeText(message).toLowerCase();
+  const explicitDays = normalized.match(/\b(\d{1,4})\s*days?\b/);
+  const clarificationDays = isClarificationReply
+    ? normalized.match(/^(\d{1,4})$/)
+    : null;
+  const rawDays = explicitDays?.[1] ?? clarificationDays?.[1];
+
+  if (!rawDays) {
+    return null;
+  }
+
+  const days = Number(rawDays);
+  return Number.isInteger(days) && days >= 1 && days <= 3650 ? days : null;
+};
+
+const getCampaignTargeting = (
+  args: Record<string, unknown>
+): Record<string, unknown> | null => {
+  const targeting = args.targeting;
+  return targeting && typeof targeting === "object" && !Array.isArray(targeting)
+    ? (targeting as Record<string, unknown>)
+    : null;
+};
+
+const getExpectedCampaignType = (message: string): string | null => {
+  const normalized = normalizeText(message).toLowerCase();
+
+  if (mentionsInactiveCustomerAudience(normalized)) {
+    return "inactivity_reengagement";
+  }
+
+  if (/\b(?:promo(?:tion)?|discount|offer|sale)\b|\d+\s*%/.test(normalized)) {
+    return "promotion";
+  }
+
+  if (
+    /\b(?:happy new month|happy new year|happy holidays?|new (?:month|year) greetings?|holiday greetings?|seasonal wishes?|festive greetings?)\b/.test(
+      normalized
+    ) ||
+    /\b(?:wish|greet)\b.*\b(?:customers?|everyone|patrons?|clients?)\b/.test(
+      normalized
+    )
+  ) {
+    return "holiday";
+  }
+
+  if (
+    /\b(?:announcement|business update|reopen(?:ed|ing)?|we(?:'re| are) (?:open|active|back))\b/.test(
+      normalized
+    )
+  ) {
+    return "announcement";
+  }
+
+  return null;
+};
+
 const getCustomerMarketingMutationIntentGuard = (
   input: AgentOrchestratorInput,
-  toolName: string
+  toolName: string,
+  args: Record<string, unknown>,
+  recentInactiveCampaignRequest: string | null
 ): ToolResult | null => {
   const message = normalizeText(input.message).toLowerCase();
   const hasCampaignReference = Boolean(
@@ -1244,20 +1382,89 @@ const getCustomerMarketingMutationIntentGuard = (
     /\b(?:campaign|promotion|promo|offer|announcement)s?\b/.test(message);
 
   if (toolName === "create_campaign_draft") {
+    const isInactiveClarificationReply = Boolean(recentInactiveCampaignRequest);
     const explicitCreation =
       (mentionsCampaign &&
         /\b(?:create|draft|start|make|prepare|set up|launch|send|write)\b/.test(
           message
         )) ||
-      isNaturalCampaignCreationRequest(message);
-    return explicitCreation
-      ? null
-      : {
+      isNaturalCampaignCreationRequest(message) ||
+      (isInactiveClarificationReply &&
+        getExplicitInactiveDays(message, true) !== null);
+
+    if (!explicitCreation) {
+      return {
+        success: false,
+        code: "CAMPAIGN_INTENT_REQUIRED",
+        message:
+          "That was a read-only customer intelligence question. No campaign draft was created."
+      };
+    }
+
+    const campaignRequest = recentInactiveCampaignRequest ?? message;
+    const targeting = getCampaignTargeting(args);
+    const targetsInactive = mentionsInactiveCustomerAudience(campaignRequest);
+    const targetsEveryone =
+      /\b(?:all\s+(?:the\s+)?(?:eligible\s+)?customers?|everyone|our\s+(?:customers?|patrons?|clients?))\b/.test(
+        campaignRequest
+      ) || isImplicitAllCustomerGreeting(campaignRequest);
+
+    if (targetsInactive) {
+      const explicitInactiveDays = getExplicitInactiveDays(
+        message,
+        isInactiveClarificationReply
+      );
+
+      if (explicitInactiveDays === null) {
+        return {
           success: false,
-          code: "CAMPAIGN_INTENT_REQUIRED",
+          code: "CAMPAIGN_INACTIVE_DAYS_REQUIRED",
           message:
-            "That was a read-only customer intelligence question. No campaign draft was created."
+            "How many days should a customer have been inactive before they are included?"
         };
+      }
+
+      if (targeting?.type !== "inactive_customers") {
+        return {
+          success: false,
+          code: "CAMPAIGN_TARGETING_MISMATCH",
+          message:
+            "Use the inactive-customer targeting rule for this campaign and keep the owner's requested inactivity period."
+        };
+      }
+
+      if (targeting.inactiveDays !== explicitInactiveDays) {
+        return {
+          success: false,
+          code: "CAMPAIGN_INACTIVE_DAYS_MISMATCH",
+          message: `Use the owner's stated inactivity period of ${explicitInactiveDays} days.`
+        };
+      }
+    } else if (
+      targetsEveryone &&
+      targeting?.type !== "all_eligible_customers"
+    ) {
+      return {
+        success: false,
+        code: "CAMPAIGN_TARGETING_MISMATCH",
+        message:
+          "Use all eligible customers because the owner asked for all customers or everyone."
+      };
+    }
+
+    const expectedCampaignType = getExpectedCampaignType(campaignRequest);
+    if (
+      expectedCampaignType &&
+      args.campaignType !== expectedCampaignType
+    ) {
+      return {
+        success: false,
+        code: "CAMPAIGN_TYPE_MISMATCH",
+        message: `Use campaign type ${expectedCampaignType} for this request.`
+      };
+    }
+
+    return null;
   }
 
   if (toolName === "update_campaign_draft") {
@@ -1549,6 +1756,10 @@ export const runAgentOrchestrator = async (
   ];
   const normalizedInputMessage = normalizeText(input.message);
   const latestHistoryMessage = history[history.length - 1];
+  const recentInactiveCampaignRequest = getRecentInactiveCampaignRequest(
+    history,
+    normalizedInputMessage
+  );
 
   if (
     latestHistoryMessage?.role !== "user" ||
@@ -1778,7 +1989,12 @@ export const runAgentOrchestrator = async (
           safeArguments
         );
         const marketingMutationGuardResult =
-          getCustomerMarketingMutationIntentGuard(input, toolName);
+          getCustomerMarketingMutationIntentGuard(
+            input,
+            toolName,
+            safeArguments,
+            recentInactiveCampaignRequest
+          );
         const result = toolCall.invalidArguments
           ? {
               success: false,
@@ -1888,6 +2104,39 @@ export const runAgentOrchestrator = async (
           name: toolName,
           content: JSON.stringify(buildToolResultForModel(toolName, result))
         });
+
+        if (
+          result.success &&
+          result.requiresConfirmation &&
+          campaignConfirmationPreviewToolNames.has(toolName) &&
+          result.message.trim()
+        ) {
+          const previewMessage = sanitizeStaffFacingFinalText(result.message);
+
+          console.info("Restaurant agent completed", {
+            provider: provider.name,
+            model: provider.model,
+            restaurantId,
+            senderRole: input.sender.role,
+            conversationKey,
+            toolRoundCount: round + 1,
+            requestedToolNames: executedTools.map((tool) => tool.name),
+            completionReason: "authoritative_campaign_confirmation_preview",
+            latencyMs: Date.now() - startedAt,
+            totalTokens: usage?.totalTokens
+          });
+
+          return {
+            success: true,
+            message: previewMessage,
+            data: importantData,
+            provider: provider.name,
+            model: provider.model,
+            responseId,
+            executedTools,
+            usage
+          };
+        }
       }
     }
 
