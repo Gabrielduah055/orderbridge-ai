@@ -1508,6 +1508,63 @@ test("campaign audience descriptions format dates in the restaurant timezone", a
   }
 });
 
+test("announcement and holiday audiences bypass missing consent but preserve explicit opt-outs", async () => {
+  const originalProfileFind = CustomerProfile.find;
+  const declinedWithoutHardOptOut = {
+    _id: profileId,
+    customerPhone,
+    orderCount: 1,
+    marketingConsent: false,
+    isOptedOut: false,
+    updatedAt: now
+  };
+
+  try {
+    CustomerProfile.find = () =>
+      resolvedQuery([declinedWithoutHardOptOut]);
+
+    const promotion = await selectCustomerCampaignAudience(
+      restaurantId,
+      { type: "all_eligible_customers" },
+      now,
+      "Africa/Accra",
+      "promotion"
+    );
+    const announcement = await selectCustomerCampaignAudience(
+      restaurantId,
+      { type: "all_eligible_customers" },
+      now,
+      "Africa/Accra",
+      "announcement"
+    );
+
+    assert.equal(promotion.estimatedEligibleRecipients, 0);
+    assert.equal(promotion.excludedNoConsent, 1);
+    assert.equal(announcement.estimatedEligibleRecipients, 1);
+    assert.equal(announcement.excludedNoConsent, 0);
+
+    CustomerProfile.find = () =>
+      resolvedQuery([
+        {
+          ...declinedWithoutHardOptOut,
+          isOptedOut: true
+        }
+      ]);
+    const holiday = await selectCustomerCampaignAudience(
+      restaurantId,
+      { type: "all_eligible_customers" },
+      now,
+      "Africa/Accra",
+      "holiday"
+    );
+
+    assert.equal(holiday.estimatedEligibleRecipients, 0);
+    assert.equal(holiday.excludedOptOut, 1);
+  } finally {
+    CustomerProfile.find = originalProfileFind;
+  }
+});
+
 test("behavioural targeting uses completed tenant-scoped orders and owned menu items", async () => {
   const originalProfileFind = CustomerProfile.find;
   const originalOrderFind = Order.find;
@@ -2051,6 +2108,45 @@ test("send-time checks cancel revoked, opted-out, missing, cancelled, and change
       })
     ).reason,
     "campaign_version_changed"
+  );
+});
+
+test("send-time campaign eligibility uses the authoritative campaign type", async () => {
+  const noConsentProfile = {
+    customerPhone,
+    marketingConsent: false,
+    isOptedOut: false
+  };
+
+  assert.equal(
+    (
+      await runCampaignStaleCheck({
+        campaign: makeCampaign({ campaignType: "promotion" }),
+        profile: noConsentProfile
+      })
+    ).reason,
+    "marketing_consent_revoked"
+  );
+  assert.equal(
+    (
+      await runCampaignStaleCheck({
+        campaign: makeCampaign({ campaignType: "announcement" }),
+        profile: noConsentProfile
+      })
+    ).reason,
+    null
+  );
+  assert.equal(
+    (
+      await runCampaignStaleCheck({
+        campaign: makeCampaign({ campaignType: "holiday" }),
+        profile: {
+          ...noConsentProfile,
+          isOptedOut: true
+        }
+      })
+    ).reason,
+    "customer_opted_out"
   );
 });
 

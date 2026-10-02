@@ -39,9 +39,9 @@ For verified staff, order/report follow-up filters are stored separately in a bo
 
 ## Campaign intent, eligibility, and media
 
-Natural requests to send customer greetings, reopening announcements, or invitations to order are treated as campaign draft requests even when the word “campaign” is absent. Read-only customer analytics remain mutation-free. One-customer marketing uses a tenant-scoped saved-customer resolution and the standard campaign approval and delivery workflow.
+Natural requests to broadcast customer greetings, reopening announcements, or invitations to order are treated as campaign draft requests even when the word “campaign” is absent. Read-only customer analytics remain mutation-free. One-customer marketing campaigns use a tenant-scoped saved-customer resolution and the standard campaign approval and delivery workflow. Owners and managers may instead preview and confirm one direct operational message to one saved customer; the backend binds that confirmation to the resolved profile and stable identity and revalidates it at delivery.
 
-Campaign eligibility is opt-out based for existing customers: valid messaging identities qualify unless the saved preference is an explicit decline or the profile is opted out. Unknown preferences remain unknown. Eligibility is recalculated during preview, approval, scheduling, and send-time checks.
+Campaign eligibility depends on campaign type. Promotions and inactivity re-engagement exclude `marketingConsent === false` and explicit opt-outs. Announcements and holiday greetings do not require marketing consent, but explicit opt-outs remain excluded. Unknown preferences remain unknown. Eligibility is recalculated during preview, approval, scheduling, and send-time checks.
 
 Campaign media is always backend-trusted. A saved menu image is resolved by restaurant item name. A custom image must arrive through the owner WhatsApp upload workflow, pass Wasender metadata limits and Cloudinary validation, and be persisted on a versioned campaign. Media edits invalidate prior approval. The queue sends the approved message as the image caption and revalidates exact campaign version, recipient eligibility, and media identity immediately before delivery.
 

@@ -91,11 +91,13 @@ Owner business reports expose busiest calendar dates and weekday aggregates for 
 
 ## Customer campaigns
 
-Existing restaurant customers with a valid current WhatsApp identity are campaign-eligible unless `marketingConsent === false` or `isOptedOut === true`. An unknown preference remains unknown; campaign eligibility does not rewrite it as consent. STOP handling immediately cancels pending promotional delivery. Provider or deployment-specific messaging restrictions may still apply independently.
+Promotional and inactivity-reengagement campaigns require a valid current WhatsApp identity and exclude customers when `marketingConsent === false` or `isOptedOut === true`. Announcement and holiday campaigns may include valid saved customers without marketing consent, but always exclude `isOptedOut === true`. An unknown preference remains unknown; campaign eligibility does not rewrite it as consent. STOP handling immediately cancels every pending campaign delivery. Provider or deployment-specific messaging restrictions may still apply independently.
 
 Campaign drafts support all eligible customers, behavioural segments, and one safely resolved saved customer. Same-name customers require masked-phone clarification, and arbitrary external recipients are not accepted. Greetings, reopening announcements, and invitations to order use the same draft, preview, explicit approval, snapshot, idempotent queue, and send-time revalidation workflow as other campaigns.
 
 A campaign may attach an existing saved menu-item image or a trusted owner-uploaded JPG, PNG, or WEBP up to 5 MB. Custom uploads use the existing Wasender decryption and Cloudinary validation path. Any message, audience, schedule, or media change increments the campaign version and requires renewed approval. Delivery sends the approved text as the image caption and cancels stale work when the campaign version, recipient eligibility, restaurant credentials, or referenced media changes.
+
+Owners and managers can preview and confirm one direct message to one safely resolved saved customer. Direct messages are tenant-scoped, reject explicitly opted-out customers, bind confirmation to the resolved profile and stable WhatsApp identity, use an idempotent outbound queue key, and revalidate staff authorization, restaurant credentials, customer identity, and opt-out state immediately before delivery.
 
 ## Firebase Setup
 

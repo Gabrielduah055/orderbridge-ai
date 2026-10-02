@@ -5,6 +5,7 @@ import {
   customerCampaignStatuses,
   customerCampaignTargetingTypes,
   customerCampaignTypes,
+  type CustomerCampaignType,
   type CustomerCampaignTargetingRule,
   type ICustomerCampaignDocument
 } from "../models/customerCampaign.model";
@@ -40,6 +41,11 @@ import { classifyCustomerMarketingEligibility } from "./customerMarketingPrefere
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import { validateTrustedCloudinaryImage } from "./cloudinary.service";
 import { maskCustomerPhone } from "./customerProfile.service";
+
+export const campaignTypeAllowsNoConsent = (
+  campaignType?: CustomerCampaignType
+): boolean =>
+  campaignType === "announcement" || campaignType === "holiday";
 
 const campaignTargetingBaseSchema = z
   .object({
@@ -554,7 +560,8 @@ export const selectCustomerCampaignAudience = async (
     | CustomerCampaignTargetingRule
     | z.infer<typeof customerCampaignTargetingSchema>,
   now = new Date(),
-  timezone?: string
+  timezone?: string,
+  campaignType?: CustomerCampaignType
 ): Promise<CustomerCampaignAudiencePreview> => {
   ensureObjectId(restaurantId, "restaurantId");
   const targeting =
@@ -658,7 +665,10 @@ export const selectCustomerCampaignAudience = async (
       excludedOptOut += 1;
       continue;
     }
-    if (eligibility === "no_consent") {
+    if (
+      eligibility === "no_consent" &&
+      !campaignTypeAllowsNoConsent(campaignType)
+    ) {
       excludedNoConsent += 1;
       continue;
     }
@@ -752,7 +762,8 @@ export const createCustomerCampaignDraft = async (
     input.restaurantId,
     targeting,
     now,
-    staff.restaurant.timezone
+    staff.restaurant.timezone,
+    parsed.campaignType
   );
   const campaign = await CustomerCampaign.create({
     restaurantId: input.restaurantId,
@@ -863,11 +874,14 @@ export const updateCustomerCampaignDraft = async (
     throw new BadRequestError("scheduledAt cannot be in the past");
   }
 
+  const effectiveCampaignType =
+    parsed.campaignType ?? campaign.campaignType;
   const preview = await selectCustomerCampaignAudience(
     input.restaurantId,
     targeting,
     now,
-    staff.restaurant.timezone || campaign.timezone
+    staff.restaurant.timezone || campaign.timezone,
+    effectiveCampaignType
   );
 
   if (parsed.name !== undefined) campaign.name = parsed.name;
@@ -965,7 +979,8 @@ export const previewCustomerCampaign = async (
     restaurantId,
     campaign.targeting,
     now,
-    campaign.timezone
+    campaign.timezone,
+    campaign.campaignType
   );
 
   return {
@@ -1102,7 +1117,8 @@ export const approveCustomerCampaign = async (
     restaurantId,
     campaign.targeting,
     now,
-    campaign.timezone
+    campaign.timezone,
+    campaign.campaignType
   );
   const restaurantObjectId = new Types.ObjectId(restaurantId);
   const session = await (

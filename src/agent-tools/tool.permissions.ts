@@ -15,6 +15,7 @@ export const toolPermissions = {
   list_customers: ["owner"],
   get_customer_insights: ["owner"],
   get_customer_segment_insights: ["owner"],
+  send_customer_message: ["owner", "manager"],
   get_latest_customer_order: ["customer"],
   respond_to_order_check_in: ["customer"],
   get_customer_recommendations: ["customer"],

@@ -129,6 +129,11 @@ import {
   startMenuItemImageUpload
 } from "../services/menuItemImageWorkflow.service";
 import { startCampaignImageUpload } from "../services/campaignImageWorkflow.service";
+import {
+  enqueueStaffCustomerMessage,
+  resolveStaffCustomerMessageTarget,
+  sendCustomerMessageSchema
+} from "../services/staffCustomerMessage.service";
 
 const emptySchema = z.object({}).strict();
 const getSenderRecipient = (context: ToolExecutionContext): string =>
@@ -989,7 +994,8 @@ const createPendingToolAction = async (
   context: ToolExecutionContext,
   toolName: ToolName,
   args: Record<string, unknown>,
-  summary: string
+  summary: string,
+  trustedData?: Record<string, unknown>
 ): Promise<ToolResult> => {
   // Cancel any stale TOOL_CALL pending actions for this sender before creating a new one.
   // Without this, every AI proposal creates a new pending action and they accumulate,
@@ -1016,7 +1022,7 @@ const createPendingToolAction = async (
     action: "TOOL_CALL",
     toolName,
     arguments: args,
-    data: args,
+    data: trustedData ?? args,
     status: "pending",
     summary,
     confirmationMessage: summary,
@@ -1740,6 +1746,101 @@ export const toolRegistry: Record<ToolName, RegisteredTool> = {
           revenue: metrics.completedRevenue,
           bestSellingItem: metrics.topSellingItems[0]
         }
+      };
+    }
+  },
+  send_customer_message: {
+    definition: {
+      name: "send_customer_message",
+      description:
+        "Owner/manager only. Preview and, after explicit persisted confirmation, queue one direct message to one safely resolved saved customer. This is not a broadcast tool; use campaign tools for multiple customers.",
+      parameters: {
+        customerName:
+          "Optional exact saved customer name. Add customerPhoneEnding when the name is ambiguous.",
+        customerPhoneEnding:
+          "Optional 3 to 10 final phone digits used to safely disambiguate a saved customer.",
+        message: "Final direct message text, maximum 500 characters."
+      }
+    },
+    roles: toolPermissions.send_customer_message,
+    sensitive: true,
+    schema: sendCustomerMessageSchema,
+    handler: async (args, context) => {
+      if (!context.confirmed) {
+        const target = await resolveStaffCustomerMessageTarget({
+          restaurantId: context.restaurantId,
+          senderPhone: context.sender.normalizedPhone,
+          customerName: args.customerName,
+          customerPhoneEnding: args.customerPhoneEnding
+        });
+        const pending = await createPendingToolAction(
+          context,
+          "send_customer_message",
+          args,
+          `Send this message to ${target.name} (${target.maskedPhone})?\n\n${args.message}`,
+          {
+            customerProfileId: target.customerProfileId,
+            customerKey: target.customerKey,
+            customerPhone: target.customerPhone
+          }
+        );
+
+        return {
+          ...pending,
+          data: {
+            customer: {
+              name: target.name,
+              maskedPhone: target.maskedPhone
+            },
+            message: args.message
+          }
+        };
+      }
+
+      const trusted = context.trustedPendingActionData;
+      const customerProfileId =
+        typeof trusted?.customerProfileId === "string"
+          ? trusted.customerProfileId
+          : "";
+      const customerPhone =
+        typeof trusted?.customerPhone === "string"
+          ? trusted.customerPhone
+          : "";
+      const customerKey =
+        typeof trusted?.customerKey === "string"
+          ? trusted.customerKey
+          : undefined;
+
+      if (
+        !context.pendingActionId ||
+        !customerProfileId ||
+        !customerPhone
+      ) {
+        return {
+          success: false,
+          code: "STAFF_DIRECT_MESSAGE_CONFIRMATION_INVALID",
+          message:
+            "That customer-message confirmation is invalid. Please create a new preview."
+        };
+      }
+
+      const result = await enqueueStaffCustomerMessage({
+        restaurantId: context.restaurantId,
+        senderPhone: context.sender.normalizedPhone,
+        message: args.message,
+        pendingActionId: context.pendingActionId,
+        customerProfileId,
+        expectedCustomerKey: customerKey,
+        expectedCustomerPhone: customerPhone
+      });
+
+      return {
+        success: true,
+        message:
+          result.status === "sent"
+            ? `That message was already sent to ${result.customer.name}.`
+            : `Message queued for ${result.customer.name}.`,
+        data: result
       };
     }
   },
