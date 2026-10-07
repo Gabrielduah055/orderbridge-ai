@@ -5,8 +5,8 @@ import { OutboundMessage } from "../models/outboundMessage.model";
 import { Restaurant } from "../models/Restaurant";
 import { WebhookEvent } from "../models/webhookEvent.model";
 import {
-  getQueuedAdminAuditCount,
   adminAuditRetentionDays,
+  getAdminAuditPersistenceState,
   sanitizeAuditChangedFields,
   sanitizeAuditMetadata
 } from "./adminAudit.service";
@@ -16,9 +16,32 @@ import { getAllRuntimeHealthSnapshots } from "./runtimeHealth.service";
 const maxOperationalRecords = 5_000;
 const whatsappObservationStaleAfterSeconds = 24 * 60 * 60;
 const agentObservationStaleAfterSeconds = 60 * 60;
+const defaultMongoPingDeadlineMs = 1_500;
+const defaultMongoBacklogDeadlineMs = 2_000;
 const processStartedAt = new Date(Date.now() - process.uptime() * 1000);
 
 type LeanRecord = Record<string, unknown>;
+
+class DiagnosticDeadlineError extends Error {}
+
+const withDeadline = async <T>(operation: Promise<T>, deadlineMs: number): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new DiagnosticDeadlineError("Diagnostic deadline exceeded")),
+      Math.max(1, deadlineMs)
+    );
+
+    void operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 
 const safeDate = (value: unknown): Date | null => {
   if (value instanceof Date) return value;
@@ -140,21 +163,136 @@ export interface OperationsWindow {
   to: Date;
 }
 
+interface WhatsAppOperationsDependencies {
+  loadRestaurants?: (filter: Record<string, unknown>, limit: number) => Promise<LeanRecord[]>;
+  loadInboundActivity?: (
+    sessionIds: string[],
+    window: OperationsWindow,
+    limit: number
+  ) => Promise<LeanRecord[]>;
+  loadOutboundActivity?: (
+    restaurantIds: unknown[],
+    window: OperationsWindow,
+    limit: number
+  ) => Promise<LeanRecord[]>;
+}
+
+const latestDateInWindow = (
+  record: LeanRecord,
+  fields: string[],
+  window: OperationsWindow
+): Date | null =>
+  fields.reduce<Date | null>((latest, field) => {
+    const date = safeDate(record[field]);
+    if (!date || date < window.from || date > window.to) return latest;
+    return !latest || date > latest ? date : latest;
+  }, null);
+
+const loadWhatsAppRestaurants = async (
+  filter: Record<string, unknown>,
+  limit: number
+): Promise<LeanRecord[]> =>
+  (await Restaurant.find(filter)
+    .select("_id name wasenderSessionId updatedAt +wasenderApiToken")
+    .sort({ _id: 1 })
+    .limit(limit)
+    .lean()) as unknown as LeanRecord[];
+
+const loadInboundActivity = async (
+  sessionIds: string[],
+  window: OperationsWindow,
+  limit: number
+): Promise<LeanRecord[]> => {
+  if (sessionIds.length === 0) return [];
+
+  return (await WebhookEvent.aggregate([
+    {
+      $match: {
+        sessionId: { $in: sessionIds },
+        $or: [
+          { processedAt: { $gte: window.from, $lte: window.to } },
+          { updatedAt: { $gte: window.from, $lte: window.to } },
+          { createdAt: { $gte: window.from, $lte: window.to } }
+        ]
+      }
+    },
+    {
+      $addFields: {
+        diagnosticActivityAt: { $max: ["$processedAt", "$updatedAt", "$createdAt"] }
+      }
+    },
+    { $match: { diagnosticActivityAt: { $gte: window.from, $lte: window.to } } },
+    { $sort: { diagnosticActivityAt: -1, _id: -1 } },
+    { $limit: limit },
+    {
+      $project: {
+        restaurantId: 1,
+        sessionId: 1,
+        status: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        processedAt: 1,
+        diagnosticActivityAt: 1
+      }
+    }
+  ])) as LeanRecord[];
+};
+
+const loadOutboundActivity = async (
+  restaurantIds: unknown[],
+  window: OperationsWindow,
+  limit: number
+): Promise<LeanRecord[]> => {
+  if (restaurantIds.length === 0) return [];
+
+  return (await OutboundMessage.aggregate([
+    {
+      $match: {
+        restaurantId: { $in: restaurantIds },
+        $or: [
+          { sentAt: { $gte: window.from, $lte: window.to } },
+          { lastAttemptAt: { $gte: window.from, $lte: window.to } },
+          { createdAt: { $gte: window.from, $lte: window.to } }
+        ]
+      }
+    },
+    {
+      $addFields: {
+        diagnosticActivityAt: { $max: ["$sentAt", "$lastAttemptAt", "$createdAt"] }
+      }
+    },
+    { $match: { diagnosticActivityAt: { $gte: window.from, $lte: window.to } } },
+    { $sort: { diagnosticActivityAt: -1, _id: -1 } },
+    { $limit: limit },
+    {
+      $project: {
+        restaurantId: 1,
+        sessionId: 1,
+        status: 1,
+        attempts: 1,
+        createdAt: 1,
+        sentAt: 1,
+        lastAttemptAt: 1,
+        diagnosticActivityAt: 1
+      }
+    }
+  ])) as LeanRecord[];
+};
+
 export const getWhatsAppOperations = async (input: {
   window: OperationsWindow;
   limit: number;
   after?: string;
-}) => {
+}, dependencies: WhatsAppOperationsDependencies = {}) => {
   const generatedAt = new Date();
   const restaurantFilter =
     input.after && Types.ObjectId.isValid(input.after)
       ? { _id: { $gt: new Types.ObjectId(input.after) } }
       : {};
-  const restaurants = (await Restaurant.find(restaurantFilter)
-    .select("_id name wasenderSessionId updatedAt +wasenderApiToken")
-    .sort({ _id: 1 })
-    .limit(input.limit + 1)
-    .lean()) as unknown as LeanRecord[];
+  const restaurants = await (dependencies.loadRestaurants ?? loadWhatsAppRestaurants)(
+    restaurantFilter,
+    input.limit + 1
+  );
   const hasMore = restaurants.length > input.limit;
   const page = restaurants.slice(0, input.limit);
   const restaurantIds = page.map((restaurant) => restaurant._id).filter(Boolean);
@@ -163,48 +301,60 @@ export const getWhatsAppOperations = async (input: {
     .filter((value): value is string => Boolean(value));
 
   const [webhooks, outboundMessages] = await Promise.all([
-    WebhookEvent.find({
-      createdAt: { $gte: input.window.from, $lte: input.window.to },
-      sessionId: { $in: sessionIds }
-    })
-      .select("restaurantId sessionId status createdAt processedAt")
-      .sort({ createdAt: -1 })
-      .limit(maxOperationalRecords + 1)
-      .lean(),
-    OutboundMessage.find({
-      createdAt: { $gte: input.window.from, $lte: input.window.to },
-      restaurantId: { $in: restaurantIds }
-    })
-      .select("restaurantId sessionId status createdAt sentAt lastAttemptAt attempts")
-      .sort({ createdAt: -1 })
-      .limit(maxOperationalRecords + 1)
-      .lean()
+    (dependencies.loadInboundActivity ?? loadInboundActivity)(
+      sessionIds,
+      input.window,
+      maxOperationalRecords + 1
+    ),
+    (dependencies.loadOutboundActivity ?? loadOutboundActivity)(
+      restaurantIds,
+      input.window,
+      maxOperationalRecords + 1
+    )
   ]);
 
-  const boundedWebhooks = (webhooks as unknown as LeanRecord[]).slice(0, maxOperationalRecords);
-  const boundedOutbound = (outboundMessages as unknown as LeanRecord[]).slice(0, maxOperationalRecords);
+  const inboundActivity = webhooks
+    .map((record) => ({
+      record,
+      activityAt: latestDateInWindow(
+        record,
+        ["diagnosticActivityAt", "processedAt", "updatedAt", "createdAt"],
+        input.window
+      )
+    }))
+    .filter((entry): entry is { record: LeanRecord; activityAt: Date } => Boolean(entry.activityAt))
+    .sort((left, right) => right.activityAt.getTime() - left.activityAt.getTime());
+  const outboundActivity = outboundMessages
+    .map((record) => ({
+      record,
+      activityAt: latestDateInWindow(
+        record,
+        ["diagnosticActivityAt", "sentAt", "lastAttemptAt", "createdAt"],
+        input.window
+      )
+    }))
+    .filter((entry): entry is { record: LeanRecord; activityAt: Date } => Boolean(entry.activityAt))
+    .sort((left, right) => right.activityAt.getTime() - left.activityAt.getTime());
+  const inboundTruncated = inboundActivity.length > maxOperationalRecords;
+  const outboundTruncated = outboundActivity.length > maxOperationalRecords;
+  const boundedWebhooks = inboundActivity.slice(0, maxOperationalRecords);
+  const boundedOutbound = outboundActivity.slice(0, maxOperationalRecords);
 
   const sessions = page.map((restaurant) => {
     const restaurantId = String(restaurant._id);
     const sessionId = safeString(restaurant.wasenderSessionId);
     const inbound = boundedWebhooks.filter(
-      (event) =>
-        String(event.restaurantId ?? "") === restaurantId ||
-        Boolean(sessionId && event.sessionId === sessionId)
+      ({ record }) =>
+        String(record.restaurantId ?? "") === restaurantId ||
+        Boolean(sessionId && record.sessionId === sessionId)
     );
     const outbound = boundedOutbound.filter(
-      (message) => String(message.restaurantId ?? "") === restaurantId
+      ({ record }) => String(record.restaurantId ?? "") === restaurantId
     );
     const lastInbound = inbound[0];
     const lastOutbound = outbound[0];
-    const lastInboundAt = lastInbound
-      ? safeDate(lastInbound.processedAt) ?? safeDate(lastInbound.createdAt)
-      : null;
-    const lastOutboundAt = lastOutbound
-      ? safeDate(lastOutbound.sentAt) ??
-        safeDate(lastOutbound.lastAttemptAt) ??
-        safeDate(lastOutbound.createdAt)
-      : null;
+    const lastInboundAt = lastInbound?.activityAt ?? null;
+    const lastOutboundAt = lastOutbound?.activityAt ?? null;
 
     return {
       restaurantId,
@@ -222,7 +372,7 @@ export const getWhatsAppOperations = async (input: {
       },
       inbound: {
         status: lastInbound
-          ? lastInbound.status === "failed"
+          ? lastInbound.record.status === "failed"
             ? "failure_observed"
             : "activity_observed"
           : "unknown",
@@ -233,11 +383,11 @@ export const getWhatsAppOperations = async (input: {
           generatedAt
         ),
         staleAfterSeconds: whatsappObservationStaleAfterSeconds,
-        processed: inbound.filter((event) => event.status === "processed").length,
-        failed: inbound.filter((event) => event.status === "failed").length
+        processed: inbound.filter(({ record }) => record.status === "processed").length,
+        failed: inbound.filter(({ record }) => record.status === "failed").length
       },
       outbound: {
-        status: lastOutbound ? safeString(lastOutbound.status) ?? "unknown" : "unknown",
+        status: lastOutbound ? safeString(lastOutbound.record.status) ?? "unknown" : "unknown",
         observedAt: lastOutboundAt,
         freshness: getFreshness(
           lastOutboundAt,
@@ -245,9 +395,9 @@ export const getWhatsAppOperations = async (input: {
           generatedAt
         ),
         staleAfterSeconds: whatsappObservationStaleAfterSeconds,
-        sent: outbound.filter((message) => message.status === "sent").length,
-        failed: outbound.filter((message) => message.status === "failed").length,
-        pending: outbound.filter((message) => message.status === "pending").length
+        sent: outbound.filter(({ record }) => record.status === "sent").length,
+        failed: outbound.filter(({ record }) => record.status === "failed").length,
+        pending: outbound.filter(({ record }) => record.status === "pending").length
       }
     };
   });
@@ -257,8 +407,10 @@ export const getWhatsAppOperations = async (input: {
     window: input.window,
     sample: {
       limit: maxOperationalRecords,
-      truncated:
-        webhooks.length > maxOperationalRecords || outboundMessages.length > maxOperationalRecords
+      truncated: inboundTruncated || outboundTruncated,
+      inboundTruncated,
+      outboundTruncated,
+      countsRepresent: "records_with_activity_in_window"
     },
     summary: {
       total: sessions.length,
@@ -329,42 +481,169 @@ export const getAgentOperations = async (input: {
   };
 };
 
-export const getSystemHealth = async () => {
-  const generatedAt = new Date();
+interface QueueBacklogValues {
+  pending: number;
+  due: number;
+  sending: number;
+  failedLast24h: number;
+  oldestPendingAt: Date | null;
+  lastAttemptAt: Date | null;
+}
+
+type QueueBacklogUnavailableReason =
+  | "mongodb_disconnected"
+  | "mongodb_ping_failed"
+  | "mongodb_ping_timeout"
+  | "query_failed"
+  | "query_timeout";
+
+interface QueueBacklogObservation {
+  status: "available" | "unavailable";
+  reason: QueueBacklogUnavailableReason | null;
+  observedAt: Date | null;
+  pending: number | null;
+  due: number | null;
+  sending: number | null;
+  failedLast24h: number | null;
+  oldestPendingAt: Date | null;
+  lastAttemptAt: Date | null;
+}
+
+interface SystemHealthDependencies {
+  now?: () => Date;
+  getMongoReadyState?: () => number;
+  pingMongo?: () => Promise<void>;
+  loadQueueBacklog?: (generatedAt: Date, deadlineMs: number) => Promise<QueueBacklogValues>;
+  pingDeadlineMs?: number;
+  backlogDeadlineMs?: number;
+}
+
+const loadQueueBacklog = async (
+  generatedAt: Date,
+  deadlineMs: number
+): Promise<QueueBacklogValues> => {
+  const oneDayAgo = new Date(generatedAt.getTime() - 24 * 60 * 60 * 1000);
+  const [pending, due, sending, failedLast24h, oldestPending, latestAttempt] = await Promise.all([
+    OutboundMessage.countDocuments({ status: "pending" }).maxTimeMS(deadlineMs).exec(),
+    OutboundMessage.countDocuments({ status: "pending", nextAttemptAt: { $lte: generatedAt } })
+      .maxTimeMS(deadlineMs)
+      .exec(),
+    OutboundMessage.countDocuments({ status: "sending" }).maxTimeMS(deadlineMs).exec(),
+    OutboundMessage.countDocuments({ status: "failed", updatedAt: { $gte: oneDayAgo } })
+      .maxTimeMS(deadlineMs)
+      .exec(),
+    OutboundMessage.findOne({ status: "pending" })
+      .select("createdAt nextAttemptAt")
+      .sort({ createdAt: 1 })
+      .maxTimeMS(deadlineMs)
+      .lean()
+      .exec(),
+    OutboundMessage.findOne({ lastAttemptAt: { $exists: true } })
+      .select("lastAttemptAt")
+      .sort({ lastAttemptAt: -1 })
+      .maxTimeMS(deadlineMs)
+      .lean()
+      .exec()
+  ]);
+
+  return {
+    pending,
+    due,
+    sending,
+    failedLast24h,
+    oldestPendingAt: safeDate((oldestPending as unknown as LeanRecord | null)?.createdAt),
+    lastAttemptAt: safeDate((latestAttempt as unknown as LeanRecord | null)?.lastAttemptAt)
+  };
+};
+
+const unavailableBacklog = (
+  reason: QueueBacklogUnavailableReason
+): QueueBacklogObservation => ({
+  status: "unavailable" as const,
+  reason,
+  observedAt: null,
+  pending: null,
+  due: null,
+  sending: null,
+  failedLast24h: null,
+  oldestPendingAt: null,
+  lastAttemptAt: null
+});
+
+export const getSystemHealth = async (dependencies: SystemHealthDependencies = {}) => {
+  const now = dependencies.now ?? (() => new Date());
+  const generatedAt = now();
+  const runtime = getAllRuntimeHealthSnapshots(generatedAt);
+  const auditState = getAdminAuditPersistenceState();
+  const readyState = dependencies.getMongoReadyState?.() ?? mongoose.connection.readyState;
+  const pingDeadlineMs = dependencies.pingDeadlineMs ?? defaultMongoPingDeadlineMs;
+  const backlogDeadlineMs = dependencies.backlogDeadlineMs ?? defaultMongoBacklogDeadlineMs;
   const mongoStartedAt = Date.now();
   let mongoStatus: "healthy" | "degraded" | "unknown" = "unknown";
   let mongoObservedAt: Date | null = null;
   let mongoLatencyMs: number | null = null;
+  let mongoFailureCode: string | null = null;
+  let backlog: QueueBacklogObservation = unavailableBacklog("mongodb_disconnected");
 
-  if (mongoose.connection.readyState === 1 && mongoose.connection.db) {
+  if (readyState !== 1) {
+    mongoStatus = "degraded";
+    mongoObservedAt = generatedAt;
+    mongoFailureCode = "MONGODB_DISCONNECTED";
+  } else {
+    const pingMongo =
+      dependencies.pingMongo ??
+      (async () => {
+        if (!mongoose.connection.db) throw new Error("MongoDB handle unavailable");
+        await mongoose.connection.db.admin().ping();
+      });
+
     try {
-      await mongoose.connection.db.admin().ping();
-      mongoObservedAt = new Date();
+      await withDeadline(pingMongo(), pingDeadlineMs);
+      mongoObservedAt = now();
       mongoLatencyMs = Date.now() - mongoStartedAt;
       mongoStatus = "healthy";
-    } catch {
-      mongoObservedAt = new Date();
-      mongoLatencyMs = Date.now() - mongoStartedAt;
+
+      try {
+        const values = await withDeadline(
+          (dependencies.loadQueueBacklog ?? loadQueueBacklog)(generatedAt, backlogDeadlineMs),
+          backlogDeadlineMs
+        );
+        backlog = {
+          status: "available",
+          reason: null,
+          observedAt: now(),
+          ...values
+        };
+      } catch (error) {
+        const timedOut = error instanceof DiagnosticDeadlineError;
+        mongoStatus = "degraded";
+        mongoObservedAt = now();
+        mongoFailureCode = timedOut
+          ? "MONGODB_BACKLOG_QUERY_TIMEOUT"
+          : "MONGODB_BACKLOG_QUERY_FAILED";
+        backlog = unavailableBacklog(timedOut ? "query_timeout" : "query_failed");
+      }
+    } catch (error) {
+      const timedOut = error instanceof DiagnosticDeadlineError;
       mongoStatus = "degraded";
+      mongoObservedAt = now();
+      mongoFailureCode = timedOut ? "MONGODB_PING_TIMEOUT" : "MONGODB_PING_FAILED";
+      backlog = unavailableBacklog(
+        timedOut ? "mongodb_ping_timeout" : "mongodb_ping_failed"
+      );
     }
   }
 
-  const oneDayAgo = new Date(generatedAt.getTime() - 24 * 60 * 60 * 1000);
-  const [pending, due, sending, failedLast24h, oldestPending, latestAttempt] = await Promise.all([
-    OutboundMessage.countDocuments({ status: "pending" }),
-    OutboundMessage.countDocuments({ status: "pending", nextAttemptAt: { $lte: generatedAt } }),
-    OutboundMessage.countDocuments({ status: "sending" }),
-    OutboundMessage.countDocuments({ status: "failed", updatedAt: { $gte: oneDayAgo } }),
-    OutboundMessage.findOne({ status: "pending" })
-      .select("createdAt nextAttemptAt")
-      .sort({ createdAt: 1 })
-      .lean(),
-    OutboundMessage.findOne({ lastAttemptAt: { $exists: true } })
-      .select("lastAttemptAt")
-      .sort({ lastAttemptAt: -1 })
-      .lean()
-  ]);
-  const runtime = getAllRuntimeHealthSnapshots(generatedAt);
+  const baseAuditRuntime =
+    runtime.find((entry) => entry.name === "audit_persistence") ?? null;
+  const auditRuntime =
+    baseAuditRuntime && auditState.unresolvedEntries > 0
+      ? {
+          ...baseAuditRuntime,
+          status: "degraded" as const,
+          lastFailureCode: "AUDIT_RETRY_PENDING"
+        }
+      : baseAuditRuntime;
 
   return {
     generatedAt,
@@ -378,26 +657,19 @@ export const getSystemHealth = async () => {
       status: mongoStatus,
       observedAt: mongoObservedAt,
       latencyMs: mongoLatencyMs,
-      readyState: mongoose.connection.readyState
+      readyState,
+      failureCode: mongoFailureCode
     },
     queue: {
       runtime: runtime.find((entry) => entry.name === "wasender_queue") ?? null,
-      backlog: {
-        observedAt: generatedAt,
-        pending,
-        due,
-        sending,
-        failedLast24h,
-        oldestPendingAt: safeDate((oldestPending as unknown as LeanRecord | null)?.createdAt),
-        lastAttemptAt: safeDate((latestAttempt as unknown as LeanRecord | null)?.lastAttemptAt)
-      }
+      backlog
     },
     schedulers: runtime.filter(
       (entry) => entry.name !== "wasender_queue" && entry.name !== "audit_persistence"
     ),
     auditPersistence: {
-      runtime: runtime.find((entry) => entry.name === "audit_persistence") ?? null,
-      queuedEntries: getQueuedAdminAuditCount()
+      runtime: auditRuntime,
+      ...auditState
     }
   };
 };

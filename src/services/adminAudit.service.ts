@@ -47,6 +47,8 @@ const allowedMetadataKeys = new Set([
 
 const retryQueue: IAdminAuditLog[] = [];
 let retryWorkerStarted = false;
+let inFlightAuditEntries = 0;
+let activeRetryPass: Promise<{ persisted: number; remaining: number }> | null = null;
 
 const boundedAuditRetentionDays = (): number => {
   const configured = Number(process.env.ADMIN_AUDIT_RETENTION_DAYS);
@@ -120,7 +122,7 @@ const persistEntry = async (
 };
 
 const enqueueRetry = (entry: IAdminAuditLog): AuditPersistenceResult => {
-  if (retryQueue.length >= maxQueuedAuditEntries) {
+  if (retryQueue.length + inFlightAuditEntries >= maxQueuedAuditEntries) {
     console.error("[adminAudit] Retry queue is full; audit entry was dropped", {
       action: entry.action,
       targetType: entry.targetType,
@@ -130,6 +132,7 @@ const enqueueRetry = (entry: IAdminAuditLog): AuditPersistenceResult => {
   }
 
   retryQueue.push(entry);
+  markRuntimeRunFailed("audit_persistence", "AUDIT_RETRY_PENDING");
   console.warn("[adminAudit] Audit entry queued for retry", {
     action: entry.action,
     targetType: entry.targetType,
@@ -196,14 +199,18 @@ export const recordAdminAuditAfterMutation = async (
   }
 };
 
-export const flushAdminAuditRetryQueue = async (
+const runAdminAuditRetryPass = async (
   dependencies: AuditPersistenceDependencies = {}
 ): Promise<{ persisted: number; remaining: number }> => {
   let persisted = 0;
   const batch = retryQueue.splice(0, auditRetryBatchSize);
+  inFlightAuditEntries += batch.length;
 
   for (const entry of batch) {
-    if (await persistEntry(entry, dependencies)) {
+    const didPersist = await persistEntry(entry, dependencies);
+    inFlightAuditEntries -= 1;
+
+    if (didPersist) {
       persisted += 1;
     } else {
       retryQueue.push(entry);
@@ -213,16 +220,36 @@ export const flushAdminAuditRetryQueue = async (
   return { persisted, remaining: retryQueue.length };
 };
 
+export const flushAdminAuditRetryQueue = (
+  dependencies: AuditPersistenceDependencies = {}
+): Promise<{ persisted: number; remaining: number }> => {
+  if (activeRetryPass) {
+    return activeRetryPass;
+  }
+
+  const pass = runAdminAuditRetryPass(dependencies);
+  activeRetryPass = pass;
+  void pass
+    .finally(() => {
+      if (activeRetryPass === pass) {
+        activeRetryPass = null;
+      }
+    })
+    .catch(() => undefined);
+  return pass;
+};
+
 export const startAdminAuditRetryWorker = (): void => {
   if (retryWorkerStarted) return;
   retryWorkerStarted = true;
   markRuntimeStarted("audit_persistence", auditRetryIntervalMs);
 
   const runPass = (): void => {
+    if (activeRetryPass) return;
     markRuntimeRunStarted("audit_persistence");
     void flushAdminAuditRetryQueue()
       .then((result) => {
-        if (result.remaining > 0) {
+        if (result.remaining > 0 || inFlightAuditEntries > 0) {
           markRuntimeRunFailed("audit_persistence", "AUDIT_RETRY_PENDING");
         } else {
           markRuntimeRunSucceeded("audit_persistence");
@@ -240,7 +267,16 @@ export const startAdminAuditRetryWorker = (): void => {
 
 export const getQueuedAdminAuditCount = (): number => retryQueue.length;
 
+export const getAdminAuditPersistenceState = () => ({
+  queuedEntries: retryQueue.length,
+  inFlightEntries: inFlightAuditEntries,
+  unresolvedEntries: retryQueue.length + inFlightAuditEntries,
+  retryPassRunning: activeRetryPass !== null
+});
+
 export const resetAdminAuditStateForTests = (): void => {
   retryQueue.splice(0, retryQueue.length);
   retryWorkerStarted = false;
+  inFlightAuditEntries = 0;
+  activeRetryPass = null;
 };
