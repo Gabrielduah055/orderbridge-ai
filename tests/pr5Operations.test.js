@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const http = require("node:http");
 const test = require("node:test");
 
 const { requireSuperAdmin } = require("../dist/middleware/requireSuperAdmin");
@@ -481,5 +482,84 @@ test("admin router protects all four contracts and controllers preserve the resp
     Object.assign(service, originals);
     delete require.cache[routesPath];
     delete require.cache[firebaseAuthPath];
+  }
+});
+
+test("authenticated health route returns bounded service unavailable when MongoDB authorization is unavailable", async () => {
+  const firebaseConfigPath = require.resolve("../dist/config/firebase");
+  const firebaseAuthPath = require.resolve("../dist/middleware/firebaseAuth.middleware");
+  const routesPath = require.resolve("../dist/routes/adminOperations.routes");
+  const appPath = require.resolve("../dist/app");
+  let firebaseVerificationCalls = 0;
+  const firebaseAuthClient = {
+    verifyIdToken: async (token) => {
+      firebaseVerificationCalls += 1;
+      assert.equal(token, "verified-firebase-token");
+      return { uid: "firebase-user-1" };
+    }
+  };
+  require.cache[firebaseConfigPath] = {
+    id: firebaseConfigPath,
+    filename: firebaseConfigPath,
+    loaded: true,
+    exports: { firebaseAdmin: { auth: () => firebaseAuthClient } }
+  };
+  delete require.cache[firebaseAuthPath];
+  delete require.cache[routesPath];
+  delete require.cache[appPath];
+
+  const { User } = require("../dist/models/User");
+  const originalFindOne = User.findOne;
+  let userLookupCalls = 0;
+  let server;
+
+  User.findOne = (...args) => {
+    userLookupCalls += 1;
+    return originalFindOne.apply(User, args);
+  };
+
+  try {
+    assert.notEqual(User.db.readyState, 1, "test requires a disconnected MongoDB authorization store");
+    const { app } = require("../dist/app");
+    server = http.createServer(app);
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+
+    const startedAt = Date.now();
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/admin/operations/health?role=super_admin`,
+      {
+        headers: {
+          authorization: "Bearer verified-firebase-token",
+          "x-user-role": "super_admin"
+        }
+      }
+    );
+    const elapsedMs = Date.now() - startedAt;
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.deepEqual(body, {
+      success: false,
+      message: "Authenticated access could not be authorized at this time"
+    });
+    assert.equal(firebaseVerificationCalls, 1);
+    assert.equal(userLookupCalls, 0);
+    assert.ok(elapsedMs < 1_000, `expected bounded response, received in ${elapsedMs}ms`);
+  } finally {
+    User.findOne = originalFindOne;
+    if (server) {
+      await new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+    delete require.cache[appPath];
+    delete require.cache[routesPath];
+    delete require.cache[firebaseAuthPath];
+    delete require.cache[firebaseConfigPath];
   }
 });
