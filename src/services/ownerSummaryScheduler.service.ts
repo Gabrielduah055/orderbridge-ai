@@ -16,6 +16,12 @@ import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
 } from "./wasenderQueue.service";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 
 const OWNER_SUMMARY_CHECK_INTERVAL_MS = 60_000;
 const DEFAULT_TIMEZONE = "Africa/Accra";
@@ -266,6 +272,7 @@ export const startOwnerSummaryScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("owner_summary_scheduler", OWNER_SUMMARY_CHECK_INTERVAL_MS);
   console.log(
     `[ownerSummary] Scheduler started (check every ${OWNER_SUMMARY_CHECK_INTERVAL_MS / 1000}s)`
   );
@@ -276,8 +283,14 @@ export const startOwnerSummaryScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("owner_summary_scheduler");
     void runOwnerSummarySchedulerPass()
       .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("owner_summary_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("owner_summary_scheduler");
+        }
         if (!schedulerPassLogged || result.summariesQueued > 0 || result.errors > 0) {
           console.info("[ownerSummary] Scheduler pass", {
             eligibleRestaurants: result.restaurantsChecked,
@@ -288,6 +301,7 @@ export const startOwnerSummaryScheduler = (): void => {
         }
       })
       .catch((error) => {
+        markRuntimeRunFailed("owner_summary_scheduler", "SCHEDULER_PASS_FAILED");
         console.error("Owner summary scheduler pass failed", {
           error: error instanceof Error ? error.message : "Unknown owner summary scheduler error"
         });

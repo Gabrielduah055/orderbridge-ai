@@ -17,6 +17,12 @@ import {
 } from "./orderFeedbackQueue.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
 import { resolveCurrentWhatsappRecipient } from "./customerIdentity.service";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 
 const ORDER_FEEDBACK_SCHEDULER_INTERVAL_MS = 60_000;
 export const ORDER_FEEDBACK_BATCH_SIZE = 50;
@@ -518,6 +524,7 @@ export const startOrderFeedbackScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("order_feedback_scheduler", ORDER_FEEDBACK_SCHEDULER_INTERVAL_MS);
   console.log(
     `[orderFeedback] Scheduler started (check every ${ORDER_FEEDBACK_SCHEDULER_INTERVAL_MS / 1000}s)`
   );
@@ -528,8 +535,14 @@ export const startOrderFeedbackScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("order_feedback_scheduler");
     void runOrderFeedbackSchedulerPass()
       .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("order_feedback_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("order_feedback_scheduler");
+        }
         if (
           !schedulerPassLogged ||
           result.followUpsScheduled > 0 ||
@@ -551,6 +564,7 @@ export const startOrderFeedbackScheduler = (): void => {
         }
       })
       .catch((error) => {
+        markRuntimeRunFailed("order_feedback_scheduler", "SCHEDULER_PASS_FAILED");
         console.error("Order feedback scheduler pass failed", {
           error:
             error instanceof Error

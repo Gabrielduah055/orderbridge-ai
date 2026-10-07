@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import * as menuImportService from "../services/menuImport.service";
 import type { MenuImportMode } from "../types/menu.types";
+import { recordAdminAuditAfterMutation } from "../services/adminAudit.service";
 
 const getRestaurantId = (req: Request): string => {
   return String(req.params.restaurantId);
@@ -17,6 +18,19 @@ export const importMenuFile = async (
       req.file,
       req.body.importMode as MenuImportMode | undefined
     );
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "menu.import",
+      targetType: "menu_import",
+      targetId: String(importRecord._id),
+      restaurantId: String(importRecord.restaurantId),
+      changedFields: ["fileType", "importMode", "status"],
+      metadata: {
+        fileType: importRecord.fileType,
+        importMode: req.body.importMode
+      }
+    });
 
     res.status(201).json({
       success: true,

@@ -1,6 +1,7 @@
 import type { IOrderDocument } from "../models/order.model";
 import type { IRestaurantDocument } from "../models/Restaurant";
 import type { ResolvedSender } from "../types/agent.types";
+import { observeOperationalTelemetry } from "./operationalTelemetry.service";
 
 interface HermesResponseOutputItem {
   type?: string;
@@ -217,6 +218,9 @@ export const sendHermesAgentMessage = async (
   const sessionKey = buildHermesSessionKey(restaurantId, sender);
   const instructions = buildHermesContextInstructions(restaurant, sender);
   const usesResponsesApi = /\/responses\/?$/i.test(agentUrl);
+  const startedAt = new Date();
+  const provider = "hermes";
+  const model = process.env.HERMES_AGENT_MODEL || "hermes-agent";
 
   try {
     const response = await fetch(agentUrl, {
@@ -265,13 +269,62 @@ export const sendHermesAgentMessage = async (
       throw new Error("Hermes agent result did not include assistant output text");
     }
 
+    observeOperationalTelemetry({
+      kind: "provider_request",
+      restaurantId,
+      senderRole: sender.role,
+      provider,
+      model,
+      success: true,
+      startedAt
+    });
+    observeOperationalTelemetry({
+      kind: "agent_turn",
+      restaurantId,
+      senderRole: sender.role,
+      provider,
+      model,
+      success: true,
+      startedAt
+    });
+
     return {
       message: sanitizeHermesOutputText(outputText),
       responseId: result.id,
       data: usesResponsesApi ? extractData(result as HermesResponsesApiResult) : undefined
     };
   } catch (error) {
-    console.error("Hermes agent response failed", error);
+    const timeoutFailure =
+      error instanceof Error &&
+      (error.name === "AbortError" || /\babort|timeout|timed out\b/i.test(error.message));
+    const errorCode = timeoutFailure
+      ? "HERMES_TIMEOUT"
+      : error instanceof Error && /status/i.test(error.message)
+        ? "HERMES_HTTP_ERROR"
+        : "HERMES_REQUEST_FAILED";
+    observeOperationalTelemetry({
+      kind: "provider_request",
+      restaurantId,
+      senderRole: sender.role,
+      provider,
+      model,
+      success: false,
+      timeout: timeoutFailure,
+      errorCode,
+      startedAt
+    });
+    observeOperationalTelemetry({
+      kind: "agent_turn",
+      restaurantId,
+      senderRole: sender.role,
+      provider,
+      model,
+      success: false,
+      timeout: timeoutFailure,
+      errorCode,
+      startedAt
+    });
+    console.error("Hermes agent response failed", { restaurantId, errorCode });
     return null;
   } finally {
     clearTimeout(timeout);

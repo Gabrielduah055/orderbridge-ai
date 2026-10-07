@@ -26,6 +26,7 @@ import type {
 } from "../../types/agent.types";
 import type { IOrderDocument } from "../../models/order.model";
 import { toolRegistry } from "../../agent-tools/tool.registry";
+import { observeOperationalTelemetry } from "../operationalTelemetry.service";
 
 const safeFallbackMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
@@ -1722,7 +1723,7 @@ export interface AgentOrchestratorDependencies {
   buildSystemPrompt?: typeof buildAgentSystemPrompt;
 }
 
-export const runAgentOrchestrator = async (
+const runAgentOrchestratorCore = async (
   input: AgentOrchestratorInput,
   dependencies: AgentOrchestratorDependencies = {}
 ): Promise<AgentOrchestratorResult> => {
@@ -1800,11 +1801,40 @@ export const runAgentOrchestrator = async (
 
   try {
     for (let round = 0; round < maxToolRounds; round += 1) {
-      const response = await provider.complete({
-        messages,
-        tools,
-        toolChoice: tools.length > 0 ? "auto" : "none"
-      });
+      const providerStartedAt = new Date();
+      let response;
+
+      try {
+        response = await provider.complete({
+          messages,
+          tools,
+          toolChoice: tools.length > 0 ? "auto" : "none"
+        });
+        observeOperationalTelemetry({
+          kind: "provider_request",
+          restaurantId,
+          senderRole: input.sender.role,
+          provider: provider.name,
+          model: provider.model,
+          success: true,
+          startedAt: providerStartedAt,
+          usage: response.usage
+        });
+      } catch (error) {
+        const errorCode = classifyOrchestratorError(error);
+        observeOperationalTelemetry({
+          kind: "provider_request",
+          restaurantId,
+          senderRole: input.sender.role,
+          provider: provider.name,
+          model: provider.model,
+          success: false,
+          timeout: errorCode === "PROVIDER_TIMEOUT",
+          errorCode,
+          startedAt: providerStartedAt
+        });
+        throw error;
+      }
       responseId = response.id ?? responseId;
       usage = mergeUsage(usage, response.usage);
 
@@ -2178,5 +2208,43 @@ export const runAgentOrchestrator = async (
       executedTools,
       usage
     };
+  }
+};
+
+export const runAgentOrchestrator = async (
+  input: AgentOrchestratorInput,
+  dependencies: AgentOrchestratorDependencies = {}
+): Promise<AgentOrchestratorResult> => {
+  const startedAt = new Date();
+
+  try {
+    const result = await runAgentOrchestratorCore(input, dependencies);
+    observeOperationalTelemetry({
+      kind: "agent_turn",
+      restaurantId: String(input.restaurant._id),
+      senderRole: input.sender.role,
+      provider: result.provider,
+      model: result.model,
+      success: result.success,
+      timeout: result.errorCode === "PROVIDER_TIMEOUT",
+      errorCode: result.success ? undefined : result.errorCode ?? "AGENT_TURN_FAILED",
+      startedAt,
+      usage: result.usage
+    });
+    return result;
+  } catch (error) {
+    const errorCode = classifyOrchestratorError(error);
+    observeOperationalTelemetry({
+      kind: "agent_turn",
+      restaurantId: String(input.restaurant._id),
+      senderRole: input.sender.role,
+      provider: dependencies.provider?.name,
+      model: dependencies.provider?.model,
+      success: false,
+      timeout: errorCode === "PROVIDER_TIMEOUT",
+      errorCode,
+      startedAt
+    });
+    throw error;
   }
 };

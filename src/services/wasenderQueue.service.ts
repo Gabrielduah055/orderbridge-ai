@@ -23,6 +23,12 @@ import {
   sendTextMessage,
   type WasenderSendResult
 } from "./wasender.service";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 import { resolveSenderIdentity } from "./senderIdentity.service";
 import {
   campaignTypeAllowsNoConsent,
@@ -1946,6 +1952,7 @@ export const startWasenderQueueWorker = (): void => {
   }
 
   workerStarted = true;
+  markRuntimeStarted("wasender_queue", workerIntervalMs);
   console.log(
     `[wasenderQueue] Worker started (check every ${workerIntervalMs / 1000}s)`
   );
@@ -1965,8 +1972,13 @@ export const startWasenderQueueWorker = (): void => {
     }
 
     workerBusy = true;
+    markRuntimeRunStarted("wasender_queue");
     void processNextQueuedWasenderMessage()
+      .then(() => {
+        markRuntimeRunSucceeded("wasender_queue");
+      })
       .catch((error) => {
+        markRuntimeRunFailed("wasender_queue", "QUEUE_PASS_FAILED");
         console.error("Wasender queue worker failed", {
           error: error instanceof Error ? error.message : "Unknown queue worker error"
         });

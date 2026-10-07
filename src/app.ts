@@ -11,6 +11,7 @@ import menuRoutes from "./routes/menu.routes";
 import orderRoutes, { restaurantOrderRoutes } from "./routes/order.routes";
 import restaurantRoutes from "./routes/restaurant.routes";
 import wasenderRoutes from "./routes/wasender.routes";
+import adminOperationsRoutes from "./routes/adminOperations.routes";
 
 export const app = express();
 
@@ -28,6 +29,7 @@ app.get("/health", (_req: Request, res: Response) => {
 
 app.use("/api/restaurants/:restaurantId/orders", restaurantOrderRoutes);
 app.use("/api/auth", authRoutes);
+app.use("/api/admin", adminOperationsRoutes);
 app.use("/api/restaurants", restaurantRoutes);
 app.use("/api/menu", menuRoutes);
 app.use("/api/orders", orderRoutes);

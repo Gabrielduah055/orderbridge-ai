@@ -68,6 +68,7 @@ const webhookEventSchema = new Schema<IWebhookEventDocument>(
 );
 
 webhookEventSchema.index({ provider: 1, eventId: 1 }, { unique: true });
+webhookEventSchema.index({ sessionId: 1, createdAt: -1 });
 
 export const WebhookEvent = model<IWebhookEventDocument>(
   "WebhookEvent",
