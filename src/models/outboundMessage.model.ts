@@ -140,6 +140,10 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
 outboundMessageSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
 outboundMessageSchema.index({ sessionId: 1, sentAt: -1 });
 outboundMessageSchema.index({ restaurantId: 1, providerMessageId: 1 });
+outboundMessageSchema.index({ restaurantId: 1, createdAt: -1 });
+outboundMessageSchema.index({ restaurantId: 1, sentAt: -1 });
+outboundMessageSchema.index({ restaurantId: 1, lastAttemptAt: -1 });
+outboundMessageSchema.index({ status: 1, updatedAt: -1 });
 
 export const OutboundMessage = model<IOutboundMessageDocument>(
   "OutboundMessage",

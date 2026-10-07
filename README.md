@@ -45,6 +45,8 @@ OPENROUTER_CUSTOMER_AGENT_ENABLED=true
 OPENROUTER_CUSTOMER_LEGACY_FALLBACK=false
 OPENROUTER_SITE_URL=
 OPENROUTER_APP_NAME=OrderBridgeAI
+OPERATIONAL_TELEMETRY_RETENTION_DAYS=30
+ADMIN_AUDIT_RETENTION_DAYS=365
 
 # Transactional post-order feedback timing (optional; safe defaults shown)
 ORDER_FEEDBACK_DELAY_MINUTES=120
@@ -141,6 +143,21 @@ Response:
   "message": "OrderBridge AI backend is running"
 }
 ```
+
+The public `GET /health` response remains intentionally minimal. Detailed operational data is available only to authenticated active users with the `super_admin` role:
+
+```http
+GET /api/admin/operations/whatsapp?window=24h&limit=50
+GET /api/admin/operations/agents?window=24h
+GET /api/admin/operations/health
+GET /api/admin/audit-logs?limit=50
+```
+
+Operational responses use a response-level `generatedAt` plus component-level `observedAt` values. A newly generated response does not refresh an old observation. MongoDB ping and queue-backlog diagnostics have explicit bounded deadlines; a disconnect, timeout, or query failure returns a partial health snapshot and marks backlog values unavailable (`null`) instead of inventing zeroes. The protected health route still requires Firebase verification followed by the active user and `super_admin` role stored in MongoDB. If MongoDB is unavailable, that authorization cannot be completed safely, so the request returns a bounded `503` response instead of bypassing authorization or returning a partial snapshot to an unverified role. Wasender configuration reports only whether credentials are configured and a masked session reference; provider connection health stays `unknown` / `not_monitored` until a direct observation exists. WhatsApp activity windows count each record once when a receive, processing, send, or latest-attempt timestamp falls within the requested inclusive window, and each direction is capped at the newest 5,000 activity records. Responses exclude credentials, message bodies, customer and order content, tool arguments/results, and raw provider payloads or errors.
+
+Agent telemetry stores separate records for complete agent turns, individual provider requests, and local tool executions. Queries are capped at 5,000 newest records and telemetry expires after 30 days by default. `OPERATIONAL_TELEMETRY_RETENTION_DAYS` may set 1-90 days. Telemetry persistence is best-effort and never breaks customer-facing agent execution.
+
+Successful super-admin mutations are audited from the authenticated backend user. Stored details are limited to action, target identifiers, changed field names, and allowlisted scalar metadata. Audit entries expire after 365 days by default; `ADMIN_AUDIT_RETENTION_DAYS` accepts 30-2,555 days. A failed initial audit write enters a bounded in-memory queue (1,000 unresolved records, retry every 5 seconds in batches of 25). Retry passes are serialized, and health reports queued and in-flight records as unresolved until persistence completes. The completed mutation response remains successful. Retries are idempotent by event ID, but this remains best effort: queued or in-flight entries can be lost on process restart and new entries are dropped if the unresolved queue is full.
 
 ## Create the First Super Admin
 

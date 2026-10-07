@@ -12,6 +12,12 @@ import {
   type CustomerDraftFollowUpState
 } from "./orderDraft.service";
 import { enqueueWasenderMessage } from "./wasenderQueue.service";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 
 const DEFAULT_FOLLOW_UP_DELAY_MINUTES = 3;
 const SCHEDULER_INTERVAL_MS = 60_000;
@@ -182,6 +188,7 @@ export const startFollowUpScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("follow_up_scheduler", SCHEDULER_INTERVAL_MS);
   console.log(`[followUp] Follow-up scheduler started (check every ${SCHEDULER_INTERVAL_MS / 1000}s)`);
 
   const runPass = (): void => {
@@ -190,12 +197,21 @@ export const startFollowUpScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("follow_up_scheduler");
     void runFollowUpPass()
       .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("follow_up_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("follow_up_scheduler");
+        }
         if (!schedulerPassLogged || result.messagesQueued > 0 || result.errors > 0) {
           console.info("[followUp] Scheduler pass", result);
           schedulerPassLogged = true;
         }
+      })
+      .catch(() => {
+        markRuntimeRunFailed("follow_up_scheduler", "SCHEDULER_PASS_FAILED");
       })
       .finally(() => {
         schedulerBusy = false;

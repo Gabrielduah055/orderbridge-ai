@@ -5,6 +5,7 @@ import { isToolAllowedForRole, type ToolName } from "./tool.permissions";
 import { toolRegistry } from "./tool.registry";
 import { getSafeErrorMessage } from "../utils/error.util";
 import { BadRequestError } from "../utils/httpErrors";
+import { observeOperationalTelemetry } from "../services/operationalTelemetry.service";
 
 const getSenderIdentityKey = (context: ToolExecutionContext): string =>
   context.sender.customerKey ?? context.sender.normalizedPhone;
@@ -19,7 +20,7 @@ const safeValidationMessage = (error: ZodError): string => {
   return firstIssue?.message ?? "Tool arguments are invalid.";
 };
 
-export const executeAgentTool = async (
+const executeAgentToolCore = async (
   toolName: string,
   rawArgs: unknown,
   context: ToolExecutionContext
@@ -107,6 +108,27 @@ export const executeAgentTool = async (
       message: "I could not complete that action right now."
     };
   }
+};
+
+export const executeAgentTool = async (
+  toolName: string,
+  rawArgs: unknown,
+  context: ToolExecutionContext
+): Promise<ToolResult> => {
+  const startedAt = new Date();
+  const result = await executeAgentToolCore(toolName, rawArgs, context);
+
+  observeOperationalTelemetry({
+    kind: "tool_execution",
+    restaurantId: context.restaurantId,
+    senderRole: context.sender.role,
+    toolName,
+    success: result.success,
+    errorCode: result.success ? undefined : result.code ?? "TOOL_EXECUTION_FAILED",
+    startedAt
+  });
+
+  return result;
 };
 
 export const executeConfirmedPendingToolAction = async (

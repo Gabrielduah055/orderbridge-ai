@@ -10,6 +10,12 @@ import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
 } from "./wasenderQueue.service";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 
 const REMINDER_CHECK_INTERVAL_MS = 60_000;
 const DEFAULT_REMINDER_DELAY_MINUTES = 3;
@@ -389,6 +395,7 @@ export const startOwnerPendingActionReminderScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("owner_pending_action_scheduler", REMINDER_CHECK_INTERVAL_MS);
   console.log(
     `[ownerPendingActionReminder] Scheduler started (check every ${REMINDER_CHECK_INTERVAL_MS / 1000}s)`
   );
@@ -399,8 +406,17 @@ export const startOwnerPendingActionReminderScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("owner_pending_action_scheduler");
     void runOwnerPendingActionReminderPass()
+      .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("owner_pending_action_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("owner_pending_action_scheduler");
+        }
+      })
       .catch((error) => {
+        markRuntimeRunFailed("owner_pending_action_scheduler", "SCHEDULER_PASS_FAILED");
         console.error("Owner pending-action reminder scheduler pass failed", {
           error:
             error instanceof Error

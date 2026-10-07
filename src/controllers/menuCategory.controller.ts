@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import * as menuCategoryService from "../services/menuCategory.service";
+import { recordAdminAuditAfterMutation } from "../services/adminAudit.service";
 
 const getRestaurantId = (req: Request): string => {
   return String(req.params.restaurantId);
@@ -16,6 +17,15 @@ export const createCategory = async (
 ): Promise<void> => {
   try {
     const category = await menuCategoryService.createCategory(getRestaurantId(req), req.body);
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "menu.category.create",
+      targetType: "menu_category",
+      targetId: String(category._id),
+      restaurantId: String(category.restaurantId),
+      changedFields: Object.keys(req.body ?? {})
+    });
 
     res.status(201).json({
       success: true,
@@ -57,6 +67,15 @@ export const updateCategory = async (
   try {
     const category = await menuCategoryService.updateCategory(getCategoryId(req), req.body);
 
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "menu.category.update",
+      targetType: "menu_category",
+      targetId: String(category._id),
+      restaurantId: String(category.restaurantId),
+      changedFields: Object.keys(req.body ?? {})
+    });
+
     res.status(200).json({
       success: true,
       message: "Menu category updated successfully",
@@ -74,6 +93,15 @@ export const deactivateCategory = async (
 ): Promise<void> => {
   try {
     const category = await menuCategoryService.deactivateCategory(getCategoryId(req));
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "menu.category.deactivate",
+      targetType: "menu_category",
+      targetId: String(category._id),
+      restaurantId: String(category.restaurantId),
+      changedFields: ["isActive"]
+    });
 
     res.status(200).json({
       success: true,
@@ -95,6 +123,15 @@ export const reorderCategories = async (
       getRestaurantId(req),
       req.body.categoryOrders
     );
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "menu.category.reorder",
+      targetType: "restaurant",
+      targetId: getRestaurantId(req),
+      restaurantId: getRestaurantId(req),
+      changedFields: ["sortOrder"]
+    });
 
     res.status(200).json({
       success: true,

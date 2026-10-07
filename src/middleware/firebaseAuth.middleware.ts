@@ -3,6 +3,35 @@ import type { DecodedIdToken } from "firebase-admin/auth";
 import { firebaseAdmin } from "../config/firebase";
 import { User } from "../models/User";
 
+const authenticatedUserLookupDeadlineMs = 1_500;
+
+class AuthenticationStoreDeadlineError extends Error {}
+
+const withAuthenticationStoreDeadline = async <T>(operation: Promise<T>): Promise<T> => {
+  let timeout: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new AuthenticationStoreDeadlineError("Authentication store deadline exceeded")),
+          authenticatedUserLookupDeadlineMs
+        );
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+const sendAuthenticationStoreUnavailable = (res: Response): void => {
+  res.status(503).json({
+    success: false,
+    message: "Authenticated access could not be authorized at this time"
+  });
+};
+
 export const firebaseAuth = async (
   req: Request,
   res: Response,
@@ -32,7 +61,25 @@ export const firebaseAuth = async (
       return;
     }
 
-    const user = await User.findOne({ firebaseUid: decodedToken.uid });
+    // Firebase proves token ownership, but active status and the authoritative
+    // application role live in MongoDB. Never substitute token claims or
+    // client-provided role data when that authorization store is unavailable.
+    if (User.db.readyState !== 1) {
+      sendAuthenticationStoreUnavailable(res);
+      return;
+    }
+
+    let user;
+    try {
+      user = await withAuthenticationStoreDeadline(
+        User.findOne({ firebaseUid: decodedToken.uid })
+          .maxTimeMS(authenticatedUserLookupDeadlineMs)
+          .exec()
+      );
+    } catch {
+      sendAuthenticationStoreUnavailable(res);
+      return;
+    }
 
     if (!user) {
       res.status(401).json({

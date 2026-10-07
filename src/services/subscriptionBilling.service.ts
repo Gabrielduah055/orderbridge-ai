@@ -1,6 +1,12 @@
 import { Types } from "mongoose";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
 import { BadRequestError, NotFoundError } from "../utils/httpErrors";
+import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
 
 const BILLING_RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let schedulerStarted = false;
@@ -174,6 +180,7 @@ export const startSubscriptionBillingScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("subscription_billing_scheduler", BILLING_RECONCILIATION_INTERVAL_MS);
   console.log("[subscriptionBilling] Daily reconciliation scheduler started");
 
   const runPass = (): void => {
@@ -182,14 +189,21 @@ export const startSubscriptionBillingScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("subscription_billing_scheduler");
     void runSubscriptionBillingReconciliation()
       .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("subscription_billing_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("subscription_billing_scheduler");
+        }
         if (!schedulerPassLogged || result.markedPastDue > 0 || result.errors > 0) {
           console.info("[subscriptionBilling] Reconciliation pass", result);
           schedulerPassLogged = true;
         }
       })
       .catch((error) => {
+        markRuntimeRunFailed("subscription_billing_scheduler", "SCHEDULER_PASS_FAILED");
         console.error("Subscription billing scheduler pass failed", {
           error:
             error instanceof Error

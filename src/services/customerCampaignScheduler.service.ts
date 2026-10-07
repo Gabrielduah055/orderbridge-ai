@@ -18,6 +18,12 @@ import {
   validateCustomerCampaignMedia
 } from "./customerCampaign.service";
 import {
+  markRuntimeRunFailed,
+  markRuntimeRunStarted,
+  markRuntimeRunSucceeded,
+  markRuntimeStarted
+} from "./runtimeHealth.service";
+import {
   enqueueWasenderMessage,
   type EnqueueWasenderMessageInput
 } from "./wasenderQueue.service";
@@ -551,6 +557,7 @@ export const startCustomerCampaignScheduler = (): void => {
   }
 
   schedulerStarted = true;
+  markRuntimeStarted("customer_campaign_scheduler", CAMPAIGN_CHECK_INTERVAL_MS);
   console.log(
     `[customerCampaign] Scheduler started (check every ${CAMPAIGN_CHECK_INTERVAL_MS / 1000}s)`
   );
@@ -561,14 +568,21 @@ export const startCustomerCampaignScheduler = (): void => {
     }
 
     schedulerBusy = true;
+    markRuntimeRunStarted("customer_campaign_scheduler");
     void runCustomerCampaignSchedulerPass()
       .then((result) => {
+        if (result.errors > 0) {
+          markRuntimeRunFailed("customer_campaign_scheduler", "PASS_COMPLETED_WITH_ERRORS");
+        } else {
+          markRuntimeRunSucceeded("customer_campaign_scheduler");
+        }
         if (!schedulerPassLogged || result.messagesQueued > 0 || result.errors > 0) {
           console.info("[customerCampaign] Scheduler pass", result);
           schedulerPassLogged = true;
         }
       })
       .catch((error) => {
+        markRuntimeRunFailed("customer_campaign_scheduler", "SCHEDULER_PASS_FAILED");
         console.error("Customer campaign scheduler pass failed", {
           error:
             error instanceof Error
