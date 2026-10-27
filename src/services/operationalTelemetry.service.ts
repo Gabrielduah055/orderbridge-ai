@@ -6,6 +6,7 @@ import {
 } from "../models/operationalTelemetry.model";
 import type { AiUsage } from "./ai/ai.types";
 import type { SenderRole } from "../types/agent.types";
+import type { AgentChannel, BusinessType } from "../types/business.types";
 
 const defaultRetentionDays = 30;
 const maxRetentionDays = 90;
@@ -25,6 +26,9 @@ export const operationalTelemetryRetentionDays = boundedRetentionDays();
 export interface OperationalTelemetryInput {
   kind: OperationalTelemetryKind;
   restaurantId?: string;
+  businessId?: string;
+  businessType?: BusinessType;
+  channel?: AgentChannel;
   senderRole?: SenderRole;
   provider?: string;
   model?: string;
@@ -64,6 +68,11 @@ export const recordOperationalTelemetry = async (
     ...(input.restaurantId && Types.ObjectId.isValid(input.restaurantId)
       ? { restaurantId: new Types.ObjectId(input.restaurantId) }
       : {}),
+    ...(input.businessId && Types.ObjectId.isValid(input.businessId)
+      ? { businessId: new Types.ObjectId(input.businessId) }
+      : {}),
+    ...(input.businessType ? { businessType: input.businessType } : {}),
+    ...(input.channel ? { channel: input.channel } : {}),
     ...(input.senderRole ? { senderRole: input.senderRole } : {}),
     ...(safeLabel(input.provider, 80) ? { provider: safeLabel(input.provider, 80) } : {}),
     ...(safeLabel(input.model, 160) ? { model: safeLabel(input.model, 160) } : {}),

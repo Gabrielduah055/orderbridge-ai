@@ -1,10 +1,12 @@
 import type { IOrderDocument } from "../../models/order.model";
 import type { IRestaurantDocument } from "../../models/Restaurant";
+import type { IBusinessDocument } from "../../models/business.model";
 import type {
+  AgentToolExecutionContext,
   ResolvedSender,
-  ToolExecutionContext,
   ToolResult
 } from "../../types/agent.types";
+import type { TrustedBusinessContext } from "../../types/business.types";
 import type { StaffOperationalState } from "./staffOperationalState.service";
 
 export type AiProviderName = "hermes" | "openrouter";
@@ -74,8 +76,10 @@ export interface ExecutedAgentTool {
   resultOrderStatus?: string;
 }
 
-export interface AgentOrchestratorInput {
+export interface RestaurantAgentOrchestratorInput {
   restaurant: IRestaurantDocument;
+  business?: never;
+  businessContext?: never;
   sender: ResolvedSender;
   message: string;
   requestId?: string;
@@ -83,6 +87,22 @@ export interface AgentOrchestratorInput {
   trustedCustomerReplyContext?: TrustedCustomerReplyContext;
   staffState?: StaffOperationalState;
 }
+
+export interface BusinessAgentOrchestratorInput {
+  restaurant?: never;
+  business: IBusinessDocument;
+  businessContext: TrustedBusinessContext;
+  sender: ResolvedSender;
+  message: string;
+  requestId?: string;
+  quotedMessageId?: string;
+  trustedCustomerReplyContext?: never;
+  staffState?: never;
+}
+
+export type AgentOrchestratorInput =
+  | RestaurantAgentOrchestratorInput
+  | BusinessAgentOrchestratorInput;
 
 export interface TrustedCustomerReplyContext {
   workflow: "active_order";
@@ -121,5 +141,5 @@ export interface AgentOrchestratorResult {
 export type AgentToolExecutor = (
   toolName: string,
   rawArgs: unknown,
-  context: ToolExecutionContext
+  context: AgentToolExecutionContext
 ) => Promise<ToolResult>;

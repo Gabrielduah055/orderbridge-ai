@@ -1,8 +1,18 @@
 import { ZodError } from "zod";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
-import type { ToolExecutionContext, ToolResult } from "../types/agent.types";
-import { isToolAllowedForRole, type ToolName } from "./tool.permissions";
-import { toolRegistry } from "./tool.registry";
+import type {
+  AgentToolExecutionContext,
+  CommerceToolExecutionContext,
+  ToolExecutionContext,
+  ToolResult
+} from "../types/agent.types";
+import {
+  isCommerceToolName,
+  isToolAllowedForContext,
+  type RestaurantToolName,
+  type ToolName
+} from "./tool.permissions";
+import { commerceToolRegistry, toolRegistry } from "./tool.registry";
 import { getSafeErrorMessage } from "../utils/error.util";
 import { BadRequestError } from "../utils/httpErrors";
 import { observeOperationalTelemetry } from "../services/operationalTelemetry.service";
@@ -10,9 +20,27 @@ import { observeOperationalTelemetry } from "../services/operationalTelemetry.se
 const getSenderIdentityKey = (context: ToolExecutionContext): string =>
   context.sender.customerKey ?? context.sender.normalizedPhone;
 
-const isToolName = (toolName: string): toolName is ToolName => {
-  return toolName in toolRegistry;
-};
+const isToolName = (toolName: string): toolName is ToolName =>
+  toolName in toolRegistry || toolName in commerceToolRegistry;
+
+const getPermissionContext = (context: AgentToolExecutionContext) =>
+  "business" in context
+    ? {
+        senderRole: context.sender.role,
+        businessType: context.businessType,
+        channel: context.channel,
+        capabilities: context.capabilities
+      }
+    : {
+        senderRole: context.sender.role,
+        businessType: "restaurant" as const,
+        channel: "whatsapp" as const,
+        capabilities: [
+          "restaurant_operations" as const,
+          "restaurant_ordering" as const,
+          "whatsapp_chat" as const
+        ]
+      };
 
 const safeValidationMessage = (error: ZodError): string => {
   const firstIssue = error.issues[0];
@@ -23,10 +51,11 @@ const safeValidationMessage = (error: ZodError): string => {
 const executeAgentToolCore = async (
   toolName: string,
   rawArgs: unknown,
-  context: ToolExecutionContext
+  context: AgentToolExecutionContext
 ): Promise<ToolResult> => {
+  const scopeId = "business" in context ? context.businessId : context.restaurantId;
   console.info("Agent tool requested", {
-    restaurantId: context.restaurantId,
+    businessId: scopeId,
     senderRole: context.sender.role,
     toolName
   });
@@ -39,11 +68,9 @@ const executeAgentToolCore = async (
     };
   }
 
-  const tool = toolRegistry[toolName];
-
-  if (!isToolAllowedForRole(toolName, context.sender.role)) {
+  if (!isToolAllowedForContext(toolName, getPermissionContext(context))) {
     console.warn("Agent tool denied", {
-      restaurantId: context.restaurantId,
+      businessId: scopeId,
       senderRole: context.sender.role,
       toolName
     });
@@ -55,6 +82,9 @@ const executeAgentToolCore = async (
     };
   }
 
+  const tool = isCommerceToolName(toolName)
+    ? commerceToolRegistry[toolName]
+    : toolRegistry[toolName as RestaurantToolName];
   const parseResult = tool.schema.safeParse(rawArgs ?? {});
 
   if (!parseResult.success) {
@@ -74,10 +104,36 @@ const executeAgentToolCore = async (
   }
 
   try {
-    const result = await tool.handler(parseResult.data, context);
+    let result: ToolResult;
+
+    if (isCommerceToolName(toolName)) {
+      if (!("business" in context)) {
+        return {
+          success: false,
+          code: "TOOL_CONTEXT_INVALID",
+          message: "That tool is not available for the current business."
+        };
+      }
+      result = await commerceToolRegistry[toolName].handler(
+        parseResult.data,
+        context as CommerceToolExecutionContext
+      );
+    } else {
+      if (!("restaurant" in context)) {
+        return {
+          success: false,
+          code: "TOOL_CONTEXT_INVALID",
+          message: "That tool is not available for the current business."
+        };
+      }
+      result = await toolRegistry[toolName as RestaurantToolName].handler(
+        parseResult.data,
+        context
+      );
+    }
 
     console.info("Agent tool completed", {
-      restaurantId: context.restaurantId,
+      businessId: scopeId,
       senderRole: context.sender.role,
       toolName,
       success: result.success,
@@ -88,7 +144,7 @@ const executeAgentToolCore = async (
     return result;
   } catch (error) {
     console.error("Agent tool execution failed", {
-      restaurantId: context.restaurantId,
+      businessId: scopeId,
       senderRole: context.sender.role,
       toolName,
       error: getSafeErrorMessage(error, "Agent tool execution failed without an error message")
@@ -113,14 +169,17 @@ const executeAgentToolCore = async (
 export const executeAgentTool = async (
   toolName: string,
   rawArgs: unknown,
-  context: ToolExecutionContext
+  context: AgentToolExecutionContext
 ): Promise<ToolResult> => {
   const startedAt = new Date();
   const result = await executeAgentToolCore(toolName, rawArgs, context);
 
   observeOperationalTelemetry({
     kind: "tool_execution",
-    restaurantId: context.restaurantId,
+    restaurantId: "restaurant" in context ? context.restaurantId : undefined,
+    businessId: "business" in context ? context.businessId : undefined,
+    businessType: "business" in context ? context.businessType : "restaurant",
+    channel: "business" in context ? context.channel : "whatsapp",
     senderRole: context.sender.role,
     toolName,
     success: result.success,

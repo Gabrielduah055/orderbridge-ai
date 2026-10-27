@@ -10,6 +10,7 @@ import {
 } from "./runtimeHealth.service";
 
 export const adminAuditActions = [
+  "business.create",
   "restaurant.create",
   "restaurant.update",
   "restaurant.status.update",
@@ -61,7 +62,7 @@ export const adminAuditRetentionDays = boundedAuditRetentionDays();
 export interface RecordAdminAuditInput {
   actor: IUserDocument;
   action: AdminAuditAction;
-  targetType: "restaurant" | "menu_category" | "menu_item" | "menu_import";
+  targetType: "business" | "restaurant" | "menu_category" | "menu_item" | "menu_import";
   targetId: string;
   restaurantId?: string;
   changedFields?: string[];

@@ -1,14 +1,18 @@
 import { executeAgentTool } from "../../agent-tools/tool.executor";
 import {
+  getRecentBusinessConversationHistory,
   getRecentAgentConversationHistory,
   saveAgentConversationMessage
 } from "../agentConversationHistory.service";
 import { getOpenRouterConfig } from "./ai.config";
 import { createAiProvider } from "./aiProvider.factory";
-import { buildAgentSystemPrompt } from "./agentPrompt.service";
 import {
-  getAgentToolDefinitionsForRole,
-  getPermittedAgentToolNamesForRole
+  buildAgentSystemPrompt,
+  buildAgentSystemPromptForInput
+} from "./agentPrompt.service";
+import {
+  getAgentToolDefinitionsForContext,
+  getPermittedAgentToolNamesForContext
 } from "./agentToolDefinitions.service";
 import type {
   AgentOrchestratorInput,
@@ -21,12 +25,15 @@ import type {
 } from "./ai.types";
 import type {
   SaveAgentMessageInput,
+  AgentHistoryMessage,
+  AgentToolExecutionContext,
   ToolExecutionContext,
   ToolResult
 } from "../../types/agent.types";
 import type { IOrderDocument } from "../../models/order.model";
-import { toolRegistry } from "../../agent-tools/tool.registry";
+import { commerceToolRegistry, toolRegistry } from "../../agent-tools/tool.registry";
 import { observeOperationalTelemetry } from "../operationalTelemetry.service";
+import type { AgentPermissionContext } from "../../types/business.types";
 
 const safeFallbackMessage =
   "I'm having trouble reaching the restaurant system right now. Please try again shortly.";
@@ -79,6 +86,12 @@ const classifyOrchestratorError = (error: unknown): string => {
 const trustedArgumentNames = new Set([
   "restaurantId",
   "restaurant_id",
+  "businessId",
+  "business_id",
+  "businessType",
+  "business_type",
+  "channel",
+  "capabilities",
   "senderPhone",
   "sender_phone",
   "senderRole",
@@ -104,7 +117,7 @@ const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " 
 const escapeRegExp = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const registeredToolNames = Object.keys(toolRegistry).sort(
+const registeredToolNames = Object.keys({ ...toolRegistry, ...commerceToolRegistry }).sort(
   (first, second) => second.length - first.length
 );
 
@@ -1124,6 +1137,22 @@ const getImportantData = (
         nextData[key] = data[key];
       }
     }
+
+    if (toolName === "search_products" && Array.isArray(data.products)) {
+      nextData.products = data.products;
+    }
+
+    if (toolName === "get_product_details" && data.product) {
+      nextData.product = data.product;
+    }
+
+    if (toolName === "check_product_availability") {
+      nextData.productAvailability = data;
+    }
+
+    if (toolName === "get_business_policies" && Array.isArray(data.policies)) {
+      nextData.policies = data.policies;
+    }
   }
 
   if (result.pendingActionId) {
@@ -1134,7 +1163,7 @@ const getImportantData = (
 };
 
 const isClearCustomerMenuMediaRequest = (input: AgentOrchestratorInput): boolean => {
-  if (input.sender.role !== "customer") {
+  if (!("restaurant" in input) || !input.restaurant || input.sender.role !== "customer") {
     return false;
   }
 
@@ -1717,10 +1746,16 @@ const getRecoverableToolFallbackMessage = (
 
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
-  getHistory?: typeof getRecentAgentConversationHistory;
+  getHistory?: (
+    scopeId: string,
+    conversationIdentity: string,
+    limit?: number
+  ) => Promise<AgentHistoryMessage[]>;
   saveMessage?: (input: SaveAgentMessageInput) => Promise<void>;
   executeTool?: AgentToolExecutor;
+  /** Legacy restaurant prompt dependency retained for caller compatibility. */
   buildSystemPrompt?: typeof buildAgentSystemPrompt;
+  buildBusinessSystemPrompt?: typeof buildAgentSystemPromptForInput;
 }
 
 const runAgentOrchestratorCore = async (
@@ -1728,24 +1763,57 @@ const runAgentOrchestratorCore = async (
   dependencies: AgentOrchestratorDependencies = {}
 ): Promise<AgentOrchestratorResult> => {
   const provider = dependencies.provider ?? createAiProvider();
-  const getHistory = dependencies.getHistory ?? getRecentAgentConversationHistory;
   const saveMessage = dependencies.saveMessage ?? saveAgentConversationMessage;
-  const buildSystemPrompt = dependencies.buildSystemPrompt ?? buildAgentSystemPrompt;
-  const restaurantId = String(input.restaurant._id);
+  const restaurantInput = "restaurant" in input && input.restaurant ? input : null;
+  const businessInput = "business" in input && input.business ? input : null;
+  const businessId = restaurantInput
+    ? String(restaurantInput.restaurant._id)
+    : businessInput!.businessContext.businessId;
+  const channel = restaurantInput ? "whatsapp" as const : businessInput!.businessContext.channel;
+  const businessType = restaurantInput
+    ? "restaurant" as const
+    : businessInput!.businessContext.businessType;
+  const capabilities = restaurantInput
+    ? ["restaurant_operations", "restaurant_ordering", "whatsapp_chat"] as const
+    : businessInput!.businessContext.capabilities;
   const senderIdentityKey =
-    input.sender.customerKey ?? input.sender.normalizedPhone;
-  const conversationKey = `${restaurantId}:${senderIdentityKey}`;
-  const tools = getAgentToolDefinitionsForRole(input.sender.role);
-  const permittedToolNames = getPermittedAgentToolNamesForRole(input.sender.role);
-  const systemPrompt = await buildSystemPrompt(
-    input.restaurant,
-    input.sender,
-    Array.from(permittedToolNames),
-    {},
-    input.staffState,
-    input.trustedCustomerReplyContext
-  );
-  const history = await getHistory(restaurantId, senderIdentityKey, 14);
+    input.sender.identityKey ??
+    input.sender.customerKey ??
+    input.sender.normalizedPhone;
+  const conversationId = restaurantInput
+    ? senderIdentityKey
+    : businessInput!.businessContext.conversationId;
+  const conversationKey = `${businessId}:${channel}:${conversationId}`;
+  const permissionContext: AgentPermissionContext = {
+    senderRole: input.sender.role,
+    businessType,
+    channel,
+    capabilities
+  };
+  const tools = getAgentToolDefinitionsForContext(permissionContext);
+  const permittedToolNames = getPermittedAgentToolNamesForContext(permissionContext);
+  const systemPrompt = restaurantInput
+    ? await (dependencies.buildSystemPrompt ?? buildAgentSystemPrompt)(
+        restaurantInput.restaurant,
+        input.sender,
+        Array.from(permittedToolNames),
+        {},
+        input.staffState,
+        input.trustedCustomerReplyContext
+      )
+    : await (
+        dependencies.buildBusinessSystemPrompt ?? buildAgentSystemPromptForInput
+      )(input, Array.from(permittedToolNames));
+  const history = dependencies.getHistory
+    ? await dependencies.getHistory(businessId, conversationId, 14)
+    : restaurantInput
+      ? await getRecentAgentConversationHistory(businessId, senderIdentityKey, 14)
+      : await getRecentBusinessConversationHistory(
+          businessId,
+          channel,
+          conversationId,
+          14
+        );
   const messages: AiMessage[] = [
     {
       role: "system",
@@ -1788,16 +1856,28 @@ const runAgentOrchestratorCore = async (
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
-  const toolExecutionContext: ToolExecutionContext = {
-    restaurantId,
-    restaurant: input.restaurant,
-    sender: input.sender,
-    requestId: input.requestId,
-    originalMessage: normalizedInputMessage,
-    quotedMessageId: input.quotedMessageId,
-    trustedStaffOrderSelection:
-      input.staffState?.recentReferences.orderSelection
-  };
+  const toolExecutionContext: AgentToolExecutionContext = restaurantInput
+    ? {
+        restaurantId: businessId,
+        restaurant: restaurantInput.restaurant,
+        sender: input.sender,
+        requestId: input.requestId,
+        originalMessage: normalizedInputMessage,
+        quotedMessageId: input.quotedMessageId,
+        trustedStaffOrderSelection:
+          input.staffState?.recentReferences.orderSelection
+      }
+    : {
+        businessId,
+        businessType: "ecommerce",
+        business: businessInput!.business,
+        channel,
+        capabilities: [...capabilities],
+        conversationId,
+        sender: input.sender,
+        requestId: input.requestId,
+        originalMessage: normalizedInputMessage
+      };
 
   try {
     for (let round = 0; round < maxToolRounds; round += 1) {
@@ -1812,7 +1892,10 @@ const runAgentOrchestratorCore = async (
         });
         observeOperationalTelemetry({
           kind: "provider_request",
-          restaurantId,
+          restaurantId: restaurantInput ? businessId : undefined,
+          businessId: businessInput ? businessId : undefined,
+          businessType,
+          channel,
           senderRole: input.sender.role,
           provider: provider.name,
           model: provider.model,
@@ -1824,7 +1907,10 @@ const runAgentOrchestratorCore = async (
         const errorCode = classifyOrchestratorError(error);
         observeOperationalTelemetry({
           kind: "provider_request",
-          restaurantId,
+          restaurantId: restaurantInput ? businessId : undefined,
+          businessId: businessInput ? businessId : undefined,
+          businessType,
+          channel,
           senderRole: input.sender.role,
           provider: provider.name,
           model: provider.model,
@@ -1861,7 +1947,7 @@ const runAgentOrchestratorCore = async (
           }
 
           console.info("[customerAgent] clarification returned", {
-            restaurantId,
+            businessId,
             reason: "ungrounded_menu_image_claim"
           });
 
@@ -1955,10 +2041,10 @@ const runAgentOrchestratorCore = async (
           };
         }
 
-        console.info("Restaurant agent completed", {
+        console.info("Agent completed", {
           provider: provider.name,
           model: provider.model,
-          restaurantId,
+          businessId,
           senderRole: input.sender.role,
           conversationKey,
           toolRoundCount: round,
@@ -2110,11 +2196,9 @@ const runAgentOrchestratorCore = async (
           safeArguments
         );
 
-        await saveMessage({
-          restaurantId,
-          senderPhone: senderIdentityKey,
+        const toolMessage = {
           senderRole: input.sender.role,
-          direction: "tool",
+          direction: "tool" as const,
           content: JSON.stringify(buildToolResultForModel(toolName, result)),
           metadata: {
             source: "openrouter_agent",
@@ -2126,7 +2210,22 @@ const runAgentOrchestratorCore = async (
             requiresConfirmation: result.requiresConfirmation,
             invalidArguments: toolCall.invalidArguments
           }
-        });
+        };
+        await saveMessage(
+          restaurantInput
+            ? {
+                ...toolMessage,
+                restaurantId: businessId,
+                senderPhone: senderIdentityKey
+              }
+            : {
+                ...toolMessage,
+                businessId,
+                businessType,
+                channel,
+                conversationId
+              }
+        );
 
         messages.push({
           role: "tool",
@@ -2143,10 +2242,10 @@ const runAgentOrchestratorCore = async (
         ) {
           const previewMessage = sanitizeStaffFacingFinalText(result.message);
 
-          console.info("Restaurant agent completed", {
+          console.info("Agent completed", {
             provider: provider.name,
             model: provider.model,
-            restaurantId,
+            businessId,
             senderRole: input.sender.role,
             conversationKey,
             toolRoundCount: round + 1,
@@ -2185,10 +2284,10 @@ const runAgentOrchestratorCore = async (
   } catch (error) {
     const errorCode = classifyOrchestratorError(error);
 
-    console.error("Restaurant agent orchestration failed", {
+    console.error("Agent orchestration failed", {
       provider: provider.name,
       model: provider.model,
-      restaurantId,
+      businessId,
       senderRole: input.sender.role,
       conversationKey,
       requestedToolNames: executedTools.map((tool) => tool.name),
@@ -2216,12 +2315,25 @@ export const runAgentOrchestrator = async (
   dependencies: AgentOrchestratorDependencies = {}
 ): Promise<AgentOrchestratorResult> => {
   const startedAt = new Date();
+  const restaurantId =
+    "restaurant" in input && input.restaurant
+      ? String(input.restaurant._id)
+      : undefined;
+  const businessId =
+    "business" in input && input.business
+      ? input.businessContext!.businessId
+      : undefined;
+  const businessType = businessId ? input.businessContext!.businessType : "restaurant";
+  const channel = businessId ? input.businessContext!.channel : "whatsapp";
 
   try {
     const result = await runAgentOrchestratorCore(input, dependencies);
     observeOperationalTelemetry({
       kind: "agent_turn",
-      restaurantId: String(input.restaurant._id),
+      restaurantId,
+      businessId,
+      businessType,
+      channel,
       senderRole: input.sender.role,
       provider: result.provider,
       model: result.model,
@@ -2236,7 +2348,10 @@ export const runAgentOrchestrator = async (
     const errorCode = classifyOrchestratorError(error);
     observeOperationalTelemetry({
       kind: "agent_turn",
-      restaurantId: String(input.restaurant._id),
+      restaurantId,
+      businessId,
+      businessType,
+      channel,
       senderRole: input.sender.role,
       provider: dependencies.provider?.name,
       model: dependencies.provider?.model,

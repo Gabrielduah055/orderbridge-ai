@@ -1,10 +1,18 @@
 import type { z } from "zod";
 import type { IOrderDocument } from "../models/order.model";
 import type { IRestaurantDocument } from "../models/Restaurant";
+import type { IBusinessDocument } from "../models/business.model";
+import type {
+  AgentChannel,
+  BusinessCapability,
+  BusinessType
+} from "./business.types";
 
 export type SenderRole = "owner" | "manager" | "customer";
 
 export interface ResolvedSender {
+  /** Stable channel-specific identity used by the shared orchestrator. */
+  identityKey?: string;
   name?: string;
   phone: string;
   normalizedAddress: string;
@@ -107,7 +115,7 @@ export interface AgentHistoryMessage {
   metadata?: Record<string, unknown>;
 }
 
-export interface SaveAgentMessageInput {
+export interface SaveRestaurantAgentMessageInput {
   restaurantId: string;
   senderPhone: string;
   senderRole: SenderRole;
@@ -115,6 +123,21 @@ export interface SaveAgentMessageInput {
   content: string;
   metadata?: Record<string, unknown>;
 }
+
+export interface SaveBusinessAgentMessageInput {
+  businessId: string;
+  businessType: BusinessType;
+  channel: AgentChannel;
+  conversationId: string;
+  senderRole: SenderRole;
+  direction: AgentConversationDirection;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type SaveAgentMessageInput =
+  | SaveRestaurantAgentMessageInput
+  | SaveBusinessAgentMessageInput;
 
 export interface ToolExecutionContext {
   restaurantId: string;
@@ -136,6 +159,22 @@ export interface ToolExecutionContext {
     }>;
   };
 }
+
+export interface CommerceToolExecutionContext {
+  businessId: string;
+  businessType: "ecommerce";
+  business: IBusinessDocument;
+  channel: AgentChannel;
+  capabilities: BusinessCapability[];
+  conversationId: string;
+  sender: ResolvedSender;
+  requestId?: string;
+  originalMessage?: string;
+}
+
+export type AgentToolExecutionContext =
+  | ToolExecutionContext
+  | CommerceToolExecutionContext;
 
 export interface ToolResult<T = unknown> {
   success: boolean;

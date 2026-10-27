@@ -1,6 +1,6 @@
 # OrderBridge AI Backend
 
-OrderBridge AI is a multi-tenant WhatsApp AI restaurant ordering SaaS. This backend foundation supports super admins, restaurants, menus, orders, Wasender webhooks, receipt PDFs, and a restaurant operations agent.
+OrderBridge AI is a multi-tenant, multi-channel AI business platform. The existing restaurant WhatsApp ordering and operations workflows remain intact, while e-commerce businesses can use the same OpenRouter agent and configured model for authenticated website shopping assistance.
 
 ## Tech Stack
 
@@ -63,6 +63,12 @@ Owner, manager, and customer WhatsApp messages use OpenRouter when `AI_PROVIDER=
 Hermes is still available for rollback with `AI_PROVIDER=hermes`. To explicitly keep customers on the legacy deterministic ordering flow while staff use OpenRouter, set `OPENROUTER_CUSTOMER_AGENT_ENABLED=false`. If customer OpenRouter fails, the backend returns a safe failure response unless `OPENROUTER_CUSTOMER_LEGACY_FALLBACK=true` is explicitly configured. Legacy fallback is never invoked after a successful AI-side customer mutation.
 
 Customer OpenRouter tools are limited to customer-safe operations: reading the restaurant profile, menu, delivery information, the customer's own order details/latest order, managing that customer's own order draft, cancelling a pre-acceptance order, requesting cancellation after acceptance, and amending a submitted order while it is still awaiting restaurant confirmation. Customers cannot update prices, change availability, read revenue, access another customer's order, or edit an order after the restaurant has acted on it. Customer cancellations, cancellation requests, and submitted-order amendments notify the owner.
+
+## E-commerce Website Chat
+
+E-commerce tenants use the additive `Business` model and do not need fake restaurant records. A website backend authenticates server-to-server at `POST /api/integrations/website-chat/:businessId/messages`; integration credentials must never be exposed in frontend JavaScript. Website customers receive only read-only external catalog and policy tools, and conversation history is isolated by business, channel, and opaque session reference.
+
+See [multi-business and channel architecture](docs/multi-business-channels.md) for provisioning, authentication, permissions, and the external commerce API contract. The future paid-order notification boundary is documented separately in [commerce payment events](docs/commerce-payment-event-contract.md).
 
 ## Order Confirmation Workflow
 

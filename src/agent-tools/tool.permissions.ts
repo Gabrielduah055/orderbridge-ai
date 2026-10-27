@@ -1,4 +1,5 @@
 import type { SenderRole } from "../types/agent.types";
+import type { AgentPermissionContext, BusinessCapability } from "../types/business.types";
 
 export const toolPermissions = {
   get_restaurant_profile: ["owner", "manager", "customer"],
@@ -57,19 +58,82 @@ export const toolPermissions = {
   update_order_draft: ["customer"],
   get_order_draft: ["customer"],
   confirm_order_draft: ["customer"],
-  cancel_order_draft: ["customer"]
+  cancel_order_draft: ["customer"],
+  search_products: ["customer"],
+  get_product_details: ["customer"],
+  check_product_availability: ["customer"],
+  get_business_policies: ["customer"]
 } as const satisfies Record<string, SenderRole[]>;
 
 export type ToolName = keyof typeof toolPermissions;
+export type CommerceToolName =
+  | "search_products"
+  | "get_product_details"
+  | "check_product_availability"
+  | "get_business_policies";
+export type RestaurantToolName = Exclude<ToolName, CommerceToolName>;
 
-export const isToolAllowedForRole = (toolName: string, role: SenderRole): boolean => {
+const commerceToolNames = new Set<ToolName>([
+  "search_products",
+  "get_product_details",
+  "check_product_availability",
+  "get_business_policies"
+]);
+
+const requiredCapabilityByTool: Partial<Record<ToolName, BusinessCapability>> = {
+  search_products: "commerce_catalog_read",
+  get_product_details: "commerce_catalog_read",
+  check_product_availability: "commerce_catalog_read",
+  get_business_policies: "commerce_catalog_read"
+};
+
+export const isCommerceToolName = (toolName: string): toolName is CommerceToolName =>
+  commerceToolNames.has(toolName as ToolName);
+
+export const isToolAllowedForContext = (
+  toolName: string,
+  context: AgentPermissionContext
+): boolean => {
   const roles = toolPermissions[toolName as ToolName] as readonly SenderRole[] | undefined;
 
-  return Boolean(roles?.includes(role));
+  if (!roles?.includes(context.senderRole)) {
+    return false;
+  }
+
+  if (isCommerceToolName(toolName)) {
+    const requiredCapability = requiredCapabilityByTool[toolName];
+    return (
+      context.businessType === "ecommerce" &&
+      (context.channel === "website" || context.channel === "whatsapp") &&
+      Boolean(requiredCapability && context.capabilities.includes(requiredCapability))
+    );
+  }
+
+  return context.businessType === "restaurant" && context.channel === "whatsapp";
+};
+
+export const isToolAllowedForRole = (toolName: string, role: SenderRole): boolean => {
+  return isToolAllowedForContext(toolName, {
+    senderRole: role,
+    businessType: "restaurant",
+    channel: "whatsapp",
+    capabilities: ["restaurant_operations", "restaurant_ordering", "whatsapp_chat"]
+  });
 };
 
 export const getAllowedToolNamesForRole = (role: SenderRole): ToolName[] => {
+  return getAllowedToolNamesForContext({
+    senderRole: role,
+    businessType: "restaurant",
+    channel: "whatsapp",
+    capabilities: ["restaurant_operations", "restaurant_ordering", "whatsapp_chat"]
+  });
+};
+
+export const getAllowedToolNamesForContext = (
+  context: AgentPermissionContext
+): ToolName[] => {
   return (Object.keys(toolPermissions) as ToolName[]).filter((toolName) =>
-    (toolPermissions[toolName] as readonly SenderRole[]).includes(role)
+    isToolAllowedForContext(toolName, context)
   );
 };

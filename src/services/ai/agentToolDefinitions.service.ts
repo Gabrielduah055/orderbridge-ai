@@ -1,7 +1,12 @@
 import { z } from "zod";
-import { toolRegistry } from "../../agent-tools/tool.registry";
+import {
+  commerceToolRegistry,
+  toolRegistry
+} from "../../agent-tools/tool.registry";
 import type { ToolName } from "../../agent-tools/tool.permissions";
+import { isToolAllowedForContext } from "../../agent-tools/tool.permissions";
 import type { SenderRole } from "../../types/agent.types";
+import type { AgentPermissionContext } from "../../types/business.types";
 import type { AiToolDefinition } from "./ai.types";
 
 type JsonSchema = Record<string, unknown>;
@@ -93,9 +98,24 @@ const zodToJsonSchema = (schema: z.ZodTypeAny): JsonSchema => {
   };
 };
 
-export const getAgentToolDefinitionsForRole = (role: SenderRole): AiToolDefinition[] => {
-  return (Object.entries(toolRegistry) as Array<[ToolName, (typeof toolRegistry)[ToolName]]>)
-    .filter(([, tool]) => tool.roles.includes(role))
+const allAgentTools: Record<
+  string,
+  {
+    definition: { description: string };
+    schema: z.ZodTypeAny;
+  }
+> = {
+  ...toolRegistry,
+  ...commerceToolRegistry
+};
+
+export const getAgentToolDefinitionsForContext = (
+  context: AgentPermissionContext
+): AiToolDefinition[] => {
+  return (Object.entries(allAgentTools) as Array<
+    [ToolName, (typeof allAgentTools)[string]]
+  >)
+    .filter(([name]) => isToolAllowedForContext(name, context))
     .map(([name, tool]) => ({
       type: "function",
       function: {
@@ -106,6 +126,21 @@ export const getAgentToolDefinitionsForRole = (role: SenderRole): AiToolDefiniti
     }));
 };
 
+export const getAgentToolDefinitionsForRole = (role: SenderRole): AiToolDefinition[] => {
+  return getAgentToolDefinitionsForContext({
+    senderRole: role,
+    businessType: "restaurant",
+    channel: "whatsapp",
+    capabilities: ["restaurant_operations", "restaurant_ordering", "whatsapp_chat"]
+  });
+};
+
 export const getPermittedAgentToolNamesForRole = (role: SenderRole): Set<string> => {
   return new Set(getAgentToolDefinitionsForRole(role).map((tool) => tool.function.name));
+};
+
+export const getPermittedAgentToolNamesForContext = (
+  context: AgentPermissionContext
+): Set<string> => {
+  return new Set(getAgentToolDefinitionsForContext(context).map((tool) => tool.function.name));
 };
