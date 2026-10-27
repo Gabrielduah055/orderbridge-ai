@@ -167,7 +167,10 @@ test("website orchestrator uses the shared provider model and strips trusted con
           ]
         };
       }
-      return { text: "I found one verified option.", toolCalls: [] };
+      return {
+        text: "I found {{P1.name}} at {{P1.price}}. It is {{P1.availability}}: {{P1.url}}",
+        toolCalls: []
+      };
     }
   };
 
@@ -206,7 +209,7 @@ test("website orchestrator uses the shared provider model and strips trusted con
   assert.equal(executions[0].context.channel, "website");
   assert.equal(result.data.products[0].canonicalUrl, "https://shop.example.com/products/p1");
   assert.match(result.message, /GHS 4,000/);
-  assert.match(result.message, /Available/);
+  assert.match(result.message, /available/i);
   assert.match(result.message, /https:\/\/shop\.example\.com\/products\/p1/);
 });
 
@@ -231,7 +234,7 @@ test("website commerce answers replace incorrect model product claims with verif
                 ]
               }
             : {
-                text: "It costs USD 1, is unavailable, has 2 TB storage, and is at https://attacker.example/fake.",
+                text: "It costs USD 1, is unavailable, has 2 TB storage and titanium blades, and is at https://attacker.example/fake.",
                 toolCalls: []
               }
       },
@@ -260,10 +263,10 @@ test("website commerce answers replace incorrect model product claims with verif
   );
 
   assert.match(result.message, /GHS 4,000/);
-  assert.match(result.message, /Available/);
+  assert.match(result.message, /available/i);
   assert.match(result.message, /storage: 256 GB/i);
   assert.match(result.message, /https:\/\/shop\.example\.com\/products\/p1/);
-  assert.doesNotMatch(result.message, /USD 1|unavailable|2 TB|attacker\.example/i);
+  assert.doesNotMatch(result.message, /USD 1|unavailable|2 TB|titanium|attacker\.example/i);
 });
 
 test("website commerce blocks unsupported product claims when no catalog tool succeeded", async () => {
@@ -287,6 +290,685 @@ test("website commerce blocks unsupported product claims when no catalog tool su
 
   assert.match(result.message, /check the verified catalog/i);
   assert.doesNotMatch(result.message, /999|attacker\.example/i);
+});
+
+test("shopping assistant recommends verified products naturally within the customer's budget", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  let capturedArguments;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(
+      business,
+      "Recommend a blender for smoothies under GHS 1,500"
+    ),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "budget-search",
+                    name: "search_products",
+                    arguments: {
+                      query: "blender",
+                      category: "kitchen appliances",
+                      maxPrice: 1500,
+                      available: true,
+                      preferences: ["smoothies"],
+                      sort: "relevance",
+                      limit: 5
+                    }
+                  }
+                ]
+              }
+            : {
+                text: "For smoothies, I'd recommend {{P2.name}}. Its verified power is {{P2.spec1}}, and it is {{P2.availability}} at {{P2.price}}. Product page: {{P2.url}}",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (_name, args) => {
+        capturedArguments = args;
+        return {
+          success: true,
+          message: "Products retrieved successfully.",
+          data: {
+            products: [
+              {
+                id: "blend-basic",
+                name: "Blend Basic",
+                price: 700,
+                currency: "GHS",
+                available: true,
+                specifications: { power: "500 W" },
+                canonicalUrl: "https://shop.example.com/products/blend-basic"
+              },
+              {
+                id: "blend-pro",
+                name: "Blend Pro",
+                price: 1200,
+                currency: "GHS",
+                available: true,
+                specifications: { power: "1000 W" },
+                canonicalUrl: "https://shop.example.com/products/blend-pro"
+              }
+            ],
+            total: 2
+          }
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(capturedArguments, {
+    query: "blender",
+    category: "kitchen appliances",
+    maxPrice: 1500,
+    available: true,
+    preferences: ["smoothies"],
+    sort: "relevance",
+    limit: 5
+  });
+  assert.match(result.message, /recommend Blend Pro/i);
+  assert.match(result.message, /1000 W/);
+  assert.match(result.message, /GHS 1,200/);
+  assert.match(result.message, /https:\/\/shop\.example\.com\/products\/blend-pro/);
+});
+
+test("shopping assistant compares products accumulated from separate detail tool calls", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(
+      business,
+      "Compare the first two blenders and recommend one for larger smoothies"
+    ),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "detail-1",
+                    name: "get_product_details",
+                    arguments: { productId: "blend-one" }
+                  },
+                  {
+                    id: "detail-2",
+                    name: "get_product_details",
+                    arguments: { productId: "blend-two" }
+                  }
+                ]
+              }
+            : {
+                text: "Between {{P1.name}} and {{P2.name}}, I'd choose {{P2.name}} for larger batches. Its jar is {{P2.spec1}}, compared with {{P1.spec1}}. They cost {{P1.price}} and {{P2.price}}. Links: {{P1.url}} and {{P2.url}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (_name, args) => ({
+        success: true,
+        message: "Product details retrieved successfully.",
+        data: {
+          product: args.productId === "blend-one"
+            ? {
+                id: "blend-one",
+                name: "Compact Blend",
+                price: 800,
+                currency: "GHS",
+                available: true,
+                specifications: { capacity: "1.2 L" },
+                canonicalUrl: "https://shop.example.com/products/blend-one"
+              }
+            : {
+                id: "blend-two",
+                name: "Family Blend",
+                price: 1100,
+                currency: "GHS",
+                available: true,
+                specifications: { capacity: "2 L" },
+                canonicalUrl: "https://shop.example.com/products/blend-two"
+              }
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /Compact Blend/);
+  assert.match(result.message, /Family Blend/);
+  assert.match(result.message, /1\.2 L/);
+  assert.match(result.message, /2 L/);
+  assert.match(result.message, /choose Family Blend/i);
+  assert.equal(result.data.products.length, 2);
+});
+
+test("multi-turn shopping follow-up resolves which verified product is cheaper", async () => {
+  const business = makeBusiness();
+  let firstRound = 0;
+  const first = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Show me two blenders"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          firstRound++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "follow-search",
+                    name: "search_products",
+                    arguments: { query: "blenders", limit: 2 }
+                  }
+                ]
+              }
+            : {
+                text: "I found {{P1.name}} at {{P1.price}} and {{P2.name}} at {{P2.price}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Products retrieved successfully.",
+        data: {
+          products: [
+            {
+              id: "cheap",
+              name: "Budget Blend",
+              price: 650,
+              currency: "GHS",
+              available: true,
+              canonicalUrl: "https://shop.example.com/products/cheap"
+            },
+            {
+              id: "premium",
+              name: "Premium Blend",
+              price: 1250,
+              currency: "GHS",
+              available: true,
+              canonicalUrl: "https://shop.example.com/products/premium"
+            }
+          ],
+          total: 2
+        }
+      })
+    }
+  );
+
+  let sawGroundingContract = false;
+  const second = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Which is cheaper?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async (request) => {
+          sawGroundingContract = request.messages.some(
+            (message) =>
+              message.role === "system" &&
+              message.content?.includes("{{P1.price}}") &&
+              message.content?.includes("{{P2.price}}")
+          );
+          return {
+            text: "{{P1.name}} is the cheaper option at {{P1.price}}; {{P2.name}} is {{P2.price}}.",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: first.message,
+          metadata: { commerceGrounding: first.data.commerceGrounding }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt"
+    }
+  );
+
+  assert.equal(sawGroundingContract, true);
+  assert.match(second.message, /Budget Blend is the cheaper option at GHS 650/);
+  assert.match(second.message, /Premium Blend is GHS 1,250/);
+  assert.equal(second.executedTools.length, 0);
+});
+
+test("backend unavailability is rendered from the latest authoritative result", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Is the blender available?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "unavailable-search",
+                    name: "search_products",
+                    arguments: { query: "blender", limit: 1 }
+                  }
+                ]
+              }
+            : {
+                text: "{{P1.name}} is currently {{P1.availability}}. Product page: {{P1.url}}",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Products retrieved successfully.",
+        data: {
+          products: [
+            {
+              id: "sold-out",
+              name: "Sold Out Blend",
+              price: 900,
+              currency: "GHS",
+              available: false,
+              canonicalUrl: "https://shop.example.com/products/sold-out"
+            }
+          ],
+          total: 1
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /Sold Out Blend is currently unavailable/);
+  assert.doesNotMatch(result.message, /currently available\b/i);
+});
+
+test("a failed availability check suppresses older search availability", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Is Fresh Blend still available?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => {
+          if (round++ === 0) {
+            return {
+              toolCalls: [
+                {
+                  id: "availability-search",
+                  name: "search_products",
+                  arguments: { query: "Fresh Blend", limit: 1 }
+                }
+              ]
+            };
+          }
+          if (round === 2) {
+            return {
+              toolCalls: [
+                {
+                  id: "availability-failed",
+                  name: "check_product_availability",
+                  arguments: { productId: "fresh-blend" }
+                }
+              ]
+            };
+          }
+          return {
+            text: "{{P1.name}} is {{P1.availability}}.",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (name) =>
+        name === "search_products"
+          ? {
+              success: true,
+              message: "Products retrieved successfully.",
+              data: {
+                products: [
+                  {
+                    id: "fresh-blend",
+                    name: "Fresh Blend",
+                    price: 1000,
+                    currency: "GHS",
+                    available: true,
+                    canonicalUrl: "https://shop.example.com/products/fresh-blend"
+                  }
+                ],
+                total: 1
+              }
+            }
+          : {
+              success: false,
+              code: "COMMERCE_PROVIDER_UNAVAILABLE",
+              message: "Current availability could not be verified."
+            }
+    }
+  );
+
+  assert.equal(result.message, "Current availability could not be verified.");
+  assert.doesNotMatch(result.message, /is available/i);
+  assert.equal("available" in result.data.products[0], false);
+});
+
+test("a newer availability result overrides earlier search availability", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Check Current Blend availability"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => {
+          if (round++ === 0) {
+            return {
+              toolCalls: [
+                {
+                  id: "override-search",
+                  name: "search_products",
+                  arguments: { query: "Current Blend", limit: 1 }
+                },
+                {
+                  id: "override-availability",
+                  name: "check_product_availability",
+                  arguments: { productId: "current-blend" }
+                }
+              ]
+            };
+          }
+          return {
+            text: "{{P1.name}} is now {{P1.availability}}.",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (name) =>
+        name === "search_products"
+          ? {
+              success: true,
+              message: "Products retrieved successfully.",
+              data: {
+                products: [
+                  {
+                    id: "current-blend",
+                    name: "Current Blend",
+                    price: 1000,
+                    currency: "GHS",
+                    available: true,
+                    canonicalUrl: "https://shop.example.com/products/current-blend"
+                  }
+                ],
+                total: 1
+              }
+            }
+          : {
+              success: true,
+              message: "Product availability retrieved successfully.",
+              data: {
+                productId: "current-blend",
+                available: false,
+                stockQuantity: 0
+              }
+            }
+    }
+  );
+
+  assert.match(result.message, /Current Blend is now unavailable/);
+  assert.equal(result.data.products[0].available, false);
+  assert.equal(result.data.products[0].stockQuantity, 0);
+});
+
+test("business policy answers remain conversational after a product search", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Can I return the blender if it does not suit me?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => {
+          if (round++ === 0) {
+            return {
+              toolCalls: [
+                {
+                  id: "policy-product",
+                  name: "search_products",
+                  arguments: { query: "blender", limit: 1 }
+                }
+              ]
+            };
+          }
+          if (round === 2) {
+            return {
+              toolCalls: [
+                {
+                  id: "returns-policy",
+                  name: "get_business_policies",
+                  arguments: { topic: "returns" }
+                }
+              ]
+            };
+          }
+          return {
+            text: "For {{P1.name}}, the approved {{POLICY1.name}} says: {{POLICY1.content}} Full policy: {{POLICY1.url}}",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (name) =>
+        name === "search_products"
+          ? {
+              success: true,
+              message: "Products retrieved successfully.",
+              data: {
+                products: [
+                  {
+                    id: "policy-blend",
+                    name: "Policy Blend",
+                    price: 950,
+                    currency: "GHS",
+                    available: true,
+                    canonicalUrl: "https://shop.example.com/products/policy-blend"
+                  }
+                ],
+                total: 1
+              }
+            }
+          : {
+              success: true,
+              message: "Business policies retrieved successfully.",
+              data: {
+                policies: [
+                  {
+                    name: "Returns",
+                    content: "Unused products may be returned within 14 days.",
+                    url: "https://shop.example.com/policies/returns"
+                  }
+                ]
+              }
+            }
+    }
+  );
+
+  assert.match(result.message, /Policy Blend/);
+  assert.match(result.message, /Unused products may be returned within 14 days/);
+  assert.match(result.message, /https:\/\/shop\.example\.com\/policies\/returns/);
+  assert.equal(result.data.products.length, 1);
+  assert.equal(result.data.policies.length, 1);
+});
+
+test("failed catalog requests cannot reuse stale facts and return a safe response", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Find a current blender price"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "failed-search",
+                    name: "search_products",
+                    arguments: { query: "blender", limit: 2 }
+                  }
+                ]
+              }
+            : {
+                text: "The blender costs GHS 1 and is available.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier options",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "stale",
+                  name: "Stale Blend",
+                  price: 500,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/stale"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: false,
+        code: "COMMERCE_PROVIDER_UNAVAILABLE",
+        message: "Product information is temporarily unavailable."
+      })
+    }
+  );
+
+  assert.equal(result.message, "Product information is temporarily unavailable.");
+  assert.doesNotMatch(result.message, /Stale Blend|GHS 1/);
+});
+
+test("products with missing specifications still receive a natural grounded answer", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Tell me about the simple blender"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "missing-specs",
+                    name: "get_product_details",
+                    arguments: { productId: "simple" }
+                  }
+                ]
+              }
+            : {
+                text: "{{P1.name}} is listed at {{P1.price}}. The catalog did not provide extra technical details, so I won't guess them. Product page: {{P1.url}}",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Product details retrieved successfully.",
+        data: {
+          product: {
+            id: "simple",
+            name: "Simple Blend",
+            price: 450,
+            currency: "GHS",
+            available: true,
+            canonicalUrl: "https://shop.example.com/products/simple"
+          }
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /Simple Blend is listed at GHS 450/);
+  assert.match(result.message, /won't guess/i);
+  assert.doesNotMatch(result.message, /undefined|null/i);
+});
+
+test("restaurant orchestrator responses remain unchanged by commerce grounding", async () => {
+  const restaurantId = new Types.ObjectId();
+  const result = await runAgentOrchestrator(
+    {
+      restaurant: { _id: restaurantId },
+      sender: {
+        identityKey: "whatsapp:+233500000001",
+        phone: "+233500000001",
+        normalizedAddress: "+233500000001",
+        normalizedPhone: "+233500000001",
+        role: "customer",
+        verified: true
+      },
+      message: "Hello"
+    },
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => ({
+          text: "Welcome back to the restaurant assistant.",
+          toolCalls: []
+        })
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted restaurant prompt"
+    }
+  );
+
+  assert.equal(result.message, "Welcome back to the restaurant assistant.");
+  assert.equal(result.executedTools.length, 0);
 });
 
 test("website customer cannot execute restaurant operational tools through orchestrator", async () => {
@@ -393,6 +1075,45 @@ test("external commerce client uses trusted endpoint credentials and grounded pr
   assert.equal(result.products[0].canonicalUrl, "https://shop.example.com/products/phone-1");
 });
 
+test("external commerce search forwards authoritative shopping filters to the business API", async () => {
+  const business = makeBusiness();
+  let requestedUrl;
+  const result = await searchCommerceProducts(
+    business,
+    "blender",
+    5,
+    {
+      minPrice: 300,
+      maxPrice: 1500,
+      category: "kitchen appliances",
+      available: true,
+      preferences: ["smoothies", "quiet"],
+      sort: "price_asc"
+    },
+    {
+      fetch: async (url) => {
+        requestedUrl = new URL(String(url));
+        return new Response(JSON.stringify({ products: [], total: 0 }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+    }
+  );
+
+  assert.equal(result.total, 0);
+  assert.equal(requestedUrl.searchParams.get("query"), "blender");
+  assert.equal(requestedUrl.searchParams.get("minPrice"), "300");
+  assert.equal(requestedUrl.searchParams.get("maxPrice"), "1500");
+  assert.equal(requestedUrl.searchParams.get("category"), "kitchen appliances");
+  assert.equal(requestedUrl.searchParams.get("available"), "true");
+  assert.deepEqual(requestedUrl.searchParams.getAll("preference"), [
+    "smoothies",
+    "quiet"
+  ]);
+  assert.equal(requestedUrl.searchParams.get("sort"), "price_asc");
+});
+
 test("external catalog rejects unapproved product URL hosts", async () => {
   const business = makeBusiness();
 
@@ -444,6 +1165,33 @@ test("missing commerce credentials fail safely without making a request", async 
   assert.equal(result.success, false);
   assert.equal(result.code, "COMMERCE_INTEGRATION_NOT_CONFIGURED");
   assert.equal(JSON.stringify(result).includes("apiKey"), false);
+});
+
+test("commerce search rejects invalid price ranges before calling the business API", async () => {
+  const business = makeBusiness();
+  const result = await executeAgentTool(
+    "search_products",
+    {
+      category: "kitchen appliances",
+      minPrice: 1500,
+      maxPrice: 500,
+      limit: 5
+    },
+    {
+      businessId: String(business._id),
+      businessType: "ecommerce",
+      business,
+      channel: "website",
+      capabilities: ["website_chat", "commerce_catalog_read"],
+      conversationId: "session-12345678",
+      sender: makeOrchestratorInput(business).sender,
+      originalMessage: "Find kitchen appliances"
+    }
+  );
+
+  assert.equal(result.success, false);
+  assert.equal(result.code, "TOOL_INVALID_ARGUMENTS");
+  assert.match(result.message, /minPrice cannot exceed maxPrice/);
 });
 
 test("website integration secrets are hashed and compared without storing plaintext", () => {

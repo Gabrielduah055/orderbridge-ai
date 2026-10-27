@@ -63,11 +63,13 @@ export const handleWebsiteChat = async (
       message: req.body.message,
       requestId: req.header("x-request-id")?.trim() || randomUUID()
     });
+    const responseData = result.data ? { ...result.data } : undefined;
+    if (responseData) delete responseData.commerceGrounding;
 
     res.status(result.success ? 200 : 503).json({
       success: result.success,
       message: result.message,
-      data: result.data,
+      data: responseData,
       responseId: result.responseId,
       conversation
     });

@@ -1764,7 +1764,57 @@ type GroundedCommerceResult =
       productId: string;
       available: boolean;
       stockQuantity?: number;
-    };
+    }
+  | { kind: "policies"; policies: GroundedCommercePolicy[] };
+
+interface GroundedCommercePolicy {
+  name: string;
+  content: string;
+  url?: string;
+}
+
+interface GroundedAvailability {
+  available?: boolean;
+  stockQuantity?: number;
+  failed?: boolean;
+}
+
+interface CommerceGroundingSnapshot {
+  capturedAt: string;
+  products: GroundedCommerceProduct[];
+  availability: Array<GroundedAvailability & { productId: string }>;
+  policies: GroundedCommercePolicy[];
+}
+
+interface CommerceGroundingState {
+  capturedAt: string;
+  products: Map<string, GroundedCommerceProduct>;
+  productOrder: string[];
+  availability: Map<string, GroundedAvailability>;
+  policies: Map<string, GroundedCommercePolicy>;
+  policyOrder: string[];
+}
+
+interface CommerceResponseContract {
+  prompt?: string;
+  replacements: Map<string, string>;
+  productTokens: Set<string>;
+  policyTokens: Set<string>;
+}
+
+const commerceGroundingHistoryMaxAgeMs = 15 * 60_000;
+const maxGroundedCommerceProducts = 20;
+const maxGroundedCommercePolicies = 20;
+const commerceTokenPattern = /\{\{(?:P|POLICY)\d+\.[A-Za-z0-9.]+\}\}/g;
+
+const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
+  capturedAt: new Date().toISOString(),
+  products: new Map(),
+  productOrder: [],
+  availability: new Map(),
+  policies: new Map(),
+  policyOrder: []
+});
 
 const isGroundedCommerceProduct = (
   value: unknown,
@@ -1855,6 +1905,41 @@ const parseGroundedCommerceResult = (
     };
   }
 
+  if (toolName === "get_business_policies" && Array.isArray(record.policies)) {
+    const policies = record.policies.filter(
+      (policy): policy is GroundedCommercePolicy => {
+        if (!policy || typeof policy !== "object") return false;
+        const candidate = policy as Record<string, unknown>;
+        if (
+          typeof candidate.name !== "string" ||
+          typeof candidate.content !== "string" ||
+          (candidate.url !== undefined && typeof candidate.url !== "string")
+        ) {
+          return false;
+        }
+        if (typeof candidate.url === "string") {
+          try {
+            const url = new URL(candidate.url);
+            return (
+              url.protocol === "https:" &&
+              !url.username &&
+              !url.password &&
+              allowedHosts.some(
+                (host) => host.trim().toLowerCase() === url.hostname.toLowerCase()
+              )
+            );
+          } catch {
+            return false;
+          }
+        }
+        return true;
+      }
+    );
+    return policies.length === record.policies.length
+      ? { kind: "policies", policies }
+      : null;
+  }
+
   return null;
 };
 
@@ -1874,45 +1959,403 @@ const formatGroundedSpecifications = (
     .join(", ");
 };
 
-const buildGroundedProductLines = (
-  product: GroundedCommerceProduct,
-  index?: number
-): string[] => {
-  const prefix = index === undefined ? "" : `${index + 1}. `;
-  const specifications = formatGroundedSpecifications(product.specifications);
-  return [
-    `${prefix}${normalizeText(product.name)} — ${formatGroundedPrice(product.price, product.currency)} — ${product.available ? "Available" : "Unavailable"}`,
-    product.description
-      ? `Description: ${normalizeText(product.description)}`
-      : null,
-    specifications ? `Specifications: ${specifications}` : null,
-    typeof product.stockQuantity === "number"
-      ? `Stock recorded: ${product.stockQuantity}`
-      : null,
-    `Product page: ${product.canonicalUrl}`
-  ].filter((line): line is string => Boolean(line));
+const upsertGroundedProduct = (
+  state: CommerceGroundingState,
+  product: GroundedCommerceProduct
+): void => {
+  if (!state.products.has(product.id)) {
+    if (state.productOrder.length >= maxGroundedCommerceProducts) {
+      const removedId = state.productOrder.shift();
+      if (removedId) {
+        state.products.delete(removedId);
+        state.availability.delete(removedId);
+      }
+    }
+    state.productOrder.push(product.id);
+  }
+  state.products.set(product.id, product);
+  state.availability.delete(product.id);
+  state.capturedAt = new Date().toISOString();
 };
 
-const buildGroundedCommerceAnswer = (
-  result: GroundedCommerceResult | undefined
-): string | null => {
-  if (!result) return null;
-
+const applyGroundedCommerceResult = (
+  state: CommerceGroundingState,
+  result: GroundedCommerceResult
+): void => {
   if (result.kind === "search") {
-    if (result.products.length === 0) return "No matching products were found.";
-    return result.products
-      .flatMap((product, index) => buildGroundedProductLines(product, index))
+    for (const product of result.products) upsertGroundedProduct(state, product);
+    return;
+  }
+  if (result.kind === "product") {
+    upsertGroundedProduct(state, result.product);
+    return;
+  }
+  if (result.kind === "availability") {
+    state.availability.set(result.productId, {
+      available: result.available,
+      stockQuantity: result.stockQuantity
+    });
+    state.capturedAt = new Date().toISOString();
+    return;
+  }
+  for (const policy of result.policies) {
+    const key = normalizeText(policy.name).toLowerCase();
+    if (!state.policies.has(key)) {
+      if (state.policyOrder.length >= maxGroundedCommercePolicies) {
+        const removedKey = state.policyOrder.shift();
+        if (removedKey) state.policies.delete(removedKey);
+      }
+      state.policyOrder.push(key);
+    }
+    state.policies.set(key, policy);
+  }
+  state.capturedAt = new Date().toISOString();
+};
+
+const markCommerceToolFailure = (
+  state: CommerceGroundingState,
+  toolName: string,
+  args: Record<string, unknown>
+): void => {
+  if (toolName === "search_products") {
+    state.products.clear();
+    state.productOrder = [];
+    state.availability.clear();
+  } else if (
+    (toolName === "get_product_details" ||
+      toolName === "check_product_availability") &&
+    typeof args.productId === "string"
+  ) {
+    if (toolName === "get_product_details") {
+      state.products.delete(args.productId);
+      state.productOrder = state.productOrder.filter((id) => id !== args.productId);
+    }
+    state.availability.set(args.productId, { failed: true });
+  } else if (toolName === "get_business_policies") {
+    state.policies.clear();
+    state.policyOrder = [];
+  }
+  state.capturedAt = new Date().toISOString();
+};
+
+const buildCommerceGroundingSnapshot = (
+  state: CommerceGroundingState
+): CommerceGroundingSnapshot => ({
+  capturedAt: state.capturedAt,
+  products: state.productOrder
+    .map((id) => state.products.get(id))
+    .filter((product): product is GroundedCommerceProduct => Boolean(product))
+    .slice(0, 20),
+  availability: Array.from(state.availability.entries())
+    .map(([productId, availability]) => ({ productId, ...availability }))
+    .slice(0, 20),
+  policies: state.policyOrder
+    .map((key) => state.policies.get(key))
+    .filter((policy): policy is GroundedCommercePolicy => Boolean(policy))
+    .slice(0, 20)
+});
+
+const restoreCommerceGroundingState = (
+  history: AgentHistoryMessage[],
+  allowedHosts: readonly string[]
+): CommerceGroundingState => {
+  const state = createEmptyCommerceGroundingState();
+  const rawSnapshot = [...history]
+    .reverse()
+    .find((message) => message.role === "assistant" && message.metadata?.commerceGrounding)
+    ?.metadata?.commerceGrounding;
+  if (!rawSnapshot || typeof rawSnapshot !== "object") return state;
+  const snapshot = rawSnapshot as Partial<CommerceGroundingSnapshot>;
+  const capturedAt = typeof snapshot.capturedAt === "string"
+    ? Date.parse(snapshot.capturedAt)
+    : Number.NaN;
+  if (
+    !Number.isFinite(capturedAt) ||
+    Date.now() - capturedAt > commerceGroundingHistoryMaxAgeMs ||
+    capturedAt - Date.now() > 60_000
+  ) {
+    return state;
+  }
+
+  for (const product of Array.isArray(snapshot.products) ? snapshot.products : []) {
+    if (isGroundedCommerceProduct(product, allowedHosts)) {
+      upsertGroundedProduct(state, product);
+    }
+  }
+  for (const entry of Array.isArray(snapshot.availability) ? snapshot.availability : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as unknown as Record<string, unknown>;
+    if (typeof candidate.productId !== "string") continue;
+    if (candidate.failed === true) {
+      state.availability.set(candidate.productId, { failed: true });
+    } else if (typeof candidate.available === "boolean") {
+      state.availability.set(candidate.productId, {
+        available: candidate.available,
+        stockQuantity:
+          typeof candidate.stockQuantity === "number"
+            ? candidate.stockQuantity
+            : undefined
+      });
+    }
+  }
+  const policiesResult = parseGroundedCommerceResult(
+    "get_business_policies",
+    { policies: Array.isArray(snapshot.policies) ? snapshot.policies : [] },
+    allowedHosts
+  );
+  if (policiesResult?.kind === "policies") {
+    applyGroundedCommerceResult(state, policiesResult);
+  }
+  state.capturedAt = new Date(capturedAt).toISOString();
+  return state;
+};
+
+const buildCommerceResponseContract = (
+  state: CommerceGroundingState
+): CommerceResponseContract => {
+  const replacements = new Map<string, string>();
+  const productTokens = new Set<string>();
+  const policyTokens = new Set<string>();
+  const lines: string[] = [];
+
+  for (const [index, productId] of state.productOrder.entries()) {
+    const product = state.products.get(productId);
+    if (!product) continue;
+    const alias = `P${index + 1}`;
+    const availabilityOverride = state.availability.get(product.id);
+    const effectiveAvailability = availabilityOverride?.failed
+      ? undefined
+      : availabilityOverride?.available ?? product.available;
+    const effectiveStock = availabilityOverride?.failed
+      ? undefined
+      : availabilityOverride?.stockQuantity ?? product.stockQuantity;
+    const tokens: string[] = [];
+    const addToken = (field: string, value: string): void => {
+      const token = `{{${alias}.${field}}}`;
+      replacements.set(token, value);
+      productTokens.add(token);
+      tokens.push(token);
+    };
+    addToken("name", normalizeText(product.name));
+    addToken("price", formatGroundedPrice(product.price, product.currency));
+    addToken("currency", product.currency.toUpperCase());
+    addToken("url", product.canonicalUrl);
+    if (product.description) addToken("description", normalizeText(product.description));
+    if (typeof effectiveAvailability === "boolean") {
+      addToken("availability", effectiveAvailability ? "available" : "unavailable");
+    }
+    if (typeof effectiveStock === "number") addToken("stock", String(effectiveStock));
+    for (const [specIndex, [key, value]] of Object.entries(
+      product.specifications ?? {}
+    ).sort(([first], [second]) => first.localeCompare(second)).entries()) {
+      const field = `spec${specIndex + 1}`;
+      const token = `{{${alias}.${field}}}`;
+      replacements.set(token, normalizeText(String(value)));
+      productTokens.add(token);
+      tokens.push(`${normalizeText(key)}=${token}`);
+    }
+    lines.push(`${alias} (${normalizeText(product.name)}): ${tokens.join(", ")}`);
+  }
+
+  for (const [index, policyKey] of state.policyOrder.entries()) {
+    const policy = state.policies.get(policyKey);
+    if (!policy) continue;
+    const alias = `POLICY${index + 1}`;
+    const fields: Array<[string, string]> = [
+      ["name", normalizeText(policy.name)],
+      ["content", normalizeText(policy.content)]
+    ];
+    if (policy.url) fields.push(["url", policy.url]);
+    const tokens = fields.map(([field, value]) => {
+      const token = `{{${alias}.${field}}}`;
+      replacements.set(token, value);
+      policyTokens.add(token);
+      return token;
+    });
+    lines.push(`${alias} (${normalizeText(policy.name)}): ${tokens.join(", ")}`);
+  }
+
+  return {
+    replacements,
+    productTokens,
+    policyTokens,
+    prompt: lines.length === 0
+      ? undefined
+      : [
+          "Trusted commerce response contract:",
+          "You may recommend, compare, explain differences, respect preferences, and answer follow-ups naturally.",
+          "Every product name, description, price, currency, availability, stock quantity, specification value, product URL, and business-policy fact must use one of the exact placeholders below.",
+          "Never write those facts as free text, never alter a placeholder, and never expose the P/POLICY aliases. The backend will validate and render placeholders after your response.",
+          "Recommendations and subjective conclusions are allowed only when they are clearly based on the supplied facts. If a required fact has no placeholder, say it could not be verified.",
+          ...lines
+        ].join("\n")
+  };
+};
+
+const containsLiteralGroundedValue = (
+  message: string,
+  state: CommerceGroundingState
+): boolean => {
+  const normalizedMessage = normalizeText(message).toLowerCase();
+  const values: string[] = [];
+  for (const product of state.products.values()) {
+    values.push(product.name, product.description ?? "");
+    values.push(
+      ...Object.values(product.specifications ?? {}).map((value) => String(value))
+    );
+  }
+  for (const policy of state.policies.values()) {
+    values.push(policy.content);
+  }
+  return values
+    .map((value) => normalizeText(value).toLowerCase())
+    .filter((value) => value.length >= 4)
+    .some((value) => normalizedMessage.includes(value));
+};
+
+const isPolicyQuestion = (message: string): boolean =>
+  /\b(?:return|refund|exchange|warranty|shipping|delivery|privacy|terms|policy|policies)\b/i.test(
+    message
+  );
+
+const isProductQuestion = (message: string): boolean =>
+  /\b(?:product|item|recommend|compare|comparison|cheaper|cheapest|budget|price|cost|available|stock|spec|link|which|first|second|better|best)\b/i.test(
+    message
+  );
+
+const containsUnsupportedCommerceNarrativeClaim = (message: string): boolean =>
+  /\b(?:has|have|includes?|features?|comes with|offers?|supports?|uses?|made (?:from|of)|equipped with)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
+    message
+  ) ||
+  /\b(?:its|their|the)\s+[A-Za-z][A-Za-z -]{1,30}\s+(?:is|are)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
+    message
+  ) ||
+  /\b(?:you|customers?|items?|products?)\s+(?:can|cannot|can't|may|must|must not|are allowed|are not allowed)\b/i.test(
+    message
+  );
+
+const renderValidatedCommerceResponse = (
+  rawMessage: string,
+  userMessage: string,
+  state: CommerceGroundingState
+): string | null => {
+  const contract = buildCommerceResponseContract(state);
+  const tokens = rawMessage.match(commerceTokenPattern) ?? [];
+  if (tokens.some((token) => !contract.replacements.has(token))) return null;
+  const withoutTokens = rawMessage.replace(commerceTokenPattern, " ");
+  if (
+    /\{\{/.test(withoutTokens) ||
+    containsUnsupportedProductClaim(withoutTokens) ||
+    containsUnsupportedCommerceNarrativeClaim(withoutTokens) ||
+    containsLiteralGroundedValue(withoutTokens, state)
+  ) {
+    return null;
+  }
+  if (
+    state.products.size > 0 &&
+    isProductQuestion(userMessage) &&
+    !tokens.some((token) => contract.productTokens.has(token))
+  ) {
+    return null;
+  }
+  if (
+    state.policies.size > 0 &&
+    isPolicyQuestion(userMessage) &&
+    !tokens.some((token) => contract.policyTokens.has(token))
+  ) {
+    return null;
+  }
+
+  let rendered = rawMessage;
+  for (const [token, value] of contract.replacements) {
+    rendered = rendered.split(token).join(value);
+  }
+  return rendered
+    .split(/\r?\n/)
+    .map((line) => normalizeText(line))
+    .filter(Boolean)
+    .join("\n");
+};
+
+const buildSafeCommerceFallback = (
+  userMessage: string,
+  state: CommerceGroundingState,
+  failureMessage?: string
+): string => {
+  if (failureMessage) return failureMessage;
+  if (isPolicyQuestion(userMessage) && state.policies.size > 0) {
+    return state.policyOrder
+      .map((key) => state.policies.get(key))
+      .filter((policy): policy is GroundedCommercePolicy => Boolean(policy))
+      .map((policy) =>
+        [policy.name, policy.content, policy.url].filter(Boolean).join(" — ")
+      )
       .join("\n");
   }
-
-  if (result.kind === "product") {
-    return buildGroundedProductLines(result.product).join("\n");
+  const products = state.productOrder
+    .map((id) => state.products.get(id))
+    .filter((product): product is GroundedCommerceProduct => Boolean(product));
+  if (products.length === 0) return unsupportedProductClaimMessage;
+  const budgetMatch = /(?:under|below|budget(?: of)?|up to)\s*(?:GHS\s*)?([\d,]+(?:\.\d+)?)/i.exec(
+    userMessage
+  );
+  const budget = budgetMatch
+    ? Number(budgetMatch[1].replace(/,/g, ""))
+    : undefined;
+  const candidates = products
+    .filter((product) => budget === undefined || product.price <= budget)
+    .sort((first, second) => first.price - second.price);
+  if (candidates.length === 0 && budget !== undefined) {
+    return `I couldn't find a verified option within GHS ${new Intl.NumberFormat("en", { maximumFractionDigits: 2 }).format(budget)}.`;
   }
+  const selected = candidates.length > 0 ? candidates : products;
+  const asksForCheaper = /\b(?:cheaper|cheapest|lowest price|most affordable)\b/i.test(
+    userMessage
+  );
+  const heading = asksForCheaper
+    ? "The lowest verified price is:"
+    : /\b(?:recommend|best|budget)\b/i.test(userMessage)
+      ? "Based on the verified catalog, these are the strongest matches:"
+      : "Here are the verified options:";
+  return [
+    heading,
+    ...selected.map((product, index) => {
+      const availabilityOverride = state.availability.get(product.id);
+      const availability = availabilityOverride?.failed
+        ? "availability could not be verified"
+        : (availabilityOverride?.available ?? product.available)
+          ? "available"
+          : "unavailable";
+      const specs = formatGroundedSpecifications(product.specifications);
+      return `${index + 1}. ${normalizeText(product.name)} — ${formatGroundedPrice(product.price, product.currency)} — ${availability}${specs ? ` — ${specs}` : ""} — ${product.canonicalUrl}`;
+    })
+  ].join("\n");
+};
 
-  const stock = typeof result.stockQuantity === "number"
-    ? ` Recorded stock: ${result.stockQuantity}.`
-    : "";
-  return `Product ${normalizeText(result.productId)} is currently ${result.available ? "available" : "unavailable"}.${stock}`;
+const mergeCommerceGroundingData = (
+  data: AgentOrchestratorResult["data"],
+  state: CommerceGroundingState
+): AgentOrchestratorResult["data"] => {
+  const snapshot = buildCommerceGroundingSnapshot(state);
+  if (snapshot.products.length === 0 && snapshot.policies.length === 0) return data;
+  const products = snapshot.products.map((product) => {
+    const override = state.availability.get(product.id);
+    if (!override?.failed) {
+      return {
+        ...product,
+        available: override?.available ?? product.available,
+        stockQuantity: override?.stockQuantity ?? product.stockQuantity
+      };
+    }
+    const { available: _available, stockQuantity: _stockQuantity, ...safeProduct } = product;
+    return safeProduct;
+  });
+  return {
+    ...(data ?? {}),
+    ...(products.length > 0 ? { products } : {}),
+    ...(snapshot.policies.length > 0 ? { policies: snapshot.policies } : {}),
+    commerceGrounding: snapshot
+  };
 };
 
 const containsUnsupportedProductClaim = (message: string): boolean =>
@@ -1927,6 +2370,12 @@ const containsUnsupportedProductClaim = (message: string): boolean =>
 
 const unsupportedProductClaimMessage =
   "I need to check the verified catalog before I can provide a product price, availability, link, or specification. Please ask me to search for the product.";
+const commerceGroundingToolNames = new Set([
+  "search_products",
+  "get_product_details",
+  "check_product_availability",
+  "get_business_policies"
+]);
 
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
@@ -1998,6 +2447,14 @@ const runAgentOrchestratorCore = async (
           conversationId,
           14
         );
+  const allowedCommerceHosts =
+    businessInput?.business.commerceIntegration?.canonicalProductHosts ?? [];
+  const commerceGroundingState = businessInput
+    ? restoreCommerceGroundingState(history, allowedCommerceHosts)
+    : createEmptyCommerceGroundingState();
+  const initialCommerceContract = businessInput
+    ? buildCommerceResponseContract(commerceGroundingState)
+    : undefined;
   const messages: AiMessage[] = [
     {
       role: "system",
@@ -2005,7 +2462,10 @@ const runAgentOrchestratorCore = async (
     },
     ...history
       .map(toConversationMessage)
-      .filter((message): message is AiMessage => Boolean(message))
+      .filter((message): message is AiMessage => Boolean(message)),
+    ...(initialCommerceContract?.prompt
+      ? [{ role: "system" as const, content: initialCommerceContract.prompt }]
+      : [])
   ];
   const normalizedInputMessage = normalizeText(input.message);
   const latestHistoryMessage = history[history.length - 1];
@@ -2037,7 +2497,7 @@ const runAgentOrchestratorCore = async (
   let latestCustomerSegment: GroundedCustomerSegmentResult | undefined;
   let latestOrderList: GroundedOrderQueryResult | undefined;
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
-  let latestCommerceResult: GroundedCommerceResult | undefined;
+  let latestCommerceFailureMessage: string | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -2192,13 +2652,19 @@ const runAgentOrchestratorCore = async (
             : finalMessage;
         }
         if (businessInput) {
-          const groundedCommerceAnswer = buildGroundedCommerceAnswer(
-            latestCommerceResult
+          importantData = mergeCommerceGroundingData(
+            importantData,
+            commerceGroundingState
           );
-          finalMessage = groundedCommerceAnswer ??
-            (containsUnsupportedProductClaim(finalMessage)
-              ? unsupportedProductClaimMessage
-              : finalMessage);
+          finalMessage = renderValidatedCommerceResponse(
+            finalMessage,
+            normalizedInputMessage,
+            commerceGroundingState
+          ) ?? buildSafeCommerceFallback(
+            normalizedInputMessage,
+            commerceGroundingState,
+            latestCommerceFailureMessage
+          );
         }
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
@@ -2358,15 +2824,27 @@ const runAgentOrchestratorCore = async (
             parseGroundedBusinessReportResult(result.data) ?? undefined;
         }
 
-        if (result.success) {
-          latestCommerceResult =
-            parseGroundedCommerceResult(
+        if (businessInput && commerceGroundingToolNames.has(toolName)) {
+          const groundedResult = result.success
+            ? parseGroundedCommerceResult(
+                toolName,
+                result.data,
+                allowedCommerceHosts
+              )
+            : null;
+          if (groundedResult) {
+            applyGroundedCommerceResult(commerceGroundingState, groundedResult);
+            latestCommerceFailureMessage = undefined;
+          } else {
+            markCommerceToolFailure(
+              commerceGroundingState,
               toolName,
-              result.data,
-              businessInput?.business.commerceIntegration
-                ?.canonicalProductHosts ?? []
-            ) ??
-            latestCommerceResult;
+              safeArguments
+            );
+            latestCommerceFailureMessage = result.success
+              ? "Product information is temporarily unavailable."
+              : result.message;
+          }
         }
 
         if (
@@ -2400,6 +2878,12 @@ const runAgentOrchestratorCore = async (
           toolName,
           safeArguments
         );
+        if (businessInput) {
+          importantData = mergeCommerceGroundingData(
+            importantData,
+            commerceGroundingState
+          );
+        }
 
         const toolMessage = {
           senderRole: input.sender.role,
@@ -2470,6 +2954,17 @@ const runAgentOrchestratorCore = async (
             executedTools,
             usage
           };
+        }
+      }
+      if (businessInput) {
+        const commerceContract = buildCommerceResponseContract(
+          commerceGroundingState
+        );
+        if (commerceContract.prompt) {
+          messages.push({
+            role: "system",
+            content: commerceContract.prompt
+          });
         }
       }
     }

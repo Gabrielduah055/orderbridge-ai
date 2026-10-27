@@ -92,7 +92,8 @@ export const handleWebsiteChatMessage = async (
         success: result.success,
         responseId: result.responseId,
         executedTools: result.executedTools,
-        usage: result.usage
+        usage: result.usage,
+        commerceGrounding: result.data?.commerceGrounding
       }
     });
 

@@ -69,6 +69,15 @@ export interface CommerceIntegrationDependencies {
   fetch?: typeof fetch;
 }
 
+export interface CommerceProductSearchFilters {
+  minPrice?: number;
+  maxPrice?: number;
+  category?: string;
+  available?: boolean;
+  preferences?: string[];
+  sort?: "relevance" | "price_asc" | "price_desc";
+}
+
 const getConfiguration = (
   business: IBusinessDocument
 ): CommerceIntegrationConfiguration => {
@@ -245,18 +254,45 @@ const validateProducts = (
 
 export const searchCommerceProducts = async (
   business: IBusinessDocument,
-  query: string,
+  query: string | undefined,
   limit: number,
-  dependencies: CommerceIntegrationDependencies = {}
+  filtersOrDependencies:
+    | CommerceProductSearchFilters
+    | CommerceIntegrationDependencies = {},
+  explicitDependencies: CommerceIntegrationDependencies = {}
 ) => {
+  const dependencies =
+    "fetch" in filtersOrDependencies
+      ? filtersOrDependencies as CommerceIntegrationDependencies
+      : explicitDependencies;
+  const filters =
+    "fetch" in filtersOrDependencies
+      ? {}
+      : filtersOrDependencies as CommerceProductSearchFilters;
   const configuration = getConfiguration(business);
   const payload = await requestJson(
     business,
     configuration.paths.search,
     dependencies,
     (url) => {
-      url.searchParams.set("query", query);
+      if (query?.trim()) url.searchParams.set("query", query.trim());
       url.searchParams.set("limit", String(limit));
+      if (filters.minPrice !== undefined) {
+        url.searchParams.set("minPrice", String(filters.minPrice));
+      }
+      if (filters.maxPrice !== undefined) {
+        url.searchParams.set("maxPrice", String(filters.maxPrice));
+      }
+      if (filters.category?.trim()) {
+        url.searchParams.set("category", filters.category.trim());
+      }
+      if (filters.available !== undefined) {
+        url.searchParams.set("available", String(filters.available));
+      }
+      for (const preference of filters.preferences ?? []) {
+        url.searchParams.append("preference", preference);
+      }
+      if (filters.sort) url.searchParams.set("sort", filters.sort);
     }
   );
   const parsed = searchResponseSchema.safeParse(payload);

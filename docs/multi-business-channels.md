@@ -65,7 +65,11 @@ For the first turn, the website backend omits conversation credentials. OrderBri
 
 Anonymous website visitors remain `verified: false`; a valid continuation token authorizes access to that conversation but does not prove a real-world customer identity.
 
-The response contains deterministic, tool-grounded product facts plus structured `products`, `product`, `productAvailability`, or `policies` data when applicable. Prices, currencies, availability, specifications, and product URLs are rendered from validated backend tool results rather than model prose. Unsupported product claims are replaced with a safe catalog-check response. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
+The response remains conversational: the existing model may recommend products, compare options, explain grounded differences, respect budgets and preferences, and answer follow-up references. After commerce tools run, the orchestrator supplies the same model with backend-issued placeholders for every trusted catalog and policy fact. The response processor rejects unknown placeholders and ungrounded literal facts, then renders valid placeholders from accumulated backend results. If validation fails, OrderBridge uses a safe factual fallback rather than exposing unsupported model prose.
+
+Multiple successful tool calls are merged by product ID, so separate detail lookups remain available for comparisons. Newer detail and availability results override older values. A failed explicit availability lookup suppresses older availability rather than allowing stale search data to win. A bounded trusted grounding snapshot may be reused for follow-up turns in the same authorized conversation for up to 15 minutes; it is stored as conversation metadata, not treated as model-authored history.
+
+The response also contains structured, tool-grounded `products`, `product`, `productAvailability`, or `policies` data when applicable. Prices, currencies, availability, specifications, policies, and product URLs always originate from validated backend tool results. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
 
 Conversation records use `businessId + channel + conversationId`. A website session is never joined to a WhatsApp customer because of a matching name or submitted phone number. Turns for one website conversation are sequenced in process, while unrelated conversations may run concurrently.
 
@@ -75,7 +79,17 @@ The website limiter enforces the configured `requestsPerMinute` across the whole
 
 The external origin and paths are trusted business configuration. Paths must be origin-relative, redirects are rejected, requests use HTTPS, timeouts are bounded to 500–15,000 ms, and response bodies are limited to 512 KiB.
 
-Search receives `query` and `limit` query parameters and returns:
+Search accepts the following validated fields when the business API supports them:
+
+- optional `query` text;
+- `limit` from 1–10;
+- non-negative `minPrice` and `maxPrice`, with `minPrice <= maxPrice`;
+- optional `category`;
+- optional `available` status;
+- up to ten `preferences` values;
+- `sort` as `relevance`, `price_asc`, or `price_desc`.
+
+At least one of `query`, `category`, or `preferences` is required. OrderBridge forwards these as `query`, `limit`, `minPrice`, `maxPrice`, `category`, `available`, repeated `preference`, and `sort` query parameters. The external business backend remains authoritative for filtering, ranking, price, availability, and relevance. It returns:
 
 ```json
 {

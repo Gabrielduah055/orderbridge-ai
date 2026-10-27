@@ -4212,22 +4212,48 @@ export const commerceToolRegistry = {
   search_products: defineCommerceTool({
     definition: {
       name: "search_products",
-      description: "Search the current business's authoritative external product catalog.",
+      description:
+        "Search the current business's authoritative external product catalog using optional price, category, availability, preference, and sort filters. The business backend performs authoritative filtering and ranking.",
       parameters: {}
     },
     roles: toolPermissions.search_products,
     schema: z
       .object({
-        query: z.string().trim().min(1).max(120),
-        limit: z.number().int().min(1).max(10).default(5)
+        query: z.string().trim().min(1).max(120).optional(),
+        limit: z.number().int().min(1).max(10).default(5),
+        minPrice: z.number().nonnegative().optional(),
+        maxPrice: z.number().nonnegative().optional(),
+        category: z.string().trim().min(1).max(120).optional(),
+        available: z.boolean().optional(),
+        preferences: z.array(z.string().trim().min(1).max(120)).max(10).optional(),
+        sort: z.enum(["relevance", "price_asc", "price_desc"]).optional()
       })
-      .strict(),
+      .strict()
+      .refine(
+        (args) => Boolean(args.query || args.category || args.preferences?.length),
+        "Provide a query, category, or at least one preference"
+      )
+      .refine(
+        (args) =>
+          args.minPrice === undefined ||
+          args.maxPrice === undefined ||
+          args.minPrice <= args.maxPrice,
+        "minPrice cannot exceed maxPrice"
+      ),
     handler: async (args, context) => {
       try {
         const data = await searchCommerceProducts(
           context.business,
           args.query,
-          args.limit
+          args.limit,
+          {
+            minPrice: args.minPrice,
+            maxPrice: args.maxPrice,
+            category: args.category,
+            available: args.available,
+            preferences: args.preferences,
+            sort: args.sort
+          }
         );
         return {
           success: true,
