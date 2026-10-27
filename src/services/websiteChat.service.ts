@@ -56,12 +56,12 @@ export const handleWebsiteChatMessage = async (
         timezone: input.business.timezone || "Africa/Accra"
       },
       sender: {
-        identityKey: `website:${conversationId}`,
+        identityKey: `website:anonymous:${conversationId}`,
         phone: "",
         normalizedAddress: "",
         normalizedPhone: "",
         role: "customer",
-        verified: true
+        verified: false
       },
       message,
       requestId: input.requestId

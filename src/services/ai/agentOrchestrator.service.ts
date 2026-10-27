@@ -1744,6 +1744,190 @@ const getRecoverableToolFallbackMessage = (
   return latestRecoverable?.message ?? null;
 };
 
+interface GroundedCommerceProduct {
+  id: string;
+  name: string;
+  description?: string;
+  price: number;
+  currency: string;
+  available: boolean;
+  stockQuantity?: number;
+  specifications?: Record<string, string | number | boolean>;
+  canonicalUrl: string;
+}
+
+type GroundedCommerceResult =
+  | { kind: "search"; products: GroundedCommerceProduct[] }
+  | { kind: "product"; product: GroundedCommerceProduct }
+  | {
+      kind: "availability";
+      productId: string;
+      available: boolean;
+      stockQuantity?: number;
+    };
+
+const isGroundedCommerceProduct = (
+  value: unknown,
+  allowedHosts: readonly string[]
+): value is GroundedCommerceProduct => {
+  if (!value || typeof value !== "object") return false;
+  const product = value as Record<string, unknown>;
+  const specifications = product.specifications;
+  let canonicalUrlIsAllowed = false;
+
+  if (typeof product.canonicalUrl === "string") {
+    try {
+      const url = new URL(product.canonicalUrl);
+      canonicalUrlIsAllowed =
+        url.protocol === "https:" &&
+        !url.username &&
+        !url.password &&
+        allowedHosts.some(
+          (host) => host.trim().toLowerCase() === url.hostname.toLowerCase()
+        );
+    } catch {
+      canonicalUrlIsAllowed = false;
+    }
+  }
+
+  return (
+    typeof product.id === "string" &&
+    typeof product.name === "string" &&
+    typeof product.price === "number" &&
+    Number.isFinite(product.price) &&
+    product.price >= 0 &&
+    typeof product.currency === "string" &&
+    typeof product.available === "boolean" &&
+    (product.description === undefined || typeof product.description === "string") &&
+    (product.stockQuantity === undefined ||
+      (typeof product.stockQuantity === "number" &&
+        Number.isInteger(product.stockQuantity) &&
+        product.stockQuantity >= 0)) &&
+    canonicalUrlIsAllowed &&
+    (!specifications ||
+      (typeof specifications === "object" &&
+        !Array.isArray(specifications) &&
+        Object.values(specifications).every(
+          (entry) =>
+            typeof entry === "string" ||
+            typeof entry === "number" ||
+            typeof entry === "boolean"
+        )))
+  );
+};
+
+const parseGroundedCommerceResult = (
+  toolName: string,
+  data: unknown,
+  allowedHosts: readonly string[]
+): GroundedCommerceResult | null => {
+  if (!data || typeof data !== "object") return null;
+  const record = data as Record<string, unknown>;
+
+  if (toolName === "search_products" && Array.isArray(record.products)) {
+    return record.products.every(
+      (product): product is GroundedCommerceProduct =>
+        isGroundedCommerceProduct(product, allowedHosts)
+    )
+      ? { kind: "search", products: record.products }
+      : null;
+  }
+
+  if (toolName === "get_product_details") {
+    return isGroundedCommerceProduct(record.product, allowedHosts)
+      ? { kind: "product", product: record.product }
+      : null;
+  }
+
+  if (
+    toolName === "check_product_availability" &&
+    typeof record.productId === "string" &&
+    typeof record.available === "boolean"
+  ) {
+    return {
+      kind: "availability",
+      productId: record.productId,
+      available: record.available,
+      stockQuantity:
+        typeof record.stockQuantity === "number"
+          ? record.stockQuantity
+          : undefined
+    };
+  }
+
+  return null;
+};
+
+const formatGroundedPrice = (price: number, currency: string): string =>
+  `${currency.toUpperCase()} ${new Intl.NumberFormat("en", {
+    maximumFractionDigits: 2
+  }).format(price)}`;
+
+const formatGroundedSpecifications = (
+  specifications: GroundedCommerceProduct["specifications"]
+): string | null => {
+  if (!specifications || Object.keys(specifications).length === 0) return null;
+
+  return Object.entries(specifications)
+    .sort(([first], [second]) => first.localeCompare(second))
+    .map(([key, value]) => `${normalizeText(key)}: ${normalizeText(String(value))}`)
+    .join(", ");
+};
+
+const buildGroundedProductLines = (
+  product: GroundedCommerceProduct,
+  index?: number
+): string[] => {
+  const prefix = index === undefined ? "" : `${index + 1}. `;
+  const specifications = formatGroundedSpecifications(product.specifications);
+  return [
+    `${prefix}${normalizeText(product.name)} — ${formatGroundedPrice(product.price, product.currency)} — ${product.available ? "Available" : "Unavailable"}`,
+    product.description
+      ? `Description: ${normalizeText(product.description)}`
+      : null,
+    specifications ? `Specifications: ${specifications}` : null,
+    typeof product.stockQuantity === "number"
+      ? `Stock recorded: ${product.stockQuantity}`
+      : null,
+    `Product page: ${product.canonicalUrl}`
+  ].filter((line): line is string => Boolean(line));
+};
+
+const buildGroundedCommerceAnswer = (
+  result: GroundedCommerceResult | undefined
+): string | null => {
+  if (!result) return null;
+
+  if (result.kind === "search") {
+    if (result.products.length === 0) return "No matching products were found.";
+    return result.products
+      .flatMap((product, index) => buildGroundedProductLines(product, index))
+      .join("\n");
+  }
+
+  if (result.kind === "product") {
+    return buildGroundedProductLines(result.product).join("\n");
+  }
+
+  const stock = typeof result.stockQuantity === "number"
+    ? ` Recorded stock: ${result.stockQuantity}.`
+    : "";
+  return `Product ${normalizeText(result.productId)} is currently ${result.available ? "available" : "unavailable"}.${stock}`;
+};
+
+const containsUnsupportedProductClaim = (message: string): boolean =>
+  /https?:\/\/\S+/i.test(message) ||
+  /\b(?:GHS|USD|EUR|GBP|NGN|KES|ZAR)\s*\d/i.test(message) ||
+  /\b\d[\d,.]*\s*(?:GHS|USD|EUR|GBP|NGN|KES|ZAR)\b/i.test(message) ||
+  /[$€£]\s*\d/i.test(message) ||
+  /\b(?:price|costs?|priced at)\b.{0,24}\d/i.test(message) ||
+  /\b(?:available|unavailable|in stock|out of stock)\b/i.test(message) ||
+  /\b\d+(?:\.\d+)?\s*(?:GB|TB|MB|GHz|Hz|inches?|MP|mAh|W)\b/i.test(message) ||
+  /\b(?:specifications?|specs?|storage|memory|ram|processor|screen size|battery)\s*(?::|is|are|of|\d)/i.test(message);
+
+const unsupportedProductClaimMessage =
+  "I need to check the verified catalog before I can provide a product price, availability, link, or specification. Please ask me to search for the product.";
+
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
   getHistory?: (
@@ -1853,6 +2037,7 @@ const runAgentOrchestratorCore = async (
   let latestCustomerSegment: GroundedCustomerSegmentResult | undefined;
   let latestOrderList: GroundedOrderQueryResult | undefined;
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
+  let latestCommerceResult: GroundedCommerceResult | undefined;
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -2005,6 +2190,15 @@ const runAgentOrchestratorCore = async (
           finalMessage = groundedAnswer
             ? sanitizeStaffFacingFinalText(groundedAnswer)
             : finalMessage;
+        }
+        if (businessInput) {
+          const groundedCommerceAnswer = buildGroundedCommerceAnswer(
+            latestCommerceResult
+          );
+          finalMessage = groundedCommerceAnswer ??
+            (containsUnsupportedProductClaim(finalMessage)
+              ? unsupportedProductClaimMessage
+              : finalMessage);
         }
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
@@ -2162,6 +2356,17 @@ const runAgentOrchestratorCore = async (
         if (result.success && toolName === "get_business_report") {
           latestBusinessReport =
             parseGroundedBusinessReportResult(result.data) ?? undefined;
+        }
+
+        if (result.success) {
+          latestCommerceResult =
+            parseGroundedCommerceResult(
+              toolName,
+              result.data,
+              businessInput?.business.commerceIntegration
+                ?.canonicalProductHosts ?? []
+            ) ??
+            latestCommerceResult;
         }
 
         if (

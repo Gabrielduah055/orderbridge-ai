@@ -282,15 +282,25 @@ export const websiteChatMessageSchema = z
     conversationId: z
       .string()
       .trim()
-      .min(8)
-      .max(160)
-      .regex(
-        /^[A-Za-z0-9._:-]+$/,
-        "conversationId may contain only letters, numbers, dots, underscores, colons, and hyphens"
-      ),
+      .regex(/^[A-Za-z0-9_-]{43}$/, "conversationId must be an OrderBridge-issued identifier")
+      .optional(),
+    conversationToken: z
+      .string()
+      .trim()
+      .regex(/^v1\.[A-Za-z0-9_-]{43}$/, "conversationToken is invalid")
+      .optional(),
     message: z.string().trim().min(1).max(4_000)
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (Boolean(value.conversationId) !== Boolean(value.conversationToken)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "conversationId and conversationToken must be supplied together",
+        path: value.conversationId ? ["conversationToken"] : ["conversationId"]
+      });
+    }
+  });
 
 const httpsUrlSchema = z.string().trim().url().refine(
   (value) => new URL(value).protocol === "https:",

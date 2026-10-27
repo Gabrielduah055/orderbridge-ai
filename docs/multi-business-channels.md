@@ -47,16 +47,29 @@ Authorization: Bearer <server-side-integration-key>
 Content-Type: application/json
 
 {
-  "conversationId": "opaque-session-reference-123",
   "message": "Show me phones under GHS 2,000"
 }
 ```
 
 The integration key must never be placed in browser JavaScript. The business ID in the path is not authorization: OrderBridge loads the business record, verifies its status, channel, capabilities, and constant-time credential hash match, then builds the trusted agent context. An optional browser `Origin` header is checked against the configured allowlist.
 
-The response contains the natural-language answer plus structured, tool-grounded `products`, `product`, `productAvailability`, or `policies` data when applicable. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
+For the first turn, the website backend omits conversation credentials. OrderBridge returns a cryptographically random `conversationId` and a signed `conversationToken`. The website backend must keep that pair server-side and bind it to its own visitor session. It supplies both values on later turns; supplying only one, guessing an identifier, changing the business, or using an invalid token is rejected before history is read. Neither the integration key nor conversation continuation token should be exposed as a public browser credential.
 
-Conversation records use `businessId + channel + conversationId`. A website session is never joined to a WhatsApp customer because of a matching name or submitted phone number. Turns for one website conversation are sequenced in process, while unrelated conversations may run concurrently. The current rate limiter is per process; distributed deployments should replace it with a shared store before horizontal scaling.
+```json
+{
+  "conversationId": "<OrderBridge-issued 256-bit identifier>",
+  "conversationToken": "<OrderBridge-signed continuation token>",
+  "message": "Which one has 256 GB storage?"
+}
+```
+
+Anonymous website visitors remain `verified: false`; a valid continuation token authorizes access to that conversation but does not prove a real-world customer identity.
+
+The response contains deterministic, tool-grounded product facts plus structured `products`, `product`, `productAvailability`, or `policies` data when applicable. Prices, currencies, availability, specifications, and product URLs are rendered from validated backend tool results rather than model prose. Unsupported product claims are replaced with a safe catalog-check response. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
+
+Conversation records use `businessId + channel + conversationId`. A website session is never joined to a WhatsApp customer because of a matching name or submitted phone number. Turns for one website conversation are sequenced in process, while unrelated conversations may run concurrently.
+
+The website limiter enforces the configured `requestsPerMinute` across the whole business, so rotating conversation identifiers cannot reset the allowance. Continued conversations also have a 30-request-per-minute burst ceiling (or the lower business limit). Excess requests return HTTP 429 with `Retry-After` and `X-RateLimit-Scope`. The limiter and turn sequencing maps are currently process-local. A horizontally scaled deployment must replace them with a shared atomic store such as Redis before enabling multiple application instances.
 
 ## External commerce API contract
 
@@ -89,7 +102,7 @@ OrderBridge does not copy catalog, inventory, customer, order, checkout, or paym
 
 ## WhatsApp compatibility and routing
 
-Restaurant WhatsApp routing remains on the existing controller, identity services, queue, and restaurant agent. When both a receiver number and Wasender session are present, both must resolve to the same restaurant; a missing or mismatched resolution fails closed. In production, `WASENDER_WEBHOOK_SECRET` is mandatory and a missing secret causes webhook authentication to fail.
+Restaurant WhatsApp routing remains on the existing controller, identity services, queue, and restaurant agent. A trusted match by receiver number or Wasender session is sufficient when the other field is absent or is not configured for that payload shape. If both identifiers resolve, they must resolve to the same restaurant; conflicting matches fail closed. In production, `WASENDER_WEBHOOK_SECRET` is mandatory and a missing secret causes webhook authentication to fail.
 
 The `Business` model reserves unique e-commerce Wasender session and number fields so a future e-commerce WhatsApp activation can use trusted tenant resolution. This change does not yet route e-commerce WhatsApp messages through restaurant identity or queue collections; those collections remain restaurant-scoped by design.
 

@@ -643,22 +643,21 @@ export const findRestaurantForWebhook = async (
       }).select("+wasenderApiToken")
     : null;
 
-  if (possibleWhatsappNumbers.length > 0 && webhook.sessionId) {
-    if (
-      !restaurantByWhatsappNumber ||
-      !restaurantBySession ||
-      String(restaurantByWhatsappNumber._id) !== String(restaurantBySession._id)
-    ) {
-      console.warn("Wasender webhook tenant identifiers did not match", {
-        hasReceiverMatch: Boolean(restaurantByWhatsappNumber),
-        hasSessionMatch: Boolean(restaurantBySession)
-      });
-      return null;
-    }
-
-    return restaurantByWhatsappNumber;
+  if (
+    restaurantByWhatsappNumber &&
+    restaurantBySession &&
+    String(restaurantByWhatsappNumber._id) !== String(restaurantBySession._id)
+  ) {
+    console.warn("Wasender webhook tenant identifiers did not match", {
+      hasReceiverMatch: true,
+      hasSessionMatch: true
+    });
+    return null;
   }
 
+  // Wasender payload shapes differ by event/version. One trusted, unique database
+  // match is sufficient when the other identifier is absent or not configured.
+  // If both identifiers resolve, they must resolve to the same restaurant above.
   return restaurantByWhatsappNumber ?? restaurantBySession;
 };
 

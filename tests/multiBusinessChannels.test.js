@@ -27,8 +27,23 @@ const {
 } = require("../dist/services/commerceIntegration.service");
 const {
   hashWebsiteIntegrationKey,
-  verifyWebsiteIntegrationKey
+  verifyWebsiteIntegrationKey,
+  createWebsiteConversationIdentity,
+  verifyWebsiteConversationIdentity
 } = require("../dist/services/websiteIntegrationAuth.service");
+const {
+  handleWebsiteChatMessage
+} = require("../dist/services/websiteChat.service");
+const {
+  handleWebsiteChat
+} = require("../dist/controllers/websiteChat.controller");
+const {
+  enforceWebsiteChatRateLimit,
+  resetWebsiteChatRateLimitsForTests
+} = require("../dist/middleware/websiteChatRateLimit.middleware");
+const {
+  normalizeIncomingWebhook
+} = require("../dist/services/wasender.service");
 const {
   findRestaurantForWebhook,
   isWebhookVerified
@@ -93,7 +108,7 @@ const makeOrchestratorInput = (business, message = "Find a laptop") => ({
     normalizedAddress: "",
     normalizedPhone: "",
     role: "customer",
-    verified: true
+    verified: false
   },
   message
 });
@@ -190,6 +205,88 @@ test("website orchestrator uses the shared provider model and strips trusted con
   assert.equal(executions[0].context.businessId, String(business._id));
   assert.equal(executions[0].context.channel, "website");
   assert.equal(result.data.products[0].canonicalUrl, "https://shop.example.com/products/p1");
+  assert.match(result.message, /GHS 4,000/);
+  assert.match(result.message, /Available/);
+  assert.match(result.message, /https:\/\/shop\.example\.com\/products\/p1/);
+});
+
+test("website commerce answers replace incorrect model product claims with verified tool data", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Tell me the price, availability, link, and storage"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "grounding-1",
+                    name: "search_products",
+                    arguments: { query: "laptop", limit: 1 }
+                  }
+                ]
+              }
+            : {
+                text: "It costs USD 1, is unavailable, has 2 TB storage, and is at https://attacker.example/fake.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Products retrieved successfully.",
+        data: {
+          products: [
+            {
+              id: "p1",
+              name: "Verified Laptop",
+              price: 4000,
+              currency: "GHS",
+              available: true,
+              specifications: { storage: "256 GB" },
+              canonicalUrl: "https://shop.example.com/products/p1"
+            }
+          ],
+          total: 1
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /GHS 4,000/);
+  assert.match(result.message, /Available/);
+  assert.match(result.message, /storage: 256 GB/i);
+  assert.match(result.message, /https:\/\/shop\.example\.com\/products\/p1/);
+  assert.doesNotMatch(result.message, /USD 1|unavailable|2 TB|attacker\.example/i);
+});
+
+test("website commerce blocks unsupported product claims when no catalog tool succeeded", async () => {
+  const business = makeBusiness();
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "What does the laptop cost?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => ({
+          text: "It costs GHS 999 and is available at https://attacker.example/item.",
+          toolCalls: []
+        })
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt"
+    }
+  );
+
+  assert.match(result.message, /check the verified catalog/i);
+  assert.doesNotMatch(result.message, /999|attacker\.example/i);
 });
 
 test("website customer cannot execute restaurant operational tools through orchestrator", async () => {
@@ -361,6 +458,206 @@ test("website integration secrets are hashed and compared without storing plaint
   assert.equal(serialized.commerceIntegration.apiKey, undefined);
 });
 
+test("website conversations use unpredictable signed continuation credentials", () => {
+  const business = makeBusiness();
+  const businessId = String(business._id);
+  const hash = business.websiteIntegration.integrationKeyHash;
+  const identity = createWebsiteConversationIdentity(businessId, hash);
+
+  assert.match(identity.conversationId, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(identity.conversationToken, /^v1\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(
+    verifyWebsiteConversationIdentity(
+      businessId,
+      identity.conversationId,
+      identity.conversationToken,
+      hash
+    ),
+    true
+  );
+  assert.equal(
+    verifyWebsiteConversationIdentity(
+      new Types.ObjectId().toString(),
+      identity.conversationId,
+      identity.conversationToken,
+      hash
+    ),
+    false
+  );
+  assert.equal(
+    verifyWebsiteConversationIdentity(
+      businessId,
+      "A".repeat(43),
+      identity.conversationToken,
+      hash
+    ),
+    false
+  );
+});
+
+test("guessed website conversation credentials cannot continue another visitor history", async () => {
+  const business = makeBusiness();
+  const response = {
+    statusCode: 200,
+    body: undefined,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    }
+  };
+  let nextError;
+
+  await handleWebsiteChat(
+    {
+      trustedBusiness: business,
+      body: {
+        conversationId: "A".repeat(43),
+        conversationToken: `v1.${"B".repeat(43)}`,
+        message: "Show my previous search"
+      },
+      header: () => undefined
+    },
+    response,
+    (error) => {
+      nextError = error;
+    }
+  );
+
+  assert.equal(nextError, undefined);
+  assert.equal(response.statusCode, 401);
+  assert.match(response.body.message, /conversation authorization/i);
+});
+
+test("anonymous website visitors are never marked identity verified", async () => {
+  const business = makeBusiness();
+  const identity = createWebsiteConversationIdentity(
+    String(business._id),
+    business.websiteIntegration.integrationKeyHash
+  );
+  let capturedInput;
+
+  await handleWebsiteChatMessage(
+    {
+      business,
+      conversationId: identity.conversationId,
+      message: "Find a phone"
+    },
+    {
+      runOrchestrator: async (input) => {
+        capturedInput = input;
+        return {
+          success: true,
+          message: "Okay",
+          provider: "openrouter",
+          model: "test-model",
+          executedTools: []
+        };
+      },
+      saveMessage: async () => undefined
+    }
+  );
+
+  assert.equal(capturedInput.sender.verified, false);
+  assert.equal(
+    capturedInput.sender.identityKey,
+    `website:anonymous:${identity.conversationId}`
+  );
+});
+
+test("business-wide website rate limits cannot be reset with new conversation IDs", () => {
+  resetWebsiteChatRateLimitsForTests();
+  const business = makeBusiness({
+    websiteIntegration: {
+      enabled: true,
+      integrationKeyHash: hashWebsiteIntegrationKey("a-secure-integration-key-value"),
+      allowedOrigins: [],
+      requestsPerMinute: 2
+    }
+  });
+
+  const invoke = (conversationId) => {
+    let nextCalled = false;
+    const response = {
+      statusCode: 200,
+      headers: {},
+      body: undefined,
+      setHeader(name, value) {
+        this.headers[name] = value;
+      },
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(body) {
+        this.body = body;
+        return this;
+      }
+    };
+    enforceWebsiteChatRateLimit(
+      { trustedBusiness: business, body: { conversationId } },
+      response,
+      () => {
+        nextCalled = true;
+      }
+    );
+    return { nextCalled, response };
+  };
+
+  assert.equal(invoke("A".repeat(43)).nextCalled, true);
+  assert.equal(invoke("B".repeat(43)).nextCalled, true);
+  const blocked = invoke("C".repeat(43));
+  assert.equal(blocked.nextCalled, false);
+  assert.equal(blocked.response.statusCode, 429);
+  assert.equal(blocked.response.headers["X-RateLimit-Scope"], "business");
+  assert.ok(Number(blocked.response.headers["Retry-After"]) >= 1);
+  resetWebsiteChatRateLimitsForTests();
+});
+
+test("website rate limiting retains a per-conversation burst cap", () => {
+  resetWebsiteChatRateLimitsForTests();
+  const business = makeBusiness({
+    websiteIntegration: {
+      enabled: true,
+      integrationKeyHash: hashWebsiteIntegrationKey("a-secure-integration-key-value"),
+      allowedOrigins: [],
+      requestsPerMinute: 100
+    }
+  });
+  const conversationId = "A".repeat(43);
+  let lastResponse;
+
+  for (let index = 0; index < 31; index += 1) {
+    const response = {
+      statusCode: 200,
+      headers: {},
+      setHeader(name, value) {
+        this.headers[name] = value;
+      },
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json() {
+        return this;
+      }
+    };
+    enforceWebsiteChatRateLimit(
+      { trustedBusiness: business, body: { conversationId } },
+      response,
+      () => undefined
+    );
+    lastResponse = response;
+  }
+
+  assert.equal(lastResponse.statusCode, 429);
+  assert.equal(lastResponse.headers["X-RateLimit-Scope"], "conversation");
+  resetWebsiteChatRateLimitsForTests();
+});
+
 test("website chat rejects client-supplied trusted business context", () => {
   const parsed = websiteChatMessageSchema.safeParse({
     conversationId: "session-12345678",
@@ -392,6 +689,63 @@ test("mismatched Wasender receiver and session fail closed", async () => {
   } finally {
     Restaurant.findOne = originalFindOne;
   }
+});
+
+test("Wasender routing accepts one trusted tenant identifier when the other is absent or unconfigured", async () => {
+  const originalFindOne = Restaurant.findOne;
+  const restaurant = { _id: new Types.ObjectId() };
+
+  try {
+    Restaurant.findOne = (filter) => ({
+      select: async () => filter.$or ? null : restaurant
+    });
+    assert.equal(
+      await findRestaurantForWebhook({
+        receiver: "+233200000099",
+        sessionId: "trusted-session"
+      }),
+      restaurant
+    );
+
+    Restaurant.findOne = () => ({ select: async () => restaurant });
+    assert.equal(
+      await findRestaurantForWebhook({
+        receiver: "+233200000001",
+        sessionId: ""
+      }),
+      restaurant
+    );
+  } finally {
+    Restaurant.findOne = originalFindOne;
+  }
+});
+
+test("representative Wasender payload shapes preserve session, receiver, sender, and message", () => {
+  const webhook = normalizeIncomingWebhook({
+    event: "messages.received",
+    sessionId: "restaurant-session-redacted",
+    receiver: "+233200000001",
+    data: {
+      messages: {
+        key: {
+          id: "message-redacted-1",
+          fromMe: false,
+          cleanedSenderPn: "+233500000001",
+          remoteJid: "233500000001@s.whatsapp.net"
+        },
+        message: {
+          conversation: "Hello, I want to order"
+        }
+      }
+    }
+  });
+
+  assert.equal(webhook.event, "messages.received");
+  assert.equal(webhook.sessionId, "restaurant-session-redacted");
+  assert.equal(webhook.receiver, "+233200000001");
+  assert.equal(webhook.senderPhone, "+233500000001");
+  assert.equal(webhook.message, "Hello, I want to order");
+  assert.equal(webhook.fromMe, false);
 });
 
 test("production Wasender webhooks fail closed when no secret is configured", () => {

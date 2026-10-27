@@ -221,7 +221,11 @@ const assertCanonicalUrl = (
     configuration.canonicalProductHosts.map((host) => host.trim().toLowerCase()).filter(Boolean)
   );
 
-  if (url.protocol !== "https:" || !allowedHosts.has(url.hostname.toLowerCase())) {
+  if (
+    url.protocol !== "https:" ||
+    Boolean(url.username || url.password) ||
+    !allowedHosts.has(url.hostname.toLowerCase())
+  ) {
     throw new CommerceIntegrationError(
       "COMMERCE_RESPONSE_INVALID",
       "Product information is temporarily unavailable."
