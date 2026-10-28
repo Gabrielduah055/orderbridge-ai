@@ -269,6 +269,69 @@ test("website commerce answers replace incorrect model product claims with verif
   assert.doesNotMatch(result.message, /USD 1|unavailable|2 TB|titanium|attacker\.example/i);
 });
 
+test("commerce grounding rejects invented warranties, durability, discounts, specifications, and features", async () => {
+  const unsupportedResponses = [
+    "I recommend {{P1.name}} for its guaranteed ten-year lifespan.",
+    "{{P1.name}} comes with a lifetime durability guarantee.",
+    "{{P1.name}} is discounted by 25% today.",
+    "I recommend {{P1.name}} because of its self-cleaning mode.",
+    "{{P1.name}} includes titanium blades and twelve speed settings."
+  ];
+
+  for (const unsupportedResponse of unsupportedResponses) {
+    const business = makeBusiness();
+    let round = 0;
+    const result = await runAgentOrchestrator(
+      makeOrchestratorInput(business, "Recommend the catalog blender"),
+      {
+        provider: {
+          name: "openrouter",
+          model: "shared-orderbridge-model",
+          complete: async () =>
+            round++ === 0
+              ? {
+                  toolCalls: [
+                    {
+                      id: `unsupported-${round}`,
+                      name: "search_products",
+                      arguments: { query: "blender", limit: 1 }
+                    }
+                  ]
+                }
+              : { text: unsupportedResponse, toolCalls: [] }
+        },
+        getHistory: async () => [],
+        saveMessage: async () => undefined,
+        buildSystemPrompt: async () => "trusted website prompt",
+        executeTool: async () => ({
+          success: true,
+          message: "Products retrieved successfully.",
+          data: {
+            products: [
+              {
+                id: "plain-blend",
+                name: "Plain Blend",
+                price: 600,
+                currency: "GHS",
+                available: true,
+                specifications: { capacity: "1.5 L" },
+                canonicalUrl: "https://shop.example.com/products/plain-blend"
+              }
+            ],
+            total: 1
+          }
+        })
+      }
+    );
+
+    assert.match(result.message, /verified catalog|verified options/i);
+    assert.doesNotMatch(
+      result.message,
+      /ten-year|lifetime|durability guarantee|25%|self-cleaning|titanium|twelve speed/i
+    );
+  }
+});
+
 test("website commerce blocks unsupported product claims when no catalog tool succeeded", async () => {
   const business = makeBusiness();
   const result = await runAgentOrchestrator(
@@ -541,9 +604,224 @@ test("multi-turn shopping follow-up resolves which verified product is cheaper",
   );
 
   assert.equal(sawGroundingContract, true);
+  assert.match(second.message, /previously verified catalog information/i);
   assert.match(second.message, /Budget Blend is the cheaper option at GHS 650/);
   assert.match(second.message, /Premium Blend is GHS 1,250/);
   assert.equal(second.executedTools.length, 0);
+  assert.equal(second.data.commerceDataFreshness.price, "cached");
+});
+
+test("a current price enquiry refreshes cached product data and uses the changed price", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "What is the current price of the blender?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "price-refresh",
+                    name: "get_product_details",
+                    arguments: { productId: "changing-price" }
+                  }
+                ]
+              }
+            : {
+                text: "The current price of {{P1.name}} is {{P1.price}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier product details",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "changing-price",
+                  name: "Changing Price Blend",
+                  price: 500,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/changing-price"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Product details retrieved successfully.",
+        data: {
+          product: {
+            id: "changing-price",
+            name: "Changing Price Blend",
+            price: 650,
+            currency: "GHS",
+            available: true,
+            canonicalUrl: "https://shop.example.com/products/changing-price"
+          }
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /GHS 650/);
+  assert.doesNotMatch(result.message, /GHS 500/);
+  assert.equal(result.data.product.price, 650);
+  assert.equal(result.data.commerceDataFreshness.price, "live");
+});
+
+test("an inventory enquiry refreshes cached availability and uses the changed stock state", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Is the blender still available?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "inventory-refresh",
+                    name: "check_product_availability",
+                    arguments: { productId: "changing-stock" }
+                  }
+                ]
+              }
+            : {
+                text: "{{P1.name}} is now {{P1.availability}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier product details",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "changing-stock",
+                  name: "Changing Stock Blend",
+                  price: 800,
+                  currency: "GHS",
+                  available: true,
+                  stockQuantity: 5,
+                  canonicalUrl: "https://shop.example.com/products/changing-stock"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: true,
+        message: "Availability retrieved successfully.",
+        data: {
+          productId: "changing-stock",
+          available: false,
+          stockQuantity: 0
+        }
+      })
+    }
+  );
+
+  assert.match(result.message, /Changing Stock Blend is now unavailable/);
+  assert.equal(result.data.products[0].available, false);
+  assert.equal(result.data.products[0].stockQuantity, 0);
+  assert.equal(result.data.productAvailability.available, false);
+  assert.equal(result.data.commerceDataFreshness.availability, "live");
+});
+
+test("a failed current-product refresh never substitutes cached price or inventory", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(
+      business,
+      "What is the current price and availability of the blender?"
+    ),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "failed-current-refresh",
+                    name: "get_product_details",
+                    arguments: { productId: "failed-refresh" }
+                  }
+                ]
+              }
+            : {
+                text: "{{P1.name}} is {{P1.availability}} at {{P1.price}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier product details",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "failed-refresh",
+                  name: "Failed Refresh Blend",
+                  price: 500,
+                  currency: "GHS",
+                  available: true,
+                  stockQuantity: 3,
+                  canonicalUrl: "https://shop.example.com/products/failed-refresh"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () => ({
+        success: false,
+        code: "COMMERCE_PROVIDER_UNAVAILABLE",
+        message: "Current product information could not be verified."
+      })
+    }
+  );
+
+  assert.equal(result.message, "Current product information could not be verified.");
+  assert.equal("products" in result.data, false);
+  assert.equal("product" in result.data, false);
+  assert.equal("productAvailability" in result.data, false);
+  assert.deepEqual(result.data.commerceGrounding.products, []);
+  assert.doesNotMatch(result.message, /GHS 500|available/i);
 });
 
 test("backend unavailability is rendered from the latest authoritative result", async () => {
@@ -823,6 +1101,218 @@ test("business policy answers remain conversational after a product search", asy
   assert.match(result.message, /https:\/\/shop\.example\.com\/policies\/returns/);
   assert.equal(result.data.products.length, 1);
   assert.equal(result.data.policies.length, 1);
+});
+
+test("failed authoritative lookups remove stale structured fields while preserving unrelated verified results", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Show the current return policy"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => {
+          if (round++ === 0) {
+            return {
+              toolCalls: [
+                {
+                  id: "structured-search",
+                  name: "search_products",
+                  arguments: { query: "blender", limit: 2 }
+                },
+                {
+                  id: "structured-detail-success",
+                  name: "get_product_details",
+                  arguments: { productId: "stale-detail" }
+                },
+                {
+                  id: "structured-availability",
+                  name: "check_product_availability",
+                  arguments: { productId: "stale-detail" }
+                },
+                {
+                  id: "structured-policy",
+                  name: "get_business_policies",
+                  arguments: { topic: "returns" }
+                }
+              ]
+            };
+          }
+          if (round === 2) {
+            return {
+              toolCalls: [
+                {
+                  id: "structured-detail-failure",
+                  name: "get_product_details",
+                  arguments: { productId: "stale-detail" }
+                }
+              ]
+            };
+          }
+          return {
+            text: "The verified {{POLICY1.name}} policy says: {{POLICY1.content}}",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (name, args) => {
+        if (name === "search_products") {
+          return {
+            success: true,
+            message: "Products retrieved successfully.",
+            data: {
+              products: [
+                {
+                  id: "stale-detail",
+                  name: "Stale Detail Blend",
+                  price: 900,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/stale-detail"
+                },
+                {
+                  id: "unrelated",
+                  name: "Unrelated Verified Blend",
+                  price: 700,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/unrelated"
+                }
+              ],
+              total: 2
+            }
+          };
+        }
+        if (name === "get_product_details") {
+          if (args.productId === "stale-detail" && round >= 2) {
+            return {
+              success: false,
+              code: "COMMERCE_PROVIDER_UNAVAILABLE",
+              message: "Product details could not be refreshed."
+            };
+          }
+          return {
+            success: true,
+            message: "Product details retrieved successfully.",
+            data: {
+              product: {
+                id: "stale-detail",
+                name: "Stale Detail Blend",
+                price: 900,
+                currency: "GHS",
+                available: true,
+                canonicalUrl: "https://shop.example.com/products/stale-detail"
+              }
+            }
+          };
+        }
+        if (name === "check_product_availability") {
+          return {
+            success: true,
+            message: "Availability retrieved successfully.",
+            data: {
+              productId: "stale-detail",
+              available: true,
+              stockQuantity: 4
+            }
+          };
+        }
+        return {
+          success: true,
+          message: "Policies retrieved successfully.",
+          data: {
+            policies: [
+              {
+                name: "Returns",
+                content: "Unused products may be returned within 14 days."
+              }
+            ]
+          }
+        };
+      }
+    }
+  );
+
+  assert.deepEqual(
+    result.data.products.map((product) => product.id),
+    ["unrelated"]
+  );
+  assert.equal("product" in result.data, false);
+  assert.equal("productAvailability" in result.data, false);
+  assert.equal(result.data.policies.length, 1);
+  assert.match(result.message, /Unused products may be returned within 14 days/);
+});
+
+test("a failed policy refresh removes an older policy from structured data", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Refresh the return policy"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () => {
+          if (round++ === 0) {
+            return {
+              toolCalls: [
+                {
+                  id: "policy-success",
+                  name: "get_business_policies",
+                  arguments: { topic: "returns" }
+                }
+              ]
+            };
+          }
+          if (round === 2) {
+            return {
+              toolCalls: [
+                {
+                  id: "policy-failure",
+                  name: "get_business_policies",
+                  arguments: { topic: "returns" }
+                }
+              ]
+            };
+          }
+          return {
+            text: "I could not verify the current return policy.",
+            toolCalls: []
+          };
+        }
+      },
+      getHistory: async () => [],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async () =>
+        round < 2
+          ? {
+              success: true,
+              message: "Policies retrieved successfully.",
+              data: {
+                policies: [
+                  {
+                    name: "Returns",
+                    content: "Unused products may be returned within 14 days."
+                  }
+                ]
+              }
+            }
+          : {
+              success: false,
+              code: "COMMERCE_PROVIDER_UNAVAILABLE",
+              message: "The current return policy could not be verified."
+            }
+    }
+  );
+
+  assert.equal("policies" in result.data, false);
+  assert.deepEqual(result.data.commerceGrounding.policies, []);
+  assert.doesNotMatch(result.message, /14 days/);
 });
 
 test("failed catalog requests cannot reuse stale facts and return a safe response", async () => {

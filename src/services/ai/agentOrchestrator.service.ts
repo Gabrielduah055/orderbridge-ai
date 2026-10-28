@@ -1138,19 +1138,27 @@ const getImportantData = (
       }
     }
 
-    if (toolName === "search_products" && Array.isArray(data.products)) {
+    if (
+      result.success &&
+      toolName === "search_products" &&
+      Array.isArray(data.products)
+    ) {
       nextData.products = data.products;
     }
 
-    if (toolName === "get_product_details" && data.product) {
+    if (result.success && toolName === "get_product_details" && data.product) {
       nextData.product = data.product;
     }
 
-    if (toolName === "check_product_availability") {
+    if (result.success && toolName === "check_product_availability") {
       nextData.productAvailability = data;
     }
 
-    if (toolName === "get_business_policies" && Array.isArray(data.policies)) {
+    if (
+      result.success &&
+      toolName === "get_business_policies" &&
+      Array.isArray(data.policies)
+    ) {
       nextData.policies = data.policies;
     }
   }
@@ -1788,6 +1796,7 @@ interface CommerceGroundingSnapshot {
 
 interface CommerceGroundingState {
   capturedAt: string;
+  restoredFromHistory: boolean;
   products: Map<string, GroundedCommerceProduct>;
   productOrder: string[];
   availability: Map<string, GroundedAvailability>;
@@ -1802,6 +1811,27 @@ interface CommerceResponseContract {
   policyTokens: Set<string>;
 }
 
+interface CommerceFreshnessRequirements {
+  price: boolean;
+  availability: boolean;
+}
+
+interface CommerceTurnVerification {
+  productLookupSucceeded: boolean;
+  productLookupFailed: boolean;
+  availabilityLookupSucceeded: boolean;
+  availabilityLookupFailed: boolean;
+}
+
+interface CommerceDataMergeOptions {
+  suppressProducts?: boolean;
+  suppressAvailability?: boolean;
+  freshness?: {
+    price: "live" | "cached" | "unverified";
+    availability: "live" | "cached" | "unverified";
+  };
+}
+
 const commerceGroundingHistoryMaxAgeMs = 15 * 60_000;
 const maxGroundedCommerceProducts = 20;
 const maxGroundedCommercePolicies = 20;
@@ -1809,6 +1839,7 @@ const commerceTokenPattern = /\{\{(?:P|POLICY)\d+\.[A-Za-z0-9.]+\}\}/g;
 
 const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
   capturedAt: new Date().toISOString(),
+  restoredFromHistory: false,
   products: new Map(),
   productOrder: [],
   availability: new Map(),
@@ -2107,6 +2138,7 @@ const restoreCommerceGroundingState = (
     applyGroundedCommerceResult(state, policiesResult);
   }
   state.capturedAt = new Date(capturedAt).toISOString();
+  state.restoredFromHistory = true;
   return state;
 };
 
@@ -2185,8 +2217,11 @@ const buildCommerceResponseContract = (
           "Trusted commerce response contract:",
           "You may recommend, compare, explain differences, respect preferences, and answer follow-ups naturally.",
           "Every product name, description, price, currency, availability, stock quantity, specification value, product URL, and business-policy fact must use one of the exact placeholders below.",
+          state.restoredFromHistory
+            ? "The product facts below came from an earlier turn. Treat them as conversation context, not as a guarantee of current price or stock. For a price or availability enquiry, call the appropriate commerce tool before answering."
+            : "The product facts below were verified during this conversation. Use a fresh commerce lookup whenever the customer asks whether price or stock is current.",
           "Never write those facts as free text, never alter a placeholder, and never expose the P/POLICY aliases. The backend will validate and render placeholders after your response.",
-          "Recommendations and subjective conclusions are allowed only when they are clearly based on the supplied facts. If a required fact has no placeholder, say it could not be verified.",
+          "Recommendations and subjective conclusions are allowed only when they are clearly based on the customer's stated preferences or the supplied placeholders. Do not add warranties, guarantees, discounts, durability, specifications, or features in surrounding prose. If a required fact has no placeholder, say it could not be verified.",
           ...lines
         ].join("\n")
   };
@@ -2223,16 +2258,195 @@ const isProductQuestion = (message: string): boolean =>
     message
   );
 
-const containsUnsupportedCommerceNarrativeClaim = (message: string): boolean =>
-  /\b(?:has|have|includes?|features?|comes with|offers?|supports?|uses?|made (?:from|of)|equipped with)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
-    message
-  ) ||
-  /\b(?:its|their|the)\s+[A-Za-z][A-Za-z -]{1,30}\s+(?:is|are)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
-    message
-  ) ||
-  /\b(?:you|customers?|items?|products?)\s+(?:can|cannot|can't|may|must|must not|are allowed|are not allowed)\b/i.test(
-    message
+const commerceClaimCategoryGroups = [
+  new Set(["warranty", "warranties", "guarantee", "guaranteed", "coverage"]),
+  new Set([
+    "durable",
+    "durability",
+    "lifespan",
+    "lifetime",
+    "long-lasting",
+    "lasts",
+    "lasting"
+  ]),
+  new Set([
+    "discount",
+    "discounted",
+    "sale",
+    "promotion",
+    "promotional",
+    "save",
+    "saving",
+    "offer"
+  ])
+];
+
+const commerceNarrativeConnectorTerms = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "based",
+  "batch",
+  "batches",
+  "because",
+  "best",
+  "better",
+  "by",
+  "catalog",
+  "choice",
+  "choose",
+  "customer",
+  "for",
+  "fit",
+  "fits",
+  "from",
+  "good",
+  "great",
+  "i",
+  "ideal",
+  "it",
+  "larger",
+  "match",
+  "matches",
+  "more",
+  "needs",
+  "of",
+  "on",
+  "option",
+  "pick",
+  "preference",
+  "preferences",
+  "recommend",
+  "recommended",
+  "smaller",
+  "stronger",
+  "suitable",
+  "suited",
+  "than",
+  "that",
+  "the",
+  "their",
+  "these",
+  "this",
+  "to",
+  "verified",
+  "with",
+  "would",
+  "your"
+]);
+
+const tokenizeCommerceNarrative = (value: string): string[] =>
+  normalizeText(value)
+    .toLowerCase()
+    .match(/[a-z]+(?:-[a-z]+)*/g) ?? [];
+
+const getCommerceEvidenceTerms = (
+  state: CommerceGroundingState
+): Set<string> => {
+  const terms = new Set<string>();
+  for (const product of state.products.values()) {
+    for (const value of [
+      product.description ?? "",
+      ...Object.keys(product.specifications ?? {}),
+      ...Object.values(product.specifications ?? {}).map(String)
+    ]) {
+      for (const term of tokenizeCommerceNarrative(value)) terms.add(term);
+    }
+    const specificationKeys = Object.keys(product.specifications ?? {})
+      .map((key) => key.toLowerCase());
+    if (specificationKeys.some((key) => /capacity|volume|size/.test(key))) {
+      for (const term of ["batch", "batches", "larger", "smaller"]) {
+        terms.add(term);
+      }
+    }
+    if (specificationKeys.some((key) => /power|watt/.test(key))) {
+      terms.add("power");
+      terms.add("powerful");
+    }
+  }
+  for (const policy of state.policies.values()) {
+    for (const term of tokenizeCommerceNarrative(
+      `${policy.name} ${policy.content}`
+    )) {
+      terms.add(term);
+    }
+  }
+  return terms;
+};
+
+const isSafeCommerceUncertaintySentence = (sentence: string): boolean =>
+  /\b(?:cannot|can't|could not|couldn't|did not|didn't|not|unable to)\s+(?:be\s+)?(?:verify|verified|confirm|confirmed|provide|provided|find|found)|\b(?:not provided|not listed|won't guess|will not guess|could not be verified)\b/i.test(
+    sentence
   );
+
+const containsUnsupportedSemanticCommerceClaim = (
+  messageWithoutTokens: string,
+  userMessage: string,
+  state: CommerceGroundingState
+): boolean => {
+  const evidenceTerms = getCommerceEvidenceTerms(state);
+  const userTerms = new Set(tokenizeCommerceNarrative(userMessage));
+  const sentences = messageWithoutTokens
+    .split(/[.!?;\n]+/)
+    .map((sentence) => normalizeText(sentence))
+    .filter(Boolean);
+
+  for (const sentence of sentences) {
+    if (isSafeCommerceUncertaintySentence(sentence)) continue;
+    if (/\d/.test(sentence)) return true;
+    const sentenceTerms = new Set(tokenizeCommerceNarrative(sentence));
+    for (const category of commerceClaimCategoryGroups) {
+      const makesCategoryClaim = Array.from(category).some((term) =>
+        sentenceTerms.has(term)
+      );
+      const hasAuthoritativeSupport = Array.from(category).some((term) =>
+        evidenceTerms.has(term)
+      );
+      if (makesCategoryClaim && !hasAuthoritativeSupport) return true;
+    }
+
+    if (/\b(?:recommend|choose|pick|prefer)\b/i.test(sentence)) {
+      const recommendationStart = sentence.search(
+        /\b(?:recommend|choose|pick|prefer)\b/i
+      );
+      const recommendationClause = sentence.slice(recommendationStart);
+      const rationale = /\b(?:for|because(?:\s+of)?|due\s+to|thanks\s+to)\s+(.+)$/i.exec(
+        recommendationClause
+      )?.[1];
+      if (rationale) {
+        const unsupportedTerms = tokenizeCommerceNarrative(rationale).filter(
+          (term) =>
+            !commerceNarrativeConnectorTerms.has(term) &&
+            !userTerms.has(term) &&
+            !evidenceTerms.has(term)
+        );
+        if (unsupportedTerms.length > 0) return true;
+      }
+    }
+  }
+  return false;
+};
+
+const containsUnsupportedCommerceNarrativeClaim = (message: string): boolean =>
+  message
+    .split(/[.!?;\n]+/)
+    .map((sentence) => normalizeText(sentence))
+    .filter(Boolean)
+    .some(
+      (sentence) =>
+        !isSafeCommerceUncertaintySentence(sentence) &&
+        (/\b(?:has|have|includes?|features?|comes with|offers?|supports?|uses?|delivers?|provides?|guarantees?|lasts?|withstands?|resists?|made (?:from|of)|equipped with)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
+          sentence
+        ) ||
+          /\b(?:its|their|the)\s+[A-Za-z][A-Za-z -]{1,30}\s+(?:is|are)\s+(?![,.;]|and\b|but\b|$)[A-Za-z]/i.test(
+            sentence
+          ) ||
+          /\b(?:you|customers?|items?|products?)\s+(?:can|cannot|can't|may|must|must not|are allowed|are not allowed)\b/i.test(
+            sentence
+          ))
+    );
 
 const renderValidatedCommerceResponse = (
   rawMessage: string,
@@ -2247,6 +2461,11 @@ const renderValidatedCommerceResponse = (
     /\{\{/.test(withoutTokens) ||
     containsUnsupportedProductClaim(withoutTokens) ||
     containsUnsupportedCommerceNarrativeClaim(withoutTokens) ||
+    containsUnsupportedSemanticCommerceClaim(
+      withoutTokens,
+      userMessage,
+      state
+    ) ||
     containsLiteralGroundedValue(withoutTokens, state)
   ) {
     return null;
@@ -2332,15 +2551,68 @@ const buildSafeCommerceFallback = (
   ].join("\n");
 };
 
+const getCommerceFreshnessRequirements = (
+  userMessage: string
+): CommerceFreshnessRequirements => {
+  const asksForRelativePrice =
+    /\b(?:cheaper|cheapest|lowest price|most affordable|compare prices?)\b/i.test(
+      userMessage
+    );
+  const asksForPrice =
+    !asksForRelativePrice &&
+    /\b(?:price|cost|costs|costing|how much)\b/i.test(userMessage);
+  const asksForAvailability =
+    /\b(?:available|availability|in stock|out of stock|inventory|stock level|stock quantity|still in stock)\b/i.test(
+      userMessage
+    );
+  return {
+    price: asksForPrice,
+    availability: asksForAvailability
+  };
+};
+
+const getCommerceFreshnessFailureMessage = (
+  requirements: CommerceFreshnessRequirements,
+  verification: CommerceTurnVerification,
+  latestFailureMessage?: string
+): string | undefined => {
+  const productLookupIsFresh =
+    verification.productLookupSucceeded && !verification.productLookupFailed;
+  const availabilityIsFresh =
+    !verification.availabilityLookupFailed &&
+    (productLookupIsFresh || verification.availabilityLookupSucceeded);
+  if (
+    (requirements.price && !productLookupIsFresh) ||
+    (requirements.availability && !availabilityIsFresh)
+  ) {
+    return latestFailureMessage ??
+      "I need to check the verified catalog and refresh the product information before confirming the current price or availability. Please try again.";
+  }
+  return undefined;
+};
+
 const mergeCommerceGroundingData = (
   data: AgentOrchestratorResult["data"],
-  state: CommerceGroundingState
+  state: CommerceGroundingState,
+  options: CommerceDataMergeOptions = {}
 ): AgentOrchestratorResult["data"] => {
   const snapshot = buildCommerceGroundingSnapshot(state);
-  if (snapshot.products.length === 0 && snapshot.policies.length === 0) return data;
+  const sourceData = { ...(data ?? {}) } as Record<string, unknown>;
+  const previousProduct = sourceData.product;
+  const previousAvailability = sourceData.productAvailability;
+  for (const key of [
+    "products",
+    "product",
+    "productAvailability",
+    "policies",
+    "commerceGrounding",
+    "commerceDataFreshness"
+  ]) {
+    delete sourceData[key];
+  }
   const products = snapshot.products.map((product) => {
     const override = state.availability.get(product.id);
-    if (!override?.failed) {
+    if (!override?.failed && !options.suppressAvailability) {
       return {
         ...product,
         available: override?.available ?? product.available,
@@ -2350,10 +2622,49 @@ const mergeCommerceGroundingData = (
     const { available: _available, stockQuantity: _stockQuantity, ...safeProduct } = product;
     return safeProduct;
   });
+  const previousProductId =
+    previousProduct && typeof previousProduct === "object"
+      ? String(
+          (previousProduct as Record<string, unknown>).id ??
+            (previousProduct as Record<string, unknown>)._id ??
+            ""
+        )
+      : "";
+  const canonicalProduct = products.find(
+    (product) => String(product.id) === previousProductId
+  );
+  const previousAvailabilityId =
+    previousAvailability && typeof previousAvailability === "object"
+      ? String(
+          (previousAvailability as Record<string, unknown>).productId ?? ""
+        )
+      : "";
+  const canonicalAvailability = state.availability.get(previousAvailabilityId);
   return {
-    ...(data ?? {}),
-    ...(products.length > 0 ? { products } : {}),
+    ...sourceData,
+    ...(!options.suppressProducts && products.length > 0 ? { products } : {}),
+    ...(!options.suppressProducts && canonicalProduct
+      ? { product: canonicalProduct }
+      : {}),
+    ...(!options.suppressAvailability &&
+    previousAvailabilityId &&
+    canonicalAvailability &&
+    !canonicalAvailability.failed &&
+    typeof canonicalAvailability.available === "boolean"
+      ? {
+          productAvailability: {
+            productId: previousAvailabilityId,
+            available: canonicalAvailability.available,
+            ...(typeof canonicalAvailability.stockQuantity === "number"
+              ? { stockQuantity: canonicalAvailability.stockQuantity }
+              : {})
+          }
+        }
+      : {}),
     ...(snapshot.policies.length > 0 ? { policies: snapshot.policies } : {}),
+    ...(snapshot.products.length > 0 && options.freshness
+      ? { commerceDataFreshness: options.freshness }
+      : {}),
     commerceGrounding: snapshot
   };
 };
@@ -2498,6 +2809,12 @@ const runAgentOrchestratorCore = async (
   let latestOrderList: GroundedOrderQueryResult | undefined;
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
   let latestCommerceFailureMessage: string | undefined;
+  const commerceTurnVerification: CommerceTurnVerification = {
+    productLookupSucceeded: false,
+    productLookupFailed: false,
+    availabilityLookupSucceeded: false,
+    availabilityLookupFailed: false
+  };
   const startedAt = Date.now();
   const maxToolRounds = getOpenRouterConfig().maxToolRounds;
   const executeTool = dependencies.executeTool ?? executeAgentTool;
@@ -2652,19 +2969,71 @@ const runAgentOrchestratorCore = async (
             : finalMessage;
         }
         if (businessInput) {
-          importantData = mergeCommerceGroundingData(
-            importantData,
-            commerceGroundingState
+          const freshnessRequirements = getCommerceFreshnessRequirements(
+            normalizedInputMessage
           );
-          finalMessage = renderValidatedCommerceResponse(
-            finalMessage,
-            normalizedInputMessage,
-            commerceGroundingState
-          ) ?? buildSafeCommerceFallback(
-            normalizedInputMessage,
-            commerceGroundingState,
+          const freshnessFailureMessage = getCommerceFreshnessFailureMessage(
+            freshnessRequirements,
+            commerceTurnVerification,
             latestCommerceFailureMessage
           );
+          const productDataWasRefreshed =
+            commerceTurnVerification.productLookupSucceeded &&
+            !commerceTurnVerification.productLookupFailed;
+          const availabilityWasRefreshed =
+            !commerceTurnVerification.availabilityLookupFailed &&
+            (productDataWasRefreshed ||
+              commerceTurnVerification.availabilityLookupSucceeded);
+          importantData = mergeCommerceGroundingData(
+            importantData,
+            commerceGroundingState,
+            {
+              suppressProducts:
+                Boolean(freshnessFailureMessage) && freshnessRequirements.price,
+              suppressAvailability:
+                Boolean(freshnessFailureMessage) &&
+                freshnessRequirements.availability,
+              freshness: {
+                price: freshnessFailureMessage && freshnessRequirements.price
+                  ? "unverified"
+                  : productDataWasRefreshed
+                    ? "live"
+                    : commerceGroundingState.restoredFromHistory
+                      ? "cached"
+                      : "live",
+                availability:
+                  freshnessFailureMessage && freshnessRequirements.availability
+                    ? "unverified"
+                    : availabilityWasRefreshed
+                      ? "live"
+                      : commerceGroundingState.restoredFromHistory
+                        ? "cached"
+                        : "live"
+              }
+            }
+          );
+          if (freshnessFailureMessage) {
+            finalMessage = freshnessFailureMessage;
+          } else {
+            const usesCachedMutableFact =
+              commerceGroundingState.restoredFromHistory &&
+              ((!productDataWasRefreshed &&
+                /\{\{P\d+\.(?:price|currency)\}\}/.test(finalMessage)) ||
+                (!availabilityWasRefreshed &&
+                  /\{\{P\d+\.(?:availability|stock)\}\}/.test(finalMessage)));
+            finalMessage = renderValidatedCommerceResponse(
+              finalMessage,
+              normalizedInputMessage,
+              commerceGroundingState
+            ) ?? buildSafeCommerceFallback(
+              normalizedInputMessage,
+              commerceGroundingState,
+              latestCommerceFailureMessage
+            );
+            if (usesCachedMutableFact) {
+              finalMessage = `Based on previously verified catalog information, not a live refresh: ${finalMessage}`;
+            }
+          }
         }
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(finalMessage, executedTools);
@@ -2834,6 +3203,16 @@ const runAgentOrchestratorCore = async (
             : null;
           if (groundedResult) {
             applyGroundedCommerceResult(commerceGroundingState, groundedResult);
+            if (
+              groundedResult.kind === "search" ||
+              groundedResult.kind === "product"
+            ) {
+              commerceTurnVerification.productLookupSucceeded = true;
+              commerceTurnVerification.productLookupFailed = false;
+            } else if (groundedResult.kind === "availability") {
+              commerceTurnVerification.availabilityLookupSucceeded = true;
+              commerceTurnVerification.availabilityLookupFailed = false;
+            }
             latestCommerceFailureMessage = undefined;
           } else {
             markCommerceToolFailure(
@@ -2841,6 +3220,14 @@ const runAgentOrchestratorCore = async (
               toolName,
               safeArguments
             );
+            if (
+              toolName === "search_products" ||
+              toolName === "get_product_details"
+            ) {
+              commerceTurnVerification.productLookupFailed = true;
+            } else if (toolName === "check_product_availability") {
+              commerceTurnVerification.availabilityLookupFailed = true;
+            }
             latestCommerceFailureMessage = result.success
               ? "Product information is temporarily unavailable."
               : result.message;
