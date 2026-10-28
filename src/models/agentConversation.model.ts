@@ -1,11 +1,21 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 import type { AgentConversationDirection, SenderRole } from "../types/agent.types";
+import {
+  agentChannels,
+  businessTypes,
+  type AgentChannel,
+  type BusinessType
+} from "../types/business.types";
 
 export const agentConversationDirections = ["user", "assistant", "tool"] as const;
 
 export interface IAgentConversationMessage {
-  restaurantId: Types.ObjectId;
-  senderPhone: string;
+  restaurantId?: Types.ObjectId;
+  senderPhone?: string;
+  businessId?: Types.ObjectId;
+  businessType?: BusinessType;
+  channel?: AgentChannel;
+  conversationId?: string;
   senderRole: SenderRole;
   direction: AgentConversationDirection;
   content: string;
@@ -24,13 +34,30 @@ const agentConversationMessageSchema = new Schema<IAgentConversationMessageDocum
     restaurantId: {
       type: Schema.Types.ObjectId,
       ref: "Restaurant",
-      required: true,
       index: true
     },
     senderPhone: {
       type: String,
-      required: true,
       trim: true,
+      index: true
+    },
+    businessId: {
+      type: Schema.Types.ObjectId,
+      ref: "Business",
+      index: true
+    },
+    businessType: {
+      type: String,
+      enum: businessTypes
+    },
+    channel: {
+      type: String,
+      enum: agentChannels
+    },
+    conversationId: {
+      type: String,
+      trim: true,
+      maxlength: 160,
       index: true
     },
     senderRole: {
@@ -61,6 +88,26 @@ agentConversationMessageSchema.index({
   restaurantId: 1,
   senderPhone: 1,
   createdAt: -1
+});
+agentConversationMessageSchema.index({
+  businessId: 1,
+  channel: 1,
+  conversationId: 1,
+  createdAt: -1
+});
+
+agentConversationMessageSchema.pre("validate", function validateConversationScope(next) {
+  const hasRestaurantScope = Boolean(this.restaurantId && this.senderPhone);
+  const hasBusinessScope = Boolean(
+    this.businessId && this.businessType && this.channel && this.conversationId
+  );
+
+  if (hasRestaurantScope === hasBusinessScope) {
+    next(new Error("Conversation messages require exactly one trusted tenant scope"));
+    return;
+  }
+
+  next();
 });
 
 export const AgentConversationMessage = model<IAgentConversationMessageDocument>(

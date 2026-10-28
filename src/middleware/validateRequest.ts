@@ -13,6 +13,12 @@ import {
   restaurantPlans,
   restaurantStatuses
 } from "../types/restaurant.types";
+import {
+  agentChannels,
+  businessCapabilities,
+  businessStatuses,
+  businessTypes
+} from "../types/business.types";
 
 const phoneSchema = z.string().trim().min(7);
 const optionalTextSchema = z.string().trim().min(1).optional();
@@ -270,6 +276,127 @@ export const agentCustomerMessageSchema = z
     message: z.string().trim().min(1)
   })
   .strict();
+
+export const websiteChatMessageSchema = z
+  .object({
+    conversationId: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9_-]{43}$/, "conversationId must be an OrderBridge-issued identifier")
+      .optional(),
+    conversationToken: z
+      .string()
+      .trim()
+      .regex(/^v1\.[A-Za-z0-9_-]{43}$/, "conversationToken is invalid")
+      .optional(),
+    message: z.string().trim().min(1).max(4_000)
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (Boolean(value.conversationId) !== Boolean(value.conversationToken)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "conversationId and conversationToken must be supplied together",
+        path: value.conversationId ? ["conversationToken"] : ["conversationId"]
+      });
+    }
+  });
+
+const httpsUrlSchema = z.string().trim().url().refine(
+  (value) => new URL(value).protocol === "https:",
+  "HTTPS is required"
+);
+const commercePathSchema = z.string().trim().min(1).refine(
+  (value) => value.startsWith("/") && !value.startsWith("//"),
+  "Path must be origin-relative"
+);
+
+export const createBusinessSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    slug: z.string().trim().min(1).max(120).regex(/^[a-z0-9-]+$/).optional(),
+    type: z.enum(businessTypes),
+    status: z.enum(businessStatuses).default("trial"),
+    restaurantId: z.string().trim().min(1).optional(),
+    ownerName: optionalTextSchema,
+    ownerEmail: z.string().trim().email().optional(),
+    ownerPhone: phoneSchema.optional(),
+    staff: z
+      .array(
+        z
+          .object({
+            name: optionalTextSchema,
+            phone: phoneSchema.optional(),
+            email: z.string().trim().email().optional(),
+            role: z.enum(["owner", "manager"])
+          })
+          .strict()
+      )
+      .default([]),
+    timezone: timezoneSchema.default("Africa/Accra"),
+    enabledChannels: z.array(z.enum(agentChannels)).default([]),
+    capabilities: z.array(z.enum(businessCapabilities)).default([]),
+    agentInstructions: z.string().trim().min(1).max(4_000).optional(),
+    websiteIntegration: z
+      .object({
+        enabled: z.boolean().default(false),
+        integrationKey: z.string().trim().min(24).max(256).optional(),
+        allowedOrigins: z.array(z.string().trim().url()).max(20).default([]),
+        requestsPerMinute: z.number().int().min(1).max(600).default(60)
+      })
+      .strict()
+      .optional(),
+    whatsappIntegration: z
+      .object({
+        enabled: z.boolean().default(false),
+        wasenderSessionId: optionalTextSchema,
+        wasenderApiToken: optionalTextSchema,
+        whatsappNumber: phoneSchema.optional()
+      })
+      .strict()
+      .optional(),
+    commerceIntegration: z
+      .object({
+        baseUrl: httpsUrlSchema,
+        apiKey: z.string().trim().min(1).max(1_000),
+        authType: z.enum(["bearer", "header"]).default("bearer"),
+        apiKeyHeader: z.string().trim().regex(/^[A-Za-z0-9-]{1,80}$/).optional(),
+        timeoutMs: z.number().int().min(500).max(15_000).default(5_000),
+        paths: z
+          .object({
+            search: commercePathSchema,
+            product: commercePathSchema.refine((value) => value.includes("{productId}"), {
+              message: "Product path must include {productId}"
+            }),
+            availability: commercePathSchema.refine(
+              (value) => value.includes("{productId}"),
+              { message: "Availability path must include {productId}" }
+            ),
+            policies: commercePathSchema
+          })
+          .strict(),
+        canonicalProductHosts: z.array(z.string().trim().min(1)).min(1).max(20)
+      })
+      .strict()
+      .optional()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.type === "ecommerce" && !value.commerceIntegration) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["commerceIntegration"],
+        message: "E-commerce businesses require commerceIntegration"
+      });
+    }
+    if (value.websiteIntegration?.enabled && !value.enabledChannels.includes("website")) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["enabledChannels"],
+        message: "Website integration requires the website channel"
+      });
+    }
+  });
 
 export const validateRequest =
   (schema: ZodSchema) =>

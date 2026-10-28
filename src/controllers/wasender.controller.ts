@@ -85,11 +85,11 @@ const getWebhookSecret = (req: Request): string | undefined => {
   return headerSecret ?? querySecret;
 };
 
-const isWebhookVerified = (req: Request): boolean => {
+export const isWebhookVerified = (req: Request): boolean => {
   const expectedSecret = process.env.WASENDER_WEBHOOK_SECRET?.trim();
 
   if (!expectedSecret) {
-    return true;
+    return process.env.NODE_ENV !== "production";
   }
 
   const incomingSecret = getWebhookSecret(req)?.trim();
@@ -626,29 +626,39 @@ export const sendAgentReplyDirectly = async (
   });
 };
 
-const findRestaurantForWebhook = async (
+export const findRestaurantForWebhook = async (
   webhook: NormalizedWasenderWebhook
 ): Promise<IRestaurantDocument | null> => {
   const receiver = normalizePhone(webhook.receiver);
   const possibleWhatsappNumbers = [webhook.receiver, receiver].filter(Boolean);
 
-  if (possibleWhatsappNumbers.length > 0) {
-    const restaurantByWhatsappNumber = await Restaurant.findOne({
+  const restaurantByWhatsappNumber = possibleWhatsappNumbers.length > 0
+    ? await Restaurant.findOne({
       $or: possibleWhatsappNumbers.map((phone) => ({ whatsappNumber: phone }))
-    }).select("+wasenderApiToken");
+    }).select("+wasenderApiToken")
+    : null;
+  const restaurantBySession = webhook.sessionId
+    ? await Restaurant.findOne({
+        wasenderSessionId: webhook.sessionId
+      }).select("+wasenderApiToken")
+    : null;
 
-    if (restaurantByWhatsappNumber) {
-      return restaurantByWhatsappNumber;
-    }
-  }
-
-  if (!webhook.sessionId) {
+  if (
+    restaurantByWhatsappNumber &&
+    restaurantBySession &&
+    String(restaurantByWhatsappNumber._id) !== String(restaurantBySession._id)
+  ) {
+    console.warn("Wasender webhook tenant identifiers did not match", {
+      hasReceiverMatch: true,
+      hasSessionMatch: true
+    });
     return null;
   }
 
-  return Restaurant.findOne({
-    wasenderSessionId: webhook.sessionId
-  }).select("+wasenderApiToken");
+  // Wasender payload shapes differ by event/version. One trusted, unique database
+  // match is sufficient when the other identifier is absent or not configured.
+  // If both identifiers resolve, they must resolve to the same restaurant above.
+  return restaurantByWhatsappNumber ?? restaurantBySession;
 };
 
 const getStructuredOrderId = (orderData: unknown): string => {

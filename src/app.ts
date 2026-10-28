@@ -12,6 +12,8 @@ import orderRoutes, { restaurantOrderRoutes } from "./routes/order.routes";
 import restaurantRoutes from "./routes/restaurant.routes";
 import wasenderRoutes from "./routes/wasender.routes";
 import adminOperationsRoutes from "./routes/adminOperations.routes";
+import websiteChatRoutes from "./routes/websiteChat.routes";
+import businessRoutes from "./routes/business.routes";
 
 export const app = express();
 
@@ -31,11 +33,13 @@ app.use("/api/restaurants/:restaurantId/orders", restaurantOrderRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminOperationsRoutes);
 app.use("/api/restaurants", restaurantRoutes);
+app.use("/api/businesses", businessRoutes);
 app.use("/api/menu", menuRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/mcp", mcpRoutes);
 app.use("/api/agent/customer", agentCustomerRoutes);
 app.use("/api/agent/owner", agentOwnerRoutes);
 app.use("/api/webhooks/wasender", wasenderRoutes);
+app.use("/api/integrations/website-chat", websiteChatRoutes);
 
 app.use(errorMiddleware);

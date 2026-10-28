@@ -25,6 +25,8 @@ The migration reuses:
 
 Tools are exposed to OpenRouter only when permitted for the resolved backend sender role. Customer tools are limited to menu/profile/delivery reads, the customer's own order lookup, and order-draft operations. The model cannot provide trusted `restaurantId`, sender phone, sender role, or session context as tool arguments.
 
+The same orchestrator now also accepts a trusted business and channel context. Tool exposure and execution evaluate sender role, business type, channel, and enabled capabilities. E-commerce website customers receive only read-only commerce catalog and policy tools. They use the same `OPENROUTER_MODEL`; there is no website-specific AI provider or model setting. Model-supplied business identity, channel, capabilities, integration credentials, or conversation identity are stripped and ignored.
+
 ## Confirmation Flow
 
 Sensitive mutation tools continue to create pending backend actions unless the backend execution context is confirmed. Explicit owner/manager confirmations and cancellations are handled deterministically before OpenRouter orchestration.
@@ -57,6 +59,8 @@ Campaign media is always backend-trusted. A saved menu image is resolved by rest
 ## Target OpenRouter Architecture
 
 Incoming WhatsApp message -> trusted backend context -> recent history plus active draft/clarification state -> OpenRouter provider -> model tool call -> local `executeAgentTool` -> Zod validation and role checks -> Mongo-backed services -> tool result returned to model -> concise final WhatsApp response.
+
+Authenticated website message -> trusted e-commerce business/channel/session context -> business-scoped recent history -> the same OpenRouter provider -> context-filtered read-only commerce tool -> trusted external HTTPS catalog API -> grounded result and canonical product links -> website response.
 
 ## Migration And Rollback
 

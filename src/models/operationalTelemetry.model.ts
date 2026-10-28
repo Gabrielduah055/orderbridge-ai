@@ -1,5 +1,6 @@
 import { Schema, model, type Types } from "mongoose";
 import type { SenderRole } from "../types/agent.types";
+import type { AgentChannel, BusinessType } from "../types/business.types";
 
 export const operationalTelemetryKinds = [
   "agent_turn",
@@ -12,6 +13,9 @@ export type OperationalTelemetryKind = (typeof operationalTelemetryKinds)[number
 export interface IOperationalTelemetry {
   kind: OperationalTelemetryKind;
   restaurantId?: Types.ObjectId;
+  businessId?: Types.ObjectId;
+  businessType?: BusinessType;
+  channel?: AgentChannel;
   senderRole?: SenderRole;
   provider?: string;
   model?: string;
@@ -40,6 +44,19 @@ const operationalTelemetrySchema = new Schema<IOperationalTelemetry>(
       type: Schema.Types.ObjectId,
       ref: "Restaurant",
       index: true
+    },
+    businessId: {
+      type: Schema.Types.ObjectId,
+      ref: "Business",
+      index: true
+    },
+    businessType: {
+      type: String,
+      enum: ["restaurant", "ecommerce"]
+    },
+    channel: {
+      type: String,
+      enum: ["whatsapp", "website"]
     },
     senderRole: {
       type: String,
@@ -115,6 +132,7 @@ const operationalTelemetrySchema = new Schema<IOperationalTelemetry>(
 operationalTelemetrySchema.index({ kind: 1, startedAt: -1 });
 operationalTelemetrySchema.index({ kind: 1, success: 1, startedAt: -1 });
 operationalTelemetrySchema.index({ restaurantId: 1, kind: 1, startedAt: -1 });
+operationalTelemetrySchema.index({ businessId: 1, channel: 1, kind: 1, startedAt: -1 });
 operationalTelemetrySchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export const OperationalTelemetry = model<IOperationalTelemetry>(

@@ -97,7 +97,14 @@ import {
   synchronizeDraftCurrentStep,
   submitOrderDraft
 } from "../services/orderDraft.service";
-import type { RegisteredTool, ToolExecutionContext, ToolResult } from "../types/agent.types";
+import type {
+  AgentToolDefinition,
+  CommerceToolExecutionContext,
+  RegisteredTool,
+  SenderRole,
+  ToolExecutionContext,
+  ToolResult
+} from "../types/agent.types";
 import { BadRequestError } from "../utils/httpErrors";
 import { formatDisplayDateTime } from "../utils/formatDisplay.util";
 import { normalizeWhatsappRecipient } from "../utils/phone.util";
@@ -120,7 +127,12 @@ import {
   respondToOrderCheckIn,
   resolveCustomerFeedback
 } from "../services/orderFeedback.service";
-import { toolPermissions, type ToolName } from "./tool.permissions";
+import {
+  toolPermissions,
+  type CommerceToolName,
+  type RestaurantToolName,
+  type ToolName
+} from "./tool.permissions";
 import {
   assignPendingImageToMenuItem,
   cancelPendingMenuItemImageConfirmation,
@@ -134,6 +146,13 @@ import {
   resolveStaffCustomerMessageTarget,
   sendCustomerMessageSchema
 } from "../services/staffCustomerMessage.service";
+import {
+  CommerceIntegrationError,
+  getCommerceAvailability,
+  getCommercePolicies,
+  getCommerceProduct,
+  searchCommerceProducts
+} from "../services/commerceIntegration.service";
 
 const emptySchema = z.object({}).strict();
 const getSenderRecipient = (context: ToolExecutionContext): string =>
@@ -1088,7 +1107,7 @@ const endOfYesterday = (): Date => {
   return date;
 };
 
-export const toolRegistry: Record<ToolName, RegisteredTool> = {
+export const toolRegistry: Record<RestaurantToolName, RegisteredTool> = {
   get_restaurant_profile: {
     definition: {
       name: "get_restaurant_profile",
@@ -4152,3 +4171,164 @@ export const getToolDefinitionsForRole = (role: ToolExecutionContext["sender"]["
     .filter((tool) => tool.roles.includes(role))
     .map((tool) => tool.definition);
 };
+
+interface CommerceRegisteredTool<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
+  definition: AgentToolDefinition;
+  roles: readonly SenderRole[];
+  schema: TSchema;
+  handler: (
+    args: z.infer<TSchema>,
+    context: CommerceToolExecutionContext
+  ) => Promise<ToolResult>;
+}
+
+const defineCommerceTool = <TSchema extends z.ZodTypeAny>(
+  tool: CommerceRegisteredTool<TSchema>
+): CommerceRegisteredTool<TSchema> => tool;
+
+const commerceProductIdSchema = z
+  .object({
+    productId: z.string().trim().min(1).max(200)
+  })
+  .strict();
+
+const toCommerceFailure = (error: unknown): ToolResult => {
+  if (error instanceof CommerceIntegrationError) {
+    return {
+      success: false,
+      code: error.code,
+      message: error.safeMessage
+    };
+  }
+
+  return {
+    success: false,
+    code: "COMMERCE_PROVIDER_UNAVAILABLE",
+    message: "Product information is temporarily unavailable."
+  };
+};
+
+export const commerceToolRegistry = {
+  search_products: defineCommerceTool({
+    definition: {
+      name: "search_products",
+      description:
+        "Search the current business's authoritative external product catalog using optional price, category, availability, preference, and sort filters. The business backend performs authoritative filtering and ranking.",
+      parameters: {}
+    },
+    roles: toolPermissions.search_products,
+    schema: z
+      .object({
+        query: z.string().trim().min(1).max(120).optional(),
+        limit: z.number().int().min(1).max(10).default(5),
+        minPrice: z.number().nonnegative().optional(),
+        maxPrice: z.number().nonnegative().optional(),
+        category: z.string().trim().min(1).max(120).optional(),
+        available: z.boolean().optional(),
+        preferences: z.array(z.string().trim().min(1).max(120)).max(10).optional(),
+        sort: z.enum(["relevance", "price_asc", "price_desc"]).optional()
+      })
+      .strict()
+      .refine(
+        (args) => Boolean(args.query || args.category || args.preferences?.length),
+        "Provide a query, category, or at least one preference"
+      )
+      .refine(
+        (args) =>
+          args.minPrice === undefined ||
+          args.maxPrice === undefined ||
+          args.minPrice <= args.maxPrice,
+        "minPrice cannot exceed maxPrice"
+      ),
+    handler: async (args, context) => {
+      try {
+        const data = await searchCommerceProducts(
+          context.business,
+          args.query,
+          args.limit,
+          {
+            minPrice: args.minPrice,
+            maxPrice: args.maxPrice,
+            category: args.category,
+            available: args.available,
+            preferences: args.preferences,
+            sort: args.sort
+          }
+        );
+        return {
+          success: true,
+          message: data.products.length
+            ? "Products retrieved successfully."
+            : "No matching products were found.",
+          data
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  get_product_details: defineCommerceTool({
+    definition: {
+      name: "get_product_details",
+      description: "Retrieve verified details and the canonical URL for one external product.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_product_details,
+    schema: commerceProductIdSchema,
+    handler: async (args, context) => {
+      try {
+        return {
+          success: true,
+          message: "Product details retrieved successfully.",
+          data: await getCommerceProduct(context.business, args.productId)
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  check_product_availability: defineCommerceTool({
+    definition: {
+      name: "check_product_availability",
+      description: "Check the current authoritative availability for one external product.",
+      parameters: {}
+    },
+    roles: toolPermissions.check_product_availability,
+    schema: commerceProductIdSchema,
+    handler: async (args, context) => {
+      try {
+        return {
+          success: true,
+          message: "Product availability retrieved successfully.",
+          data: await getCommerceAvailability(context.business, args.productId)
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  get_business_policies: defineCommerceTool({
+    definition: {
+      name: "get_business_policies",
+      description: "Retrieve approved customer-facing policies from the business backend.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_business_policies,
+    schema: z
+      .object({
+        topic: z.string().trim().min(1).max(120).optional()
+      })
+      .strict(),
+    handler: async (args, context) => {
+      try {
+        return {
+          success: true,
+          message: "Business policies retrieved successfully.",
+          data: await getCommercePolicies(context.business, args.topic)
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  })
+} as const;
