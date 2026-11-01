@@ -125,3 +125,24 @@ The `Business` model reserves unique e-commerce Wasender session and number fiel
 ## Provisioning
 
 Authenticated super administrators can create and inspect common business records through `/api/businesses`. When website chat is enabled and no integration key is supplied, creation returns a generated key once. Only its hash is persisted. Commerce API keys and Wasender tokens are never returned in serialized business records.
+
+Business configuration can be edited with `PATCH /api/businesses/:businessId`. The JSON body is a strict partial object containing any of `name`, `status`, owner/contact fields, `staff`, `timezone`, `agentInstructions`, `websiteIntegration`, or `commerceIntegration`. Nested integration objects are also partial. Omitted fields are preserved, and an empty or whitespace-only `commerceIntegration.apiKey` keeps the stored catalog credential unchanged. Business type, slug, restaurant identity, channels, capabilities, WhatsApp settings, and website integration keys cannot be changed through this endpoint.
+
+```json
+{
+  "status": "active",
+  "websiteIntegration": {
+    "enabled": true,
+    "allowedOrigins": ["https://shop.example.com"],
+    "requestsPerMinute": 120
+  },
+  "commerceIntegration": {
+    "baseUrl": "https://api.example.com",
+    "authType": "header",
+    "apiKeyHeader": "x-api-key",
+    "apiKey": "<new-catalog-api-key>",
+    "paths": { "search": "/catalog/search" },
+    "canonicalProductHosts": ["shop.example.com"]
+  }
+}
+```

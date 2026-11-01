@@ -1,11 +1,16 @@
 import { randomBytes } from "crypto";
+import { Types } from "mongoose";
 import slugify from "slugify";
 import { Business } from "../models/business.model";
 import type { z } from "zod";
-import type { createBusinessSchema } from "../middleware/validateRequest";
+import type {
+  createBusinessSchema,
+  updateBusinessSchema
+} from "../middleware/validateRequest";
 import { hashWebsiteIntegrationKey } from "./websiteIntegrationAuth.service";
 
 export type CreateBusinessInput = z.infer<typeof createBusinessSchema>;
+export type UpdateBusinessInput = z.infer<typeof updateBusinessSchema>;
 
 export const createBusiness = async (input: CreateBusinessInput) => {
   const generatedIntegrationKey =
@@ -41,3 +46,77 @@ export const listBusinesses = async () =>
 
 export const getBusinessById = async (businessId: string) =>
   Business.findById(businessId);
+
+export const updateBusiness = async (
+  businessId: string,
+  input: UpdateBusinessInput
+) => {
+  if (!Types.ObjectId.isValid(businessId)) return null;
+
+  const business = await Business.findById(businessId);
+  if (!business) return null;
+
+  const changedFields: string[] = [];
+  const setField = (path: string, value: unknown): void => {
+    if (value === undefined) return;
+    business.set(path, value);
+    changedFields.push(path);
+  };
+
+  setField("name", input.name);
+  setField("status", input.status);
+  setField("ownerName", input.ownerName);
+  setField("ownerEmail", input.ownerEmail);
+  setField("ownerPhone", input.ownerPhone);
+  setField("staff", input.staff);
+  setField("timezone", input.timezone);
+  setField("agentInstructions", input.agentInstructions);
+
+  setField("websiteIntegration.enabled", input.websiteIntegration?.enabled);
+  setField(
+    "websiteIntegration.allowedOrigins",
+    input.websiteIntegration?.allowedOrigins
+  );
+  setField(
+    "websiteIntegration.requestsPerMinute",
+    input.websiteIntegration?.requestsPerMinute
+  );
+
+  setField("commerceIntegration.baseUrl", input.commerceIntegration?.baseUrl);
+  setField("commerceIntegration.authType", input.commerceIntegration?.authType);
+  setField(
+    "commerceIntegration.apiKeyHeader",
+    input.commerceIntegration?.apiKeyHeader
+  );
+  setField(
+    "commerceIntegration.paths.search",
+    input.commerceIntegration?.paths?.search
+  );
+  setField(
+    "commerceIntegration.paths.product",
+    input.commerceIntegration?.paths?.product
+  );
+  setField(
+    "commerceIntegration.paths.availability",
+    input.commerceIntegration?.paths?.availability
+  );
+  setField(
+    "commerceIntegration.paths.policies",
+    input.commerceIntegration?.paths?.policies
+  );
+  setField(
+    "commerceIntegration.canonicalProductHosts",
+    input.commerceIntegration?.canonicalProductHosts
+  );
+
+  const apiKey = input.commerceIntegration?.apiKey;
+  if (apiKey) {
+    setField("commerceIntegration.apiKey", apiKey);
+  }
+
+  if (changedFields.length > 0) {
+    await business.save();
+  }
+
+  return { business, changedFields };
+};

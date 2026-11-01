@@ -332,6 +332,73 @@ test("commerce grounding rejects invented warranties, durability, discounts, spe
   }
 });
 
+test("product claims cannot borrow evidence or placeholders from another product", async () => {
+  const unsupportedResponses = [
+    "I recommend {{P2.name}} for its lifetime warranty.",
+    "{{P2.name}} warranty: {{P1.spec1}}."
+  ];
+
+  for (const unsupportedResponse of unsupportedResponses) {
+    const business = makeBusiness();
+    let round = 0;
+    const result = await runAgentOrchestrator(
+      makeOrchestratorInput(business, "Compare the warranty on both blenders"),
+      {
+        provider: {
+          name: "openrouter",
+          model: "shared-orderbridge-model",
+          complete: async () =>
+            round++ === 0
+              ? {
+                  toolCalls: [
+                    {
+                      id: `product-evidence-${round}`,
+                      name: "search_products",
+                      arguments: { query: "blender", limit: 2 }
+                    }
+                  ]
+                }
+              : { text: unsupportedResponse, toolCalls: [] }
+        },
+        getHistory: async () => [],
+        saveMessage: async () => undefined,
+        buildSystemPrompt: async () => "trusted website prompt",
+        executeTool: async () => ({
+          success: true,
+          message: "Products retrieved successfully.",
+          data: {
+            products: [
+              {
+                id: "covered-blend",
+                name: "Covered Blend",
+                description: "Includes a lifetime warranty.",
+                price: 1000,
+                currency: "GHS",
+                available: true,
+                specifications: { warranty: "10 years" },
+                canonicalUrl: "https://shop.example.com/products/covered-blend"
+              },
+              {
+                id: "basic-blend",
+                name: "Basic Blend",
+                price: 600,
+                currency: "GHS",
+                available: true,
+                canonicalUrl: "https://shop.example.com/products/basic-blend"
+              }
+            ],
+            total: 2
+          }
+        })
+      }
+    );
+
+    assert.doesNotMatch(result.message, /Basic Blend[^\n]*(?:lifetime|10 years)/i);
+    assert.match(result.message, /Covered Blend/);
+    assert.match(result.message, /Basic Blend/);
+  }
+});
+
 test("website commerce blocks unsupported product claims when no catalog tool succeeded", async () => {
   const business = makeBusiness();
   const result = await runAgentOrchestrator(
@@ -822,6 +889,198 @@ test("a failed current-product refresh never substitutes cached price or invento
   assert.equal("productAvailability" in result.data, false);
   assert.deepEqual(result.data.commerceGrounding.products, []);
   assert.doesNotMatch(result.message, /GHS 500|available/i);
+});
+
+test("partial price refresh keeps the successful product live without exposing the failed product's cached price", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "What are the current prices of both blenders?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "partial-price-success",
+                    name: "get_product_details",
+                    arguments: { productId: "price-live" }
+                  },
+                  {
+                    id: "partial-price-failure",
+                    name: "get_product_details",
+                    arguments: { productId: "price-failed" }
+                  }
+                ]
+              }
+            : {
+                text: "The refreshed price for {{P1.name}} is {{P1.price}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier prices",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "price-live",
+                  name: "Live Price Blend",
+                  price: 500,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/price-live"
+                },
+                {
+                  id: "price-failed",
+                  name: "Failed Price Blend",
+                  price: 900,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/price-failed"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (_name, args) =>
+        args.productId === "price-live"
+          ? {
+              success: true,
+              message: "Product details retrieved successfully.",
+              data: {
+                product: {
+                  id: "price-live",
+                  name: "Live Price Blend",
+                  price: 650,
+                  currency: "GHS",
+                  available: true,
+                  canonicalUrl: "https://shop.example.com/products/price-live"
+                }
+              }
+            }
+          : {
+              success: false,
+              code: "COMMERCE_PROVIDER_UNAVAILABLE",
+              message: "The second product price could not be refreshed."
+            }
+    }
+  );
+
+  assert.match(result.message, /Live Price Blend.*GHS 650/);
+  assert.doesNotMatch(result.message, /Failed Price Blend|GHS 900/);
+  assert.deepEqual(result.data.products.map((product) => product.id), ["price-live"]);
+  assert.deepEqual(result.data.commerceDataFreshness.products, [
+    { productId: "price-live", price: "live", availability: "live" }
+  ]);
+});
+
+test("partial stock refresh labels each product and suppresses only the failed product's cached inventory", async () => {
+  const business = makeBusiness();
+  let round = 0;
+  const result = await runAgentOrchestrator(
+    makeOrchestratorInput(business, "Which blenders are still in stock?"),
+    {
+      provider: {
+        name: "openrouter",
+        model: "shared-orderbridge-model",
+        complete: async () =>
+          round++ === 0
+            ? {
+                toolCalls: [
+                  {
+                    id: "partial-stock-success",
+                    name: "check_product_availability",
+                    arguments: { productId: "stock-live" }
+                  },
+                  {
+                    id: "partial-stock-failure",
+                    name: "check_product_availability",
+                    arguments: { productId: "stock-failed" }
+                  }
+                ]
+              }
+            : {
+                text: "{{P1.name}} is now {{P1.availability}}.",
+                toolCalls: []
+              }
+      },
+      getHistory: async () => [
+        {
+          role: "assistant",
+          content: "Earlier stock",
+          metadata: {
+            commerceGrounding: {
+              capturedAt: new Date().toISOString(),
+              products: [
+                {
+                  id: "stock-live",
+                  name: "Live Stock Blend",
+                  price: 700,
+                  currency: "GHS",
+                  available: true,
+                  stockQuantity: 5,
+                  canonicalUrl: "https://shop.example.com/products/stock-live"
+                },
+                {
+                  id: "stock-failed",
+                  name: "Failed Stock Blend",
+                  price: 800,
+                  currency: "GHS",
+                  available: true,
+                  stockQuantity: 4,
+                  canonicalUrl: "https://shop.example.com/products/stock-failed"
+                }
+              ],
+              availability: [],
+              policies: []
+            }
+          }
+        }
+      ],
+      saveMessage: async () => undefined,
+      buildSystemPrompt: async () => "trusted website prompt",
+      executeTool: async (_name, args) =>
+        args.productId === "stock-live"
+          ? {
+              success: true,
+              message: "Availability retrieved successfully.",
+              data: {
+                productId: "stock-live",
+                available: false,
+                stockQuantity: 0
+              }
+            }
+          : {
+              success: false,
+              code: "COMMERCE_PROVIDER_UNAVAILABLE",
+              message: "The second product inventory could not be refreshed."
+            }
+    }
+  );
+
+  assert.match(result.message, /Live Stock Blend is now unavailable/);
+  assert.doesNotMatch(result.message, /Failed Stock Blend/);
+  const failedProduct = result.data.products.find(
+    (product) => product.id === "stock-failed"
+  );
+  assert.equal("available" in failedProduct, false);
+  assert.equal("stockQuantity" in failedProduct, false);
+  assert.deepEqual(result.data.commerceDataFreshness.products, [
+    { productId: "stock-live", price: "cached", availability: "live" },
+    { productId: "stock-failed", price: "cached", availability: "unverified" }
+  ]);
 });
 
 test("backend unavailability is rendered from the latest authoritative result", async () => {

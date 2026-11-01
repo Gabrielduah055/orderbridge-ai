@@ -398,6 +398,86 @@ export const createBusinessSchema = z
     }
   });
 
+const businessStaffContactSchema = z
+  .object({
+    name: optionalTextSchema,
+    phone: phoneSchema.optional(),
+    email: z.string().trim().email().optional(),
+    role: z.enum(["owner", "manager"])
+  })
+  .strict();
+
+const updateWebsiteIntegrationSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    allowedOrigins: z.array(z.string().trim().url()).max(20).optional(),
+    requestsPerMinute: z.number().int().min(1).max(600).optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one website integration field is required"
+  });
+
+const updateCommercePathsSchema = z
+  .object({
+    search: commercePathSchema.optional(),
+    product: commercePathSchema
+      .refine((value) => value.includes("{productId}"), {
+        message: "Product path must include {productId}"
+      })
+      .optional(),
+    availability: commercePathSchema
+      .refine((value) => value.includes("{productId}"), {
+        message: "Availability path must include {productId}"
+      })
+      .optional(),
+    policies: commercePathSchema.optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one commerce path is required"
+  });
+
+const updateCommerceIntegrationSchema = z
+  .object({
+    baseUrl: httpsUrlSchema.optional(),
+    apiKey: z.string().max(1_000).transform((value) => value.trim()).optional(),
+    authType: z.enum(["bearer", "header"]).optional(),
+    apiKeyHeader: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9-]{1,80}$/)
+      .optional(),
+    paths: updateCommercePathsSchema.optional(),
+    canonicalProductHosts: z
+      .array(z.string().trim().min(1))
+      .min(1)
+      .max(20)
+      .optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one commerce integration field is required"
+  });
+
+export const updateBusinessSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    status: z.enum(businessStatuses).optional(),
+    ownerName: optionalTextSchema,
+    ownerEmail: z.string().trim().email().optional(),
+    ownerPhone: phoneSchema.optional(),
+    staff: z.array(businessStaffContactSchema).optional(),
+    timezone: timezoneSchema.optional(),
+    agentInstructions: z.string().trim().min(1).max(4_000).optional(),
+    websiteIntegration: updateWebsiteIntegrationSchema.optional(),
+    commerceIntegration: updateCommerceIntegrationSchema.optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one field is required"
+  });
+
 export const validateRequest =
   (schema: ZodSchema) =>
   (req: Request, res: Response, next: NextFunction): void => {
