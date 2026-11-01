@@ -11,6 +11,7 @@ import {
 
 export const adminAuditActions = [
   "business.create",
+  "business.update",
   "restaurant.create",
   "restaurant.update",
   "restaurant.status.update",

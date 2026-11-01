@@ -62,3 +62,34 @@ export const getBusiness = async (
     next(error);
   }
 };
+
+export const updateBusiness = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const result = await businessService.updateBusiness(
+      String(req.params.businessId),
+      req.body
+    );
+    if (!result) throw new NotFoundError("Business not found");
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "business.update",
+      targetType: "business",
+      targetId: String(result.business._id),
+      changedFields: result.changedFields,
+      metadata: { status: result.business.status }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Business updated successfully",
+      data: result.business
+    });
+  } catch (error) {
+    next(error);
+  }
+};

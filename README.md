@@ -68,6 +68,8 @@ Customer OpenRouter tools are limited to customer-safe operations: reading the r
 
 E-commerce tenants use the additive `Business` model and do not need fake restaurant records. A website backend authenticates server-to-server at `POST /api/integrations/website-chat/:businessId/messages`; integration credentials must never be exposed in frontend JavaScript. Website customers receive only read-only external catalog and policy tools, and conversation history is isolated by business, channel, and opaque session reference.
 
+Super administrators can update allowlisted business profile, status, website, and commerce configuration with `PATCH /api/businesses/:businessId`. The request is a strict partial JSON object; nested integration objects are partial, omitted values and stored secrets are preserved, and blank catalog API-key input leaves the current key unchanged.
+
 See [multi-business and channel architecture](docs/multi-business-channels.md) for provisioning, authentication, permissions, and the external commerce API contract. The future paid-order notification boundary is documented separately in [commerce payment events](docs/commerce-payment-event-contract.md).
 
 ## Order Confirmation Workflow
