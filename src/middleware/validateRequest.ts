@@ -302,6 +302,107 @@ export const websiteChatMessageSchema = z
     }
   });
 
+const commerceEventDateSchema = z
+  .string()
+  .trim()
+  .datetime({ offset: true })
+  .transform((value) => new Date(value));
+const commerceEventTextSchema = (maximum: number) =>
+  z.string().trim().min(1).max(maximum);
+const commerceEventMoneySchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(10_000_000_000_000);
+
+const commercePaidOrderItemSchema = z
+  .object({
+    externalProductId: commerceEventTextSchema(160),
+    name: commerceEventTextSchema(300),
+    quantity: z.number().int().min(1).max(10_000),
+    unitPricePesewas: commerceEventMoneySchema,
+    lineTotalPesewas: commerceEventMoneySchema
+  })
+  .strict()
+  .superRefine((item, context) => {
+    const calculatedLineTotal = item.quantity * item.unitPricePesewas;
+    if (
+      !Number.isSafeInteger(calculatedLineTotal) ||
+      item.lineTotalPesewas !== calculatedLineTotal
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["lineTotalPesewas"],
+        message: "lineTotalPesewas must equal quantity multiplied by unitPricePesewas"
+      });
+    }
+  });
+
+export const commercePaidOrderEventSchema = z
+  .object({
+    type: z.literal("order.paid"),
+    eventId: commerceEventTextSchema(160),
+    occurredAt: commerceEventDateSchema,
+    order: z
+      .object({
+        externalOrderId: commerceEventTextSchema(160),
+        orderNumber: commerceEventTextSchema(120),
+        paymentReference: commerceEventTextSchema(200),
+        paidAt: commerceEventDateSchema,
+        currency: z.literal("GHS"),
+        productPaymentTotalPesewas: commerceEventMoneySchema,
+        items: z.array(commercePaidOrderItemSchema).min(1).max(100),
+        customer: z
+          .object({
+            name: commerceEventTextSchema(200),
+            phone: commerceEventTextSchema(32).refine(
+              (value) => value.length >= 7,
+              "Customer phone must contain at least 7 characters"
+            ),
+            email: z.string().trim().email().max(254).optional(),
+            whatsappConsent: z.boolean()
+          })
+          .strict(),
+        delivery: z
+          .object({
+            recipientName: commerceEventTextSchema(200).optional(),
+            recipientPhone: commerceEventTextSchema(32).optional(),
+            addressLine1: commerceEventTextSchema(300).optional(),
+            addressLine2: commerceEventTextSchema(300).optional(),
+            city: commerceEventTextSchema(120).optional(),
+            region: commerceEventTextSchema(120).optional(),
+            postalCode: commerceEventTextSchema(32).optional(),
+            countryCode: z
+              .string()
+              .trim()
+              .regex(/^[A-Z]{2}$/)
+              .optional(),
+            instructions: commerceEventTextSchema(1_000).optional(),
+            chargeStatus: z.literal("to_be_arranged")
+          })
+          .strict()
+      })
+      .strict()
+  })
+  .strict()
+  .superRefine((event, context) => {
+    const itemTotal = event.order.items.reduce(
+      (total, item) => total + item.lineTotalPesewas,
+      0
+    );
+
+    if (
+      !Number.isSafeInteger(itemTotal) ||
+      itemTotal !== event.order.productPaymentTotalPesewas
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["order", "productPaymentTotalPesewas"],
+        message: "productPaymentTotalPesewas must equal the sum of item line totals"
+      });
+    }
+  });
+
 const httpsUrlSchema = z.string().trim().url().refine(
   (value) => new URL(value).protocol === "https:",
   "HTTPS is required"

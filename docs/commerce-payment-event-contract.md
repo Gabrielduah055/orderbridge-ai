@@ -1,72 +1,82 @@
-# Future Commerce `order.paid` Event Contract
+# Commerce `order.paid` Event Contract
 
-This document defines the boundary for a later pull request. The current multi-business change does not receive payment events, generate commerce receipts, or send payment notifications.
+Chunk 3A provides a durable, idempotent intake boundary for authoritative paid-order events. It stores the event only. It does not send WhatsApp messages, generate receipts, invoke AI, verify payment itself, or arrange delivery. Kawama remains authoritative for payment verification.
 
-## Intended flow
-
-1. The commerce backend verifies payment using its payment provider.
-2. The commerce backend sends an authenticated, idempotent `order.paid` event to OrderBridge.
-3. OrderBridge revalidates the business, event signature, event ID, and authoritative order snapshot.
-4. OrderBridge creates or retrieves the saved receipt-delivery record.
-5. OrderBridge sends the customer receipt and sends the business owner the trusted order details.
-6. The owner contacts the customer personally to agree on destination and delivery fee.
-
-OrderBridge must not calculate, quote, or negotiate the delivery fee for this commerce workflow.
-
-## Proposed HTTP contract
+## Endpoint and authentication
 
 ```http
-POST /api/integrations/commerce-events/<businessId>
-X-OrderBridge-Event-Id: evt_opaque_unique_value
-X-OrderBridge-Timestamp: 2026-10-27T12:00:00Z
-X-OrderBridge-Signature: sha256=<hmac-of-raw-body-and-timestamp>
+POST /api/integrations/commerce/<businessId>/events
+Authorization: Bearer <server-side-website-integration-key>
 Content-Type: application/json
 ```
 
+The credential is the business's existing website integration key and must be kept in Kawama's backend. It must never be exposed in browser JavaScript. OrderBridge resolves the path business to an `active` or `trial` e-commerce business and verifies the stored key hash using a constant-time comparison. Chat enablement, website capabilities, browser origins, and conversation tokens do not apply to this endpoint. A body-supplied business ID is rejected by the strict request schema and is never used for tenant scope.
+
+## Request
+
+All money values are integer pesewas. The currency is `GHS`. Each line total must equal `quantity * unitPricePesewas`, and `productPaymentTotalPesewas` must equal the sum of all item line totals.
+
 ```json
 {
-  "version": "2026-10-01",
   "type": "order.paid",
-  "occurredAt": "2026-10-27T12:00:00Z",
+  "eventId": "evt_opaque_unique_value",
+  "occurredAt": "2026-11-02T10:30:00Z",
   "order": {
     "externalOrderId": "order_123",
     "orderNumber": "KW-123",
+    "paymentReference": "pay_123",
+    "paidAt": "2026-11-02T10:29:30Z",
     "currency": "GHS",
-    "subtotal": 1250,
-    "discount": 0,
-    "tax": 0,
-    "totalPaid": 1250,
-    "paymentReference": "provider_reference_redacted_for_customer",
+    "productPaymentTotalPesewas": 125000,
     "items": [
       {
         "externalProductId": "product-123",
         "name": "Example product",
         "quantity": 1,
-        "unitPrice": 1250,
-        "lineTotal": 1250
+        "unitPricePesewas": 125000,
+        "lineTotalPesewas": 125000
       }
     ],
     "customer": {
       "name": "Example Customer",
-      "receiptDestination": "+233000000000"
+      "phone": "+233000000000",
+      "email": "customer@example.com",
+      "whatsappConsent": true
+    },
+    "delivery": {
+      "recipientName": "Example Customer",
+      "recipientPhone": "+233000000000",
+      "addressLine1": "Known address or area",
+      "city": "Accra",
+      "region": "Greater Accra",
+      "countryCode": "GH",
+      "instructions": "Optional bounded delivery note",
+      "chargeStatus": "to_be_arranged"
     }
   }
 }
 ```
 
-The exact payload will be finalized against Kawama's authoritative paid-order representation. OrderBridge must not accept client-authored totals or a browser-generated payment success event.
+Optional delivery fields are `recipientName`, `recipientPhone`, `addressLine1`, `addressLine2`, `city`, `region`, `postalCode`, `countryCode`, and `instructions`. `chargeStatus` is required and can only be `to_be_arranged`. Delivery charges are therefore not part of `productPaymentTotalPesewas`; they must be agreed separately in a later workflow.
 
-## Required safeguards
+The JSON object is strict and bounded: unknown fields are rejected, strings and arrays have maximum sizes, at least one and at most 100 items are accepted, and only `order.paid` is supported.
 
-- Resolve the signing secret from the trusted business record; never from the body.
-- Verify the signature against the raw request bytes and a bounded timestamp window.
-- Require a unique `(businessId, eventId)` record before side effects.
-- Re-fetch or cryptographically trust a bounded authoritative order snapshot from the configured commerce backend before generating messages.
-- Persist receipt and owner-notification states separately so partial failure is retryable.
-- Revalidate the customer's current permitted delivery destination at send time.
-- Never put commerce events into restaurant order state transitions or calculate a restaurant delivery fee.
-- Store bounded metadata and redact credentials, full provider payloads, and sensitive payment data from logs.
+## Responses and idempotency
 
-## Reusable integration points
+A new event is stored with `receivedAt` and `status: "received"` and returns `201`:
 
-The follow-up implementation should add a channel-neutral inbound integration-event record, a commerce receipt view built from the verified external order snapshot, and business-scoped outbound notification interfaces. Existing receipt formatting and Wasender queue behavior may be reused only after their current `restaurantId` assumptions are made additive and send-time tenant revalidation remains intact.
+```json
+{
+  "success": true,
+  "message": "Commerce event received",
+  "data": { "eventId": "evt_opaque_unique_value", "status": "received" }
+}
+```
+
+An equivalent retry returns `200` with `message: "Commerce event already received"`. Reusing an event ID, external order ID, or payment reference with different validated content returns `409`. The original event is never overwritten. Uniqueness is enforced per business by MongoDB indexes for the event ID, external order ID, and payment reference, so concurrent retries have the same outcome.
+
+Invalid credentials return `401`, and invalid or unsupported payloads return `400` using the standard validation response.
+
+## Boundary for Chunk 3B
+
+Chunk 3B may read records from this collection to implement downstream processing, but must treat the stored event as an immutable Kawama-issued payment snapshot. It must revalidate current tenant, customer destination/consent, and delivery state before any send; persist receipt and notification outcomes independently; and remain retry-safe. Chunk 3B must not reinterpret product payment as including delivery charges or place these commerce events into restaurant order state transitions.

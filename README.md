@@ -70,7 +70,7 @@ E-commerce tenants use the additive `Business` model and do not need fake restau
 
 Super administrators can update allowlisted business profile, status, website, and commerce configuration with `PATCH /api/businesses/:businessId`. The request is a strict partial JSON object; nested integration objects are partial, omitted values and stored secrets are preserved, and blank catalog API-key input leaves the current key unchanged.
 
-See [multi-business and channel architecture](docs/multi-business-channels.md) for provisioning, authentication, permissions, and the external commerce API contract. The future paid-order notification boundary is documented separately in [commerce payment events](docs/commerce-payment-event-contract.md).
+See [multi-business and channel architecture](docs/multi-business-channels.md) for provisioning, authentication, permissions, and the external commerce API contract. The paid-order intake boundary and the contract for its future notification consumer are documented separately in [commerce payment events](docs/commerce-payment-event-contract.md).
 
 ## Order Confirmation Workflow
 
