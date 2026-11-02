@@ -23,7 +23,8 @@ const {
 } = require("../dist/models/agentConversation.model");
 const {
   CommerceIntegrationError,
-  searchCommerceProducts
+  searchCommerceProducts,
+  testCommerceConnection
 } = require("../dist/services/commerceIntegration.service");
 const {
   hashWebsiteIntegrationKey,
@@ -1861,6 +1862,54 @@ test("external commerce search forwards authoritative shopping filters to the bu
     "quiet"
   ]);
   assert.equal(requestedUrl.searchParams.get("sort"), "price_asc");
+});
+
+test("commerce connection check bounds product search and accepts empty lists", async () => {
+  const business = makeBusiness();
+  const requests = [];
+  const result = await testCommerceConnection(business, "phone", {
+    fetch: async (url, options) => {
+      const requestedUrl = new URL(String(url));
+      requests.push({ url: requestedUrl, options });
+      const body = requestedUrl.pathname.endsWith("/products/search")
+        ? { products: [], total: 0 }
+        : { policies: [] };
+
+      return new Response(JSON.stringify(body), { status: 200 });
+    }
+  });
+
+  const searchRequest = requests.find(({ url }) =>
+    url.pathname.endsWith("/products/search")
+  );
+  assert.equal(searchRequest.url.searchParams.get("query"), "phone");
+  assert.equal(searchRequest.url.searchParams.get("limit"), "1");
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every(({ options }) => options.method === "GET"));
+  assert.ok(requests.every(({ options }) =>
+    options.headers.Authorization === "Bearer trusted-api-key"
+  ));
+  assert.deepEqual(
+    result.checks.map(({ name, success }) => ({ name, success })),
+    [
+      { name: "productSearch", success: true },
+      { name: "policies", success: true }
+    ]
+  );
+  assert.match(result.checkedAt, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("commerce connection check returns safe failures without provider bodies or credentials", async () => {
+  const business = makeBusiness();
+  const result = await testCommerceConnection(business, "phone", {
+    fetch: async () => new Response("raw-provider-secret", { status: 503 })
+  });
+  const serialized = JSON.stringify(result);
+
+  assert.ok(result.checks.every((check) => check.success === false));
+  assert.ok(result.checks.every((check) => typeof check.error === "string"));
+  assert.equal(serialized.includes("raw-provider-secret"), false);
+  assert.equal(serialized.includes("trusted-api-key"), false);
 });
 
 test("external catalog rejects unapproved product URL hosts", async () => {
