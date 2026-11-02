@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import * as businessService from "../services/business.service";
 import { NotFoundError } from "../utils/httpErrors";
 import { recordAdminAuditAfterMutation } from "../services/adminAudit.service";
+import { testCommerceConnection as runCommerceConnectionTest } from "../services/commerceIntegration.service";
 
 export const createBusiness = async (
   req: Request,
@@ -89,6 +90,24 @@ export const updateBusiness = async (
       message: "Business updated successfully",
       data: result.business
     });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const testCommerceConnection = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const business = await businessService.getBusinessForCommerceConnectionCheck(
+      String(req.params.businessId)
+    );
+    if (!business) throw new NotFoundError("Business not found");
+
+    const result = await runCommerceConnectionTest(business, req.body.searchTerm);
+    res.status(200).json({ success: true, data: result });
   } catch (error) {
     next(error);
   }

@@ -478,6 +478,12 @@ export const updateBusinessSchema = z
     message: "At least one field is required"
   });
 
+export const testCommerceConnectionSchema = z
+  .object({
+    searchTerm: z.string().trim().min(1).max(100)
+  })
+  .strict();
+
 export const validateRequest =
   (schema: ZodSchema) =>
   (req: Request, res: Response, next: NextFunction): void => {

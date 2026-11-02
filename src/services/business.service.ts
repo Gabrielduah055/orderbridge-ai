@@ -47,6 +47,12 @@ export const listBusinesses = async () =>
 export const getBusinessById = async (businessId: string) =>
   Business.findById(businessId);
 
+export const getBusinessForCommerceConnectionCheck = async (businessId: string) => {
+  if (!Types.ObjectId.isValid(businessId)) return null;
+
+  return Business.findById(businessId).select("+commerceIntegration.apiKey");
+};
+
 export const updateBusiness = async (
   businessId: string,
   input: UpdateBusinessInput

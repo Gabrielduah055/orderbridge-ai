@@ -78,6 +78,20 @@ export interface CommerceProductSearchFilters {
   sort?: "relevance" | "price_asc" | "price_desc";
 }
 
+export type CommerceConnectionCheckName = "productSearch" | "policies";
+
+export interface CommerceConnectionCheckResult {
+  name: CommerceConnectionCheckName;
+  success: boolean;
+  details?: string;
+  error?: string;
+}
+
+export interface CommerceConnectionTestResult {
+  checkedAt: string;
+  checks: CommerceConnectionCheckResult[];
+}
+
 const getConfiguration = (
   business: IBusinessDocument
 ): CommerceIntegrationConfiguration => {
@@ -391,4 +405,67 @@ export const getCommercePolicies = async (
   }
 
   return parsed.data;
+};
+
+const getSafeConnectionFailure = (error: unknown): string => {
+  if (!(error instanceof CommerceIntegrationError)) {
+    return "The connection check could not be completed.";
+  }
+
+  switch (error.code) {
+    case "COMMERCE_INTEGRATION_NOT_CONFIGURED":
+      return "The saved commerce integration is not fully configured.";
+    case "COMMERCE_INTEGRATION_INVALID_CONFIGURATION":
+      return "The saved commerce integration configuration is invalid.";
+    case "COMMERCE_PROVIDER_TIMEOUT":
+      return "The provider did not respond before the configured timeout.";
+    case "COMMERCE_PROVIDER_UNAVAILABLE":
+      return "The provider rejected the request or is currently unavailable.";
+    case "COMMERCE_RESPONSE_TOO_LARGE":
+      return "The provider response exceeded the allowed size.";
+    case "COMMERCE_RESPONSE_INVALID":
+      return "The provider response did not match the expected contract.";
+    default:
+      return "The connection check could not be completed.";
+  }
+};
+
+export const testCommerceConnection = async (
+  business: IBusinessDocument,
+  searchTerm: string,
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<CommerceConnectionTestResult> => {
+  const [productSearch, policies] = await Promise.all([
+    searchCommerceProducts(business, searchTerm, 1, dependencies)
+      .then<CommerceConnectionCheckResult>((result) => ({
+        name: "productSearch",
+        success: true,
+        details: result.products.length === 0
+          ? "Product search returned a valid empty product list."
+          : "Product search returned a valid product."
+      }))
+      .catch<CommerceConnectionCheckResult>((error: unknown) => ({
+        name: "productSearch",
+        success: false,
+        error: getSafeConnectionFailure(error)
+      })),
+    getCommercePolicies(business, undefined, dependencies)
+      .then<CommerceConnectionCheckResult>((result) => ({
+        name: "policies",
+        success: true,
+        details: result.policies.length === 0
+          ? "Policies returned a valid empty list."
+          : "Policies returned a valid response."
+      }))
+      .catch<CommerceConnectionCheckResult>((error: unknown) => ({
+        name: "policies",
+        success: false,
+        error: getSafeConnectionFailure(error)
+      }))
+  ]);
+
+  return {
+    checkedAt: new Date().toISOString(),
+    checks: [productSearch, policies]
+  };
 };
