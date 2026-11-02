@@ -14,6 +14,7 @@ import wasenderRoutes from "./routes/wasender.routes";
 import adminOperationsRoutes from "./routes/adminOperations.routes";
 import websiteChatRoutes from "./routes/websiteChat.routes";
 import businessRoutes from "./routes/business.routes";
+import commerceEventRoutes from "./routes/commerceEvent.routes";
 
 export const app = express();
 
@@ -41,5 +42,6 @@ app.use("/api/agent/customer", agentCustomerRoutes);
 app.use("/api/agent/owner", agentOwnerRoutes);
 app.use("/api/webhooks/wasender", wasenderRoutes);
 app.use("/api/integrations/website-chat", websiteChatRoutes);
+app.use("/api/integrations/commerce", commerceEventRoutes);
 
 app.use(errorMiddleware);
