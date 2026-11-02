@@ -149,20 +149,42 @@ const commercePaidOrderEventSchema =
 
 commercePaidOrderEventSchema.index(
   { businessId: 1, eventId: 1 },
-  { unique: true }
+  { unique: true, name: "commerce_event_business_event_unique" }
 );
 commercePaidOrderEventSchema.index(
   { businessId: 1, "order.externalOrderId": 1 },
-  { unique: true }
+  { unique: true, name: "commerce_event_business_order_unique" }
 );
 commercePaidOrderEventSchema.index(
   { businessId: 1, "order.paymentReference": 1 },
-  { unique: true }
+  { unique: true, name: "commerce_event_business_payment_unique" }
 );
-commercePaidOrderEventSchema.index({ businessId: 1, receivedAt: -1 });
+commercePaidOrderEventSchema.index(
+  { businessId: 1, receivedAt: -1 },
+  { name: "commerce_event_business_received" }
+);
 
 export const CommercePaidOrderEvent =
   model<ICommercePaidOrderEventDocument>(
     "CommercePaidOrderEvent",
     commercePaidOrderEventSchema
   );
+
+export const ensureCommercePaidOrderEventIndexes = async (): Promise<void> => {
+  await CommercePaidOrderEvent.collection.createIndex(
+    { businessId: 1, eventId: 1 },
+    { unique: true, name: "commerce_event_business_event_unique" }
+  );
+  await CommercePaidOrderEvent.collection.createIndex(
+    { businessId: 1, "order.externalOrderId": 1 },
+    { unique: true, name: "commerce_event_business_order_unique" }
+  );
+  await CommercePaidOrderEvent.collection.createIndex(
+    { businessId: 1, "order.paymentReference": 1 },
+    { unique: true, name: "commerce_event_business_payment_unique" }
+  );
+  await CommercePaidOrderEvent.collection.createIndex(
+    { businessId: 1, receivedAt: -1 },
+    { name: "commerce_event_business_received" }
+  );
+};
