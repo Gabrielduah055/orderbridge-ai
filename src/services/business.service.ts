@@ -53,6 +53,25 @@ export const getBusinessForCommerceConnectionCheck = async (businessId: string) 
   return Business.findById(businessId).select("+commerceIntegration.apiKey");
 };
 
+export const rotateWebsiteIntegrationKey = async (businessId: string) => {
+  if (!Types.ObjectId.isValid(businessId)) return null;
+
+  const websiteIntegrationKey = randomBytes(32).toString("base64url");
+  const integrationKeyHash = hashWebsiteIntegrationKey(websiteIntegrationKey);
+  const business = await Business.findOneAndUpdate(
+    { _id: businessId },
+    { $set: { "websiteIntegration.integrationKeyHash": integrationKeyHash } },
+    { new: true }
+  );
+
+  if (!business) return null;
+
+  return {
+    business,
+    websiteIntegrationKey
+  };
+};
+
 export const updateBusiness = async (
   businessId: string,
   input: UpdateBusinessInput

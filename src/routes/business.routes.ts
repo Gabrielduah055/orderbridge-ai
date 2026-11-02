@@ -3,6 +3,7 @@ import {
   createBusiness,
   getBusiness,
   listBusinesses,
+  rotateWebsiteIntegrationKey,
   testCommerceConnection,
   updateBusiness
 } from "../controllers/business.controller";
@@ -19,6 +20,7 @@ const router = Router();
 router.use(firebaseAuth, requireSuperAdmin);
 router.post("/", validateRequest(createBusinessSchema), createBusiness);
 router.get("/", listBusinesses);
+router.post("/:businessId/website/rotate-key", rotateWebsiteIntegrationKey);
 router.post(
   "/:businessId/commerce/test",
   validateRequest(testCommerceConnectionSchema),

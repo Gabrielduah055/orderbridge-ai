@@ -112,3 +112,32 @@ export const testCommerceConnection = async (
     next(error);
   }
 };
+
+export const rotateWebsiteIntegrationKey = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const result = await businessService.rotateWebsiteIntegrationKey(
+      String(req.params.businessId)
+    );
+    if (!result) throw new NotFoundError("Business not found");
+
+    await recordAdminAuditAfterMutation({
+      actor: req.user!,
+      action: "business.website_key.rotate",
+      targetType: "business",
+      targetId: String(result.business._id),
+      changedFields: ["websiteIntegration"]
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Website integration key regenerated successfully",
+      data: { websiteIntegrationKey: result.websiteIntegrationKey }
+    });
+  } catch (error) {
+    next(error);
+  }
+};

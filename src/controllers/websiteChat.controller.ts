@@ -34,6 +34,7 @@ export const handleWebsiteChat = async (
       ) {
         res.status(401).json({
           success: false,
+          code: "WEBSITE_CONVERSATION_INVALID",
           message: "Website conversation authorization is invalid"
         });
         return;
