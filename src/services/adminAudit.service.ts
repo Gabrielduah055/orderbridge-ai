@@ -12,6 +12,7 @@ import {
 export const adminAuditActions = [
   "business.create",
   "business.update",
+  "business.website_key.rotate",
   "restaurant.create",
   "restaurant.update",
   "restaurant.status.update",
