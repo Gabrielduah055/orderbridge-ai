@@ -1,6 +1,10 @@
 import { Schema, model, type Document, type Types } from "mongoose";
 
-export const commercePaidOrderEventStatuses = ["received"] as const;
+export const commercePaidOrderEventStatuses = [
+  "received",
+  "processing",
+  "enqueued"
+] as const;
 
 export type CommercePaidOrderEventStatus =
   (typeof commercePaidOrderEventStatuses)[number];
@@ -54,6 +58,13 @@ export interface ICommercePaidOrderEvent {
   receivedAt: Date;
   status: CommercePaidOrderEventStatus;
   payloadHash: string;
+  processingAttempts: number;
+  nextProcessingAttemptAt: Date;
+  processingClaimId?: string;
+  processingLeaseExpiresAt?: Date;
+  lastProcessingAttemptAt?: Date;
+  lastProcessingError?: string;
+  enqueueCompletedAt?: Date;
 }
 
 export interface ICommercePaidOrderEventDocument
@@ -139,7 +150,23 @@ const commercePaidOrderEventSchema =
         type: String,
         required: true,
         select: false
-      }
+      },
+      processingAttempts: {
+        type: Number,
+        required: true,
+        default: 0,
+        min: 0
+      },
+      nextProcessingAttemptAt: {
+        type: Date,
+        required: true,
+        default: Date.now
+      },
+      processingClaimId: { type: String, trim: true },
+      processingLeaseExpiresAt: { type: Date },
+      lastProcessingAttemptAt: { type: Date },
+      lastProcessingError: { type: String, trim: true },
+      enqueueCompletedAt: { type: Date }
     },
     {
       strict: true,
@@ -162,6 +189,10 @@ commercePaidOrderEventSchema.index(
 commercePaidOrderEventSchema.index(
   { businessId: 1, receivedAt: -1 },
   { name: "commerce_event_business_received" }
+);
+commercePaidOrderEventSchema.index(
+  { status: 1, nextProcessingAttemptAt: 1, processingLeaseExpiresAt: 1, receivedAt: 1 },
+  { name: "commerce_event_notification_claim" }
 );
 
 export const CommercePaidOrderEvent =
@@ -186,5 +217,9 @@ export const ensureCommercePaidOrderEventIndexes = async (): Promise<void> => {
   await CommercePaidOrderEvent.collection.createIndex(
     { businessId: 1, receivedAt: -1 },
     { name: "commerce_event_business_received" }
+  );
+  await CommercePaidOrderEvent.collection.createIndex(
+    { status: 1, nextProcessingAttemptAt: 1, processingLeaseExpiresAt: 1, receivedAt: 1 },
+    { name: "commerce_event_notification_claim" }
   );
 };

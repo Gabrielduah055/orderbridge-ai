@@ -27,6 +27,7 @@ export interface WebsiteIntegrationConfiguration {
 
 export interface WhatsappIntegrationConfiguration {
   enabled: boolean;
+  commerceNotificationsEnabled: boolean;
   wasenderSessionId?: string;
   wasenderApiToken?: string;
   whatsappNumber?: string;
@@ -138,6 +139,7 @@ const businessSchema = new Schema<IBusinessDocument>(
       type: new Schema(
         {
           enabled: { type: Boolean, default: false },
+          commerceNotificationsEnabled: { type: Boolean, default: false },
           wasenderSessionId: { type: String, trim: true },
           wasenderApiToken: { type: String, trim: true, select: false },
           whatsappNumber: { type: String, trim: true }

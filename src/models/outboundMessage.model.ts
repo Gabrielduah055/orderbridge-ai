@@ -8,6 +8,7 @@ export type OutboundMessageStatus = (typeof outboundMessageStatuses)[number];
 
 export interface IOutboundMessage {
   restaurantId?: Types.ObjectId;
+  businessId?: Types.ObjectId;
   sessionId: string;
   to: string;
   type: OutboundMessageType;
@@ -40,6 +41,11 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
     restaurantId: {
       type: Schema.Types.ObjectId,
       ref: "Restaurant",
+      index: true
+    },
+    businessId: {
+      type: Schema.Types.ObjectId,
+      ref: "Business",
       index: true
     },
     sessionId: {
@@ -138,14 +144,23 @@ const outboundMessageSchema = new Schema<IOutboundMessageDocument>(
 );
 
 outboundMessageSchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+outboundMessageSchema.index({ businessId: 1, status: 1, nextAttemptAt: 1, createdAt: 1 });
 outboundMessageSchema.index({ sessionId: 1, sentAt: -1 });
 outboundMessageSchema.index({ restaurantId: 1, providerMessageId: 1 });
 outboundMessageSchema.index({ restaurantId: 1, createdAt: -1 });
 outboundMessageSchema.index({ restaurantId: 1, sentAt: -1 });
 outboundMessageSchema.index({ restaurantId: 1, lastAttemptAt: -1 });
+outboundMessageSchema.index({ businessId: 1, providerMessageId: 1 });
+outboundMessageSchema.index({ businessId: 1, createdAt: -1 });
+outboundMessageSchema.index({ businessId: 1, sentAt: -1 });
+outboundMessageSchema.index({ businessId: 1, lastAttemptAt: -1 });
 outboundMessageSchema.index({ status: 1, updatedAt: -1 });
 
 export const OutboundMessage = model<IOutboundMessageDocument>(
   "OutboundMessage",
   outboundMessageSchema
 );
+
+export const ensureOutboundMessageIndexes = async (): Promise<void> => {
+  await OutboundMessage.createIndexes();
+};

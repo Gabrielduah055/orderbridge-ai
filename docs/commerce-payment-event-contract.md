@@ -1,6 +1,6 @@
 # Commerce `order.paid` Event Contract
 
-Chunk 3A provides a durable, idempotent intake boundary for authoritative paid-order events. It stores the event only. It does not send WhatsApp messages, generate receipts, invoke AI, verify payment itself, or arrange delivery. Kawama remains authoritative for payment verification.
+The commerce endpoint provides a durable, idempotent intake boundary for authoritative paid-order events. Intake stores and acknowledges the event before any notification work. It does not generate receipts, invoke AI, verify payment itself, or arrange delivery. Kawama remains authoritative for payment verification.
 
 ## Endpoint and authentication
 
@@ -77,6 +77,12 @@ An equivalent retry returns `200` with `message: "Commerce event already receive
 
 Invalid credentials return `401`, and invalid or unsupported payloads return `400` using the standard validation response.
 
-## Boundary for Chunk 3B
+## WhatsApp notification processing
 
-Chunk 3B may read records from this collection to implement downstream processing, but must treat the stored event as an immutable Kawama-issued payment snapshot. It must revalidate current tenant, customer destination/consent, and delivery state before any send; persist receipt and notification outcomes independently; and remain retry-safe. Chunk 3B must not reinterpret product payment as including delivery charges or place these commerce events into restaurant order state transitions.
+Commerce paid-order notifications are opt-in. Set `whatsappIntegration.commerceNotificationsEnabled` to `true` on the Business only after its WhatsApp integration is enabled and has a valid Wasender session, token, sending number, WhatsApp channel, and owner/manager notification recipient. The flag defaults to `false`. Turning it off pauses both event enqueueing and pending commerce queue deliveries without affecting restaurant messages.
+
+A background consumer atomically claims stored events with an expiring lease. Missing or paused configuration is recorded and retried with bounded backoff; an expired claim can be recovered after a worker crash. Deterministic queue keys cover the business, event, notification kind, and normalized recipient, so partial enqueueing can resume without recreating jobs that already exist. The event advances to `enqueued` only after every required customer and deduplicated staff job is durable.
+
+Before every send, the queue reloads the matching Business and event, rechecks business status, opt-in, WhatsApp configuration and channel, resolves that Business's current session and token, and verifies customer consent or current staff membership. Customer and individual staff outcomes remain independent queue records. Temporary provider failures retry the same record under the existing queue spacing and retry rules; stale recipients are cancelled. Commerce notifications never use restaurant records, restaurant identity resolution, global credentials, AI, or model-authored text.
+
+The stored payment snapshot remains immutable. Customer confirmations identify `Business.name`, the order number, product amount paid and currency, and state that delivery fees will be arranged separately. Staff notifications use the saved items, totals, customer contact, and delivery details. PDF receipts are outside this chunk; when added, they must use `Business.name` as the merchant.
