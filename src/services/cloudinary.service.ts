@@ -205,6 +205,63 @@ export const uploadImageFromUrl = uploadDecryptedImageFromUrl;
  * Deletes an image from Cloudinary using its CDN URL.
  * Silently ignores errors so a failed delete never blocks other operations.
  */
+export interface TrustedCloudinaryRawAsset {
+  secureUrl: string;
+  publicId: string;
+  uploadedAt: Date;
+}
+
+/**
+ * Uploads a raw file buffer (e.g. a generated PDF) to Cloudinary.
+ * Uses `resource_type: "raw"` so the file is served as-is without image
+ * transformations. The `publicId` is caller-defined to ensure stable,
+ * tenant-scoped asset identity for idempotent retries.
+ */
+export const uploadRawBuffer = async (
+  buffer: Buffer,
+  publicId: string,
+  folder: string,
+  format?: string
+): Promise<TrustedCloudinaryRawAsset> => {
+  ensureConfigured();
+
+  const result = await new Promise<{
+    secure_url?: string;
+    public_id?: string;
+  }>((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        public_id: publicId,
+        resource_type: "raw",
+        ...(format ? { format } : {}),
+        overwrite: false,
+        unique_filename: false
+      },
+      (error, uploadResult) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(uploadResult ?? {});
+      }
+    );
+    stream.end(buffer);
+  });
+
+  if (!result.secure_url || !result.public_id) {
+    throw new Error(
+      "Cloudinary accepted the raw upload but returned incomplete asset metadata."
+    );
+  }
+
+  return {
+    secureUrl: result.secure_url,
+    publicId: result.public_id,
+    uploadedAt: new Date()
+  };
+};
+
 export const deleteImageByUrl = async (imageUrl: string): Promise<void> => {
   if (!imageUrl || !isCloudinaryConfigured()) {
     return;
