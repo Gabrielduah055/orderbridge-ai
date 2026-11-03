@@ -18,6 +18,15 @@ export class BadRequestError extends Error {
   }
 }
 
+export class ConflictError extends Error {
+  statusCode = 409;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ConflictError";
+  }
+}
+
 export class ForbiddenError extends Error {
   statusCode = 403;
 
