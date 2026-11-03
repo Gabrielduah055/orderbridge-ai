@@ -11,6 +11,7 @@ import { logScheduledMessagingCredentialDiagnostics } from "./services/scheduler
 import { startSubscriptionBillingScheduler } from "./services/subscriptionBilling.service";
 import { startAdminAuditRetryWorker } from "./services/adminAudit.service";
 import { startCommercePaidOrderNotificationWorker } from "./services/commercePaidOrderNotification.service";
+import { startCommerceReceiptWorker } from "./services/commerceReceiptGeneration.service";
 
 const startServer = async (): Promise<void> => {
   await connectDb();
@@ -20,6 +21,7 @@ const startServer = async (): Promise<void> => {
   });
   startWasenderQueueWorker();
   startCommercePaidOrderNotificationWorker();
+  startCommerceReceiptWorker();
   void logScheduledMessagingCredentialDiagnostics().catch((error) => {
     console.error("[schedulerCredentials] Startup check failed", {
       error: error instanceof Error ? error.message : "Unknown scheduler credential diagnostic error"

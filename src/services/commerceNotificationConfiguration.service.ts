@@ -8,12 +8,15 @@ export const commercePaidOrderCustomerNotificationKind =
   "commerce_paid_order_customer";
 export const commercePaidOrderStaffNotificationKind =
   "commerce_paid_order_staff";
+export const commercePaidOrderReceiptNotificationKind =
+  "commerce_paid_order_receipt";
 
 export const isCommercePaidOrderNotificationKind = (
   kind: unknown
 ): boolean =>
   kind === commercePaidOrderCustomerNotificationKind ||
-  kind === commercePaidOrderStaffNotificationKind;
+  kind === commercePaidOrderStaffNotificationKind ||
+  kind === commercePaidOrderReceiptNotificationKind;
 
 export const getNormalizedCommerceStaffRecipients = (
   business: Pick<IBusinessDocument, "ownerPhone" | "staff">

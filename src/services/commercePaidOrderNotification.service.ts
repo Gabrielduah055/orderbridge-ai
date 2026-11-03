@@ -11,6 +11,7 @@ import {
   getCommerceNotificationConfigurationReason,
   getNormalizedCommerceStaffRecipients
 } from "./commerceNotificationConfiguration.service";
+import { ensureCommerceReceiptRecord } from "./commerceReceiptGeneration.service";
 import {
   markRuntimeRunFailed,
   markRuntimeRunStarted,
@@ -256,6 +257,21 @@ export const processNextCommercePaidOrderNotification = async (): Promise<boolea
           commerceEventId: event.eventId,
           recipientType: "staff"
         }
+      });
+    }
+
+    // Create the receipt record so the receipt worker can generate and
+    // deliver the PDF independently of text notifications.
+    try {
+      await ensureCommerceReceiptRecord(businessId, event.eventId, business.name);
+    } catch (receiptError) {
+      console.error("Commerce receipt record creation failed (non-fatal)", {
+        businessId,
+        commerceEventId: event.eventId,
+        error:
+          receiptError instanceof Error
+            ? receiptError.message
+            : "Unknown receipt record error"
       });
     }
 

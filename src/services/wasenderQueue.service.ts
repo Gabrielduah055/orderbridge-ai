@@ -3,6 +3,7 @@ import { Order } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import { Restaurant } from "../models/Restaurant";
 import { Business } from "../models/business.model";
+import { CommerceReceipt } from "../models/commerceReceipt.model";
 import { CommercePaidOrderEvent } from "../models/commercePaidOrderEvent.model";
 import { CustomerCampaign } from "../models/customerCampaign.model";
 import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
@@ -56,6 +57,7 @@ import {
 } from "./orderFeedbackQueue.service";
 import {
   commercePaidOrderCustomerNotificationKind,
+  commercePaidOrderReceiptNotificationKind,
   commercePaidOrderStaffNotificationKind,
   getCommerceNotificationConfigurationReason,
   getNormalizedCommerceStaffRecipients,
@@ -131,6 +133,7 @@ const transactionalKinds = new Set([
   "marketing_consent_request",
   "staff_direct_message",
   commercePaidOrderCustomerNotificationKind,
+  commercePaidOrderReceiptNotificationKind,
   commercePaidOrderStaffNotificationKind
 ]);
 
@@ -1612,7 +1615,7 @@ const refreshQueuedCommerceNotification = async (
   }
 
   const normalizedQueuedRecipient = normalizeGhanaPhone(message.to);
-  if (kind === commercePaidOrderCustomerNotificationKind) {
+  if (kind === commercePaidOrderCustomerNotificationKind || kind === commercePaidOrderReceiptNotificationKind) {
     const customerRecipient = normalizeGhanaPhone(event.order.customer.phone);
     if (!event.order.customer.whatsappConsent) {
       return { outcome: "cancel", reason: "customer_whatsapp_consent_missing" };
@@ -1624,6 +1627,21 @@ const refreshQueuedCommerceNotification = async (
       return { outcome: "cancel", reason: "customer_recipient_changed_or_invalid" };
     }
     message.to = customerRecipient;
+
+    if (kind === commercePaidOrderReceiptNotificationKind) {
+      const commerceReceiptId =
+        typeof message.metadata?.commerceReceiptId === "string"
+          ? message.metadata.commerceReceiptId
+          : "";
+      if (!commerceReceiptId) {
+        return { outcome: "cancel", reason: "receipt_metadata_missing" };
+      }
+      const receipt = await CommerceReceipt.findById(commerceReceiptId);
+      if (!receipt || !receipt.pdfAssetUrl) {
+        return { outcome: "defer", reason: "receipt_pdf_not_ready" };
+      }
+      message.documentUrl = receipt.pdfAssetUrl;
+    }
   } else {
     const currentRecipients = getNormalizedCommerceStaffRecipients(business);
     if (

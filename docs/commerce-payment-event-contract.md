@@ -85,4 +85,42 @@ A background consumer atomically claims stored events with an expiring lease. Mi
 
 Before every send, the queue reloads the matching Business and event, rechecks business status, opt-in, WhatsApp configuration and channel, resolves that Business's current session and token, and verifies customer consent or current staff membership. Customer and individual staff outcomes remain independent queue records. Temporary provider failures retry the same record under the existing queue spacing and retry rules; stale recipients are cancelled. Commerce notifications never use restaurant records, restaurant identity resolution, global credentials, AI, or model-authored text.
 
-The stored payment snapshot remains immutable. Customer confirmations identify `Business.name`, the order number, product amount paid and currency, and state that delivery fees will be arranged separately. Staff notifications use the saved items, totals, customer contact, and delivery details. PDF receipts are outside this chunk; when added, they must use `Business.name` as the merchant.
+The stored payment snapshot remains immutable. Customer confirmations identify `Business.name`, the order number, product amount paid and currency, and state that delivery fees will be arranged separately. Staff notifications use the saved items, totals, customer contact, and delivery details.
+
+## PDF receipt generation and delivery
+
+A separate background worker generates and delivers PDF receipts independently of text notification outcomes. Receipts use `Business.name` as the merchant, never restaurant records.
+
+### Receipt record lifecycle
+
+When the text-notification consumer marks an event `enqueued`, it also creates a `CommerceReceipt` record keyed by `(businessId, commerceEventId)`. A duplicate-key race returns the existing record. The receipt record stores a stable `receiptNumber`, the snapshotted `merchantName`, and progresses through `pending → generating → generated → enqueued` (or `failed`).
+
+### Generation and storage
+
+The receipt worker atomically claims a pending receipt with an expiring lease (5 minutes). Crashed worker leases expire and are reclaimed. The worker generates a PDF in memory using PDFKit containing:
+
+- **Merchant name** (`Business.name` snapshot), receipt number, order number
+- **Payment date**, customer name, phone, optional email
+- **Itemized line items** with quantities, unit prices (integer pesewas converted correctly), line totals, and currency
+- **Product total paid** — no taxes, fees, or discounts are invented
+- **Delivery fee note**: "Delivery fees are arranged separately."
+
+The PDF buffer is uploaded to Cloudinary as a `raw` resource using a deterministic, tenant-scoped public ID (`commerce-receipts/{businessId}/{eventId}`). Cloudinary's `overwrite: false` prevents duplicate uploads on retry. The asset URL and public ID are persisted on the receipt record so retries reuse the same PDF.
+
+Generation failures are deferred with exponential backoff (30 seconds to 15 minutes) up to 8 attempts before the receipt is marked `failed`. Missing Cloudinary configuration causes a deferral, not a permanent failure.
+
+### Document delivery
+
+Once the PDF is durably stored, the worker enqueues a `document` message for the event's `customer.phone` using a deterministic idempotency key: `commerce:{businessId}:{eventId}:receipt:{normalizedRecipient}`. The queue kind is `commerce_paid_order_receipt`.
+
+Before sending, the queue refreshes the matching receipt and Business, rechecks:
+- Business eligibility, status, and `commerceNotificationsEnabled`
+- WhatsApp integration (enabled, channel, session, token)
+- Customer `whatsappConsent` from the event (uses the **customer** consent branch, not the staff-recipient branch)
+- Receipt PDF URL availability
+
+The Business's current session and token are resolved at send time. Global or cross-tenant credentials are never used. Queue spacing, fairness, pause handling, and retry rules are reused from the existing commerce notification infrastructure.
+
+### Independence from text notifications
+
+Receipt processing is fully independent of customer and staff text notification delivery outcomes. The receipt worker does not reset event processing status, recreate text notification queue jobs, or depend on their send results. Generation failures and document-delivery failures are separately recoverable through their own retry chains.
