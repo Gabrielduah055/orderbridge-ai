@@ -9,6 +9,7 @@ import {
   type BusinessStatus,
   type BusinessType
 } from "../types/business.types";
+import { isWhatsappPhoneAddress } from "../utils/phone.util";
 
 export interface BusinessStaffContact {
   name?: string;
@@ -29,6 +30,8 @@ export interface WhatsappIntegrationConfiguration {
   wasenderSessionId?: string;
   wasenderApiToken?: string;
   whatsappNumber?: string;
+  hasWasenderApiToken?: boolean;
+  configurationComplete?: boolean;
 }
 
 export interface CommerceApiPaths {
@@ -191,7 +194,21 @@ const businessSchema = new Schema<IBusinessDocument>(
           delete returned.websiteIntegration.integrationKeyHash;
         }
         if (returned.whatsappIntegration) {
+          const hasWasenderApiToken = Boolean(
+            returned.whatsappIntegration.wasenderApiToken?.trim()
+          );
           delete returned.whatsappIntegration.wasenderApiToken;
+          const hasNotificationRecipient = [
+            returned.ownerPhone,
+            ...(returned.staff ?? []).map((contact) => contact.phone)
+          ].some((phone) => isWhatsappPhoneAddress(phone));
+          returned.whatsappIntegration.hasWasenderApiToken = hasWasenderApiToken;
+          returned.whatsappIntegration.configurationComplete = Boolean(
+            returned.whatsappIntegration.wasenderSessionId?.trim() &&
+              hasWasenderApiToken &&
+              isWhatsappPhoneAddress(returned.whatsappIntegration.whatsappNumber) &&
+              hasNotificationRecipient
+          );
         }
         if (returned.commerceIntegration) {
           delete returned.commerceIntegration.apiKey;

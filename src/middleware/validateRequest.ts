@@ -19,8 +19,17 @@ import {
   businessStatuses,
   businessTypes
 } from "../types/business.types";
+import {
+  isWhatsappPhoneAddress,
+  normalizeGhanaPhone
+} from "../utils/phone.util";
 
 const phoneSchema = z.string().trim().min(7);
+const businessPhoneSchema = z
+  .string()
+  .trim()
+  .refine(isWhatsappPhoneAddress, "Phone must be a valid WhatsApp phone number")
+  .transform(normalizeGhanaPhone);
 const optionalTextSchema = z.string().trim().min(1).optional();
 const ownerSummaryTimeSchema = z
   .string()
@@ -421,13 +430,13 @@ export const createBusinessSchema = z
     restaurantId: z.string().trim().min(1).optional(),
     ownerName: optionalTextSchema,
     ownerEmail: z.string().trim().email().optional(),
-    ownerPhone: phoneSchema.optional(),
+    ownerPhone: businessPhoneSchema.optional(),
     staff: z
       .array(
         z
           .object({
             name: optionalTextSchema,
-            phone: phoneSchema.optional(),
+            phone: businessPhoneSchema.optional(),
             email: z.string().trim().email().optional(),
             role: z.enum(["owner", "manager"])
           })
@@ -452,7 +461,7 @@ export const createBusinessSchema = z
         enabled: z.boolean().default(false),
         wasenderSessionId: optionalTextSchema,
         wasenderApiToken: optionalTextSchema,
-        whatsappNumber: phoneSchema.optional()
+        whatsappNumber: businessPhoneSchema.optional()
       })
       .strict()
       .optional(),
@@ -502,7 +511,7 @@ export const createBusinessSchema = z
 const businessStaffContactSchema = z
   .object({
     name: optionalTextSchema,
-    phone: phoneSchema.optional(),
+    phone: businessPhoneSchema.optional(),
     email: z.string().trim().email().optional(),
     role: z.enum(["owner", "manager"])
   })
@@ -517,6 +526,18 @@ const updateWebsiteIntegrationSchema = z
   .strict()
   .refine((value) => Object.keys(value).length > 0, {
     message: "At least one website integration field is required"
+  });
+
+const updateWhatsappIntegrationSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    wasenderSessionId: z.string().trim().min(1).max(500).optional(),
+    wasenderApiToken: z.string().max(1_000).transform((value) => value.trim()).optional(),
+    whatsappNumber: businessPhoneSchema.optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one WhatsApp integration field is required"
   });
 
 const updateCommercePathsSchema = z
@@ -567,11 +588,12 @@ export const updateBusinessSchema = z
     status: z.enum(businessStatuses).optional(),
     ownerName: optionalTextSchema,
     ownerEmail: z.string().trim().email().optional(),
-    ownerPhone: phoneSchema.optional(),
+    ownerPhone: businessPhoneSchema.optional(),
     staff: z.array(businessStaffContactSchema).optional(),
     timezone: timezoneSchema.optional(),
     agentInstructions: z.string().trim().min(1).max(4_000).optional(),
     websiteIntegration: updateWebsiteIntegrationSchema.optional(),
+    whatsappIntegration: updateWhatsappIntegrationSchema.optional(),
     commerceIntegration: updateCommerceIntegrationSchema.optional()
   })
   .strict()

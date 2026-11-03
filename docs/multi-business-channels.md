@@ -126,7 +126,9 @@ The `Business` model reserves unique e-commerce Wasender session and number fiel
 
 Authenticated super administrators can create and inspect common business records through `/api/businesses`. When website chat is enabled and no integration key is supplied, creation returns a generated key once. Only its hash is persisted. Commerce API keys and Wasender tokens are never returned in serialized business records.
 
-Business configuration can be edited with `PATCH /api/businesses/:businessId`. The JSON body is a strict partial object containing any of `name`, `status`, owner/contact fields, `staff`, `timezone`, `agentInstructions`, `websiteIntegration`, or `commerceIntegration`. Nested integration objects are also partial. Omitted fields are preserved, and an empty or whitespace-only `commerceIntegration.apiKey` keeps the stored catalog credential unchanged. Business type, slug, restaurant identity, channels, capabilities, WhatsApp settings, and website integration keys cannot be changed through this endpoint.
+Business configuration can be edited with `PATCH /api/businesses/:businessId`. The JSON body is a strict partial object containing any of `name`, `status`, owner/contact fields, `staff`, `timezone`, `agentInstructions`, `websiteIntegration`, `whatsappIntegration`, or `commerceIntegration`. Nested integration objects are also partial. Omitted fields are preserved, and an empty or whitespace-only commerce API key or Wasender token keeps the corresponding stored credential unchanged. Enabling WhatsApp requires a session ID, API token, valid sending number, and at least one valid owner/manager notification number. The WhatsApp channel entry is synchronized with the integration toggle while other channels and capabilities are preserved. Business type, slug, restaurant identity, capabilities, and website integration keys cannot be changed through this endpoint.
+
+Business responses never include the Wasender API token. The safe `hasWasenderApiToken` and `configurationComplete` flags report whether a token is stored and whether all required WhatsApp settings and notification recipients are present.
 
 ```json
 {
