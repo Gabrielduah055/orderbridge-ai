@@ -91,7 +91,7 @@ export const createBusiness = async (input: CreateBusinessInput) => {
     validateEnabledWhatsappConfiguration(business);
     await business.save();
   } catch (error) {
-    throwSafeBusinessConflict(error);
+    return throwSafeBusinessConflict(error);
   }
 
   return {
@@ -216,12 +216,14 @@ export const updateBusiness = async (
     setField("commerceIntegration.apiKey", apiKey);
   }
 
-  const enabledChannels = business.enabledChannels.filter(
-    (channel) => channel !== "whatsapp"
-  );
-  if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
-  if (enabledChannels.join("|") !== business.enabledChannels.join("|")) {
-    setField("enabledChannels", enabledChannels);
+  if (input.whatsappIntegration !== undefined) {
+    const enabledChannels = business.enabledChannels.filter(
+      (channel) => channel !== "whatsapp"
+    );
+    if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
+    if (enabledChannels.join("|") !== business.enabledChannels.join("|")) {
+      setField("enabledChannels", enabledChannels);
+    }
   }
 
   if (
