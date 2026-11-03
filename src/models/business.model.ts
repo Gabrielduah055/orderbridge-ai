@@ -30,8 +30,10 @@ export interface WhatsappIntegrationConfiguration {
   commerceNotificationsEnabled: boolean;
   wasenderSessionId?: string;
   wasenderApiToken?: string;
+  webhookSecretHash?: string;
   whatsappNumber?: string;
   hasWasenderApiToken?: boolean;
+  hasWebhookSecret?: boolean;
   configurationComplete?: boolean;
 }
 
@@ -142,6 +144,7 @@ const businessSchema = new Schema<IBusinessDocument>(
           commerceNotificationsEnabled: { type: Boolean, default: false },
           wasenderSessionId: { type: String, trim: true },
           wasenderApiToken: { type: String, trim: true, select: false },
+          webhookSecretHash: { type: String, trim: true, select: false },
           whatsappNumber: { type: String, trim: true }
         },
         { _id: false }
@@ -199,12 +202,17 @@ const businessSchema = new Schema<IBusinessDocument>(
           const hasWasenderApiToken = Boolean(
             returned.whatsappIntegration.wasenderApiToken?.trim()
           );
+          const hasWebhookSecret = Boolean(
+            returned.whatsappIntegration.webhookSecretHash?.trim()
+          );
           delete returned.whatsappIntegration.wasenderApiToken;
+          delete returned.whatsappIntegration.webhookSecretHash;
           const hasNotificationRecipient = [
             returned.ownerPhone,
             ...(returned.staff ?? []).map((contact) => contact.phone)
           ].some((phone) => isWhatsappPhoneAddress(phone));
           returned.whatsappIntegration.hasWasenderApiToken = hasWasenderApiToken;
+          returned.whatsappIntegration.hasWebhookSecret = hasWebhookSecret;
           returned.whatsappIntegration.configurationComplete = Boolean(
             returned.whatsappIntegration.wasenderSessionId?.trim() &&
               hasWasenderApiToken &&

@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import { createHash } from "crypto";
 import {
   decryptWasenderMedia,
   sendTextMessage,
@@ -6,6 +7,7 @@ import {
 } from "../services/wasender.service";
 import { Order } from "../models/order.model";
 import { Restaurant, type IRestaurantDocument } from "../models/Restaurant";
+import { Business, type IBusinessDocument } from "../models/business.model";
 import { WebhookEvent } from "../models/webhookEvent.model";
 import { OutboundMessage } from "../models/outboundMessage.model";
 import { findActiveDraft, recordInboundCustomerTurn } from "../services/orderDraft.service";
@@ -35,6 +37,7 @@ import type {
   SenderRole
 } from "../types/agent.types";
 import {
+  isValidWhatsappRecipient,
   normalizeGhanaPhone,
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
@@ -50,6 +53,12 @@ import {
   prepareUploadedCampaignImage
 } from "../services/campaignImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
+import { handleCommerceChatMessage } from "../services/websiteChat.service";
+import {
+  commerceWhatsappChatReplyKind,
+  getCommerceWhatsappChatConfigurationReason
+} from "../services/commerceNotificationConfiguration.service";
+import { verifyWhatsappWebhookSecret } from "../services/whatsappWebhookAuth.service";
 
 const customerConversationQueues = new Map<string, Promise<void>>();
 
@@ -138,7 +147,7 @@ const buildWebhookPayload = (req: Request): Record<string, unknown> => {
 };
 
 const shouldProcessWebhook = (webhook: NormalizedWasenderWebhook): boolean => {
-  if (webhook.fromMe) {
+  if (webhook.fromMe || webhook.isGroup) {
     return false;
   }
 
@@ -661,6 +670,104 @@ export const findRestaurantForWebhook = async (
   return restaurantByWhatsappNumber ?? restaurantBySession;
 };
 
+type ResolvedWasenderWebhookTenant =
+  | { kind: "restaurant"; restaurant: IRestaurantDocument }
+  | { kind: "business"; business: IBusinessDocument };
+
+type WasenderWebhookTenantResolution =
+  | { tenant: ResolvedWasenderWebhookTenant; reason?: never }
+  | { tenant: null; reason: "not_found" | "ambiguous" | "conflict" };
+
+const getResolvedTenantKey = (tenant: ResolvedWasenderWebhookTenant): string =>
+  tenant.kind === "restaurant"
+    ? `restaurant:${String(tenant.restaurant._id)}`
+    : `business:${String(tenant.business._id)}`;
+
+const resolveWasenderWebhookTenant = async (
+  webhook: NormalizedWasenderWebhook
+): Promise<WasenderWebhookTenantResolution> => {
+  const sessionId = webhook.sessionId.trim();
+  const receiver = normalizePhone(webhook.receiver);
+  if (!sessionId && !receiver) return { tenant: null, reason: "not_found" };
+
+  const receiverValues = Array.from(
+    new Set(
+      [webhook.receiver?.trim(), receiver].filter(
+        (value): value is string => Boolean(value)
+      )
+    )
+  );
+  const restaurantFilter = sessionId && receiver
+    ? {
+        $or: [
+          { wasenderSessionId: sessionId },
+          { whatsappNumber: { $in: receiverValues } }
+        ]
+      }
+    : sessionId
+      ? { wasenderSessionId: sessionId }
+      : { whatsappNumber: { $in: receiverValues } };
+  const businessFilter = sessionId && receiver
+    ? {
+        $or: [
+          { "whatsappIntegration.wasenderSessionId": sessionId },
+          { "whatsappIntegration.whatsappNumber": { $in: receiverValues } }
+        ]
+      }
+    : sessionId
+      ? { "whatsappIntegration.wasenderSessionId": sessionId }
+      : { "whatsappIntegration.whatsappNumber": { $in: receiverValues } };
+
+  const [restaurants, businesses] = await Promise.all([
+    Restaurant.find(restaurantFilter)
+      .limit(3)
+      .select("+wasenderApiToken"),
+    Business.find({ type: "ecommerce", ...businessFilter })
+      .limit(3)
+      .select(
+        "+whatsappIntegration.wasenderApiToken +whatsappIntegration.webhookSecretHash +commerceIntegration.apiKey"
+      )
+  ]);
+
+  const tenants: ResolvedWasenderWebhookTenant[] = [
+    ...restaurants.map((restaurant) => ({
+      kind: "restaurant" as const,
+      restaurant
+    })),
+    ...businesses.map((business) => ({ kind: "business" as const, business }))
+  ];
+  const sessionMatches = sessionId
+    ? tenants.filter((tenant) =>
+        tenant.kind === "restaurant"
+          ? tenant.restaurant.wasenderSessionId === sessionId
+          : tenant.business.whatsappIntegration?.wasenderSessionId === sessionId
+      )
+    : [];
+  const receiverMatches = receiver
+    ? tenants.filter((tenant) =>
+        normalizePhone(
+          tenant.kind === "restaurant"
+            ? tenant.restaurant.whatsappNumber
+            : tenant.business.whatsappIntegration?.whatsappNumber
+        ) === receiver
+      )
+    : [];
+
+  if (sessionMatches.length > 1 || receiverMatches.length > 1) {
+    return { tenant: null, reason: "ambiguous" };
+  }
+  if (
+    sessionMatches[0] &&
+    receiverMatches[0] &&
+    getResolvedTenantKey(sessionMatches[0]) !== getResolvedTenantKey(receiverMatches[0])
+  ) {
+    return { tenant: null, reason: "conflict" };
+  }
+
+  const tenant = sessionMatches[0] ?? receiverMatches[0];
+  return tenant ? { tenant } : { tenant: null, reason: "not_found" };
+};
+
 const getStructuredOrderId = (orderData: unknown): string => {
   return typeof orderData === "object" && orderData !== null && "_id" in orderData
     ? String((orderData as { _id?: unknown })._id)
@@ -757,8 +864,9 @@ export const sendCustomerOrderSideEffects = async (
   await sendSingleCustomerOrderSideEffect(restaurant, customerResponse, customerResponse.data?.order);
 };
 
-const processNormalizedWebhook = async (
-  webhook: NormalizedWasenderWebhook
+const processNormalizedRestaurantWebhook = async (
+  webhook: NormalizedWasenderWebhook,
+  restaurant: IRestaurantDocument
 ): Promise<void> => {
   const eventId = webhook.messageId ?? "";
 
@@ -771,24 +879,6 @@ const processNormalizedWebhook = async (
       payload: webhook.rawPayload,
       status: "processing"
     });
-
-    const restaurant = await findRestaurantForWebhook(webhook);
-
-    if (!restaurant) {
-      console.error("Wasender webhook restaurant not found", {
-        sessionId: webhook.sessionId,
-        receiver: webhook.receiver
-      });
-      webhookEvent.status = "failed";
-      webhookEvent.failureReason = "Restaurant not found for Wasender webhook";
-      webhookEvent.failureDetails = {
-        sessionId: webhook.sessionId,
-        receiver: webhook.receiver
-      };
-      webhookEvent.processedAt = new Date();
-      await webhookEvent.save();
-      return;
-    }
 
     if (!webhook.from) {
       throw new Error("Wasender webhook missing sender identity");
@@ -1031,21 +1121,184 @@ const processNormalizedWebhook = async (
   }
 };
 
-export const handleWasenderWebhook = (
+const buildCommerceWebhookEventId = (
+  businessId: string,
+  sessionId: string,
+  providerMessageId: string
+): string =>
+  `commerce:${createHash("sha256")
+    .update(`${businessId}:${sessionId}:${providerMessageId}`, "utf8")
+    .digest("hex")}`;
+
+const processNormalizedCommerceWebhook = async (
+  webhook: NormalizedWasenderWebhook,
+  business: IBusinessDocument
+): Promise<void> => {
+  const businessId = String(business._id);
+  const sessionId = business.whatsappIntegration!.wasenderSessionId!;
+  const providerMessageId = webhook.messageId ?? "";
+  const eventId = buildCommerceWebhookEventId(
+    businessId,
+    sessionId,
+    providerMessageId
+  );
+
+  try {
+    const webhookEvent = await WebhookEvent.create({
+      provider: "wasender",
+      eventId,
+      sessionId,
+      from: webhook.from,
+      payload: webhook.rawPayload,
+      status: "processing"
+    });
+    const recipientAddress = normalizeWhatsappRecipient(
+      webhook.senderPhone || webhook.senderUsername || webhook.from
+    );
+
+    if (
+      !providerMessageId ||
+      !isValidWhatsappRecipient(recipientAddress) ||
+      webhook.messageType !== "text" ||
+      !webhook.message.trim()
+    ) {
+      webhookEvent.status = "processed";
+      webhookEvent.processedAt = new Date();
+      await webhookEvent.save();
+      return;
+    }
+
+    const normalizedPhone = normalizeGhanaPhone(recipientAddress);
+    const conversationId = `whatsapp:${recipientAddress.toLowerCase()}`;
+    const result = await handleCommerceChatMessage({
+      business,
+      channel: "whatsapp",
+      conversationId,
+      message: webhook.message,
+      sender: {
+        identityKey: conversationId,
+        phone: normalizedPhone,
+        normalizedAddress: recipientAddress,
+        normalizedPhone,
+        recipientAddress,
+        role: "customer",
+        verified: Boolean(normalizedPhone)
+      },
+      source: "whatsapp_chat",
+      requestId: providerMessageId,
+      metadata: {
+        provider: "wasender",
+        providerMessageId,
+        sessionId
+      }
+    });
+
+    await enqueueWasenderMessage({
+      businessId,
+      sessionId,
+      to: recipientAddress,
+      type: "text",
+      text: result.message,
+      apiKey: business.whatsappIntegration!.wasenderApiToken!,
+      idempotencyKey: `${eventId}:reply`,
+      metadata: {
+        kind: commerceWhatsappChatReplyKind,
+        businessId,
+        providerMessageId,
+        recipientAddress,
+        conversationId,
+        recipientType: "webhook_sender"
+      }
+    });
+
+    webhookEvent.status = "processed";
+    webhookEvent.processedAt = new Date();
+    await webhookEvent.save();
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: number }).code === 11000
+    ) {
+      return;
+    }
+
+    console.error("Commerce Wasender webhook processing failed", {
+      businessId,
+      eventId,
+      failureReason: getErrorMessage(error)
+    });
+    await WebhookEvent.updateOne(
+      { provider: "wasender", eventId },
+      {
+        $set: {
+          status: "failed",
+          processedAt: new Date(),
+          failureReason: getErrorMessage(error),
+          failureDetails: getErrorDetails(error)
+        },
+        $setOnInsert: {
+          sessionId,
+          from: webhook.from,
+          payload: webhook.rawPayload
+        }
+      },
+      { upsert: true }
+    );
+  }
+};
+
+export const handleWasenderWebhook = async (
   req: Request,
   res: Response,
   next: NextFunction
-): void => {
+): Promise<void> => {
   try {
-    if (!isWebhookVerified(req)) {
-      res.status(401).json({
+    const webhook = normalizeIncomingWebhook(buildWebhookPayload(req));
+    const resolution = await resolveWasenderWebhookTenant(webhook);
+    if (!resolution.tenant) {
+      res.status(resolution.reason === "not_found" ? 404 : 409).json({
         success: false,
-        message: "Invalid webhook secret"
+        message:
+          resolution.reason === "not_found"
+            ? "Webhook tenant not found"
+            : "Webhook tenant identifiers are ambiguous or conflicting"
       });
       return;
     }
 
-    const webhook = normalizeIncomingWebhook(buildWebhookPayload(req));
+    if (resolution.tenant.kind === "restaurant") {
+      if (!isWebhookVerified(req)) {
+        res.status(401).json({
+          success: false,
+          message: "Invalid webhook secret"
+        });
+        return;
+      }
+    } else {
+      const business = resolution.tenant.business;
+      if (
+        !verifyWhatsappWebhookSecret(
+          req.header("x-webhook-signature"),
+          business.whatsappIntegration?.webhookSecretHash
+        )
+      ) {
+        res.status(401).json({
+          success: false,
+          message: "Invalid webhook secret"
+        });
+        return;
+      }
+
+      if (getCommerceWhatsappChatConfigurationReason(business)) {
+        res.status(403).json({
+          success: false,
+          message: "Business WhatsApp chat is unavailable"
+        });
+        return;
+      }
+    }
 
     res.status(200).json({
       success: true
@@ -1055,7 +1308,15 @@ export const handleWasenderWebhook = (
       return;
     }
 
-    void processNormalizedWebhook(webhook);
+    if (resolution.tenant.kind === "restaurant") {
+      void processNormalizedRestaurantWebhook(
+        webhook,
+        resolution.tenant.restaurant
+      );
+      return;
+    }
+
+    void processNormalizedCommerceWebhook(webhook, resolution.tenant.business);
   } catch (error) {
     next(error);
   }
