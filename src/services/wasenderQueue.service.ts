@@ -2,6 +2,8 @@ import { Types } from "mongoose";
 import { Order } from "../models/order.model";
 import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import { Restaurant } from "../models/Restaurant";
+import { Business } from "../models/business.model";
+import { CommercePaidOrderEvent } from "../models/commercePaidOrderEvent.model";
 import { CustomerCampaign } from "../models/customerCampaign.model";
 import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
 import { CustomerProfile } from "../models/customerProfile.model";
@@ -37,6 +39,7 @@ import {
 } from "./customerCampaign.service";
 import {
   isValidWhatsappRecipient,
+  isWhatsappPhoneAddress,
   normalizeGhanaPhone,
   normalizeWhatsappRecipient
 } from "../utils/phone.util";
@@ -51,9 +54,17 @@ import {
   getQueuedOrderFeedbackStaleReason,
   scheduleOrderFeedbackFollowUp
 } from "./orderFeedbackQueue.service";
+import {
+  commercePaidOrderCustomerNotificationKind,
+  commercePaidOrderStaffNotificationKind,
+  getCommerceNotificationConfigurationReason,
+  getNormalizedCommerceStaffRecipients,
+  isCommercePaidOrderNotificationKind
+} from "./commerceNotificationConfiguration.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
+  businessId?: string;
   sessionId: string;
   to: string;
   type: OutboundMessageType;
@@ -72,8 +83,10 @@ const workerIntervalMs = 1_000;
 const defaultMaxAttempts = 5;
 const staleSendingRecoveryMs = 5 * 60_000;
 const recipientVerificationMaxBackoffMs = 15 * 60_000;
+const maxConsecutiveRestaurantQueueSelections = 5;
 let workerStarted = false;
 let workerBusy = false;
+let consecutiveRestaurantQueueSelections = 0;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -116,7 +129,9 @@ const transactionalKinds = new Set([
   "order_feedback_owner_notification",
   "order_feedback_staff_notification",
   "marketing_consent_request",
-  "staff_direct_message"
+  "staff_direct_message",
+  commercePaidOrderCustomerNotificationKind,
+  commercePaidOrderStaffNotificationKind
 ]);
 
 export const recoverableRecipientCancellationReasons = new Set([
@@ -1269,7 +1284,8 @@ export const enqueueWasenderMessage = async (
   const idempotencyFilter = input.idempotencyKey
     ? {
         idempotencyKey: input.idempotencyKey,
-        ...(input.restaurantId ? { restaurantId: input.restaurantId } : {})
+        ...(input.restaurantId ? { restaurantId: input.restaurantId } : {}),
+        ...(input.businessId ? { businessId: input.businessId } : {})
       }
     : undefined;
 
@@ -1334,6 +1350,7 @@ export const enqueueWasenderMessage = async (
   try {
     return await OutboundMessage.create({
       restaurantId: input.restaurantId,
+      businessId: input.businessId,
       sessionId: input.sessionId,
       to: input.to,
       type: input.type,
@@ -1522,36 +1539,176 @@ export const refreshQueuedCustomerRecipient = async (
   };
 };
 
+type CommerceQueueRefreshResult =
+  | { outcome: "ready" }
+  | { outcome: "defer"; reason: string }
+  | { outcome: "cancel"; reason: string };
+
+const getCommerceQueueDeferralDelayMs = (
+  metadata?: Record<string, unknown>
+): number => {
+  const deferrals = Number(metadata?.commerceDeferrals ?? 0);
+  const exponent = Math.min(
+    Math.max(Number.isInteger(deferrals) ? deferrals : 0, 0),
+    8
+  );
+  return Math.min(30_000 * 2 ** exponent, 15 * 60_000);
+};
+
+const refreshQueuedCommerceNotification = async (
+  message: IOutboundMessageDocument
+): Promise<CommerceQueueRefreshResult> => {
+  const kind = message.metadata?.kind;
+  if (!isCommercePaidOrderNotificationKind(kind)) {
+    return { outcome: "ready" };
+  }
+
+  const queuedBusinessId = message.businessId ? String(message.businessId) : "";
+  const metadataBusinessId =
+    typeof message.metadata?.businessId === "string"
+      ? message.metadata.businessId
+      : "";
+  const commerceEventId =
+    typeof message.metadata?.commerceEventId === "string"
+      ? message.metadata.commerceEventId
+      : "";
+
+  if (
+    !queuedBusinessId ||
+    !metadataBusinessId ||
+    queuedBusinessId !== metadataBusinessId ||
+    !Types.ObjectId.isValid(queuedBusinessId) ||
+    !commerceEventId
+  ) {
+    return { outcome: "cancel", reason: "invalid_commerce_queue_scope" };
+  }
+
+  const [business, event] = await Promise.all([
+    Business.findById(queuedBusinessId).select(
+      "+whatsappIntegration.wasenderApiToken"
+    ),
+    CommercePaidOrderEvent.findOne({
+      businessId: queuedBusinessId,
+      eventId: commerceEventId
+    })
+  ]);
+
+  if (!business) {
+    return { outcome: "cancel", reason: "business_missing" };
+  }
+  if (!event) {
+    return { outcome: "cancel", reason: "commerce_event_missing" };
+  }
+  if (event.status !== "enqueued") {
+    return { outcome: "defer", reason: "commerce_event_enqueue_incomplete" };
+  }
+  if (business.type !== "ecommerce" || business.status === "cancelled") {
+    return { outcome: "cancel", reason: "business_no_longer_eligible" };
+  }
+
+  const configurationReason = getCommerceNotificationConfigurationReason(business);
+  if (configurationReason) {
+    return { outcome: "defer", reason: configurationReason };
+  }
+
+  const normalizedQueuedRecipient = normalizeGhanaPhone(message.to);
+  if (kind === commercePaidOrderCustomerNotificationKind) {
+    const customerRecipient = normalizeGhanaPhone(event.order.customer.phone);
+    if (!event.order.customer.whatsappConsent) {
+      return { outcome: "cancel", reason: "customer_whatsapp_consent_missing" };
+    }
+    if (
+      !isWhatsappPhoneAddress(customerRecipient) ||
+      normalizedQueuedRecipient !== customerRecipient
+    ) {
+      return { outcome: "cancel", reason: "customer_recipient_changed_or_invalid" };
+    }
+    message.to = customerRecipient;
+  } else {
+    const currentRecipients = getNormalizedCommerceStaffRecipients(business);
+    if (
+      !isWhatsappPhoneAddress(normalizedQueuedRecipient) ||
+      !currentRecipients.includes(normalizedQueuedRecipient)
+    ) {
+      return { outcome: "cancel", reason: "staff_recipient_removed_or_changed" };
+    }
+    message.to = normalizedQueuedRecipient;
+  }
+
+  message.sessionId = business.whatsappIntegration!.wasenderSessionId!;
+  message.apiKey = business.whatsappIntegration!.wasenderApiToken!;
+  return { outcome: "ready" };
+};
+
 export const processNextQueuedWasenderMessage = async (
   dependencies: ProcessQueuedWasenderMessageDependencies = {}
 ): Promise<boolean> => {
   const now = new Date();
-  const candidate = await OutboundMessage.findOne({
-    status: "pending",
+  const dueFilter = {
+    status: "pending" as const,
     nextAttemptAt: { $lte: now }
-  })
-    .sort({ nextAttemptAt: 1, createdAt: 1 })
-    .select("+apiKey +imageUrl");
+  };
+  const [restaurantCandidate, businessCandidate] = await Promise.all([
+    OutboundMessage.findOne({
+      ...dueFilter,
+      businessId: { $exists: false }
+    })
+      .sort({ nextAttemptAt: 1, createdAt: 1 })
+      .select("+apiKey +imageUrl"),
+    OutboundMessage.findOne({
+      ...dueFilter,
+      businessId: { $exists: true }
+    })
+      .sort({ nextAttemptAt: 1, createdAt: 1 })
+      .select("+apiKey +imageUrl")
+  ]);
+  const shouldSelectBusiness = Boolean(
+    businessCandidate &&
+      (!restaurantCandidate ||
+        consecutiveRestaurantQueueSelections >=
+          maxConsecutiveRestaurantQueueSelections)
+  );
+  const candidate = shouldSelectBusiness
+    ? businessCandidate
+    : restaurantCandidate ?? businessCandidate;
 
   if (!candidate) {
     return false;
   }
 
+  if (candidate.businessId) {
+    consecutiveRestaurantQueueSelections = 0;
+  } else {
+    consecutiveRestaurantQueueSelections = Math.min(
+      consecutiveRestaurantQueueSelections + 1,
+      maxConsecutiveRestaurantQueueSelections
+    );
+  }
+
+  const candidateIsCommerce = isCommercePaidOrderNotificationKind(
+    candidate.metadata?.kind
+  );
   const spacingMs = getSessionSpacingMs();
-  const lastSent = await OutboundMessage.findOne({
-    sessionId: candidate.sessionId,
-    status: "sent",
-    sentAt: { $exists: true }
-  })
-    .sort({ sentAt: -1 })
-    .select("sentAt");
+  if (!candidateIsCommerce) {
+    const lastSent = await OutboundMessage.findOne({
+      sessionId: candidate.sessionId,
+      status: "sent",
+      sentAt: { $exists: true }
+    })
+      .sort({ sentAt: -1 })
+      .select("sentAt");
 
-  const nextSessionSendAt = getNextSessionSendAt(lastSent?.sentAt, new Date(), spacingMs);
+    const nextSessionSendAt = getNextSessionSendAt(
+      lastSent?.sentAt,
+      new Date(),
+      spacingMs
+    );
 
-  if (nextSessionSendAt) {
-    candidate.nextAttemptAt = nextSessionSendAt;
-    await candidate.save();
-    return true;
+    if (nextSessionSendAt) {
+      candidate.nextAttemptAt = nextSessionSendAt;
+      await candidate.save();
+      return true;
+    }
   }
 
   const locked = await OutboundMessage.findOneAndUpdate(
@@ -1576,6 +1733,69 @@ export const processNextQueuedWasenderMessage = async (
 
   if (!locked) {
     return true;
+  }
+
+  const commerceMessage = isCommercePaidOrderNotificationKind(
+    locked.metadata?.kind
+  );
+  if (commerceMessage) {
+    let refreshed: CommerceQueueRefreshResult;
+    try {
+      refreshed = await refreshQueuedCommerceNotification(locked);
+    } catch {
+      refreshed = {
+        outcome: "defer",
+        reason: "commerce_notification_revalidation_failed"
+      };
+    }
+    if (refreshed.outcome === "cancel") {
+      locked.status = "cancelled";
+      locked.lastError = refreshed.reason;
+      await locked.save();
+      console.info("Stale commerce notification cancelled", {
+        businessId: locked.businessId ? String(locked.businessId) : undefined,
+        commerceEventId: locked.metadata?.commerceEventId,
+        kind: locked.metadata?.kind,
+        queueMessageId: String(locked._id),
+        reason: refreshed.reason
+      });
+      return true;
+    }
+    if (refreshed.outcome === "defer") {
+      const delayMs = getCommerceQueueDeferralDelayMs(locked.metadata);
+      const deferrals = Number(locked.metadata?.commerceDeferrals ?? 0);
+      locked.status = "pending";
+      locked.attempts = Math.max(locked.attempts - 1, 0);
+      locked.nextAttemptAt = new Date(Date.now() + delayMs);
+      locked.lastError = refreshed.reason;
+      locked.metadata = {
+        ...locked.metadata,
+        commerceDeferrals:
+          (Number.isInteger(deferrals) && deferrals >= 0 ? deferrals : 0) + 1
+      };
+      await locked.save();
+      return true;
+    }
+
+    const lastSent = await OutboundMessage.findOne({
+      sessionId: locked.sessionId,
+      status: "sent",
+      sentAt: { $exists: true }
+    })
+      .sort({ sentAt: -1 })
+      .select("sentAt");
+    const nextSessionSendAt = getNextSessionSendAt(
+      lastSent?.sentAt,
+      new Date(),
+      spacingMs
+    );
+    if (nextSessionSendAt) {
+      locked.status = "pending";
+      locked.attempts = Math.max(locked.attempts - 1, 0);
+      locked.nextAttemptAt = nextSessionSendAt;
+      await locked.save();
+      return true;
+    }
   }
 
   if (
@@ -1770,7 +1990,11 @@ export const processNextQueuedWasenderMessage = async (
     }
   }
 
-  const refreshedRecipient = await refreshQueuedCustomerRecipient(locked);
+  const refreshedRecipient: Awaited<
+    ReturnType<typeof refreshQueuedCustomerRecipient>
+  > = commerceMessage
+    ? { safe: true, recipient: locked.to }
+    : await refreshQueuedCustomerRecipient(locked);
   if (!refreshedRecipient.safe) {
     if (refreshedRecipient.temporary) {
       locked.status = "pending";
@@ -1837,8 +2061,10 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   const result = await (dependencies.sendMessage ?? sendQueuedWasenderMessage)(locked);
-  await updateOrderSideEffectAfterSend(locked, result);
-  await applyOrderFeedbackProviderResult(locked, result);
+  if (!commerceMessage) {
+    await updateOrderSideEffectAfterSend(locked, result);
+    await applyOrderFeedbackProviderResult(locked, result);
+  }
 
   if (result.success) {
     locked.status = "sent";
@@ -1848,7 +2074,9 @@ export const processNextQueuedWasenderMessage = async (
     locked.providerMessageId = extractWasenderProviderMessageId(result.data);
     locked.lastError = undefined;
     await locked.save();
-    await updateCampaignRecipientAfterAttempt(locked, result, false);
+    if (!commerceMessage) {
+      await updateCampaignRecipientAfterAttempt(locked, result, false);
+    }
     return true;
   }
 
@@ -1864,11 +2092,13 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   await locked.save();
-  await updateCampaignRecipientAfterAttempt(
-    locked,
-    result,
-    locked.status === "failed"
-  );
+  if (!commerceMessage) {
+    await updateCampaignRecipientAfterAttempt(
+      locked,
+      result,
+      locked.status === "failed"
+    );
+  }
 
   if (locked.type === "image") {
     console.warn("[customerAgent] menu image delivery failed", {

@@ -459,6 +459,7 @@ export const createBusinessSchema = z
     whatsappIntegration: z
       .object({
         enabled: z.boolean().default(false),
+        commerceNotificationsEnabled: z.boolean().default(false),
         wasenderSessionId: optionalTextSchema,
         wasenderApiToken: optionalTextSchema,
         whatsappNumber: businessPhoneSchema.optional()
@@ -531,6 +532,7 @@ const updateWebsiteIntegrationSchema = z
 const updateWhatsappIntegrationSchema = z
   .object({
     enabled: z.boolean().optional(),
+    commerceNotificationsEnabled: z.boolean().optional(),
     wasenderSessionId: z.string().trim().min(1).max(500).optional(),
     wasenderApiToken: z.string().max(1_000).transform((value) => value.trim()).optional(),
     whatsappNumber: businessPhoneSchema.optional()

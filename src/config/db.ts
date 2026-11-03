@@ -1,6 +1,7 @@
 import dns from "dns";
 import mongoose from "mongoose";
 import { ensureCommercePaidOrderEventIndexes } from "../models/commercePaidOrderEvent.model";
+import { ensureOutboundMessageIndexes } from "../models/outboundMessage.model";
 import { ensureCustomerCampaignRecipientIndexes } from "../models/customerCampaignRecipient.model";
 import { ensureCustomerIdentityIndexes } from "../models/customerIdentityIndexes";
 import { env } from "./env";
@@ -43,6 +44,7 @@ export const connectDb = async (
       await ensureCustomerIdentityIndexes();
       await ensureCustomerCampaignRecipientIndexes();
       await ensureCommercePaidOrderEventIndexes();
+      await ensureOutboundMessageIndexes();
     }
 
     console.log("MongoDB connected successfully");

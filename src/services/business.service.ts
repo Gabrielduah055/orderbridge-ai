@@ -172,6 +172,10 @@ export const updateBusiness = async (
 
   setField("whatsappIntegration.enabled", input.whatsappIntegration?.enabled);
   setField(
+    "whatsappIntegration.commerceNotificationsEnabled",
+    input.whatsappIntegration?.commerceNotificationsEnabled
+  );
+  setField(
     "whatsappIntegration.wasenderSessionId",
     input.whatsappIntegration?.wasenderSessionId
   );

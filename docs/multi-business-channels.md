@@ -120,7 +120,7 @@ OrderBridge does not copy catalog, inventory, customer, order, checkout, or paym
 
 Restaurant WhatsApp routing remains on the existing controller, identity services, queue, and restaurant agent. A trusted match by receiver number or Wasender session is sufficient when the other field is absent or is not configured for that payload shape. If both identifiers resolve, they must resolve to the same restaurant; conflicting matches fail closed. In production, `WASENDER_WEBHOOK_SECRET` is mandatory and a missing secret causes webhook authentication to fail.
 
-The `Business` model reserves unique e-commerce Wasender session and number fields so a future e-commerce WhatsApp activation can use trusted tenant resolution. This change does not yet route e-commerce WhatsApp messages through restaurant identity or queue collections; those collections remain restaurant-scoped by design.
+The `Business` model owns unique e-commerce Wasender session and number fields. Opt-in paid-order notifications use business-scoped outbound queue records and revalidate the current Business configuration before every send. Inbound e-commerce WhatsApp conversations are still not routed through restaurant identity, restaurant records, or restaurant customer collections.
 
 ## Provisioning
 
@@ -129,6 +129,8 @@ Authenticated super administrators can create and inspect common business record
 Business configuration can be edited with `PATCH /api/businesses/:businessId`. The JSON body is a strict partial object containing any of `name`, `status`, owner/contact fields, `staff`, `timezone`, `agentInstructions`, `websiteIntegration`, `whatsappIntegration`, or `commerceIntegration`. Nested integration objects are also partial. Omitted fields are preserved, and an empty or whitespace-only commerce API key or Wasender token keeps the corresponding stored credential unchanged. Enabling WhatsApp requires a session ID, API token, valid sending number, and at least one valid owner/manager notification number. The WhatsApp channel entry is synchronized with the integration toggle while other channels and capabilities are preserved. Business type, slug, restaurant identity, capabilities, and website integration keys cannot be changed through this endpoint.
 
 Business responses never include the Wasender API token. The safe `hasWasenderApiToken` and `configurationComplete` flags report whether a token is stored and whether all required WhatsApp settings and notification recipients are present.
+
+Commerce paid-order notifications additionally require `whatsappIntegration.commerceNotificationsEnabled: true`. It defaults to `false`; turning it off pauses commerce notification enqueueing and delivery while leaving restaurant messaging unchanged.
 
 ```json
 {
