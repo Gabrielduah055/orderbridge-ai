@@ -93,11 +93,11 @@ A separate background worker generates and delivers PDF receipts independently o
 
 ### Receipt record lifecycle
 
-When the text-notification consumer marks an event `enqueued`, it also creates a `CommerceReceipt` record keyed by `(businessId, commerceEventId)`. A duplicate-key race returns the existing record. The receipt record stores a stable `receiptNumber`, the snapshotted `merchantName`, and progresses through `pending → generating → generated → enqueued` (or `failed`).
+When the text-notification consumer marks an event `enqueued`, it also creates a `CommerceReceipt` record keyed by `(businessId, commerceEventId)`. A duplicate-key race returns the existing record. If the initial receipt-record creation fails, a periodic reconciliation sweep in the receipt worker detects enqueued events lacking a receipt and creates one idempotently, without resetting event processing or replaying text notifications. The receipt record stores a random, per-business-unique `receiptNumber`, the snapshotted `merchantName`, and progresses through `pending → generating → generated → enqueued` (or `failed`). Receipts whose PDF is already stored (`generated`) but whose enqueue crashed are reclaimed with the existing PDF, skipping regeneration.
 
 ### Generation and storage
 
-The receipt worker atomically claims a pending receipt with an expiring lease (5 minutes). Crashed worker leases expire and are reclaimed. The worker generates a PDF in memory using PDFKit containing:
+The receipt worker atomically claims a pending or generated receipt with an expiring lease (5 minutes). Crashed worker leases expire and are reclaimed. Missing Cloudinary configuration, incomplete event readiness, and paused business settings cause deferrals that do not consume the generation attempt budget; only actual PDF generation and upload attempts are counted. The worker generates a PDF in memory using PDFKit containing:
 
 - **Merchant name** (`Business.name` snapshot), receipt number, order number
 - **Payment date**, customer name, phone, optional email
@@ -105,15 +105,15 @@ The receipt worker atomically claims a pending receipt with an expiring lease (5
 - **Product total paid** — no taxes, fees, or discounts are invented
 - **Delivery fee note**: "Delivery fees are arranged separately."
 
-The PDF buffer is uploaded to Cloudinary as a `raw` resource using a deterministic, tenant-scoped public ID (`commerce-receipts/{businessId}/{eventId}`). Cloudinary's `overwrite: false` prevents duplicate uploads on retry. The asset URL and public ID are persisted on the receipt record so retries reuse the same PDF.
+The PDF buffer is uploaded to Cloudinary as a `raw` resource using a stable, opaque, tenant-scoped public ID (`commerce-receipts/{receiptObjectId}.pdf`). Cloudinary's `overwrite: false` prevents duplicate uploads on retry. The asset URL and public ID are persisted on the receipt record so retries reuse the same PDF.
 
-Generation failures are deferred with exponential backoff (30 seconds to 15 minutes) up to 8 attempts before the receipt is marked `failed`. Missing Cloudinary configuration causes a deferral, not a permanent failure.
+Generation failures are deferred with exponential backoff (30 seconds to 15 minutes) up to 8 actual generation attempts before the receipt is marked `failed`. Missing Cloudinary configuration causes a deferral without counting against the budget.
 
 ### Document delivery
 
 Once the PDF is durably stored, the worker enqueues a `document` message for the event's `customer.phone` using a deterministic idempotency key: `commerce:{businessId}:{eventId}:receipt:{normalizedRecipient}`. The queue kind is `commerce_paid_order_receipt`.
 
-Before sending, the queue refreshes the matching receipt and Business, rechecks:
+Before sending, the queue refreshes the matching receipt (validated by receipt ID, business ID, and event ID), rechecks:
 - Business eligibility, status, and `commerceNotificationsEnabled`
 - WhatsApp integration (enabled, channel, session, token)
 - Customer `whatsappConsent` from the event (uses the **customer** consent branch, not the staff-recipient branch)

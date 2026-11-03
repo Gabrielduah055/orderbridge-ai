@@ -93,7 +93,7 @@ commerceReceiptSchema.index(
 );
 commerceReceiptSchema.index(
   { businessId: 1, receiptNumber: 1 },
-  { name: "commerce_receipt_business_number" }
+  { unique: true, name: "commerce_receipt_business_number_unique" }
 );
 
 export const CommerceReceipt = model<ICommerceReceiptDocument>(
@@ -110,8 +110,21 @@ export const ensureCommerceReceiptIndexes = async (): Promise<void> => {
     { status: 1, nextGenerationAttemptAt: 1, generationLeaseExpiresAt: 1, createdAt: 1 },
     { name: "commerce_receipt_generation_claim" }
   );
+  // Drop the old non-unique index if it exists, then create the unique replacement
+  try {
+    await CommerceReceipt.collection.dropIndex("commerce_receipt_business_number");
+  } catch (error) {
+    if (
+      !error ||
+      typeof error !== "object" ||
+      !("code" in error) ||
+      (error as { code?: number }).code !== 27
+    ) {
+      throw error;
+    }
+  }
   await CommerceReceipt.collection.createIndex(
     { businessId: 1, receiptNumber: 1 },
-    { name: "commerce_receipt_business_number" }
+    { unique: true, name: "commerce_receipt_business_number_unique" }
   );
 };

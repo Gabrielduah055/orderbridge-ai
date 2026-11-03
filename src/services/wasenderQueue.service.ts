@@ -1633,11 +1633,18 @@ const refreshQueuedCommerceNotification = async (
         typeof message.metadata?.commerceReceiptId === "string"
           ? message.metadata.commerceReceiptId
           : "";
-      if (!commerceReceiptId) {
-        return { outcome: "cancel", reason: "receipt_metadata_missing" };
+      if (!commerceReceiptId || !Types.ObjectId.isValid(commerceReceiptId)) {
+        return { outcome: "cancel", reason: "receipt_metadata_invalid" };
       }
-      const receipt = await CommerceReceipt.findById(commerceReceiptId);
-      if (!receipt || !receipt.pdfAssetUrl) {
+      const receipt = await CommerceReceipt.findOne({
+        _id: commerceReceiptId,
+        businessId: queuedBusinessId,
+        commerceEventId
+      });
+      if (!receipt) {
+        return { outcome: "cancel", reason: "receipt_ownership_mismatch" };
+      }
+      if (!receipt.pdfAssetUrl || !receipt.pdfAssetPublicId) {
         return { outcome: "defer", reason: "receipt_pdf_not_ready" };
       }
       message.documentUrl = receipt.pdfAssetUrl;

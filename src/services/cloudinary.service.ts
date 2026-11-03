@@ -221,7 +221,7 @@ export const uploadRawBuffer = async (
   buffer: Buffer,
   publicId: string,
   folder: string,
-  format = "pdf"
+  format?: string
 ): Promise<TrustedCloudinaryRawAsset> => {
   ensureConfigured();
 
@@ -234,7 +234,7 @@ export const uploadRawBuffer = async (
         folder,
         public_id: publicId,
         resource_type: "raw",
-        format,
+        ...(format ? { format } : {}),
         overwrite: false,
         unique_filename: false
       },

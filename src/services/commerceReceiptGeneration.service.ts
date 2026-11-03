@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomBytes, randomUUID } from "crypto";
 import PDFDocument from "pdfkit";
 import { Business } from "../models/business.model";
 import {
@@ -30,8 +30,10 @@ const workerIntervalMs = 3_000;
 const generationLeaseMs = 5 * 60_000;
 const initialDeferralMs = 30_000;
 const maximumDeferralMs = 15 * 60_000;
+const reconciliationIntervalMs = 60_000;
 let workerStarted = false;
 let workerBusy = false;
+let lastReconciliationAt = 0;
 
 // ── PDF layout constants ───────────────────────────────────────────────
 
@@ -51,16 +53,21 @@ const formatMoney = (pesewas: number, currency: string): string =>
 const formatDateTime = (date: Date): string =>
   date.toISOString().replace("T", " ").slice(0, 16);
 
-const buildReceiptNumber = (
-  businessId: string,
-  eventId: string
-): string => `CR-${businessId.slice(-6).toUpperCase()}-${eventId.slice(0, 12).toUpperCase()}`;
+/**
+ * Generates a stable, opaque receipt number using random bytes.
+ * Format: CR-{16 random hex chars}. Per-business uniqueness is enforced
+ * by the `(businessId, receiptNumber)` unique index.
+ */
+const generateReceiptNumber = (): string =>
+  `CR-${randomBytes(8).toString("hex").toUpperCase()}`;
 
-const buildAssetPublicId = (
-  businessId: string,
-  commerceEventId: string
-): string =>
-  `${businessId}/${commerceEventId}`;
+/**
+ * Builds a Cloudinary-safe raw PDF public ID from the receipt's own
+ * ObjectId. Ends with `.pdf` so raw-resource serving sets the correct
+ * content type. The folder is supplied separately to `uploadRawBuffer`.
+ */
+const buildAssetPublicId = (receiptId: string): string =>
+  `${receiptId}.pdf`;
 
 const buildReceiptQueueIdempotencyKey = (
   businessId: string,
@@ -204,22 +211,47 @@ const generateCommerceReceiptPdf = (
 
     for (const item of event.order.items) {
       const itemStartY = doc.y;
+
+      // Measure both cells so we can align from the same starting position
+      const amountWidth = 56;
+      const columnGap = 6;
+      const nameWidth = contentWidth - amountWidth - columnGap;
+      const amountText = formatMoney(item.lineTotalPesewas, event.order.currency);
+
+      const nameHeight = doc
+        .font("Helvetica-Bold")
+        .fontSize(8.8)
+        .heightOfString(item.name, { width: nameWidth });
+
+      const amountHeight = doc
+        .font("Helvetica-Bold")
+        .fontSize(8.8)
+        .heightOfString(amountText, { width: amountWidth });
+
+      // Render name from start position
       doc
         .font("Helvetica-Bold")
         .fontSize(8.8)
         .fillColor(brandColor)
         .text(item.name, receiptMargin, itemStartY, {
-          width: contentWidth - 52
+          width: nameWidth
         });
+
+      // Render amount from the same start position
       doc
         .font("Helvetica-Bold")
         .fontSize(8.8)
         .text(
-          formatMoney(item.lineTotalPesewas, event.order.currency),
-          receiptMargin + contentWidth - 56,
+          amountText,
+          receiptMargin + contentWidth - amountWidth,
           itemStartY,
-          { align: "right", width: 56 }
+          { align: "right", width: amountWidth }
         );
+
+      // Advance past the taller cell before placing the detail line
+      const rowHeight = Math.max(nameHeight, amountHeight);
+      doc.y = itemStartY + rowHeight + 1;
+
       doc
         .font("Helvetica")
         .fontSize(7.5)
@@ -227,7 +259,7 @@ const generateCommerceReceiptPdf = (
         .text(
           `${item.quantity} x ${formatMoney(item.unitPricePesewas, event.order.currency)}`,
           receiptMargin,
-          doc.y + 1,
+          doc.y,
           { width: contentWidth }
         );
       moveY(doc, 7);
@@ -281,23 +313,38 @@ const getGenerationDeferralMs = (attempts: number): number => {
   return Math.min(initialDeferralMs * 2 ** exponent, maximumDeferralMs);
 };
 
+/**
+ * Releases a claimed receipt back to a reclaimable state.
+ *
+ * - Receipts whose PDF is already stored return to `generated` (not
+ *   `pending`) so the worker retries only the enqueue, and are never
+ *   marked `failed` since the generation budget does not apply.
+ * - Receipts without a PDF return to `pending` unless the generation
+ *   budget is exhausted, in which case they become `failed`.
+ */
 const deferClaimedReceipt = async (
   receipt: ICommerceReceiptDocument,
   claimId: string,
   reason: string,
   now = new Date()
 ): Promise<void> => {
+  const hasStoredPdf = Boolean(receipt.pdfAssetUrl && receipt.pdfAssetPublicId);
   const isFinalFailure =
-    receipt.generationAttempts >= receipt.maxGenerationAttempts;
+    !hasStoredPdf && receipt.generationAttempts >= receipt.maxGenerationAttempts;
+
   await CommerceReceipt.updateOne(
     {
       _id: receipt._id,
-      status: "generating",
+      status: { $in: ["generating", "generated"] },
       generationClaimId: claimId
     },
     {
       $set: {
-        status: isFinalFailure ? "failed" : "pending",
+        status: isFinalFailure
+          ? "failed"
+          : hasStoredPdf
+            ? "generated"
+            : "pending",
         nextGenerationAttemptAt: new Date(
           now.getTime() + getGenerationDeferralMs(receipt.generationAttempts)
         ),
@@ -311,13 +358,26 @@ const deferClaimedReceipt = async (
   );
 };
 
+/**
+ * Atomically claims the next receipt eligible for processing.
+ *
+ * Eligible statuses:
+ * - `pending`   – ready for first/next generation attempt (no lease)
+ * - `generating`– previous owner's lease expired (crash recovery)
+ * - `generated` – PDF exists but enqueue failed or crashed; requires
+ *                 expired or absent lease before reclaim
+ *
+ * `generationAttempts` is NOT incremented here. The caller increments
+ * it only when an actual PDF generation/upload attempt is made, keeping
+ * configuration deferrals and enqueue retries out of the budget.
+ */
 const claimNextReceipt = async (
   now = new Date()
 ): Promise<{ receipt: ICommerceReceiptDocument; claimId: string } | null> => {
   const claimId = randomUUID();
   const receipt = await CommerceReceipt.findOneAndUpdate(
     {
-      status: { $in: ["pending", "generating"] },
+      status: { $in: ["pending", "generating", "generated"] },
       $and: [
         {
           $or: [
@@ -327,7 +387,6 @@ const claimNextReceipt = async (
         },
         {
           $or: [
-            { status: "pending" },
             { generationLeaseExpiresAt: { $lte: now } },
             { generationLeaseExpiresAt: { $exists: false } }
           ]
@@ -338,10 +397,8 @@ const claimNextReceipt = async (
       $set: {
         status: "generating",
         generationClaimId: claimId,
-        generationLeaseExpiresAt: new Date(now.getTime() + generationLeaseMs),
-        lastGenerationAttemptAt: now
-      },
-      $inc: { generationAttempts: 1 }
+        generationLeaseExpiresAt: new Date(now.getTime() + generationLeaseMs)
+      }
     },
     {
       new: true,
@@ -356,46 +413,156 @@ const claimNextReceipt = async (
 /**
  * Creates a receipt record for an enqueued commerce event if one does
  * not already exist. Called by the text-notification consumer after it
- * marks the event `enqueued`. A duplicate-key race returns the existing
- * record.
+ * completes the event's text enqueueing, and by the reconciliation sweep
+ * for events whose original receipt creation failed. A duplicate-key race
+ * returns the existing record. Receipt-number collisions are retried with
+ * a new random number.
  */
 export const ensureCommerceReceiptRecord = async (
   businessId: string,
   commerceEventId: string,
   merchantName: string
 ): Promise<ICommerceReceiptDocument> => {
-  const receiptNumber = buildReceiptNumber(businessId, commerceEventId);
-  try {
-    return await CommerceReceipt.create({
-      businessId,
-      commerceEventId,
-      receiptNumber,
-      merchantName,
-      status: "pending",
-      generationAttempts: 0,
-      maxGenerationAttempts: 8,
-      nextGenerationAttemptAt: new Date()
-    });
-  } catch (error) {
-    if (
-      error &&
-      typeof error === "object" &&
-      "code" in error &&
-      (error as { code?: number }).code === 11000
-    ) {
-      const existing = await CommerceReceipt.findOne({
+  const existing = await CommerceReceipt.findOne({
+    businessId,
+    commerceEventId
+  });
+  if (existing) return existing;
+
+  const maxReceiptNumberAttempts = 3;
+  for (let attempt = 0; attempt < maxReceiptNumberAttempts; attempt++) {
+    const receiptNumber = generateReceiptNumber();
+    try {
+      return await CommerceReceipt.create({
         businessId,
-        commerceEventId
+        commerceEventId,
+        receiptNumber,
+        merchantName,
+        status: "pending",
+        generationAttempts: 0,
+        maxGenerationAttempts: 8,
+        nextGenerationAttemptAt: new Date()
       });
-      if (existing) return existing;
+    } catch (error) {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        (error as { code?: number }).code === 11000
+      ) {
+        // Duplicate key — either a race on (businessId, commerceEventId)
+        // or a receipt-number collision within this business.
+        const raceExisting = await CommerceReceipt.findOne({
+          businessId,
+          commerceEventId
+        });
+        if (raceExisting) return raceExisting;
+        // Receipt-number collision — retry with a new random number
+        continue;
+      }
+      throw error;
     }
-    throw error;
+  }
+  throw new Error(
+    "Failed to generate unique receipt number after retries"
+  );
+};
+
+// ── Reconciliation ─────────────────────────────────────────────────────
+
+/**
+ * Finds the oldest `enqueued` commerce event that lacks a receipt record and
+ * creates one idempotently. This covers events processed by 3D1 whose
+ * `ensureCommerceReceiptRecord` call failed or events that predated the
+ * receipt feature. Runs at most once per `reconciliationIntervalMs`,
+ * independently of the generation queue.
+ */
+const reconcileNextMissingReceipt = async (): Promise<boolean> => {
+  const [event] = await CommercePaidOrderEvent.aggregate<{
+    businessId: unknown;
+    eventId: string;
+    merchantName: string;
+  }>([
+    { $match: { status: "enqueued" } },
+    { $sort: { enqueueCompletedAt: 1, _id: 1 } },
+    {
+      $lookup: {
+        from: CommerceReceipt.collection.name,
+        let: { businessId: "$businessId", eventId: "$eventId" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ["$businessId", "$$businessId"] },
+                  { $eq: ["$commerceEventId", "$$eventId"] }
+                ]
+              }
+            }
+          },
+          { $limit: 1 }
+        ],
+        as: "receipts"
+      }
+    },
+    { $match: { "receipts.0": { $exists: false } } },
+    {
+      $lookup: {
+        from: Business.collection.name,
+        localField: "businessId",
+        foreignField: "_id",
+        as: "businesses"
+      }
+    },
+    { $unwind: "$businesses" },
+    {
+      $project: {
+        businessId: 1,
+        eventId: 1,
+        merchantName: "$businesses.name"
+      }
+    },
+    { $limit: 1 }
+  ]);
+
+  if (!event) return false;
+
+  const businessId = String(event.businessId);
+  try {
+    await ensureCommerceReceiptRecord(
+      businessId,
+      event.eventId,
+      event.merchantName
+    );
+    console.log("[commerceReceiptGeneration] Reconciled missing receipt", {
+      businessId,
+      eventId: event.eventId
+    });
+    return true;
+  } catch (error) {
+    console.error("[commerceReceiptGeneration] Receipt reconciliation failed", {
+      businessId,
+      eventId: event.eventId,
+      error: error instanceof Error ? error.message : "Unknown reconciliation error"
+    });
+    return false;
   }
 };
 
 // ── Process one receipt ────────────────────────────────────────────────
 
 export const processNextCommerceReceipt = async (): Promise<boolean> => {
+  if (Date.now() - lastReconciliationAt >= reconciliationIntervalMs) {
+    lastReconciliationAt = Date.now();
+    try {
+      await reconcileNextMissingReceipt();
+    } catch (error) {
+      console.error("[commerceReceiptGeneration] Reconciliation sweep failed", {
+        error: error instanceof Error ? error.message : "Unknown reconciliation error"
+      });
+    }
+  }
+
   const claimed = await claimNextReceipt();
   if (!claimed) return false;
 
@@ -405,6 +572,7 @@ export const processNextCommerceReceipt = async (): Promise<boolean> => {
   try {
     // If the PDF is already stored, skip generation and go to enqueue.
     if (!receipt.pdfAssetUrl || !receipt.pdfAssetPublicId) {
+      // ── Configuration checks (do NOT consume the generation budget) ──
       if (!isCloudinaryConfigured()) {
         await deferClaimedReceipt(receipt, claimId, "cloudinary_not_configured");
         return true;
@@ -420,18 +588,55 @@ export const processNextCommerceReceipt = async (): Promise<boolean> => {
         return true;
       }
 
+      const configBusiness = await Business.findById(businessId).select(
+        "+whatsappIntegration.wasenderApiToken"
+      );
+      if (!configBusiness) {
+        await deferClaimedReceipt(receipt, claimId, "business_missing");
+        return true;
+      }
+      const configReason = getCommerceNotificationConfigurationReason(configBusiness);
+      if (configReason) {
+        await deferClaimedReceipt(receipt, claimId, configReason);
+        return true;
+      }
+
+      if (receipt.generationAttempts >= receipt.maxGenerationAttempts) {
+        await deferClaimedReceipt(
+          receipt,
+          claimId,
+          "receipt_generation_attempts_exhausted"
+        );
+        return true;
+      }
+
+      // ── Actual generation attempt — count it against the budget ──
+      const budgetUpdate = await CommerceReceipt.findOneAndUpdate(
+        {
+          _id: receipt._id,
+          status: "generating",
+          generationClaimId: claimId
+        },
+        {
+          $inc: { generationAttempts: 1 },
+          $set: { lastGenerationAttemptAt: new Date() }
+        },
+        { new: true }
+      );
+      if (!budgetUpdate) return true;
+      receipt.generationAttempts = budgetUpdate.generationAttempts;
+
       const pdfBuffer = await generateCommerceReceiptPdf(
         receipt.merchantName,
         receipt.receiptNumber,
         event
       );
 
-      const assetPublicId = buildAssetPublicId(businessId, receipt.commerceEventId);
+      const assetPublicId = buildAssetPublicId(String(receipt._id));
       const asset = await uploadRawBuffer(
         pdfBuffer,
         assetPublicId,
-        "commerce-receipts",
-        "pdf"
+        "commerce-receipts"
       );
 
       await CommerceReceipt.updateOne(
