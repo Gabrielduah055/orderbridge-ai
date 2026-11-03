@@ -65,6 +65,7 @@ import {
   getNormalizedCommerceStaffRecipients,
   isCommerceWhatsappQueueKind
 } from "./commerceNotificationConfiguration.service";
+import { resolveCurrentBusinessWhatsappRecipient } from "./businessWasenderIdentity.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -1606,14 +1607,42 @@ const refreshQueuedCommerceNotification = async (
         : ""
     );
     const queuedRecipient = normalizeWhatsappRecipient(message.to);
+    const customerKey =
+      typeof message.metadata?.customerKey === "string"
+        ? message.metadata.customerKey
+        : "";
+    const identitySessionId =
+      typeof message.metadata?.identitySessionId === "string"
+        ? message.metadata.identitySessionId
+        : "";
     if (
       !isValidWhatsappRecipient(expectedRecipient) ||
-      queuedRecipient !== expectedRecipient
+      queuedRecipient !== expectedRecipient ||
+      !customerKey ||
+      identitySessionId !== business.whatsappIntegration!.wasenderSessionId
     ) {
       return { outcome: "cancel", reason: "chat_recipient_invalid" };
     }
 
-    message.to = expectedRecipient;
+    const recipientResolution = await resolveCurrentBusinessWhatsappRecipient({
+      businessId: queuedBusinessId,
+      sessionId: identitySessionId,
+      customerKey,
+      fallbackAddress: expectedRecipient,
+      apiKey: business.whatsappIntegration!.wasenderApiToken!
+    });
+    if (!recipientResolution.resolved || !recipientResolution.recipient) {
+      return recipientResolution.temporary
+        ? { outcome: "defer", reason: recipientResolution.reason }
+        : { outcome: "cancel", reason: recipientResolution.reason };
+    }
+
+    message.to = recipientResolution.recipient;
+    message.metadata = {
+      ...message.metadata,
+      recipientAddress: recipientResolution.recipient,
+      customerKey
+    };
     message.sessionId = business.whatsappIntegration!.wasenderSessionId!;
     message.apiKey = business.whatsappIntegration!.wasenderApiToken!;
     return { outcome: "ready" };

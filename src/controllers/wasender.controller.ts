@@ -1,5 +1,4 @@
 import type { NextFunction, Request, Response } from "express";
-import { createHash } from "crypto";
 import {
   decryptWasenderMedia,
   sendTextMessage,
@@ -37,9 +36,7 @@ import type {
   SenderRole
 } from "../types/agent.types";
 import {
-  isValidWhatsappRecipient,
-  normalizeGhanaPhone,
-  normalizeWhatsappRecipient
+  normalizeGhanaPhone
 } from "../utils/phone.util";
 import { resolveSenderIdentity } from "../services/senderIdentity.service";
 import { resolveWasenderCustomerIdentity } from "../services/wasenderIdentity.service";
@@ -53,12 +50,9 @@ import {
   prepareUploadedCampaignImage
 } from "../services/campaignImageWorkflow.service";
 import { getSafeErrorMessage, redactUrls } from "../utils/error.util";
-import { handleCommerceChatMessage } from "../services/websiteChat.service";
-import {
-  commerceWhatsappChatReplyKind,
-  getCommerceWhatsappChatConfigurationReason
-} from "../services/commerceNotificationConfiguration.service";
+import { getCommerceWhatsappChatConfigurationReason } from "../services/commerceNotificationConfiguration.service";
 import { verifyWhatsappWebhookSecret } from "../services/whatsappWebhookAuth.service";
+import { persistCommerceWhatsappWebhookEvent } from "../services/commerceWhatsappWebhook.service";
 
 const customerConversationQueues = new Map<string, Promise<void>>();
 
@@ -722,7 +716,11 @@ const resolveWasenderWebhookTenant = async (
     Restaurant.find(restaurantFilter)
       .limit(3)
       .select("+wasenderApiToken"),
-    Business.find({ type: "ecommerce", ...businessFilter })
+    Business.find({
+      type: "ecommerce",
+      "whatsappIntegration.enabled": true,
+      ...businessFilter
+    })
       .limit(3)
       .select(
         "+whatsappIntegration.wasenderApiToken +whatsappIntegration.webhookSecretHash +commerceIntegration.apiKey"
@@ -1121,134 +1119,6 @@ const processNormalizedRestaurantWebhook = async (
   }
 };
 
-const buildCommerceWebhookEventId = (
-  businessId: string,
-  sessionId: string,
-  providerMessageId: string
-): string =>
-  `commerce:${createHash("sha256")
-    .update(`${businessId}:${sessionId}:${providerMessageId}`, "utf8")
-    .digest("hex")}`;
-
-const processNormalizedCommerceWebhook = async (
-  webhook: NormalizedWasenderWebhook,
-  business: IBusinessDocument
-): Promise<void> => {
-  const businessId = String(business._id);
-  const sessionId = business.whatsappIntegration!.wasenderSessionId!;
-  const providerMessageId = webhook.messageId ?? "";
-  const eventId = buildCommerceWebhookEventId(
-    businessId,
-    sessionId,
-    providerMessageId
-  );
-
-  try {
-    const webhookEvent = await WebhookEvent.create({
-      provider: "wasender",
-      eventId,
-      sessionId,
-      from: webhook.from,
-      payload: webhook.rawPayload,
-      status: "processing"
-    });
-    const recipientAddress = normalizeWhatsappRecipient(
-      webhook.senderPhone || webhook.senderUsername || webhook.from
-    );
-
-    if (
-      !providerMessageId ||
-      !isValidWhatsappRecipient(recipientAddress) ||
-      webhook.messageType !== "text" ||
-      !webhook.message.trim()
-    ) {
-      webhookEvent.status = "processed";
-      webhookEvent.processedAt = new Date();
-      await webhookEvent.save();
-      return;
-    }
-
-    const normalizedPhone = normalizeGhanaPhone(recipientAddress);
-    const conversationId = `whatsapp:${recipientAddress.toLowerCase()}`;
-    const result = await handleCommerceChatMessage({
-      business,
-      channel: "whatsapp",
-      conversationId,
-      message: webhook.message,
-      sender: {
-        identityKey: conversationId,
-        phone: normalizedPhone,
-        normalizedAddress: recipientAddress,
-        normalizedPhone,
-        recipientAddress,
-        role: "customer",
-        verified: Boolean(normalizedPhone)
-      },
-      source: "whatsapp_chat",
-      requestId: providerMessageId,
-      metadata: {
-        provider: "wasender",
-        providerMessageId,
-        sessionId
-      }
-    });
-
-    await enqueueWasenderMessage({
-      businessId,
-      sessionId,
-      to: recipientAddress,
-      type: "text",
-      text: result.message,
-      apiKey: business.whatsappIntegration!.wasenderApiToken!,
-      idempotencyKey: `${eventId}:reply`,
-      metadata: {
-        kind: commerceWhatsappChatReplyKind,
-        businessId,
-        providerMessageId,
-        recipientAddress,
-        conversationId,
-        recipientType: "webhook_sender"
-      }
-    });
-
-    webhookEvent.status = "processed";
-    webhookEvent.processedAt = new Date();
-    await webhookEvent.save();
-  } catch (error) {
-    if (
-      error &&
-      typeof error === "object" &&
-      "code" in error &&
-      (error as { code?: number }).code === 11000
-    ) {
-      return;
-    }
-
-    console.error("Commerce Wasender webhook processing failed", {
-      businessId,
-      eventId,
-      failureReason: getErrorMessage(error)
-    });
-    await WebhookEvent.updateOne(
-      { provider: "wasender", eventId },
-      {
-        $set: {
-          status: "failed",
-          processedAt: new Date(),
-          failureReason: getErrorMessage(error),
-          failureDetails: getErrorDetails(error)
-        },
-        $setOnInsert: {
-          sessionId,
-          from: webhook.from,
-          payload: webhook.rawPayload
-        }
-      },
-      { upsert: true }
-    );
-  }
-};
-
 export const handleWasenderWebhook = async (
   req: Request,
   res: Response,
@@ -1300,11 +1170,24 @@ export const handleWasenderWebhook = async (
       }
     }
 
-    res.status(200).json({
-      success: true
-    });
+    const processable = shouldProcessWebhook(webhook);
+    if (
+      resolution.tenant.kind === "business" &&
+      processable &&
+      webhook.messageType === "text" &&
+      webhook.message.trim()
+    ) {
+      const business = resolution.tenant.business;
+      await persistCommerceWhatsappWebhookEvent(
+        String(business._id),
+        business.whatsappIntegration!.wasenderSessionId!,
+        webhook
+      );
+    }
 
-    if (!shouldProcessWebhook(webhook)) {
+    res.status(200).json({ success: true });
+
+    if (!processable) {
       return;
     }
 
@@ -1316,7 +1199,7 @@ export const handleWasenderWebhook = async (
       return;
     }
 
-    void processNormalizedCommerceWebhook(webhook, resolution.tenant.business);
+    // E-commerce text messages are processed by the leased background worker.
   } catch (error) {
     next(error);
   }

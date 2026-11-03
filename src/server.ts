@@ -12,6 +12,7 @@ import { startSubscriptionBillingScheduler } from "./services/subscriptionBillin
 import { startAdminAuditRetryWorker } from "./services/adminAudit.service";
 import { startCommercePaidOrderNotificationWorker } from "./services/commercePaidOrderNotification.service";
 import { startCommerceReceiptWorker } from "./services/commerceReceiptGeneration.service";
+import { startCommerceWhatsappWebhookWorker } from "./services/commerceWhatsappWebhook.service";
 
 const startServer = async (): Promise<void> => {
   await connectDb();
@@ -20,6 +21,7 @@ const startServer = async (): Promise<void> => {
     console.log(`OrderBridge AI backend listening on port ${env.port}`);
   });
   startWasenderQueueWorker();
+  startCommerceWhatsappWebhookWorker();
   startCommercePaidOrderNotificationWorker();
   startCommerceReceiptWorker();
   void logScheduledMessagingCredentialDiagnostics().catch((error) => {

@@ -1,5 +1,6 @@
 export const runtimeComponentNames = [
   "wasender_queue",
+  "commerce_whatsapp_webhooks",
   "commerce_paid_order_notifications",
   "commerce_receipt_generation",
   "follow_up_scheduler",
