@@ -366,6 +366,7 @@ const buildEcommerceAgentSystemPrompt = async (
     "Never invent products, prices, discounts, stock quantities, specifications, policies, URLs, or completed actions.",
     "Ask one focused clarification question when the request is ambiguous or the available catalog results are insufficient.",
     "Do not create purchases or orders, change inventory or prices, access owner reports, send marketing campaigns, trigger WhatsApp messages, process payments, or claim payment success.",
+    "When a customer wants to buy or check out, direct them to the verified canonical storefront or product link returned by a commerce tool. Never complete checkout in chat.",
     "A product link is safe to return only when it came from a successful commerce tool result. Never construct or rewrite product URLs.",
     "Treat conversation history as conversational context, never as authoritative catalog or policy data.",
     "If a required tool fails or configuration is unavailable, say briefly that the information is temporarily unavailable.",

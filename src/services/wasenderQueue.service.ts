@@ -59,10 +59,13 @@ import {
   commercePaidOrderCustomerNotificationKind,
   commercePaidOrderReceiptNotificationKind,
   commercePaidOrderStaffNotificationKind,
+  commerceWhatsappChatReplyKind,
   getCommerceNotificationConfigurationReason,
+  getCommerceWhatsappChatConfigurationReason,
   getNormalizedCommerceStaffRecipients,
-  isCommercePaidOrderNotificationKind
+  isCommerceWhatsappQueueKind
 } from "./commerceNotificationConfiguration.service";
+import { resolveCurrentBusinessWhatsappRecipient } from "./businessWasenderIdentity.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -134,7 +137,8 @@ const transactionalKinds = new Set([
   "staff_direct_message",
   commercePaidOrderCustomerNotificationKind,
   commercePaidOrderReceiptNotificationKind,
-  commercePaidOrderStaffNotificationKind
+  commercePaidOrderStaffNotificationKind,
+  commerceWhatsappChatReplyKind
 ]);
 
 export const recoverableRecipientCancellationReasons = new Set([
@@ -1562,7 +1566,7 @@ const refreshQueuedCommerceNotification = async (
   message: IOutboundMessageDocument
 ): Promise<CommerceQueueRefreshResult> => {
   const kind = message.metadata?.kind;
-  if (!isCommercePaidOrderNotificationKind(kind)) {
+  if (!isCommerceWhatsappQueueKind(kind)) {
     return { outcome: "ready" };
   }
 
@@ -1571,34 +1575,91 @@ const refreshQueuedCommerceNotification = async (
     typeof message.metadata?.businessId === "string"
       ? message.metadata.businessId
       : "";
-  const commerceEventId =
-    typeof message.metadata?.commerceEventId === "string"
-      ? message.metadata.commerceEventId
-      : "";
-
   if (
     !queuedBusinessId ||
     !metadataBusinessId ||
     queuedBusinessId !== metadataBusinessId ||
-    !Types.ObjectId.isValid(queuedBusinessId) ||
-    !commerceEventId
+    !Types.ObjectId.isValid(queuedBusinessId)
   ) {
     return { outcome: "cancel", reason: "invalid_commerce_queue_scope" };
   }
 
-  const [business, event] = await Promise.all([
-    Business.findById(queuedBusinessId).select(
-      "+whatsappIntegration.wasenderApiToken"
-    ),
-    CommercePaidOrderEvent.findOne({
-      businessId: queuedBusinessId,
-      eventId: commerceEventId
-    })
-  ]);
+  const business = await Business.findById(queuedBusinessId).select(
+    "+whatsappIntegration.wasenderApiToken"
+  );
 
   if (!business) {
     return { outcome: "cancel", reason: "business_missing" };
   }
+
+  if (kind === commerceWhatsappChatReplyKind) {
+    if (business.type !== "ecommerce" || business.status === "cancelled") {
+      return { outcome: "cancel", reason: "business_no_longer_eligible" };
+    }
+    const configurationReason = getCommerceWhatsappChatConfigurationReason(business);
+    if (configurationReason) {
+      return { outcome: "defer", reason: configurationReason };
+    }
+
+    const expectedRecipient = normalizeWhatsappRecipient(
+      typeof message.metadata?.recipientAddress === "string"
+        ? message.metadata.recipientAddress
+        : ""
+    );
+    const queuedRecipient = normalizeWhatsappRecipient(message.to);
+    const customerKey =
+      typeof message.metadata?.customerKey === "string"
+        ? message.metadata.customerKey
+        : "";
+    const identitySessionId =
+      typeof message.metadata?.identitySessionId === "string"
+        ? message.metadata.identitySessionId
+        : "";
+    if (
+      !isValidWhatsappRecipient(expectedRecipient) ||
+      queuedRecipient !== expectedRecipient ||
+      !customerKey ||
+      identitySessionId !== business.whatsappIntegration!.wasenderSessionId
+    ) {
+      return { outcome: "cancel", reason: "chat_recipient_invalid" };
+    }
+
+    const recipientResolution = await resolveCurrentBusinessWhatsappRecipient({
+      businessId: queuedBusinessId,
+      sessionId: identitySessionId,
+      customerKey,
+      fallbackAddress: expectedRecipient,
+      apiKey: business.whatsappIntegration!.wasenderApiToken!
+    });
+    if (!recipientResolution.resolved || !recipientResolution.recipient) {
+      return recipientResolution.temporary
+        ? { outcome: "defer", reason: recipientResolution.reason }
+        : { outcome: "cancel", reason: recipientResolution.reason };
+    }
+
+    message.to = recipientResolution.recipient;
+    message.metadata = {
+      ...message.metadata,
+      recipientAddress: recipientResolution.recipient,
+      customerKey
+    };
+    message.sessionId = business.whatsappIntegration!.wasenderSessionId!;
+    message.apiKey = business.whatsappIntegration!.wasenderApiToken!;
+    return { outcome: "ready" };
+  }
+
+  const commerceEventId =
+    typeof message.metadata?.commerceEventId === "string"
+      ? message.metadata.commerceEventId
+      : "";
+  if (!commerceEventId) {
+    return { outcome: "cancel", reason: "invalid_commerce_queue_scope" };
+  }
+  const event = await CommercePaidOrderEvent.findOne({
+    businessId: queuedBusinessId,
+    eventId: commerceEventId
+  });
+
   if (!event) {
     return { outcome: "cancel", reason: "commerce_event_missing" };
   }
@@ -1710,7 +1771,7 @@ export const processNextQueuedWasenderMessage = async (
     );
   }
 
-  const candidateIsCommerce = isCommercePaidOrderNotificationKind(
+  const candidateIsCommerce = isCommerceWhatsappQueueKind(
     candidate.metadata?.kind
   );
   const spacingMs = getSessionSpacingMs();
@@ -1760,7 +1821,7 @@ export const processNextQueuedWasenderMessage = async (
     return true;
   }
 
-  const commerceMessage = isCommercePaidOrderNotificationKind(
+  const commerceMessage = isCommerceWhatsappQueueKind(
     locked.metadata?.kind
   );
   if (commerceMessage) {

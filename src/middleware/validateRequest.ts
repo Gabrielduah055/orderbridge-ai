@@ -535,6 +535,7 @@ const updateWhatsappIntegrationSchema = z
     commerceNotificationsEnabled: z.boolean().optional(),
     wasenderSessionId: z.string().trim().min(1).max(500).optional(),
     wasenderApiToken: z.string().max(1_000).transform((value) => value.trim()).optional(),
+    webhookSecret: z.string().max(1_000).transform((value) => value.trim()).optional(),
     whatsappNumber: businessPhoneSchema.optional()
   })
   .strict()

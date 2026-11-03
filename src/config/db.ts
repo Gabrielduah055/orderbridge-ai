@@ -5,6 +5,8 @@ import { ensureCommerceReceiptIndexes } from "../models/commerceReceipt.model";
 import { ensureOutboundMessageIndexes } from "../models/outboundMessage.model";
 import { ensureCustomerCampaignRecipientIndexes } from "../models/customerCampaignRecipient.model";
 import { ensureCustomerIdentityIndexes } from "../models/customerIdentityIndexes";
+import { ensureWebhookEventIndexes } from "../models/webhookEvent.model";
+import { ensureBusinessCustomerChannelIdentityIndexes } from "../models/businessCustomerChannelIdentity.model";
 import { env } from "./env";
 
 const getMongoErrorMessage = (error: unknown): string => {
@@ -43,6 +45,8 @@ export const connectDb = async (
 
     if (options.ensureIndexes !== false) {
       await ensureCustomerIdentityIndexes();
+      await ensureBusinessCustomerChannelIdentityIndexes();
+      await ensureWebhookEventIndexes();
       await ensureCustomerCampaignRecipientIndexes();
       await ensureCommercePaidOrderEventIndexes();
       await ensureOutboundMessageIndexes();

@@ -35,6 +35,7 @@ export interface NormalizedWasenderWebhook {
   quotedMessageId?: string;
   receiver?: string;
   fromMe?: boolean;
+  isGroup?: boolean;
   rawMessage: Record<string, unknown>;
   rawPayload: Record<string, unknown>;
 }
@@ -820,6 +821,10 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     "key.senderPn",
     "data.messages.key.senderPn"
   ]);
+  const remoteJid = firstStringFromSources(senderSources, [
+    "key.remoteJid",
+    "data.messages.key.remoteJid"
+  ]);
   const phoneIdentity = firstWhatsappPhone(senderSources, [
     { path: "key.cleanedParticipantPn", source: "cleanedParticipantPn" },
     { path: "data.messages.key.cleanedParticipantPn", source: "cleanedParticipantPn" },
@@ -970,6 +975,10 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     "data.messages.message.extendedTextMessage.contextInfo.stanzaId"
   ]);
   const fromMe = firstBoolean(messagePayload, ["key.fromMe", "fromMe"]);
+  const isGroup = Boolean(
+    remoteJid?.toLowerCase().endsWith("@g.us") ||
+      rawRemoteAddress?.toLowerCase().endsWith("@g.us")
+  );
   const rawMessage =
     messagePayload && typeof messagePayload === "object"
       ? (messagePayload as Record<string, unknown>)
@@ -995,6 +1004,7 @@ export const normalizeIncomingWebhook = (payload: unknown): NormalizedWasenderWe
     quotedMessageId,
     receiver: receiver || undefined,
     fromMe,
+    isGroup,
     rawMessage,
     rawPayload
   };

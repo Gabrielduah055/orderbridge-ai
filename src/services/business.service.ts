@@ -10,7 +10,11 @@ import type {
 import { hashWebsiteIntegrationKey } from "./websiteIntegrationAuth.service";
 import { BadRequestError, ConflictError } from "../utils/httpErrors";
 import { isWhatsappPhoneAddress } from "../utils/phone.util";
-import type { AgentChannel } from "../types/business.types";
+import type {
+  AgentChannel,
+  BusinessCapability
+} from "../types/business.types";
+import { hashWhatsappWebhookSecret } from "./whatsappWebhookAuth.service";
 
 export type CreateBusinessInput = z.infer<typeof createBusinessSchema>;
 export type UpdateBusinessInput = z.infer<typeof updateBusinessSchema>;
@@ -89,6 +93,13 @@ export const createBusiness = async (input: CreateBusinessInput) => {
     );
     if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
     business.enabledChannels = enabledChannels;
+    if (business.type === "ecommerce") {
+      const capabilities: BusinessCapability[] = business.capabilities.filter(
+        (capability) => capability !== "whatsapp_chat"
+      );
+      if (business.whatsappIntegration?.enabled) capabilities.push("whatsapp_chat");
+      business.capabilities = capabilities;
+    }
     validateEnabledWhatsappConfiguration(business);
     await business.save();
   } catch (error) {
@@ -103,11 +114,15 @@ export const createBusiness = async (input: CreateBusinessInput) => {
 
 export const listBusinesses = async () =>
   Business.find({})
-    .select("+whatsappIntegration.wasenderApiToken")
+    .select(
+      "+whatsappIntegration.wasenderApiToken +whatsappIntegration.webhookSecretHash"
+    )
     .sort({ createdAt: -1 });
 
 export const getBusinessById = async (businessId: string) =>
-  Business.findById(businessId).select("+whatsappIntegration.wasenderApiToken");
+  Business.findById(businessId).select(
+    "+whatsappIntegration.wasenderApiToken +whatsappIntegration.webhookSecretHash"
+  );
 
 export const getBusinessForCommerceConnectionCheck = async (businessId: string) => {
   if (!Types.ObjectId.isValid(businessId)) return null;
@@ -141,7 +156,7 @@ export const updateBusiness = async (
   if (!Types.ObjectId.isValid(businessId)) return null;
 
   const business = await Business.findById(businessId).select(
-    "+whatsappIntegration.wasenderApiToken"
+    "+whatsappIntegration.wasenderApiToken +whatsappIntegration.webhookSecretHash"
   );
   if (!business) return null;
 
@@ -188,6 +203,13 @@ export const updateBusiness = async (
   if (wasenderApiToken) {
     setField("whatsappIntegration.wasenderApiToken", wasenderApiToken);
   }
+  const webhookSecret = input.whatsappIntegration?.webhookSecret;
+  if (webhookSecret) {
+    setField(
+      "whatsappIntegration.webhookSecretHash",
+      hashWhatsappWebhookSecret(webhookSecret)
+    );
+  }
 
   setField("commerceIntegration.baseUrl", input.commerceIntegration?.baseUrl);
   setField("commerceIntegration.authType", input.commerceIntegration?.authType);
@@ -228,6 +250,15 @@ export const updateBusiness = async (
     if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
     if (enabledChannels.join("|") !== business.enabledChannels.join("|")) {
       setField("enabledChannels", enabledChannels);
+    }
+    if (business.type === "ecommerce") {
+      const capabilities: BusinessCapability[] = business.capabilities.filter(
+        (capability) => capability !== "whatsapp_chat"
+      );
+      if (business.whatsappIntegration?.enabled) capabilities.push("whatsapp_chat");
+      if (capabilities.join("|") !== business.capabilities.join("|")) {
+        setField("capabilities", capabilities);
+      }
     }
   }
 
