@@ -10,6 +10,7 @@ import type {
 import { hashWebsiteIntegrationKey } from "./websiteIntegrationAuth.service";
 import { BadRequestError, ConflictError } from "../utils/httpErrors";
 import { isWhatsappPhoneAddress } from "../utils/phone.util";
+import type { AgentChannel } from "../types/business.types";
 
 export type CreateBusinessInput = z.infer<typeof createBusinessSchema>;
 export type UpdateBusinessInput = z.infer<typeof updateBusinessSchema>;
@@ -83,7 +84,7 @@ export const createBusiness = async (input: CreateBusinessInput) => {
           }
         : undefined
     });
-    const enabledChannels = business.enabledChannels.filter(
+    const enabledChannels: AgentChannel[] = business.enabledChannels.filter(
       (channel) => channel !== "whatsapp"
     );
     if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
@@ -221,7 +222,7 @@ export const updateBusiness = async (
   }
 
   if (input.whatsappIntegration !== undefined) {
-    const enabledChannels = business.enabledChannels.filter(
+    const enabledChannels: AgentChannel[] = business.enabledChannels.filter(
       (channel) => channel !== "whatsapp"
     );
     if (business.whatsappIntegration?.enabled) enabledChannels.push("whatsapp");
