@@ -79,7 +79,7 @@ Invalid credentials return `401`, and invalid or unsupported payloads return `40
 
 ## WhatsApp notification processing
 
-Commerce paid-order notifications are opt-in. Set `whatsappIntegration.commerceNotificationsEnabled` to `true` on the Business only after its WhatsApp integration is enabled and has a valid Wasender session, token, sending number, WhatsApp channel, and owner/manager notification recipient. The flag defaults to `false`. Turning it off pauses both event enqueueing and pending commerce queue deliveries without affecting restaurant messages.
+Commerce paid-order notifications are opt-in. Set `whatsappIntegration.commerceNotificationsEnabled` to `true` on the Business only after its WhatsApp integration is enabled and has a valid Wasender session, token, sending number, WhatsApp channel, and owner/manager notification recipient. The flag defaults to `false`. Turning it off pauses both event enqueueing and pending commerce queue deliveries. Queue selection uses bounded weighted fairness so restaurant messaging remains operational while due commerce work also continues to make progress.
 
 A background consumer atomically claims stored events with an expiring lease. Missing or paused configuration is recorded and retried with bounded backoff; an expired claim can be recovered after a worker crash. Deterministic queue keys cover the business, event, notification kind, and normalized recipient, so partial enqueueing can resume without recreating jobs that already exist. The event advances to `enqueued` only after every required customer and deduplicated staff job is durable.
 

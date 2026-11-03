@@ -83,8 +83,10 @@ const workerIntervalMs = 1_000;
 const defaultMaxAttempts = 5;
 const staleSendingRecoveryMs = 5 * 60_000;
 const recipientVerificationMaxBackoffMs = 15 * 60_000;
+const maxConsecutiveRestaurantQueueSelections = 5;
 let workerStarted = false;
 let workerBusy = false;
+let consecutiveRestaurantQueueSelections = 0;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1646,20 +1648,41 @@ export const processNextQueuedWasenderMessage = async (
     status: "pending" as const,
     nextAttemptAt: { $lte: now }
   };
-  const restaurantCandidate = await OutboundMessage.findOne({
-    ...dueFilter,
-    businessId: { $exists: false }
-  })
-    .sort({ nextAttemptAt: 1, createdAt: 1 })
-    .select("+apiKey +imageUrl");
-  const candidate =
-    restaurantCandidate ??
-    (await OutboundMessage.findOne(dueFilter)
+  const [restaurantCandidate, businessCandidate] = await Promise.all([
+    OutboundMessage.findOne({
+      ...dueFilter,
+      businessId: { $exists: false }
+    })
       .sort({ nextAttemptAt: 1, createdAt: 1 })
-      .select("+apiKey +imageUrl"));
+      .select("+apiKey +imageUrl"),
+    OutboundMessage.findOne({
+      ...dueFilter,
+      businessId: { $exists: true }
+    })
+      .sort({ nextAttemptAt: 1, createdAt: 1 })
+      .select("+apiKey +imageUrl")
+  ]);
+  const shouldSelectBusiness = Boolean(
+    businessCandidate &&
+      (!restaurantCandidate ||
+        consecutiveRestaurantQueueSelections >=
+          maxConsecutiveRestaurantQueueSelections)
+  );
+  const candidate = shouldSelectBusiness
+    ? businessCandidate
+    : restaurantCandidate ?? businessCandidate;
 
   if (!candidate) {
     return false;
+  }
+
+  if (candidate.businessId) {
+    consecutiveRestaurantQueueSelections = 0;
+  } else {
+    consecutiveRestaurantQueueSelections = Math.min(
+      consecutiveRestaurantQueueSelections + 1,
+      maxConsecutiveRestaurantQueueSelections
+    );
   }
 
   const candidateIsCommerce = isCommercePaidOrderNotificationKind(
