@@ -129,7 +129,7 @@ Receipt processing is fully independent of customer and staff text notification 
 
 Newly enqueued commerce receipt messages are marked as eligible for a purchase review invitation. An invitation job is created only after that receipt's `OutboundMessage` is durably marked `sent`; `CommerceReceipt.status = enqueued` alone is not sufficient. The job is not tied to physical delivery, and receipts created before this feature are not automatically backfilled.
 
-The durable job is unique per business, external order ID, and customer recipient. Workers use atomic expiring claims, bounded retries with exponential backoff, and a reconciliation pass limited to sent receipt messages carrying the new eligibility marker. After a claim, OrderBridge calls:
+The durable job is unique per business, external order ID, and customer recipient. Workers use atomic expiring claims and bounded retries with exponential backoff for commerce API and processing failures. Intentional notification/configuration pauses return the job to `pending` without consuming an attempt, so it resumes when the business is re-enabled. Before fetching links, the worker uses the same deterministic queue idempotency key and tenant/order/customer scope to reconnect any invitation message created before job finalization was interrupted. A reconciliation pass remains limited to sent receipt messages carrying the new eligibility marker. After a claim, OrderBridge calls:
 
 `POST /api/integrations/orderbridge/orders/{externalOrderId}/review-links`
 
@@ -142,13 +142,13 @@ The request uses `Business.commerceIntegration.apiKey` as a Bearer token. It nev
     {
       "productId": "product-1",
       "name": "Product name",
-      "reviewState": "pending",
+      "reviewState": "available",
       "reviewUrl": "https://shop.example.com/reviews/product-1"
     }
   ]
 }
 ```
 
-The returned order number and product names must match the paid-order snapshot, every product ID must belong to that order and be unique in the response, and each non-null review URL must be HTTPS on a host listed in `commerceIntegration.canonicalProductHosts`. Submitted products and null URLs are omitted. If nothing remains, no WhatsApp message is queued.
+The returned order number and product names must match the paid-order snapshot. `reviewState` is either `available` or `submitted`, and the response must cover every distinct purchased product ID exactly once: missing, duplicate, unexpected, and empty-for-nonempty-order product sets are rejected. Each non-null review URL must be HTTPS on a host listed in `commerceIntegration.canonicalProductHosts`. Submitted products and null URLs are omitted from the invitation; a valid all-submitted response therefore queues no WhatsApp message.
 
 All remaining products are grouped into one customer message using the dedicated `commerce_purchase_review_invitation` queue kind. Its deterministic queue idempotency key is scoped by business, external order, and customer recipient. At send time the queue revalidates the paid event, customer consent and recipient, business eligibility, current WhatsApp credentials, the durable invitation job, and the successfully sent source receipt. Invitation failure changes neither payment/event state nor receipt or manager-notification delivery, and does not resend the PDF.

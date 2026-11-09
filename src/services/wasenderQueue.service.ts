@@ -1735,10 +1735,16 @@ const refreshQueuedCommerceNotification = async (
       if (!job) {
         return { outcome: "cancel", reason: "review_invitation_scope_invalid" };
       }
-      if (
-        job.status === "processing" ||
-        !job.invitationOutboundMessageId
-      ) {
+      if (job.status === "failed" || job.status === "skipped") {
+        return { outcome: "cancel", reason: "review_invitation_no_longer_sendable" };
+      }
+      if (job.status === "sent") {
+        return { outcome: "cancel", reason: "review_invitation_already_sent" };
+      }
+      if (job.status === "processing") {
+        return { outcome: "defer", reason: "review_invitation_not_ready" };
+      }
+      if (!job.invitationOutboundMessageId) {
         return { outcome: "defer", reason: "review_invitation_not_ready" };
       }
       if (

@@ -61,7 +61,7 @@ const reviewLinksResponseSchema = z
           .object({
             productId: z.union([z.string(), z.number()]).transform(String),
             name: z.string().trim().min(1).max(300),
-            reviewState: z.string().trim().min(1).max(50),
+            reviewState: z.enum(["available", "submitted"]),
             reviewUrl: z.string().url().max(2_048).nullable()
           })
           .strict()
@@ -314,6 +314,13 @@ export const getCommerceReviewLinks = async (
         );
       }
     }
+  }
+
+  if (seenIds.size !== expectedProductNames.size) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_REVIEW_RESPONSE_INVALID",
+      "Review links are temporarily unavailable."
+    );
   }
 
   return parsed.data;

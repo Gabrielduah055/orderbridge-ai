@@ -163,7 +163,6 @@ const claimNextJob = async (
   const job = await CommerceReviewInvitationJob.findOneAndUpdate(
     {
       status: { $in: ["pending", "processing"] },
-      $expr: { $lt: ["$attempts", "$maxAttempts"] },
       nextAttemptAt: { $lte: now },
       $or: [
         { leaseExpiresAt: { $lte: now } },
@@ -174,10 +173,8 @@ const claimNextJob = async (
       $set: {
         status: "processing",
         claimId,
-        leaseExpiresAt: new Date(now.getTime() + leaseMs),
-        lastAttemptAt: now
-      },
-      $inc: { attempts: 1 }
+        leaseExpiresAt: new Date(now.getTime() + leaseMs)
+      }
     },
     { new: true, sort: { nextAttemptAt: 1, createdAt: 1 } }
   );
@@ -185,30 +182,87 @@ const claimNextJob = async (
   return job ? { job, claimId } : null;
 };
 
-const failExhaustedInterruptedJobs = async (now = new Date()): Promise<void> => {
-  const result = await CommerceReviewInvitationJob.updateMany(
+const findExistingInvitationMessage = async (
+  job: ICommerceReviewInvitationJobDocument,
+  businessId: string
+) =>
+  OutboundMessage.findOne({
+    businessId,
+    idempotencyKey: buildQueueIdempotencyKey(
+      businessId,
+      job.externalOrderId,
+      job.customerRecipient
+    )
+  });
+
+const existingInvitationMessageMatchesScope = (
+  job: ICommerceReviewInvitationJobDocument,
+  businessId: string,
+  message: NonNullable<
+    Awaited<ReturnType<typeof findExistingInvitationMessage>>
+  >
+): boolean =>
+  message.to === job.customerRecipient &&
+  message.metadata?.kind === commercePurchaseReviewInvitationKind &&
+  message.metadata.businessId === businessId &&
+  message.metadata.commerceEventId === job.commerceEventId &&
+  message.metadata.recipientType === "customer";
+
+const reconnectExistingInvitationMessage = async (
+  job: ICommerceReviewInvitationJobDocument,
+  claimId: string,
+  businessId: string,
+  message: Awaited<ReturnType<typeof findExistingInvitationMessage>>
+): Promise<void> => {
+  if (!message) return;
+
+  const terminalFailure = message.status === "failed" || message.status === "cancelled";
+  const nextStatus = message.status === "sent"
+    ? "sent"
+    : terminalFailure
+      ? "failed"
+      : "enqueued";
+  const now = new Date();
+
+  const jobUpdate = await CommerceReviewInvitationJob.updateOne(
     {
-      status: { $in: ["pending", "processing"] },
-      $expr: { $gte: ["$attempts", "$maxAttempts"] },
-      $or: [
-        { leaseExpiresAt: { $lte: now } },
-        { leaseExpiresAt: { $exists: false } }
-      ]
+      _id: job._id,
+      businessId,
+      status: "processing",
+      claimId
     },
     {
       $set: {
-        status: "failed",
+        status: nextStatus,
+        invitationOutboundMessageId: message._id,
         completedAt: now,
-        lastErrorCode: "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED"
+        ...(terminalFailure
+          ? { lastErrorCode: "REVIEW_INVITATION_QUEUE_TERMINAL" }
+          : {})
       },
-      $unset: { claimId: "", leaseExpiresAt: "" }
+      $unset: {
+        claimId: "",
+        leaseExpiresAt: "",
+        ...(!terminalFailure ? { lastErrorCode: "" } : {})
+      }
     }
   );
-  if (result.modifiedCount > 0) {
-    console.warn("Commerce review invitation jobs failed", {
-      code: "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED",
-      count: result.modifiedCount
-    });
+  if (jobUpdate.modifiedCount === 0) return;
+
+  await OutboundMessage.updateOne(
+    {
+      _id: message._id,
+      businessId,
+      idempotencyKey: message.idempotencyKey
+    },
+    {
+      $set: {
+        "metadata.commerceReviewInvitationJobId": String(job._id)
+      }
+    }
+  );
+  if (terminalFailure) {
+    logFailureCode(job, businessId, "REVIEW_INVITATION_QUEUE_TERMINAL");
   }
 };
 
@@ -256,6 +310,42 @@ const deferJob = async (
   );
 };
 
+const deferPausedJob = async (
+  job: ICommerceReviewInvitationJobDocument,
+  claimId: string,
+  reason: string
+): Promise<void> => {
+  await CommerceReviewInvitationJob.updateOne(
+    { _id: job._id, status: "processing", claimId },
+    {
+      $set: {
+        status: "pending",
+        nextAttemptAt: new Date(Date.now() + initialRetryMs),
+        lastErrorCode: reason
+      },
+      $unset: { claimId: "", leaseExpiresAt: "", completedAt: "" }
+    }
+  );
+};
+
+const beginProcessingAttempt = async (
+  job: ICommerceReviewInvitationJobDocument,
+  claimId: string
+): Promise<ICommerceReviewInvitationJobDocument | null> =>
+  CommerceReviewInvitationJob.findOneAndUpdate(
+    {
+      _id: job._id,
+      status: "processing",
+      claimId,
+      $expr: { $lt: ["$attempts", "$maxAttempts"] }
+    },
+    {
+      $inc: { attempts: 1 },
+      $set: { lastAttemptAt: new Date() }
+    },
+    { new: true }
+  );
+
 export const processNextCommerceReviewInvitation = async (): Promise<boolean> => {
   if (Date.now() - lastReconciliationAt >= reconciliationIntervalMs) {
     lastReconciliationAt = Date.now();
@@ -269,13 +359,51 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
     }
   }
 
-  await failExhaustedInterruptedJobs();
   const claimed = await claimNextJob();
   if (!claimed) return false;
   const { job, claimId } = claimed;
   const businessId = String(job.businessId);
 
   try {
+    const existingInvitationMessage = await findExistingInvitationMessage(
+      job,
+      businessId
+    );
+    if (existingInvitationMessage) {
+      if (
+        !existingInvitationMessageMatchesScope(
+          job,
+          businessId,
+          existingInvitationMessage
+        )
+      ) {
+        await finishJob(job, claimId, "failed", {
+          lastErrorCode: "REVIEW_INVITATION_QUEUE_SCOPE_MISMATCH"
+        });
+        logFailureCode(
+          job,
+          businessId,
+          "REVIEW_INVITATION_QUEUE_SCOPE_MISMATCH"
+        );
+        return true;
+      }
+      await reconnectExistingInvitationMessage(
+        job,
+        claimId,
+        businessId,
+        existingInvitationMessage
+      );
+      return true;
+    }
+
+    if (job.attempts >= job.maxAttempts) {
+      await finishJob(job, claimId, "failed", {
+        lastErrorCode: "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED"
+      });
+      logFailureCode(job, businessId, "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED");
+      return true;
+    }
+
     const receiptMessage = await OutboundMessage.findOne({
       _id: job.receiptOutboundMessageId,
       businessId,
@@ -325,8 +453,16 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
     const configurationReason = getCommerceNotificationConfigurationReason(business);
     if (configurationReason) {
       const errorCode = configurationReason.toUpperCase();
-      await deferJob(job, claimId, errorCode);
-      logFailureCode(job, businessId, errorCode);
+      await deferPausedJob(job, claimId, errorCode);
+      return true;
+    }
+
+    const attemptedJob = await beginProcessingAttempt(job, claimId);
+    if (!attemptedJob) {
+      await finishJob(job, claimId, "failed", {
+        lastErrorCode: "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED"
+      });
+      logFailureCode(job, businessId, "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED");
       return true;
     }
 
@@ -355,7 +491,7 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
     });
 
     if (products.length === 0) {
-      await finishJob(job, claimId, "skipped");
+      await finishJob(attemptedJob, claimId, "skipped");
       return true;
     }
 
@@ -376,12 +512,12 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
         kind: commercePurchaseReviewInvitationKind,
         businessId,
         commerceEventId: event.eventId,
-        commerceReviewInvitationJobId: String(job._id),
+        commerceReviewInvitationJobId: String(attemptedJob._id),
         recipientType: "customer"
       }
     });
 
-    await finishJob(job, claimId, "enqueued", {
+    await finishJob(attemptedJob, claimId, "enqueued", {
       invitationOutboundMessageId: invitationMessage._id
     });
     return true;
@@ -390,8 +526,52 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
       error instanceof CommerceIntegrationError
         ? error.code
         : "REVIEW_INVITATION_PROCESSING_FAILED";
-    await deferJob(job, claimId, errorCode);
-    logFailureCode(job, businessId, errorCode);
+    const existingInvitationMessage = await findExistingInvitationMessage(
+      job,
+      businessId
+    );
+    if (existingInvitationMessage) {
+      if (
+        existingInvitationMessageMatchesScope(
+          job,
+          businessId,
+          existingInvitationMessage
+        )
+      ) {
+        await reconnectExistingInvitationMessage(
+          job,
+          claimId,
+          businessId,
+          existingInvitationMessage
+        );
+      } else {
+        await finishJob(job, claimId, "failed", {
+          lastErrorCode: "REVIEW_INVITATION_QUEUE_SCOPE_MISMATCH"
+        });
+        logFailureCode(
+          job,
+          businessId,
+          "REVIEW_INVITATION_QUEUE_SCOPE_MISMATCH"
+        );
+      }
+      return true;
+    }
+    let currentJob = await CommerceReviewInvitationJob.findOne({
+      _id: job._id,
+      status: "processing",
+      claimId
+    });
+    if (currentJob && currentJob.attempts === job.attempts) {
+      currentJob = await beginProcessingAttempt(currentJob, claimId);
+    }
+    if (currentJob) {
+      await deferJob(currentJob, claimId, errorCode);
+      logFailureCode(currentJob, businessId, errorCode);
+    } else {
+      await finishJob(job, claimId, "failed", {
+        lastErrorCode: "REVIEW_INVITATION_ATTEMPTS_EXHAUSTED"
+      });
+    }
     return true;
   }
 };
