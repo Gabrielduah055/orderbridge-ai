@@ -3,6 +3,7 @@ export const runtimeComponentNames = [
   "commerce_whatsapp_webhooks",
   "commerce_paid_order_notifications",
   "commerce_receipt_generation",
+  "commerce_review_invitation",
   "follow_up_scheduler",
   "owner_summary_scheduler",
   "owner_pending_action_scheduler",

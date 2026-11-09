@@ -52,8 +52,29 @@ const policiesResponseSchema = z
     policies: z.array(policySchema).max(20)
   });
 
+const reviewLinksResponseSchema = z
+  .object({
+    orderNumber: z.string().trim().min(1).max(200),
+    products: z
+      .array(
+        z
+          .object({
+            productId: z.union([z.string(), z.number()]).transform(String),
+            name: z.string().trim().min(1).max(300),
+            reviewState: z.string().trim().min(1).max(50),
+            reviewUrl: z.string().url().max(2_048).nullable()
+          })
+          .strict()
+      )
+      .max(100)
+  })
+  .strict();
+
 export type CommerceProduct = z.infer<typeof productSchema>;
 export type CommercePolicy = z.infer<typeof policySchema>;
+export type CommerceReviewLink = z.infer<
+  typeof reviewLinksResponseSchema
+>["products"][number];
 
 export class CommerceIntegrationError extends Error {
   constructor(
@@ -137,7 +158,8 @@ const buildApiUrl = (
 };
 
 const buildHeaders = (
-  configuration: CommerceIntegrationConfiguration
+  configuration: CommerceIntegrationConfiguration,
+  forceBearer = false
 ): Record<string, string> => {
   const apiKey = configuration.apiKey?.trim();
 
@@ -148,7 +170,7 @@ const buildHeaders = (
     );
   }
 
-  if (configuration.authType === "bearer") {
+  if (forceBearer || configuration.authType === "bearer") {
     return { Accept: "application/json", Authorization: `Bearer ${apiKey}` };
   }
 
@@ -169,7 +191,11 @@ const requestJson = async (
   path: string,
   dependencies: CommerceIntegrationDependencies,
   configureUrl?: (url: URL) => void,
-  productId?: string
+  productId?: string,
+  requestOptions: {
+    method?: "GET" | "POST";
+    forceBearer?: boolean;
+  } = {}
 ): Promise<unknown> => {
   const configuration = getConfiguration(business);
   const url = buildApiUrl(configuration, path, productId);
@@ -180,8 +206,8 @@ const requestJson = async (
 
   try {
     const response = await (dependencies.fetch ?? fetch)(url, {
-      method: "GET",
-      headers: buildHeaders(configuration),
+      method: requestOptions.method ?? "GET",
+      headers: buildHeaders(configuration, requestOptions.forceBearer),
       signal: controller.signal,
       redirect: "error"
     });
@@ -233,6 +259,64 @@ const requestJson = async (
   } finally {
     clearTimeout(timeout);
   }
+};
+
+export const getCommerceReviewLinks = async (
+  business: IBusinessDocument,
+  externalOrderId: string,
+  expectedOrderNumber: string,
+  expectedProducts: ReadonlyArray<{ productId: string; name: string }>,
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<{ orderNumber: string; products: CommerceReviewLink[] }> => {
+  const configuration = getConfiguration(business);
+  const reviewLinksPath =
+    `/api/integrations/orderbridge/orders/${encodeURIComponent(externalOrderId)}/review-links`;
+  const payload = await requestJson(
+    business,
+    reviewLinksPath,
+    dependencies,
+    undefined,
+    undefined,
+    { method: "POST", forceBearer: true }
+  );
+  const parsed = reviewLinksResponseSchema.safeParse(payload);
+
+  if (!parsed.success || parsed.data.orderNumber !== expectedOrderNumber) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_REVIEW_RESPONSE_INVALID",
+      "Review links are temporarily unavailable."
+    );
+  }
+
+  const expectedProductNames = new Map(
+    expectedProducts.map((product) => [product.productId, product.name])
+  );
+  const seenIds = new Set<string>();
+  for (const product of parsed.data.products) {
+    if (
+      expectedProductNames.get(product.productId) !== product.name ||
+      seenIds.has(product.productId)
+    ) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_REVIEW_RESPONSE_INVALID",
+        "Review links are temporarily unavailable."
+      );
+    }
+    seenIds.add(product.productId);
+
+    if (product.reviewUrl) {
+      try {
+        assertCanonicalUrl(product.reviewUrl, configuration);
+      } catch {
+        throw new CommerceIntegrationError(
+          "COMMERCE_REVIEW_RESPONSE_INVALID",
+          "Review links are temporarily unavailable."
+        );
+      }
+    }
+  }
+
+  return parsed.data;
 };
 
 const assertCanonicalUrl = (

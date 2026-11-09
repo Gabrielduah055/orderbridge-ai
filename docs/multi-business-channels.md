@@ -132,6 +132,8 @@ Business responses never include the Wasender API token. The safe `hasWasenderAp
 
 Commerce paid-order notifications additionally require `whatsappIntegration.commerceNotificationsEnabled: true`. It defaults to `false`; turning it off pauses commerce notification enqueueing and delivery while leaving restaurant messaging unchanged.
 
+Purchase review invitations also require the configured commerce backend to expose `POST /api/integrations/orderbridge/orders/{orderId}/review-links`. OrderBridge supplies `order.externalOrderId` as `orderId` and authenticates with `commerceIntegration.apiKey` in the `Authorization: Bearer ...` header. Review URLs must use HTTPS and a hostname listed in `commerceIntegration.canonicalProductHosts`; the website integration key is not used.
+
 ```json
 {
   "status": "active",

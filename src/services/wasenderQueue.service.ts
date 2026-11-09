@@ -4,6 +4,7 @@ import { PendingAgentAction } from "../models/pendingAgentAction.model";
 import { Restaurant } from "../models/Restaurant";
 import { Business } from "../models/business.model";
 import { CommerceReceipt } from "../models/commerceReceipt.model";
+import { CommerceReviewInvitationJob } from "../models/commerceReviewInvitationJob.model";
 import { CommercePaidOrderEvent } from "../models/commercePaidOrderEvent.model";
 import { CustomerCampaign } from "../models/customerCampaign.model";
 import { CustomerCampaignRecipient } from "../models/customerCampaignRecipient.model";
@@ -59,12 +60,14 @@ import {
   commercePaidOrderCustomerNotificationKind,
   commercePaidOrderReceiptNotificationKind,
   commercePaidOrderStaffNotificationKind,
+  commercePurchaseReviewInvitationKind,
   commerceWhatsappChatReplyKind,
   getCommerceNotificationConfigurationReason,
   getCommerceWhatsappChatConfigurationReason,
   getNormalizedCommerceStaffRecipients,
   isCommerceWhatsappQueueKind
 } from "./commerceNotificationConfiguration.service";
+import { ensureCommerceReviewInvitationJobForSentReceipt } from "./commerceReviewInvitationJob.service";
 import { resolveCurrentBusinessWhatsappRecipient } from "./businessWasenderIdentity.service";
 
 export interface EnqueueWasenderMessageInput {
@@ -137,6 +140,7 @@ const transactionalKinds = new Set([
   "staff_direct_message",
   commercePaidOrderCustomerNotificationKind,
   commercePaidOrderReceiptNotificationKind,
+  commercePurchaseReviewInvitationKind,
   commercePaidOrderStaffNotificationKind,
   commerceWhatsappChatReplyKind
 ]);
@@ -1676,7 +1680,11 @@ const refreshQueuedCommerceNotification = async (
   }
 
   const normalizedQueuedRecipient = normalizeGhanaPhone(message.to);
-  if (kind === commercePaidOrderCustomerNotificationKind || kind === commercePaidOrderReceiptNotificationKind) {
+  if (
+    kind === commercePaidOrderCustomerNotificationKind ||
+    kind === commercePaidOrderReceiptNotificationKind ||
+    kind === commercePurchaseReviewInvitationKind
+  ) {
     const customerRecipient = normalizeGhanaPhone(event.order.customer.phone);
     if (!event.order.customer.whatsappConsent) {
       return { outcome: "cancel", reason: "customer_whatsapp_consent_missing" };
@@ -1709,6 +1717,46 @@ const refreshQueuedCommerceNotification = async (
         return { outcome: "defer", reason: "receipt_pdf_not_ready" };
       }
       message.documentUrl = receipt.pdfAssetUrl;
+    } else if (kind === commercePurchaseReviewInvitationKind) {
+      const jobId =
+        typeof message.metadata?.commerceReviewInvitationJobId === "string"
+          ? message.metadata.commerceReviewInvitationJobId
+          : "";
+      if (!jobId || !Types.ObjectId.isValid(jobId)) {
+        return { outcome: "cancel", reason: "review_invitation_metadata_invalid" };
+      }
+      const job = await CommerceReviewInvitationJob.findOne({
+        _id: jobId,
+        businessId: queuedBusinessId,
+        commerceEventId,
+        externalOrderId: event.order.externalOrderId,
+        customerRecipient
+      });
+      if (!job) {
+        return { outcome: "cancel", reason: "review_invitation_scope_invalid" };
+      }
+      if (
+        job.status === "processing" ||
+        !job.invitationOutboundMessageId
+      ) {
+        return { outcome: "defer", reason: "review_invitation_not_ready" };
+      }
+      if (
+        job.status !== "enqueued" ||
+        String(job.invitationOutboundMessageId) !== String(message._id)
+      ) {
+        return { outcome: "cancel", reason: "review_invitation_no_longer_sendable" };
+      }
+      const sentReceiptExists = await OutboundMessage.exists({
+        _id: job.receiptOutboundMessageId,
+        businessId: queuedBusinessId,
+        status: "sent",
+        "metadata.kind": commercePaidOrderReceiptNotificationKind,
+        "metadata.reviewInvitationEligible": true
+      });
+      if (!sentReceiptExists) {
+        return { outcome: "cancel", reason: "receipt_message_not_sent" };
+      }
     }
   } else {
     const currentRecipients = getNormalizedCommerceStaffRecipients(business);
@@ -1838,6 +1886,25 @@ export const processNextQueuedWasenderMessage = async (
       locked.status = "cancelled";
       locked.lastError = refreshed.reason;
       await locked.save();
+      if (locked.metadata?.kind === commercePurchaseReviewInvitationKind) {
+        const jobId = locked.metadata.commerceReviewInvitationJobId;
+        if (typeof jobId === "string" && Types.ObjectId.isValid(jobId)) {
+          await CommerceReviewInvitationJob.updateOne(
+            {
+              _id: jobId,
+              businessId: locked.businessId,
+              status: "enqueued"
+            },
+            {
+              $set: {
+                status: "failed",
+                completedAt: new Date(),
+                lastErrorCode: refreshed.reason.toUpperCase()
+              }
+            }
+          );
+        }
+      }
       console.info("Stale commerce notification cancelled", {
         businessId: locked.businessId ? String(locked.businessId) : undefined,
         commerceEventId: locked.metadata?.commerceEventId,
@@ -2160,6 +2227,44 @@ export const processNextQueuedWasenderMessage = async (
     locked.providerMessageId = extractWasenderProviderMessageId(result.data);
     locked.lastError = undefined;
     await locked.save();
+    if (
+      locked.metadata?.kind === commercePaidOrderReceiptNotificationKind &&
+      locked.metadata.reviewInvitationEligible === true
+    ) {
+      try {
+        const invitationJob = await ensureCommerceReviewInvitationJobForSentReceipt(
+          String(locked._id)
+        );
+        if (!invitationJob) {
+          console.warn("Commerce review invitation trigger failed", {
+            businessId: locked.businessId ? String(locked.businessId) : undefined,
+            commerceEventId: locked.metadata.commerceEventId,
+            receiptQueueMessageId: String(locked._id),
+            code: "REVIEW_INVITATION_JOB_NOT_CREATED"
+          });
+        }
+      } catch {
+        console.warn("Commerce review invitation trigger failed", {
+          businessId: locked.businessId ? String(locked.businessId) : undefined,
+          commerceEventId: locked.metadata.commerceEventId,
+          receiptQueueMessageId: String(locked._id),
+          code: "REVIEW_INVITATION_TRIGGER_FAILED"
+        });
+      }
+    } else if (locked.metadata?.kind === commercePurchaseReviewInvitationKind) {
+      await CommerceReviewInvitationJob.updateOne(
+        {
+          _id: locked.metadata.commerceReviewInvitationJobId,
+          businessId: locked.businessId,
+          invitationOutboundMessageId: locked._id,
+          status: "enqueued"
+        },
+        {
+          $set: { status: "sent", completedAt: locked.sentAt },
+          $unset: { lastErrorCode: "" }
+        }
+      );
+    }
     if (!commerceMessage) {
       await updateCampaignRecipientAfterAttempt(locked, result, false);
     }
@@ -2178,6 +2283,32 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   await locked.save();
+  if (
+    locked.status === "failed" &&
+    locked.metadata?.kind === commercePurchaseReviewInvitationKind
+  ) {
+    await CommerceReviewInvitationJob.updateOne(
+      {
+        _id: locked.metadata.commerceReviewInvitationJobId,
+        businessId: locked.businessId,
+        invitationOutboundMessageId: locked._id,
+        status: "enqueued"
+      },
+      {
+        $set: {
+          status: "failed",
+          completedAt: new Date(),
+          lastErrorCode: "REVIEW_INVITATION_SEND_FAILED"
+        }
+      }
+    );
+    console.warn("Commerce review invitation send failed", {
+      businessId: locked.businessId ? String(locked.businessId) : undefined,
+      commerceEventId: locked.metadata.commerceEventId,
+      jobId: locked.metadata.commerceReviewInvitationJobId,
+      code: "REVIEW_INVITATION_SEND_FAILED"
+    });
+  }
   if (!commerceMessage) {
     await updateCampaignRecipientAfterAttempt(
       locked,
