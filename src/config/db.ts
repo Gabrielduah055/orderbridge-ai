@@ -2,6 +2,7 @@ import dns from "dns";
 import mongoose from "mongoose";
 import { ensureCommercePaidOrderEventIndexes } from "../models/commercePaidOrderEvent.model";
 import { ensureCommerceReceiptIndexes } from "../models/commerceReceipt.model";
+import { ensureCommerceReviewInvitationJobIndexes } from "../models/commerceReviewInvitationJob.model";
 import { ensureOutboundMessageIndexes } from "../models/outboundMessage.model";
 import { ensureCustomerCampaignRecipientIndexes } from "../models/customerCampaignRecipient.model";
 import { ensureCustomerIdentityIndexes } from "../models/customerIdentityIndexes";
@@ -51,6 +52,7 @@ export const connectDb = async (
       await ensureCommercePaidOrderEventIndexes();
       await ensureOutboundMessageIndexes();
       await ensureCommerceReceiptIndexes();
+      await ensureCommerceReviewInvitationJobIndexes();
     }
 
     console.log("MongoDB connected successfully");

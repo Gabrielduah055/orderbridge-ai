@@ -10,6 +10,8 @@ export const commercePaidOrderStaffNotificationKind =
   "commerce_paid_order_staff";
 export const commercePaidOrderReceiptNotificationKind =
   "commerce_paid_order_receipt";
+export const commercePurchaseReviewInvitationKind =
+  "commerce_purchase_review_invitation";
 export const commerceWhatsappChatReplyKind =
   "commerce_whatsapp_chat_reply";
 
@@ -18,7 +20,8 @@ export const isCommercePaidOrderNotificationKind = (
 ): boolean =>
   kind === commercePaidOrderCustomerNotificationKind ||
   kind === commercePaidOrderStaffNotificationKind ||
-  kind === commercePaidOrderReceiptNotificationKind;
+  kind === commercePaidOrderReceiptNotificationKind ||
+  kind === commercePurchaseReviewInvitationKind;
 
 export const isCommerceWhatsappQueueKind = (kind: unknown): boolean =>
   isCommercePaidOrderNotificationKind(kind) ||

@@ -732,6 +732,7 @@ export const processNextCommerceReceipt = async (): Promise<boolean> => {
         businessId,
         commerceEventId: event.eventId,
         commerceReceiptId: String(receipt._id),
+        reviewInvitationEligible: true,
         recipientType: "customer"
       }
     });
