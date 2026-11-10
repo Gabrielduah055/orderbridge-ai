@@ -556,11 +556,12 @@ export const processNextCommerceReviewInvitation = async (): Promise<boolean> =>
       }
       return true;
     }
-    let currentJob = await CommerceReviewInvitationJob.findOne({
-      _id: job._id,
-      status: "processing",
-      claimId
-    });
+    let currentJob: ICommerceReviewInvitationJobDocument | null =
+      await CommerceReviewInvitationJob.findOne({
+        _id: job._id,
+        status: "processing",
+        claimId
+      });
     if (currentJob && currentJob.attempts === job.attempts) {
       currentJob = await beginProcessingAttempt(currentJob, claimId);
     }
