@@ -21,6 +21,7 @@ import type {
   AiMessage,
   AiProvider,
   AiUsage,
+  CommercePageContext,
   ExecutedAgentTool
 } from "./ai.types";
 import type {
@@ -1877,14 +1878,17 @@ interface CommerceDataMergeOptions {
   freshnessByProduct?: Map<string, CommerceProductFreshness>;
   requirements?: CommerceFreshnessRequirements;
   visibleProductIds?: ReadonlySet<string>;
+  visibleProductOrder?: readonly string[];
   includeCategories?: boolean;
   includePolicies?: boolean;
+  maxVisibleProducts?: number;
 }
 
 const commerceGroundingHistoryMaxAgeMs = 15 * 60_000;
 const maxGroundedCommerceProducts = 20;
 const maxGroundedCommerceCategories = 100;
 const maxGroundedCommercePolicies = 20;
+const commerceWebsiteProductCardLimit = 4;
 const commerceTokenPattern = /\{\{(?:P|CAT|POLICY)\d+\.[A-Za-z0-9.]+\}\}/g;
 
 const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
@@ -2493,7 +2497,7 @@ const isStandaloneCommerceGreeting = (message: string): boolean =>
   );
 
 const requestsDetailedCommerceReply = (message: string): boolean =>
-  /\b(?:details?|describe|explain|specifications?|specs?|features?|compare|comparison|differences?|pros?|cons?|why|tell me (?:about|more)|more about|capacity|dimensions?|weight|size|colou?r|material|storage|memory|processor|screen|battery|power)\b/i.test(
+  /\b(?:details?|descriptions?|describe|explain|explanation|information|info|specifications?|specs?|features?|compare|comparison|differences?|pros?|cons?|why|what (?:is|are) (?:this|it)|how (?:does|do|can|should|is|are|to)|tell me (?:about|more)|more about|care|clean|use|works?|capacity|dimensions?|weight|size|colou?r|material|storage|memory|processor|screen|battery|power)\b/i.test(
     message
   );
 
@@ -2503,6 +2507,18 @@ const isConciseCommerceReply = (message: string): boolean => {
     .map((part) => normalizeText(part))
     .filter(Boolean);
   return parts.length <= 3 && message.length <= 480;
+};
+
+const containsUnverifiedPageContextLiteral = (
+  message: string,
+  pageContext?: CommercePageContext
+): boolean => {
+  if (!pageContext) return false;
+  const normalizedMessage = normalizeText(message).toLocaleLowerCase("en");
+  return [pageContext.productId, pageContext.productSlug, pageContext.productName]
+    .map((value) => normalizeText(value).toLocaleLowerCase("en"))
+    .filter((value) => value.length >= 3)
+    .some((value) => normalizedMessage.includes(value));
 };
 
 const commerceClaimCategoryGroups = [
@@ -2768,7 +2784,8 @@ const renderValidatedCommerceResponse = (
   rawMessage: string,
   userMessage: string,
   state: CommerceGroundingState,
-  channel: "website" | "whatsapp"
+  channel: "website" | "whatsapp",
+  pageContext?: CommercePageContext
 ): string | null => {
   const contract = buildCommerceResponseContract(state);
   const tokens = rawMessage.match(commerceTokenPattern) ?? [];
@@ -2776,9 +2793,16 @@ const renderValidatedCommerceResponse = (
   const detailedReplyRequested = requestsDetailedCommerceReply(userMessage);
   if (!detailedReplyRequested && !isConciseCommerceReply(rawMessage)) return null;
   if (
+    channel === "website" &&
+    new Set(productMetadata.map(({ productId }) => productId)).size >
+      commerceWebsiteProductCardLimit
+  ) {
+    return null;
+  }
+  if (
     productMetadata.some(
       ({ field }) =>
-        (channel === "website" && (field === "url" || field === "description")) ||
+        (channel === "website" && field === "url") ||
         (!detailedReplyRequested &&
           (field === "description" || field.startsWith("spec")))
     )
@@ -2790,6 +2814,7 @@ const renderValidatedCommerceResponse = (
   const withoutTokens = rawMessage.replace(commerceTokenPattern, " ");
   if (
     /\{\{/.test(withoutTokens) ||
+    containsUnverifiedPageContextLiteral(withoutTokens, pageContext) ||
     containsUnsupportedProductClaim(withoutTokens) ||
     containsUnsupportedCommerceNarrativeClaim(withoutTokens) ||
     containsUnsupportedSemanticCommerceClaim(
@@ -2876,8 +2901,13 @@ const buildSafeCommerceFallback = (
   const budget = budgetMatch
     ? Number(budgetMatch[1].replace(/,/g, ""))
     : undefined;
+  const productsById = new Map(products.map((product) => [product.id, product]));
   const relevantProducts = preferredProductIds.size > 0
-    ? products.filter((product) => preferredProductIds.has(product.id))
+    ? Array.from(preferredProductIds)
+        .map((productId) => productsById.get(productId))
+        .filter(
+          (product): product is GroundedCommerceProduct => Boolean(product)
+        )
     : products;
   const candidates = relevantProducts
     .filter((product) => budget === undefined || product.price <= budget)
@@ -3045,11 +3075,23 @@ const mergeCommerceGroundingData = (
   ]) {
     delete sourceData[key];
   }
-  const exposedSnapshotProducts = options.visibleProductIds
-    ? snapshot.products.filter((product) =>
+  const snapshotProductsById = new Map(
+    snapshot.products.map((product) => [product.id, product])
+  );
+  const selectedSnapshotProducts = options.visibleProductOrder
+    ? options.visibleProductOrder
+        .map((productId) => snapshotProductsById.get(productId))
+        .filter(
+          (product): product is GroundedCommerceProduct => Boolean(product)
+        )
+    : options.visibleProductIds
+      ? snapshot.products.filter((product) =>
         options.visibleProductIds?.has(product.id)
       )
-    : snapshot.products;
+      : snapshot.products;
+  const exposedSnapshotProducts = options.maxVisibleProducts === undefined
+    ? selectedSnapshotProducts
+    : selectedSnapshotProducts.slice(0, options.maxVisibleProducts);
   const products = exposedSnapshotProducts.map((product) => {
     const freshness = options.freshnessByProduct?.get(product.id) ?? {
       price: state.restoredFromHistory ? "cached" : "live",
@@ -3111,7 +3153,11 @@ const mergeCommerceGroundingData = (
               ? {
                   totalProducts: snapshot.totalProducts,
                   returnedProducts:
-                    snapshot.overviewReturnedProducts ?? snapshot.products.length
+                    options.visibleProductIds ||
+                    options.visibleProductOrder ||
+                    options.maxVisibleProducts !== undefined
+                      ? exposedSnapshotProducts.length
+                      : snapshot.overviewReturnedProducts ?? snapshot.products.length
                 }
               : {})
           }
@@ -3378,6 +3424,27 @@ const getCommerceDiscoveryIntent = (
   return null;
 };
 
+const selectCommerceResponseProducts = (
+  products: GroundedCommerceProduct[],
+  channel: "website" | "whatsapp"
+): GroundedCommerceProduct[] =>
+  channel === "website"
+    ? products.slice(0, commerceWebsiteProductCardLimit)
+    : products;
+
+const selectCommerceResponseProductIds = (
+  state: CommerceGroundingState,
+  productIds: ReadonlySet<string>,
+  channel: "website" | "whatsapp"
+): ReadonlySet<string> => {
+  if (channel !== "website") return productIds;
+  return new Set(
+    Array.from(productIds)
+      .filter((productId) => state.products.has(productId))
+      .slice(0, commerceWebsiteProductCardLimit)
+  );
+};
+
 const formatCommerceProductLines = (
   products: GroundedCommerceProduct[],
   channel: "website" | "whatsapp"
@@ -3396,6 +3463,10 @@ const buildCatalogOverviewMessage = (
   result: Extract<GroundedCommerceResult, { kind: "overview" }>,
   channel: "website" | "whatsapp"
 ): string => {
+  const responseProducts = selectCommerceResponseProducts(
+    result.products,
+    channel
+  );
   const displayedCategories = result.categories.slice(0, 6);
   const categoryText = result.categories.length === 0
     ? "No verified categories are currently listed."
@@ -3404,19 +3475,19 @@ const buildCatalogOverviewMessage = (
           ? `Some verified categories`
           : "Verified categories"
       }: ${displayedCategories.map((category) => category.name).join(", ")}.`;
-  if (result.products.length === 0) {
+  if (responseProducts.length === 0) {
     return `${categoryText} No matching products are currently available.`;
   }
   if (channel === "website") {
-    const count = result.products.length;
+    const count = responseProducts.length;
     return `${categoryText} I found ${count} verified ${count === 1 ? "product" : "products"}; see the ${count === 1 ? "card" : "cards"} for current details.`;
   }
-  const displayedProducts = Math.min(result.products.length, 3);
+  const displayedProducts = Math.min(responseProducts.length, 3);
   const productHeading = `Here ${displayedProducts === 1 ? "is" : "are"} ${displayedProducts} verified ${displayedProducts === 1 ? "option" : "options"}:`;
   return [
     categoryText,
     productHeading,
-    ...formatCommerceProductLines(result.products, channel)
+    ...formatCommerceProductLines(responseProducts, channel)
   ].join("\n\n");
 };
 
@@ -3426,20 +3497,24 @@ const buildCatalogSearchMessage = (
   isCategory: boolean,
   channel: "website" | "whatsapp"
 ): string => {
-  if (result.products.length === 0) {
+  const responseProducts = selectCommerceResponseProducts(
+    result.products,
+    channel
+  );
+  if (responseProducts.length === 0) {
     return isCategory
       ? `I couldn't find any verified products currently listed in the ${subject} category.`
       : `I couldn't find any verified products matching “${subject}”. Try another product name or ask to browse the available categories.`;
   }
   if (channel === "website") {
-    const count = result.products.length;
+    const count = responseProducts.length;
     return `I found ${count} verified ${count === 1 ? "match" : "matches"} for ${subject}. See the product ${count === 1 ? "card" : "cards"} for current prices, availability, and details.`;
   }
-  const displayedProducts = Math.min(result.products.length, 3);
+  const displayedProducts = Math.min(responseProducts.length, 3);
   const heading = typeof result.total === "number" && result.total > result.products.length
     ? `Here are ${displayedProducts} of ${result.total} verified matches for ${subject}:`
     : `Here ${displayedProducts === 1 ? "is" : "are"} ${displayedProducts} verified ${displayedProducts === 1 ? "match" : "matches"} for ${subject}:`;
-  return [heading, ...formatCommerceProductLines(result.products, channel)].join("\n\n");
+  return [heading, ...formatCommerceProductLines(responseProducts, channel)].join("\n\n");
 };
 
 const buildUnknownCategoryMessage = (
@@ -3726,26 +3801,41 @@ const runAgentOrchestratorCore = async (
                 ? groundedResult.products.map((product) => product.id)
                 : []
             ),
+            visibleProductOrder:
+              groundedResult &&
+              (groundedResult.kind === "overview" ||
+                groundedResult.kind === "search")
+                ? groundedResult.products.map((product) => product.id)
+                : [],
             includeCategories: toolName === "get_catalog_overview",
-            includePolicies: false
+            includePolicies: false,
+            maxVisibleProducts:
+              channel === "website" ? commerceWebsiteProductCardLimit : undefined
           }
         );
         if (groundedResult?.kind === "overview") {
+          const responseProducts = selectCommerceResponseProducts(
+            groundedResult.products,
+            channel
+          );
           importantData = {
             ...(importantData ?? {}),
             categories: groundedResult.categories.map((category) => category.name),
-            products: groundedResult.products,
+            products: responseProducts,
             catalogOverview: {
               totalCategories: groundedResult.totalCategories,
               returnedCategories: groundedResult.categories.length,
               totalProducts: groundedResult.totalProducts,
-              returnedProducts: groundedResult.products.length
+              returnedProducts: responseProducts.length
             }
           };
         } else if (groundedResult?.kind === "search") {
           importantData = {
             ...(importantData ?? {}),
-            products: groundedResult.products
+            products: selectCommerceResponseProducts(
+              groundedResult.products,
+              channel
+            )
           };
         }
 
@@ -3885,13 +3975,21 @@ const runAgentOrchestratorCore = async (
             visibleProductIds: new Set(
               outcome.groundedResult.products.map((product) => product.id)
             ),
+            visibleProductOrder: outcome.groundedResult.products.map(
+              (product) => product.id
+            ),
             includeCategories: true,
-            includePolicies: false
+            includePolicies: false,
+            maxVisibleProducts:
+              channel === "website" ? commerceWebsiteProductCardLimit : undefined
           }
         );
         importantData = {
           ...(importantData ?? {}),
-          products: outcome.groundedResult.products
+          products: selectCommerceResponseProducts(
+            outcome.groundedResult.products,
+            channel
+          )
         };
         return finishDiscovery(
           true,
@@ -4111,13 +4209,19 @@ const runAgentOrchestratorCore = async (
             }
           }
           const responseTokens = finalMessage.match(commerceTokenPattern) ?? [];
+          const visibleResponseProductIds = selectCommerceResponseProductIds(
+            commerceGroundingState,
+            responseProductIds,
+            channel
+          );
           importantData = mergeCommerceGroundingData(
             importantData,
             commerceGroundingState,
             {
               freshnessByProduct,
               requirements: freshnessRequirements,
-              visibleProductIds: responseProductIds,
+              visibleProductIds: visibleResponseProductIds,
+              visibleProductOrder: Array.from(visibleResponseProductIds),
               includeCategories:
                 isCategoryQuestion(normalizedInputMessage) ||
                 responseTokens.some((token) =>
@@ -4127,7 +4231,11 @@ const runAgentOrchestratorCore = async (
                 isPolicyQuestion(normalizedInputMessage) ||
                 responseTokens.some((token) =>
                   commerceContract.policyTokens.has(token)
-                )
+                ),
+              maxVisibleProducts:
+                channel === "website"
+                  ? commerceWebsiteProductCardLimit
+                  : undefined
             }
           );
           if (freshnessFailureMessage) {
@@ -4148,7 +4256,8 @@ const runAgentOrchestratorCore = async (
               finalMessage,
               normalizedInputMessage,
               commerceGroundingState,
-              channel
+              channel,
+              businessInput.commercePageContext
             );
             const usedCommerceFallback = !renderedCommerceResponse;
             finalMessage = renderedCommerceResponse ?? buildSafeCommerceFallback(
@@ -4156,12 +4265,12 @@ const runAgentOrchestratorCore = async (
               commerceGroundingState,
               channel,
               latestCommerceFailureMessage,
-              responseProductIds
+              visibleResponseProductIds
             );
             const fallbackUsesCachedFacts =
               usedCommerceFallback &&
               !latestCommerceFailureMessage &&
-              Array.from(responseProductIds).some(
+              Array.from(visibleResponseProductIds).some(
                 (productId) => {
                   const freshness = freshnessByProduct.get(productId);
                   return (
@@ -4470,8 +4579,18 @@ const runAgentOrchestratorCore = async (
                 ...commerceTurnVerification.freshPrices,
                 ...commerceTurnVerification.freshAvailability
               ]),
+              visibleProductOrder: Array.from(
+                new Set([
+                  ...commerceTurnVerification.freshPrices,
+                  ...commerceTurnVerification.freshAvailability
+                ])
+              ),
               includeCategories: toolName === "get_catalog_overview",
-              includePolicies: toolName === "get_business_policies"
+              includePolicies: toolName === "get_business_policies",
+              maxVisibleProducts:
+                channel === "website"
+                  ? commerceWebsiteProductCardLimit
+                  : undefined
             }
           );
         }
