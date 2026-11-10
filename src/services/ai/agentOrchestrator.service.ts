@@ -3149,44 +3149,60 @@ const getGroundedCategory = (
 ): GroundedCommerceCategory | undefined =>
   state.categories.get(cleanCommerceDiscoveryTerm(value).toLocaleLowerCase("en"));
 
-const parseCommerceNamedSearch = (
+interface CommerceDiscoveryConstraints {
+  minPrice?: number;
+  maxPrice?: number;
+  available?: boolean;
+  sort?: "price_asc";
+}
+
+const parseCommerceConstraints = (
   value: string
-): Omit<Extract<CommerceDiscoveryIntent, { kind: "search" }>, "kind"> | null => {
-  let query = cleanCommerceDiscoveryTerm(value);
+): { cleanedTerm: string; modifiers: CommerceDiscoveryConstraints } => {
+  let term = cleanCommerceDiscoveryTerm(value);
   const maxPriceMatch =
     /\b(?:under|below|up to|no more than)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
-      query
+      term
     );
   const minPriceMatch =
     /\b(?:over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
-      query
+      term
     );
   const parsePrice = (match: RegExpExecArray | null): number | undefined => {
     if (!match?.[1]) return undefined;
-    const value = Number(match[1].replace(/,/g, ""));
-    return Number.isFinite(value) && value >= 0 ? value : undefined;
+    const parsed = Number(match[1].replace(/,/g, ""));
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
   };
   const maxPrice = parsePrice(maxPriceMatch);
   const minPrice = parsePrice(minPriceMatch);
-  if (maxPriceMatch) query = query.replace(maxPriceMatch[0], " ");
-  if (minPriceMatch) query = query.replace(minPriceMatch[0], " ");
-  const available = /\b(?:available|in stock)\b/i.test(query)
+  if (maxPriceMatch) term = term.replace(maxPriceMatch[0], " ");
+  if (minPriceMatch) term = term.replace(minPriceMatch[0], " ");
+  const available = /\b(?:available|in stock)\b/i.test(term)
     ? true
     : undefined;
-  query = query.replace(/\b(?:that are\s+)?(?:available|in stock)\b/gi, " ");
-  const sort = /\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(query)
+  term = term.replace(/\b(?:that are\s+)?(?:available|in stock)\b/gi, " ");
+  const sort = /\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(term)
     ? "price_asc" as const
     : undefined;
-  query = query.replace(/\b(?:cheapest|lowest[- ]priced|lowest price)\b/gi, " ");
-  query = cleanCommerceDiscoveryTerm(query);
-  if (!query || query.length > 120) return null;
+  term = term.replace(/\b(?:cheapest|lowest[- ]priced|lowest price)\b/gi, " ");
+  term = cleanCommerceDiscoveryTerm(term);
   return {
-    query,
-    ...(minPrice !== undefined ? { minPrice } : {}),
-    ...(maxPrice !== undefined ? { maxPrice } : {}),
-    ...(available !== undefined ? { available } : {}),
-    ...(sort ? { sort } : {})
+    cleanedTerm: term,
+    modifiers: {
+      ...(minPrice !== undefined ? { minPrice } : {}),
+      ...(maxPrice !== undefined ? { maxPrice } : {}),
+      ...(available !== undefined ? { available } : {}),
+      ...(sort ? { sort } : {})
+    }
   };
+};
+
+const parseCommerceNamedSearch = (
+  value: string
+): Omit<Extract<CommerceDiscoveryIntent, { kind: "search" }>, "kind"> | null => {
+  const { cleanedTerm, modifiers } = parseCommerceConstraints(value);
+  if (!cleanedTerm || cleanedTerm.length > 120) return null;
+  return { query: cleanedTerm, ...modifiers };
 };
 
 const getCommerceDiscoveryIntent = (
@@ -3225,8 +3241,8 @@ const getCommerceDiscoveryIntent = (
     )?.[1] ??
     /^(?:please\s+)?(?:the\s+)?(.+?)\s+category[?.!]*$/i.exec(normalized)?.[1];
   if (explicitCategory) {
-    const category = cleanCommerceDiscoveryTerm(explicitCategory);
-    if (category && category.length <= 120) return { kind: "category", category };
+    const { cleanedTerm: explicitTerm, modifiers: explicitModifiers } = parseCommerceConstraints(explicitCategory);
+    if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
   }
 
   const namedRequest =
@@ -3263,14 +3279,15 @@ const getCommerceDiscoveryIntent = (
     );
   if (!isShortCatalogTerm) return null;
 
-  const category = getGroundedCategory(state, normalized);
-  if (category) return { kind: "category", category: category.name };
+  const { cleanedTerm: shortTerm, modifiers: shortModifiers } = parseCommerceConstraints(normalized);
+  const category = getGroundedCategory(state, shortTerm || normalized);
+  if (category) return { kind: "category", category: category.name, ...shortModifiers };
   if (
     state.lastDiscoveryKind === "overview" &&
-    state.categories.size > 0 &&
-    words.length === 1
+    state.categories.size > 0
   ) {
-    return { kind: "category", category: cleanCommerceDiscoveryTerm(normalized) };
+    const searchTerm = cleanCommerceDiscoveryTerm(shortTerm || normalized);
+    if (searchTerm) return { kind: "search", query: searchTerm, ...shortModifiers };
   }
   return null;
 };
@@ -3300,8 +3317,8 @@ const buildCatalogOverviewMessage = (
     return `${categoryText}\n\nNo currently available products were returned.`;
   }
   const productHeading = result.totalProducts > result.products.length
-    ? `A verified product selection (showing ${result.products.length} of ${result.totalProducts} currently available products):`
-    : "Verified products currently available:";
+    ? `A verified product selection (showing ${result.products.length} of ${result.totalProducts} products):`
+    : "Verified products:";
   return [
     categoryText,
     productHeading,
