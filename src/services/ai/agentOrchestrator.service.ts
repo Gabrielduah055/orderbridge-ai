@@ -3245,6 +3245,15 @@ const getCommerceDiscoveryIntent = (
     if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
   }
 
+  const contextualCommerceFollowUp =
+    /^(?:please\s+)?show\s+me\s+(?:more|(?:(?:the\s+)?(?:first|second|third|fourth|fifth)(?:\s+(?:one|item|product))?)|(?:(?:this|that)(?:\s+(?:one|item|product))?))\s*[?.!]*$/i.test(
+      message.trim()
+    );
+
+  if (contextualCommerceFollowUp) {
+    return null;
+  }
+
   const namedRequest =
     /^(?:please\s+)?(?:search(?:\s+for)?|find|look\s+for|show\s+me|do\s+you\s+have|i(?:'m| am)?\s+looking\s+for|i\s+(?:need|want))\s+(.+?)[?.!]*$/i.exec(
       normalized
