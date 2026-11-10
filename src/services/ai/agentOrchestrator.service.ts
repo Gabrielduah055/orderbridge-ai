@@ -3205,6 +3205,11 @@ const parseCommerceNamedSearch = (
   return { query: cleanedTerm, ...modifiers };
 };
 
+const isContextualCommerceFollowUp = (message: string): boolean =>
+  /^(?:please\s+)?(?:(?:show\s+me\s+)?(?:(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)(?:\s+(?:one|product|item|option))?|(?:that|this)(?:\s+(?:one|product|item))?|the\s+(?:one|product|item))|(?:(?:tell|show)\s+me\s+)?more(?:\s+(?:details?|info(?:rmation)?|about\s+(?:it|that|this)))?|number\s+\d+|(?:option|product|item)\s+\d+|(?:go\s+back|go\s+on|what\s+(?:about|else)))[?.!]*$/i.test(
+    normalizeText(message)
+  );
+
 const getCommerceDiscoveryIntent = (
   message: string,
   state: CommerceGroundingState
@@ -3245,12 +3250,7 @@ const getCommerceDiscoveryIntent = (
     if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
   }
 
-  const contextualCommerceFollowUp =
-    /^(?:please\s+)?show\s+me\s+(?:more|(?:(?:the\s+)?(?:first|second|third|fourth|fifth)(?:\s+(?:one|item|product))?)|(?:(?:this|that)(?:\s+(?:one|item|product))?))\s*[?.!]*$/i.test(
-      message.trim()
-    );
-
-  if (contextualCommerceFollowUp) {
+  if (isContextualCommerceFollowUp(normalized)) {
     return null;
   }
 
@@ -3287,14 +3287,6 @@ const getCommerceDiscoveryIntent = (
       normalized
     );
   if (!isShortCatalogTerm) return null;
-
-  if (
-    /^(?:(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)(?:\s+(?:one|product|item|option))?|(?:that|this|the)\s+(?:one|product|item)|(?:(?:tell|show)\s+me\s+)?more(?:\s+(?:details?|info(?:rmation)?|about\s+(?:it|that|this)))?|number\s+\d+|(?:option|product|item)\s+\d+|(?:go\s+back|go\s+on|what\s+(?:about|else)))$/i.test(
-      normalized
-    )
-  ) {
-    return null;
-  }
 
   const { cleanedTerm: shortTerm, modifiers: shortModifiers } = parseCommerceConstraints(normalized);
   const category = getGroundedCategory(state, shortTerm || normalized);
