@@ -25,7 +25,7 @@ The migration reuses:
 
 Tools are exposed to OpenRouter only when permitted for the resolved backend sender role. Customer tools are limited to menu/profile/delivery reads, the customer's own order lookup, and order-draft operations. The model cannot provide trusted `restaurantId`, sender phone, sender role, or session context as tool arguments.
 
-The same orchestrator now also accepts a trusted business and channel context. Tool exposure and execution evaluate sender role, business type, channel, and enabled capabilities. E-commerce website customers receive only read-only commerce catalog and policy tools. They use the same `OPENROUTER_MODEL`; there is no website-specific AI provider or model setting. Model-supplied business identity, channel, capabilities, integration credentials, or conversation identity are stripped and ignored.
+The same orchestrator now also accepts a trusted business and channel context. Tool exposure and execution evaluate sender role, business type, channel, and enabled capabilities. E-commerce website and WhatsApp customers receive only read-only commerce catalog and policy tools. General catalog/category discovery and clear named searches are executed deterministically through those permitted tools before a model can answer, while grounded category context supports short follow-ups. They use the same `OPENROUTER_MODEL`; there is no website-specific AI provider or model setting. Model-supplied business identity, channel, capabilities, integration credentials, or conversation identity are stripped and ignored.
 
 ## Confirmation Flow
 
@@ -60,7 +60,7 @@ Campaign media is always backend-trusted. A saved menu image is resolved by rest
 
 Incoming WhatsApp message -> trusted backend context -> recent history plus active draft/clarification state -> OpenRouter provider -> model tool call -> local `executeAgentTool` -> Zod validation and role checks -> Mongo-backed services -> tool result returned to model -> concise final WhatsApp response.
 
-Authenticated website message -> trusted e-commerce business/channel/session context -> business-scoped recent history -> the same OpenRouter provider -> context-filtered read-only commerce tool -> trusted external HTTPS catalog API -> grounded result and canonical product links -> website response.
+Authenticated website message or trusted e-commerce WhatsApp message -> trusted business/channel/customer context -> business-scoped recent history -> deterministic catalog discovery when applicable, otherwise the same OpenRouter provider -> context-filtered read-only commerce tool -> trusted external HTTPS catalog API -> grounded categories/products and canonical product links -> channel response.
 
 ## Migration And Rollback
 

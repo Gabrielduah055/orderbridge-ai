@@ -59,6 +59,7 @@ export const toolPermissions = {
   get_order_draft: ["customer"],
   confirm_order_draft: ["customer"],
   cancel_order_draft: ["customer"],
+  get_catalog_overview: ["customer"],
   search_products: ["customer"],
   get_product_details: ["customer"],
   check_product_availability: ["customer"],
@@ -67,6 +68,7 @@ export const toolPermissions = {
 
 export type ToolName = keyof typeof toolPermissions;
 export type CommerceToolName =
+  | "get_catalog_overview"
   | "search_products"
   | "get_product_details"
   | "check_product_availability"
@@ -74,6 +76,7 @@ export type CommerceToolName =
 export type RestaurantToolName = Exclude<ToolName, CommerceToolName>;
 
 const commerceToolNames = new Set<ToolName>([
+  "get_catalog_overview",
   "search_products",
   "get_product_details",
   "check_product_availability",
@@ -81,6 +84,7 @@ const commerceToolNames = new Set<ToolName>([
 ]);
 
 const requiredCapabilityByTool: Partial<Record<ToolName, BusinessCapability>> = {
+  get_catalog_overview: "commerce_catalog_read",
   search_products: "commerce_catalog_read",
   get_product_details: "commerce_catalog_read",
   check_product_availability: "commerce_catalog_read",

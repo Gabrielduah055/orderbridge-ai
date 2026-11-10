@@ -218,6 +218,10 @@ export const updateBusiness = async (
     input.commerceIntegration?.apiKeyHeader
   );
   setField(
+    "commerceIntegration.paths.overview",
+    input.commerceIntegration?.paths?.overview
+  );
+  setField(
     "commerceIntegration.paths.search",
     input.commerceIntegration?.paths?.search
   );

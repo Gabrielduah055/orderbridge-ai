@@ -475,6 +475,7 @@ export const createBusinessSchema = z
         timeoutMs: z.number().int().min(500).max(15_000).default(5_000),
         paths: z
           .object({
+            overview: commercePathSchema.optional(),
             search: commercePathSchema,
             product: commercePathSchema.refine((value) => value.includes("{productId}"), {
               message: "Product path must include {productId}"
@@ -545,6 +546,7 @@ const updateWhatsappIntegrationSchema = z
 
 const updateCommercePathsSchema = z
   .object({
+    overview: commercePathSchema.optional(),
     search: commercePathSchema.optional(),
     product: commercePathSchema
       .refine((value) => value.includes("{productId}"), {
