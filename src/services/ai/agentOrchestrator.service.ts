@@ -3161,11 +3161,11 @@ const parseCommerceConstraints = (
 ): { cleanedTerm: string; modifiers: CommerceDiscoveryConstraints } => {
   let term = cleanCommerceDiscoveryTerm(value);
   const maxPriceMatch =
-    /\b(?:under|below|up to|no more than)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
+    /\b(?:under|below|up to|no more than)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)(?:\s*(?:GHS|GH₵|cedis?))?/i.exec(
       term
     );
   const minPriceMatch =
-    /\b(?:over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
+    /\b(?:over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)(?:\s*(?:GHS|GH₵|cedis?))?/i.exec(
       term
     );
   const parsePrice = (match: RegExpExecArray | null): number | undefined => {
@@ -3212,7 +3212,7 @@ const getCommerceDiscoveryIntent = (
   const normalized = normalizeText(message);
   const lower = normalized.toLocaleLowerCase("en");
   const hasNarrowingModifier =
-    /\b(?:under|below|up to|no more than|over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?[\d,]+|\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(
+    /\b(?:under|below|up to|no more than|over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?[\d,]+(?:\s*(?:GHS|GH₵|cedis?))?|\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(
       normalized
     );
   if (
@@ -3278,6 +3278,14 @@ const getCommerceDiscoveryIntent = (
       normalized
     );
   if (!isShortCatalogTerm) return null;
+
+  if (
+    /^(?:(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)(?:\s+(?:one|product|item|option))?|(?:that|this|the)\s+(?:one|product|item)|(?:(?:tell|show)\s+me\s+)?more(?:\s+(?:details?|info(?:rmation)?|about\s+(?:it|that|this)))?|number\s+\d+|(?:option|product|item)\s+\d+|(?:go\s+back|go\s+on|what\s+(?:about|else)))$/i.test(
+      normalized
+    )
+  ) {
+    return null;
+  }
 
   const { cleanedTerm: shortTerm, modifiers: shortModifiers } = parseCommerceConstraints(normalized);
   const category = getGroundedCategory(state, shortTerm || normalized);
