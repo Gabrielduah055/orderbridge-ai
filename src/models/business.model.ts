@@ -38,6 +38,7 @@ export interface WhatsappIntegrationConfiguration {
 }
 
 export interface CommerceApiPaths {
+  overview?: string;
   search: string;
   product: string;
   availability: string;
@@ -175,6 +176,7 @@ const businessSchema = new Schema<IBusinessDocument>(
           paths: {
             type: new Schema(
               {
+                overview: { type: String, validate: localPathValidator },
                 search: { type: String, required: true, validate: localPathValidator },
                 product: { type: String, required: true, validate: localPathValidator },
                 availability: { type: String, required: true, validate: localPathValidator },

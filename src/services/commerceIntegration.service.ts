@@ -26,6 +26,63 @@ const searchResponseSchema = z
   .object({
     products: z.array(productSchema).max(20),
     total: z.number().int().nonnegative().optional()
+  })
+  .refine(
+    (value) => value.total === undefined || value.total >= value.products.length,
+    { path: ["total"], message: "Total cannot be smaller than returned products" }
+  );
+
+const catalogOverviewResponseSchema = z
+  .object({
+    categories: z.array(z.string().trim().min(1).max(120)).max(100),
+    products: z.array(productSchema).max(10),
+    totalCategories: z.number().int().nonnegative(),
+    totalProducts: z.number().int().nonnegative()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const normalizedCategories = value.categories.map((category) =>
+      category.toLocaleLowerCase("en")
+    );
+    if (new Set(normalizedCategories).size !== normalizedCategories.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["categories"],
+        message: "Categories must be unique"
+      });
+    }
+    const productIds = value.products.map((product) => product.id);
+    if (new Set(productIds).size !== productIds.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["products"],
+        message: "Products must be unique"
+      });
+    }
+    if (value.totalCategories < value.categories.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["totalCategories"],
+        message: "Category total cannot be smaller than the returned selection"
+      });
+    }
+    if (value.totalCategories > 0 && value.categories.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["categories"],
+        message: "A nonempty category total requires a returned selection"
+      });
+    }
+    if (
+      value.totalProducts < value.products.length ||
+      (value.totalProducts > 0 && value.products.length === 0)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["totalProducts"],
+        message: "Product total does not match the returned selection"
+      });
+    }
   });
 
 const productResponseSchema = z
@@ -71,6 +128,9 @@ const reviewLinksResponseSchema = z
   .strict();
 
 export type CommerceProduct = z.infer<typeof productSchema>;
+export type CommerceCatalogOverview = z.infer<
+  typeof catalogOverviewResponseSchema
+>;
 export type CommercePolicy = z.infer<typeof policySchema>;
 export type CommerceReviewLink = z.infer<
   typeof reviewLinksResponseSchema
@@ -355,6 +415,40 @@ const validateProducts = (
     assertCanonicalUrl(product.canonicalUrl, configuration);
   }
   return products;
+};
+
+export const getCommerceCatalogOverview = async (
+  business: IBusinessDocument,
+  limit: number,
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<CommerceCatalogOverview> => {
+  const configuration = getConfiguration(business);
+  const overviewPath = configuration.paths.overview;
+  if (!overviewPath) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_INTEGRATION_INVALID_CONFIGURATION",
+      "Catalog information is temporarily unavailable."
+    );
+  }
+  const payload = await requestJson(
+    business,
+    overviewPath,
+    dependencies,
+    (url) => url.searchParams.set("limit", String(limit))
+  );
+  const parsed = catalogOverviewResponseSchema.safeParse(payload);
+
+  if (!parsed.success) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_RESPONSE_INVALID",
+      "Catalog information is temporarily unavailable."
+    );
+  }
+
+  return {
+    ...parsed.data,
+    products: validateProducts(parsed.data.products, configuration)
+  };
 };
 
 export const searchCommerceProducts = async (

@@ -148,6 +148,7 @@ import {
 } from "../services/staffCustomerMessage.service";
 import {
   CommerceIntegrationError,
+  getCommerceCatalogOverview,
   getCommerceAvailability,
   getCommercePolicies,
   getCommerceProduct,
@@ -4209,6 +4210,31 @@ const toCommerceFailure = (error: unknown): ToolResult => {
 };
 
 export const commerceToolRegistry = {
+  get_catalog_overview: defineCommerceTool({
+    definition: {
+      name: "get_catalog_overview",
+      description:
+        "Retrieve authoritative catalog categories, total counts, and a bounded product selection for general browsing. Use this when the customer asks what the store sells or which categories are available without naming a product or category.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_catalog_overview,
+    schema: z
+      .object({
+        limit: z.number().int().min(1).max(10).default(5)
+      })
+      .strict(),
+    handler: async (args, context) => {
+      try {
+        return {
+          success: true,
+          message: "Catalog overview retrieved successfully.",
+          data: await getCommerceCatalogOverview(context.business, args.limit)
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
   search_products: defineCommerceTool({
     definition: {
       name: "search_products",

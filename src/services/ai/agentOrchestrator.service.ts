@@ -1146,6 +1146,22 @@ const getImportantData = (
       nextData.products = data.products;
     }
 
+    if (
+      result.success &&
+      toolName === "get_catalog_overview" &&
+      Array.isArray(data.categories) &&
+      Array.isArray(data.products)
+    ) {
+      nextData.categories = data.categories;
+      nextData.products = data.products;
+      nextData.catalogOverview = {
+        totalCategories: data.totalCategories,
+        returnedCategories: data.categories.length,
+        totalProducts: data.totalProducts,
+        returnedProducts: data.products.length
+      };
+    }
+
     if (result.success && toolName === "get_product_details" && data.product) {
       nextData.product = data.product;
     }
@@ -1764,8 +1780,19 @@ interface GroundedCommerceProduct {
   canonicalUrl: string;
 }
 
+interface GroundedCommerceCategory {
+  name: string;
+}
+
 type GroundedCommerceResult =
-  | { kind: "search"; products: GroundedCommerceProduct[] }
+  | {
+      kind: "overview";
+      categories: GroundedCommerceCategory[];
+      products: GroundedCommerceProduct[];
+      totalCategories: number;
+      totalProducts: number;
+    }
+  | { kind: "search"; products: GroundedCommerceProduct[]; total?: number }
   | { kind: "product"; product: GroundedCommerceProduct }
   | {
       kind: "availability";
@@ -1789,6 +1816,11 @@ interface GroundedAvailability {
 
 interface CommerceGroundingSnapshot {
   capturedAt: string;
+  categories: GroundedCommerceCategory[];
+  totalCategories?: number;
+  totalProducts?: number;
+  overviewReturnedProducts?: number;
+  lastDiscoveryKind?: "overview" | "search" | "category";
   products: GroundedCommerceProduct[];
   availability: Array<GroundedAvailability & { productId: string }>;
   policies: GroundedCommercePolicy[];
@@ -1797,6 +1829,12 @@ interface CommerceGroundingSnapshot {
 interface CommerceGroundingState {
   capturedAt: string;
   restoredFromHistory: boolean;
+  categories: Map<string, GroundedCommerceCategory>;
+  categoryOrder: string[];
+  totalCategories?: number;
+  totalProducts?: number;
+  overviewReturnedProducts?: number;
+  lastDiscoveryKind?: "overview" | "search" | "category";
   products: Map<string, GroundedCommerceProduct>;
   productOrder: string[];
   availability: Map<string, GroundedAvailability>;
@@ -1812,6 +1850,7 @@ interface CommerceResponseContract {
     string,
     { productId: string; field: string }
   >;
+  categoryTokens: Set<string>;
   policyTokens: Set<string>;
 }
 
@@ -1841,12 +1880,15 @@ interface CommerceDataMergeOptions {
 
 const commerceGroundingHistoryMaxAgeMs = 15 * 60_000;
 const maxGroundedCommerceProducts = 20;
+const maxGroundedCommerceCategories = 100;
 const maxGroundedCommercePolicies = 20;
-const commerceTokenPattern = /\{\{(?:P|POLICY)\d+\.[A-Za-z0-9.]+\}\}/g;
+const commerceTokenPattern = /\{\{(?:P|CAT|POLICY)\d+\.[A-Za-z0-9.]+\}\}/g;
 
 const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
   capturedAt: new Date().toISOString(),
   restoredFromHistory: false,
+  categories: new Map(),
+  categoryOrder: [],
   products: new Map(),
   productOrder: [],
   availability: new Map(),
@@ -1904,6 +1946,16 @@ const isGroundedCommerceProduct = (
   );
 };
 
+const isGroundedCommerceCategory = (
+  value: unknown
+): value is GroundedCommerceCategory =>
+  Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as Record<string, unknown>).name === "string" &&
+      normalizeText(String((value as Record<string, unknown>).name)).length > 0
+  );
+
 const parseGroundedCommerceResult = (
   toolName: string,
   data: unknown,
@@ -1912,12 +1964,62 @@ const parseGroundedCommerceResult = (
   if (!data || typeof data !== "object") return null;
   const record = data as Record<string, unknown>;
 
+  if (
+    toolName === "get_catalog_overview" &&
+    Array.isArray(record.categories) &&
+    Array.isArray(record.products) &&
+    typeof record.totalCategories === "number" &&
+    Number.isInteger(record.totalCategories) &&
+    record.totalCategories >= record.categories.length &&
+    typeof record.totalProducts === "number" &&
+    Number.isInteger(record.totalProducts) &&
+    record.totalProducts >= record.products.length
+  ) {
+    const categories = record.categories.map((category) => ({
+      name: typeof category === "string" ? normalizeText(category) : ""
+    }));
+    const uniqueCategoryNames = new Set(
+      categories.map((category) => category.name.toLocaleLowerCase("en"))
+    );
+    const productIds = record.products
+      .filter((product): product is GroundedCommerceProduct =>
+        isGroundedCommerceProduct(product, allowedHosts)
+      )
+      .map((product) => product.id);
+    if (
+      categories.every(isGroundedCommerceCategory) &&
+      uniqueCategoryNames.size === categories.length &&
+      productIds.length === record.products.length &&
+      new Set(productIds).size === productIds.length &&
+      !(record.totalCategories > 0 && record.categories.length === 0) &&
+      !(record.totalProducts > 0 && record.products.length === 0)
+    ) {
+      return {
+        kind: "overview",
+        categories,
+        products: record.products as GroundedCommerceProduct[],
+        totalCategories: record.totalCategories,
+        totalProducts: record.totalProducts
+      };
+    }
+    return null;
+  }
+
   if (toolName === "search_products" && Array.isArray(record.products)) {
     return record.products.every(
       (product): product is GroundedCommerceProduct =>
         isGroundedCommerceProduct(product, allowedHosts)
     )
-      ? { kind: "search", products: record.products }
+      ? {
+          kind: "search",
+          products: record.products,
+          total:
+            typeof record.total === "number" &&
+            Number.isInteger(record.total) &&
+            record.total >= record.products.length
+              ? record.total
+              : undefined
+        }
       : null;
   }
 
@@ -2020,8 +2122,25 @@ const applyGroundedCommerceResult = (
   state: CommerceGroundingState,
   result: GroundedCommerceResult
 ): void => {
+  if (result.kind === "overview") {
+    state.categories.clear();
+    state.categoryOrder = [];
+    for (const category of result.categories.slice(0, maxGroundedCommerceCategories)) {
+      const key = category.name.toLocaleLowerCase("en");
+      state.categories.set(key, category);
+      state.categoryOrder.push(key);
+    }
+    state.totalCategories = result.totalCategories;
+    state.totalProducts = result.totalProducts;
+    state.overviewReturnedProducts = result.products.length;
+    state.lastDiscoveryKind = "overview";
+    for (const product of result.products) upsertGroundedProduct(state, product);
+    state.capturedAt = new Date().toISOString();
+    return;
+  }
   if (result.kind === "search") {
     for (const product of result.products) upsertGroundedProduct(state, product);
+    state.lastDiscoveryKind = "search";
     return;
   }
   if (result.kind === "product") {
@@ -2055,10 +2174,23 @@ const markCommerceToolFailure = (
   toolName: string,
   args: Record<string, unknown>
 ): void => {
-  if (toolName === "search_products") {
+  if (toolName === "get_catalog_overview") {
+    state.categories.clear();
+    state.categoryOrder = [];
+    state.totalCategories = undefined;
+    state.totalProducts = undefined;
+    state.overviewReturnedProducts = undefined;
+    state.lastDiscoveryKind = undefined;
     state.products.clear();
     state.productOrder = [];
     state.availability.clear();
+  } else if (toolName === "search_products") {
+    state.products.clear();
+    state.productOrder = [];
+    state.availability.clear();
+    state.totalProducts = undefined;
+    state.overviewReturnedProducts = undefined;
+    state.lastDiscoveryKind = "search";
   } else if (
     (toolName === "get_product_details" ||
       toolName === "check_product_availability") &&
@@ -2080,6 +2212,20 @@ const buildCommerceGroundingSnapshot = (
   state: CommerceGroundingState
 ): CommerceGroundingSnapshot => ({
   capturedAt: state.capturedAt,
+  categories: state.categoryOrder
+    .map((key) => state.categories.get(key))
+    .filter((category): category is GroundedCommerceCategory => Boolean(category))
+    .slice(0, maxGroundedCommerceCategories),
+  ...(state.totalCategories !== undefined
+    ? { totalCategories: state.totalCategories }
+    : {}),
+  ...(state.totalProducts !== undefined ? { totalProducts: state.totalProducts } : {}),
+  ...(state.overviewReturnedProducts !== undefined
+    ? { overviewReturnedProducts: state.overviewReturnedProducts }
+    : {}),
+  ...(state.lastDiscoveryKind
+    ? { lastDiscoveryKind: state.lastDiscoveryKind }
+    : {}),
   products: state.productOrder
     .map((id) => state.products.get(id))
     .filter((product): product is GroundedCommerceProduct => Boolean(product))
@@ -2113,6 +2259,47 @@ const restoreCommerceGroundingState = (
     capturedAt - Date.now() > 60_000
   ) {
     return state;
+  }
+
+  const restoredCategoryNames = new Set<string>();
+  for (const category of Array.isArray(snapshot.categories) ? snapshot.categories : []) {
+    if (!isGroundedCommerceCategory(category)) continue;
+    const name = normalizeText(category.name);
+    const key = name.toLocaleLowerCase("en");
+    if (restoredCategoryNames.has(key)) continue;
+    restoredCategoryNames.add(key);
+    state.categories.set(key, { name });
+    state.categoryOrder.push(key);
+    if (state.categoryOrder.length >= maxGroundedCommerceCategories) break;
+  }
+  if (
+    typeof snapshot.totalCategories === "number" &&
+    Number.isInteger(snapshot.totalCategories) &&
+    snapshot.totalCategories >= state.categoryOrder.length
+  ) {
+    state.totalCategories = snapshot.totalCategories;
+  }
+  if (
+    typeof snapshot.totalProducts === "number" &&
+    Number.isInteger(snapshot.totalProducts) &&
+    snapshot.totalProducts >= 0
+  ) {
+    state.totalProducts = snapshot.totalProducts;
+  }
+  if (
+    typeof snapshot.overviewReturnedProducts === "number" &&
+    Number.isInteger(snapshot.overviewReturnedProducts) &&
+    snapshot.overviewReturnedProducts >= 0 &&
+    snapshot.overviewReturnedProducts <= 10
+  ) {
+    state.overviewReturnedProducts = snapshot.overviewReturnedProducts;
+  }
+  if (
+    snapshot.lastDiscoveryKind === "overview" ||
+    snapshot.lastDiscoveryKind === "search" ||
+    snapshot.lastDiscoveryKind === "category"
+  ) {
+    state.lastDiscoveryKind = snapshot.lastDiscoveryKind;
   }
 
   for (const product of Array.isArray(snapshot.products) ? snapshot.products : []) {
@@ -2158,6 +2345,7 @@ const buildCommerceResponseContract = (
     string,
     { productId: string; field: string }
   >();
+  const categoryTokens = new Set<string>();
   const policyTokens = new Set<string>();
   const lines: string[] = [];
 
@@ -2202,6 +2390,16 @@ const buildCommerceResponseContract = (
     lines.push(`${alias} (${normalizeText(product.name)}): ${tokens.join(", ")}`);
   }
 
+  for (const [index, categoryKey] of state.categoryOrder.entries()) {
+    const category = state.categories.get(categoryKey);
+    if (!category) continue;
+    const alias = `CAT${index + 1}`;
+    const token = `{{${alias}.name}}`;
+    replacements.set(token, normalizeText(category.name));
+    categoryTokens.add(token);
+    lines.push(`${alias}: ${token}`);
+  }
+
   for (const [index, policyKey] of state.policyOrder.entries()) {
     const policy = state.policies.get(policyKey);
     if (!policy) continue;
@@ -2224,13 +2422,14 @@ const buildCommerceResponseContract = (
     replacements,
     productTokens,
     productTokenMetadata,
+    categoryTokens,
     policyTokens,
     prompt: lines.length === 0
       ? undefined
       : [
           "Trusted commerce response contract:",
           "You may recommend, compare, explain differences, respect preferences, and answer follow-ups naturally.",
-          "Every product name, description, price, currency, availability, stock quantity, specification value, product URL, and business-policy fact must use one of the exact placeholders below.",
+          "Every category name, product name, description, price, currency, availability, stock quantity, specification value, product URL, and business-policy fact must use one of the exact placeholders below.",
           state.restoredFromHistory
             ? "The product facts below came from an earlier turn. Treat them as conversation context, not as a guarantee of current price or stock. For a price or availability enquiry, call the appropriate commerce tool before answering."
             : "The product facts below were verified during this conversation. Use a fresh commerce lookup whenever the customer asks whether price or stock is current.",
@@ -2253,6 +2452,9 @@ const containsLiteralGroundedValue = (
       ...Object.values(product.specifications ?? {}).map((value) => String(value))
     );
   }
+  for (const category of state.categories.values()) {
+    values.push(category.name);
+  }
   for (const policy of state.policies.values()) {
     values.push(policy.content);
   }
@@ -2264,6 +2466,11 @@ const containsLiteralGroundedValue = (
 
 const isPolicyQuestion = (message: string): boolean =>
   /\b(?:return|refund|exchange|warranty|shipping|delivery|privacy|terms|policy|policies)\b/i.test(
+    message
+  );
+
+const isCategoryQuestion = (message: string): boolean =>
+  /\b(?:category|categories|catalog|catalogue|what do you sell|what is available)\b/i.test(
     message
   );
 
@@ -2563,6 +2770,13 @@ const renderValidatedCommerceResponse = (
     return null;
   }
   if (
+    state.categories.size > 0 &&
+    isCategoryQuestion(userMessage) &&
+    !tokens.some((token) => contract.categoryTokens.has(token))
+  ) {
+    return null;
+  }
+  if (
     state.policies.size > 0 &&
     isPolicyQuestion(userMessage) &&
     !tokens.some((token) => contract.policyTokens.has(token))
@@ -2754,6 +2968,8 @@ const mergeCommerceGroundingData = (
   const previousProduct = sourceData.product;
   const previousAvailability = sourceData.productAvailability;
   for (const key of [
+    "categories",
+    "catalogOverview",
     "products",
     "product",
     "productAvailability",
@@ -2807,6 +3023,28 @@ const mergeCommerceGroundingData = (
   const canonicalAvailability = state.availability.get(previousAvailabilityId);
   return {
     ...sourceData,
+    ...(snapshot.categories.length > 0
+      ? { categories: snapshot.categories.map((category) => category.name) }
+      : {}),
+    ...(snapshot.totalCategories !== undefined || snapshot.totalProducts !== undefined
+      ? {
+          catalogOverview: {
+            ...(snapshot.totalCategories !== undefined
+              ? {
+                  totalCategories: snapshot.totalCategories,
+                  returnedCategories: snapshot.categories.length
+                }
+              : {}),
+            ...(snapshot.totalProducts !== undefined
+              ? {
+                  totalProducts: snapshot.totalProducts,
+                  returnedProducts:
+                    snapshot.overviewReturnedProducts ?? snapshot.products.length
+                }
+              : {})
+          }
+        }
+      : {}),
     ...(products.length > 0 ? { products } : {}),
     ...(canonicalProduct ? { product: canonicalProduct } : {}),
     ...(previousAvailabilityId &&
@@ -2871,13 +3109,250 @@ const containsUnsupportedProductClaim = (message: string): boolean =>
   /\b(?:specifications?|specs?|storage|memory|ram|processor|screen size|battery)\s*(?::|is|are|of|\d)/i.test(message);
 
 const unsupportedProductClaimMessage =
-  "I need to check the verified catalog before I can provide a product price, availability, link, or specification. Please ask me to search for the product.";
+  "I couldn't verify matching catalog products from that request. Please try a product name or ask to browse the available categories.";
 const commerceGroundingToolNames = new Set([
+  "get_catalog_overview",
   "search_products",
   "get_product_details",
   "check_product_availability",
   "get_business_policies"
 ]);
+
+type CommerceDiscoveryIntent =
+  | { kind: "overview" }
+  | {
+      kind: "search";
+      query: string;
+      minPrice?: number;
+      maxPrice?: number;
+      available?: boolean;
+      sort?: "price_asc";
+    }
+  | {
+      kind: "category";
+      category: string;
+      minPrice?: number;
+      maxPrice?: number;
+      available?: boolean;
+      sort?: "price_asc";
+    };
+
+const cleanCommerceDiscoveryTerm = (value: string): string =>
+  normalizeText(value)
+    .replace(/[?.!,;:]+$/g, "")
+    .replace(/^(?:a|an|some|the)\s+/i, "")
+    .trim();
+
+const getGroundedCategory = (
+  state: CommerceGroundingState,
+  value: string
+): GroundedCommerceCategory | undefined =>
+  state.categories.get(cleanCommerceDiscoveryTerm(value).toLocaleLowerCase("en"));
+
+const parseCommerceNamedSearch = (
+  value: string
+): Omit<Extract<CommerceDiscoveryIntent, { kind: "search" }>, "kind"> | null => {
+  let query = cleanCommerceDiscoveryTerm(value);
+  const maxPriceMatch =
+    /\b(?:under|below|up to|no more than)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
+      query
+    );
+  const minPriceMatch =
+    /\b(?:over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?([\d,]+(?:\.\d+)?)/i.exec(
+      query
+    );
+  const parsePrice = (match: RegExpExecArray | null): number | undefined => {
+    if (!match?.[1]) return undefined;
+    const value = Number(match[1].replace(/,/g, ""));
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  };
+  const maxPrice = parsePrice(maxPriceMatch);
+  const minPrice = parsePrice(minPriceMatch);
+  if (maxPriceMatch) query = query.replace(maxPriceMatch[0], " ");
+  if (minPriceMatch) query = query.replace(minPriceMatch[0], " ");
+  const available = /\b(?:available|in stock)\b/i.test(query)
+    ? true
+    : undefined;
+  query = query.replace(/\b(?:that are\s+)?(?:available|in stock)\b/gi, " ");
+  const sort = /\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(query)
+    ? "price_asc" as const
+    : undefined;
+  query = query.replace(/\b(?:cheapest|lowest[- ]priced|lowest price)\b/gi, " ");
+  query = cleanCommerceDiscoveryTerm(query);
+  if (!query || query.length > 120) return null;
+  return {
+    query,
+    ...(minPrice !== undefined ? { minPrice } : {}),
+    ...(maxPrice !== undefined ? { maxPrice } : {}),
+    ...(available !== undefined ? { available } : {}),
+    ...(sort ? { sort } : {})
+  };
+};
+
+const getCommerceDiscoveryIntent = (
+  message: string,
+  state: CommerceGroundingState
+): CommerceDiscoveryIntent | null => {
+  const normalized = normalizeText(message);
+  const lower = normalized.toLocaleLowerCase("en");
+  const hasNarrowingModifier =
+    /\b(?:under|below|up to|no more than|over|above|at least|from)\s*(?:(?:GHS|GH₵|cedis?)\s*)?[\d,]+|\b(?:cheapest|lowest[- ]priced|lowest price)\b/i.test(
+      normalized
+    );
+  if (
+    /\b(?:order|checkout|pay|payment|receipt|delivery|refund|return|policy|review)\b/i.test(
+      normalized
+    )
+  ) {
+    return null;
+  }
+
+  if (
+    !hasNarrowingModifier &&
+    (/\b(?:categories? available|available categories?|list of (?:items|products)|items? available|products? available|browse (?:the )?(?:catalog|catalogue|products|items)|what (?:do you|does (?:the )?store) sell|what (?:do you|does (?:the )?store) have)\b/i.test(
+      normalized
+    ) ||
+      /^(?:please\s+)?(?:show|list|open)?\s*(?:me\s+)?(?:the\s+)?(?:catalog|catalogue|categories|products|items)[?.!]*$/i.test(
+        normalized
+      ))
+  ) {
+    return { kind: "overview" };
+  }
+
+  const explicitCategory =
+    /^(?:please\s+)?(?:show|list|browse|search)(?:\s+me)?(?:\s+(?:products|items))?\s+(?:in|from)\s+(?:the\s+)?(.+?)(?:\s+category)?[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    /^(?:please\s+)?(?:the\s+)?(.+?)\s+category[?.!]*$/i.exec(normalized)?.[1];
+  if (explicitCategory) {
+    const category = cleanCommerceDiscoveryTerm(explicitCategory);
+    if (category && category.length <= 120) return { kind: "category", category };
+  }
+
+  const namedRequest =
+    /^(?:please\s+)?(?:search(?:\s+for)?|find|look\s+for|show\s+me|do\s+you\s+have|i(?:'m| am)?\s+looking\s+for|i\s+(?:need|want))\s+(.+?)[?.!]*$/i.exec(
+      normalized
+    )?.[1];
+  if (namedRequest) {
+    const parsedSearch = parseCommerceNamedSearch(namedRequest);
+    const term = parsedSearch?.query ?? cleanCommerceDiscoveryTerm(namedRequest);
+    if (
+      /^(?:products?|items?|catalog(?:ue)?|categories|anything|what you have)$/i.test(
+        term
+      )
+    ) {
+      return hasNarrowingModifier ? null : { kind: "overview" };
+    }
+    const category = getGroundedCategory(state, term);
+    if (category) {
+      const { query: _query, ...filters } = parsedSearch ?? { query: term };
+      return { kind: "category", category: category.name, ...filters };
+    }
+    if (parsedSearch) return { kind: "search", ...parsedSearch };
+    return null;
+  }
+
+  const words = lower.split(/\s+/).filter(Boolean);
+  const isShortCatalogTerm =
+    normalized.length <= 80 &&
+    words.length >= 1 &&
+    words.length <= 4 &&
+    /^[A-Za-z0-9][A-Za-z0-9&'\-/ ]*$/.test(normalized) &&
+    !/^(?:hi|hello|hey|thanks|thank you|yes|no|okay|ok|more|cheaper|first|second|that|this|it|those|them|which one)$/i.test(
+      normalized
+    );
+  if (!isShortCatalogTerm) return null;
+
+  const category = getGroundedCategory(state, normalized);
+  if (category) return { kind: "category", category: category.name };
+  if (
+    state.lastDiscoveryKind === "overview" &&
+    state.categories.size > 0 &&
+    words.length === 1
+  ) {
+    return { kind: "category", category: cleanCommerceDiscoveryTerm(normalized) };
+  }
+  return null;
+};
+
+const formatCommerceProductLines = (
+  products: GroundedCommerceProduct[]
+): string[] =>
+  products.map(
+    (product, index) =>
+      `${index + 1}. ${normalizeText(product.name)} — ${formatGroundedPrice(
+        product.price,
+        product.currency
+      )} — ${product.available ? "available" : "currently unavailable"}\n${product.canonicalUrl}`
+  );
+
+const buildCatalogOverviewMessage = (
+  result: Extract<GroundedCommerceResult, { kind: "overview" }>
+): string => {
+  const categoryText = result.categories.length === 0
+    ? "No verified categories are currently listed."
+    : `${
+        result.totalCategories > result.categories.length
+          ? `Verified categories (showing ${result.categories.length} of ${result.totalCategories})`
+          : "Verified categories"
+      }: ${result.categories.map((category) => category.name).join(", ")}.`;
+  if (result.products.length === 0) {
+    return `${categoryText}\n\nNo currently available products were returned.`;
+  }
+  const productHeading = result.totalProducts > result.products.length
+    ? `A verified product selection (showing ${result.products.length} of ${result.totalProducts} currently available products):`
+    : "Verified products currently available:";
+  return [
+    categoryText,
+    productHeading,
+    ...formatCommerceProductLines(result.products)
+  ].join("\n\n");
+};
+
+const buildCatalogSearchMessage = (
+  result: Extract<GroundedCommerceResult, { kind: "search" }>,
+  subject: string,
+  isCategory: boolean
+): string => {
+  if (result.products.length === 0) {
+    return isCategory
+      ? `I couldn't find any verified products currently listed in the ${subject} category.`
+      : `I couldn't find any verified products matching “${subject}”. Try another product name or ask to browse the available categories.`;
+  }
+  const heading = typeof result.total === "number" && result.total > result.products.length
+    ? `Showing ${result.products.length} of ${result.total} verified matches for ${subject}:`
+    : `Verified matches for ${subject}:`;
+  return [heading, ...formatCommerceProductLines(result.products)].join("\n\n");
+};
+
+const buildUnknownCategoryMessage = (
+  requestedCategory: string,
+  state: CommerceGroundingState
+): string => {
+  const categories = state.categoryOrder
+    .map((key) => state.categories.get(key)?.name)
+    .filter((name): name is string => Boolean(name));
+  if (categories.length === 0) {
+    return `I couldn't find a verified category named “${requestedCategory}”. No verified categories are currently listed.`;
+  }
+  const categoryLabel =
+    state.totalCategories !== undefined && state.totalCategories > categories.length
+      ? `The returned category selection is partial. Some verified categories are: ${categories.join(", ")}.`
+      : `The verified categories are: ${categories.join(", ")}.`;
+  return state.totalCategories !== undefined && state.totalCategories > categories.length
+    ? `I couldn't confirm a category named “${requestedCategory}”. ${categoryLabel}`
+    : `I couldn't find a verified category named “${requestedCategory}”. ${categoryLabel}`;
+};
+
+const getCommerceDiscoveryFailureMessage = (result: ToolResult): string => {
+  if (result.code === "TOOL_INVALID_ARGUMENTS") {
+    return "I couldn't run that catalog lookup because the request was incomplete or invalid. Please name a product, choose a verified category, or ask to browse the catalog.";
+  }
+  if (result.code === "COMMERCE_RESPONSE_INVALID") {
+    return "The catalog returned information I couldn't safely verify. Please try again shortly.";
+  }
+  return "I couldn't reach the verified catalog right now. Please try again shortly.";
+};
 
 export interface AgentOrchestratorDependencies {
   provider?: AiProvider;
@@ -3033,6 +3508,289 @@ const runAgentOrchestratorCore = async (
       };
 
   try {
+    const discoveryIntent = businessInput
+      ? getCommerceDiscoveryIntent(
+          normalizedInputMessage,
+          commerceGroundingState
+        )
+      : null;
+    if (businessInput && discoveryIntent) {
+      const executeDiscoveryTool = async (
+        toolName: "get_catalog_overview" | "search_products",
+        args: Record<string, unknown>
+      ): Promise<{
+        result: ToolResult;
+        groundedResult: GroundedCommerceResult | null;
+      }> => {
+        const rawResult = await executeTool(
+          toolName,
+          args,
+          toolExecutionContext
+        );
+        const groundedResult = rawResult.success
+          ? parseGroundedCommerceResult(
+              toolName,
+              rawResult.data,
+              allowedCommerceHosts
+            )
+          : null;
+        const result: ToolResult = rawResult.success && !groundedResult
+          ? {
+              success: false,
+              code: "COMMERCE_RESPONSE_INVALID",
+              message: "Catalog information is temporarily unavailable."
+            }
+          : rawResult.code === "TOOL_INVALID_ARGUMENTS"
+            ? {
+                ...rawResult,
+                message:
+                  "The catalog lookup request was incomplete or invalid."
+              }
+            : rawResult;
+
+        if (groundedResult) {
+          applyGroundedCommerceResult(commerceGroundingState, groundedResult);
+          if (
+            groundedResult.kind === "overview" ||
+            groundedResult.kind === "search"
+          ) {
+            for (const product of groundedResult.products) {
+              commerceTurnVerification.freshPrices.add(product.id);
+              commerceTurnVerification.failedPrices.delete(product.id);
+              commerceTurnVerification.freshAvailability.add(product.id);
+              commerceTurnVerification.failedAvailability.delete(product.id);
+            }
+          }
+        } else {
+          markCommerceToolFailure(commerceGroundingState, toolName, args);
+        }
+
+        executedTools.push({
+          name: toolName,
+          success: result.success,
+          code: result.code,
+          message: result.message
+        });
+        importantData = getImportantData(
+          importantData,
+          result,
+          toolName,
+          args
+        );
+        importantData = mergeCommerceGroundingData(
+          importantData,
+          commerceGroundingState,
+          {
+            freshnessByProduct: getCommerceFreshnessByProduct(
+              commerceGroundingState,
+              commerceTurnVerification
+            )
+          }
+        );
+        if (groundedResult?.kind === "overview") {
+          importantData = {
+            ...(importantData ?? {}),
+            categories: groundedResult.categories.map((category) => category.name),
+            products: groundedResult.products,
+            catalogOverview: {
+              totalCategories: groundedResult.totalCategories,
+              returnedCategories: groundedResult.categories.length,
+              totalProducts: groundedResult.totalProducts,
+              returnedProducts: groundedResult.products.length
+            }
+          };
+        } else if (groundedResult?.kind === "search") {
+          importantData = {
+            ...(importantData ?? {}),
+            products: groundedResult.products
+          };
+        }
+
+        const toolMessage = {
+          senderRole: input.sender.role,
+          direction: "tool" as const,
+          content: JSON.stringify(buildToolResultForModel(toolName, result)),
+          metadata: {
+            source: "deterministic_commerce_discovery",
+            provider: provider.name,
+            model: provider.model,
+            toolName,
+            success: result.success,
+            code: result.code
+          }
+        };
+        await saveMessage({
+          ...toolMessage,
+          businessId,
+          businessType,
+          channel,
+          conversationId
+        });
+        return { result, groundedResult };
+      };
+
+      const finishDiscovery = (
+        success: boolean,
+        message: string,
+        errorCode?: string
+      ): AgentOrchestratorResult => ({
+        success,
+        message,
+        data: importantData,
+        ...(errorCode ? { errorCode } : {}),
+        provider: provider.name,
+        model: provider.model,
+        executedTools,
+        usage
+      });
+
+      if (
+        discoveryIntent.kind === "overview" &&
+        permittedToolNames.has("get_catalog_overview")
+      ) {
+        const outcome = await executeDiscoveryTool("get_catalog_overview", {
+          limit: 5
+        });
+        if (!outcome.result.success || outcome.groundedResult?.kind !== "overview") {
+          return finishDiscovery(
+            false,
+            getCommerceDiscoveryFailureMessage(outcome.result),
+            outcome.result.code
+          );
+        }
+        return finishDiscovery(
+          true,
+          buildCatalogOverviewMessage(outcome.groundedResult)
+        );
+      }
+
+      if (
+        discoveryIntent.kind === "category" &&
+        permittedToolNames.has("get_catalog_overview") &&
+        permittedToolNames.has("search_products")
+      ) {
+        if (
+          commerceGroundingState.categories.size === 0 ||
+          (commerceGroundingState.restoredFromHistory &&
+            !getGroundedCategory(
+              commerceGroundingState,
+              discoveryIntent.category
+            ))
+        ) {
+          const overviewOutcome = await executeDiscoveryTool(
+            "get_catalog_overview",
+            { limit: 5 }
+          );
+          if (
+            !overviewOutcome.result.success ||
+            overviewOutcome.groundedResult?.kind !== "overview"
+          ) {
+            return finishDiscovery(
+              false,
+              getCommerceDiscoveryFailureMessage(overviewOutcome.result),
+              overviewOutcome.result.code
+            );
+          }
+        }
+        const category = getGroundedCategory(
+          commerceGroundingState,
+          discoveryIntent.category
+        );
+        if (!category) {
+          importantData = {
+            ...(importantData ?? {}),
+            products: []
+          };
+          return finishDiscovery(
+            true,
+            buildUnknownCategoryMessage(
+              discoveryIntent.category,
+              commerceGroundingState
+            )
+          );
+        }
+        const outcome = await executeDiscoveryTool("search_products", {
+          category: category.name,
+          limit: 5,
+          ...(discoveryIntent.minPrice !== undefined
+            ? { minPrice: discoveryIntent.minPrice }
+            : {}),
+          ...(discoveryIntent.maxPrice !== undefined
+            ? { maxPrice: discoveryIntent.maxPrice }
+            : {}),
+          ...(discoveryIntent.available !== undefined
+            ? { available: discoveryIntent.available }
+            : {}),
+          ...(discoveryIntent.sort ? { sort: discoveryIntent.sort } : {})
+        });
+        if (!outcome.result.success || outcome.groundedResult?.kind !== "search") {
+          return finishDiscovery(
+            false,
+            getCommerceDiscoveryFailureMessage(outcome.result),
+            outcome.result.code
+          );
+        }
+        commerceGroundingState.lastDiscoveryKind = "category";
+        importantData = mergeCommerceGroundingData(
+          importantData,
+          commerceGroundingState,
+          {
+            freshnessByProduct: getCommerceFreshnessByProduct(
+              commerceGroundingState,
+              commerceTurnVerification
+            )
+          }
+        );
+        importantData = {
+          ...(importantData ?? {}),
+          products: outcome.groundedResult.products
+        };
+        return finishDiscovery(
+          true,
+          buildCatalogSearchMessage(
+            outcome.groundedResult,
+            category.name,
+            true
+          )
+        );
+      }
+
+      if (
+        discoveryIntent.kind === "search" &&
+        permittedToolNames.has("search_products")
+      ) {
+        const outcome = await executeDiscoveryTool("search_products", {
+          query: discoveryIntent.query,
+          limit: 5,
+          ...(discoveryIntent.minPrice !== undefined
+            ? { minPrice: discoveryIntent.minPrice }
+            : {}),
+          ...(discoveryIntent.maxPrice !== undefined
+            ? { maxPrice: discoveryIntent.maxPrice }
+            : {}),
+          ...(discoveryIntent.available !== undefined
+            ? { available: discoveryIntent.available }
+            : {}),
+          ...(discoveryIntent.sort ? { sort: discoveryIntent.sort } : {})
+        });
+        if (!outcome.result.success || outcome.groundedResult?.kind !== "search") {
+          return finishDiscovery(
+            false,
+            getCommerceDiscoveryFailureMessage(outcome.result),
+            outcome.result.code
+          );
+        }
+        return finishDiscovery(
+          true,
+          buildCatalogSearchMessage(
+            outcome.groundedResult,
+            discoveryIntent.query,
+            false
+          )
+        );
+      }
+    }
+
     for (let round = 0; round < maxToolRounds; round += 1) {
       const providerStartedAt = new Date();
       let response;
@@ -3339,7 +4097,7 @@ const runAgentOrchestratorCore = async (
             safeArguments,
             recentInactiveCampaignRequest
           );
-        const result = toolCall.invalidArguments
+        const rawResult: ToolResult = toolCall.invalidArguments
           ? {
               success: false,
               code: "TOOL_INVALID_ARGUMENTS",
@@ -3360,6 +4118,16 @@ const runAgentOrchestratorCore = async (
                 code: "TOOL_FORBIDDEN",
                 message: "That tool is not available for the current sender role."
               };
+        const result: ToolResult =
+          businessInput &&
+          commerceGroundingToolNames.has(toolName) &&
+          rawResult.code === "TOOL_INVALID_ARGUMENTS"
+            ? {
+                ...rawResult,
+                message:
+                  "The catalog lookup request was incomplete or invalid. Please name a product, choose a verified category, or ask to browse the catalog."
+              }
+            : rawResult;
 
         if (
           result.success &&
@@ -3402,7 +4170,10 @@ const runAgentOrchestratorCore = async (
             : null;
           if (groundedResult) {
             applyGroundedCommerceResult(commerceGroundingState, groundedResult);
-            if (groundedResult.kind === "search") {
+            if (
+              groundedResult.kind === "overview" ||
+              groundedResult.kind === "search"
+            ) {
               for (const product of groundedResult.products) {
                 commerceTurnVerification.freshPrices.add(product.id);
                 commerceTurnVerification.failedPrices.delete(product.id);
@@ -3430,7 +4201,9 @@ const runAgentOrchestratorCore = async (
             }
             latestCommerceFailureMessage = undefined;
           } else {
-            const failedProductIds = toolName === "search_products"
+            const failedProductIds =
+              toolName === "get_catalog_overview" ||
+              toolName === "search_products"
               ? [...commerceGroundingState.productOrder]
               : typeof safeArguments.productId === "string"
                 ? [safeArguments.productId]
@@ -3441,6 +4214,7 @@ const runAgentOrchestratorCore = async (
               safeArguments
             );
             if (
+              toolName === "get_catalog_overview" ||
               toolName === "search_products" ||
               toolName === "get_product_details"
             ) {
@@ -3613,7 +4387,9 @@ const runAgentOrchestratorCore = async (
 
     return {
       success: false,
-      message: safeFallbackMessage,
+      message: businessInput
+        ? "I'm having trouble reaching the shopping system right now. Please try again shortly."
+        : safeFallbackMessage,
       data: importantData,
       errorCode,
       provider: provider.name,

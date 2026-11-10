@@ -28,8 +28,9 @@ Tool exposure and execution both evaluate the same trusted permission context:
 3. channel;
 4. enabled capabilities.
 
-Legacy role-only helpers continue to mean a restaurant WhatsApp context, preserving existing callers and evaluations. Website e-commerce customers receive only these read-only tools when `commerce_catalog_read` is enabled:
+Legacy role-only helpers continue to mean a restaurant WhatsApp context, preserving existing callers and evaluations. E-commerce customers on an enabled website or WhatsApp channel receive only these read-only tools when `commerce_catalog_read` is enabled:
 
+- `get_catalog_overview`;
 - `search_products`;
 - `get_product_details`;
 - `check_product_availability`;
@@ -65,13 +66,15 @@ For the first turn, the website backend omits conversation credentials. OrderBri
 
 Anonymous website visitors remain `verified: false`; a valid continuation token authorizes access to that conversation but does not prove a real-world customer identity.
 
-The response remains conversational: the existing model may recommend products, compare options, explain grounded differences, respect budgets and preferences, and answer follow-up references. After commerce tools run, the orchestrator supplies the same model with backend-issued placeholders for every trusted catalog and policy fact. The response processor rejects unknown placeholders, ungrounded literal facts, and unsupported product-specific narrative claims. Narrative validation compares warranty, guarantee, durability, discount, feature, and recommendation-rationale concepts with authoritative catalog evidence and the customer's stated preferences; it is not based only on pattern matching. If validation fails, OrderBridge uses a safe factual fallback rather than exposing unsupported model prose.
+Clear catalog discovery is shared by website and e-commerce WhatsApp chat. Broad browse and category-list requests execute `get_catalog_overview`; named product requests execute `search_products`; a short category follow-up is matched only against categories from the recent trusted overview before a category search runs. Unknown categories, valid empty searches, invalid tool arguments, unsafe backend responses, and provider failures return distinct customer-safe replies. The model is not asked to repeat a search the customer already requested.
+
+The response remains conversational: the existing model may recommend products, compare options, explain grounded differences, respect budgets and preferences, and answer follow-up references. After commerce tools run, the orchestrator supplies the same model with backend-issued placeholders for every trusted category, catalog, and policy fact. The response processor rejects unknown placeholders, ungrounded literal facts, and unsupported product-specific narrative claims. Narrative validation compares warranty, guarantee, durability, discount, feature, and recommendation-rationale concepts with authoritative catalog evidence and the customer's stated preferences; it is not based only on pattern matching. If validation fails, OrderBridge uses a safe factual fallback rather than exposing unsupported model prose.
 
 Multiple successful tool calls are merged by product ID, so separate detail lookups remain available for comparisons. Newer detail and availability results override older values. Failed authoritative lookups remove the affected `products`, `product`, `productAvailability`, or `policies` fields while preserving unrelated verified results. Empty invalidation snapshots are persisted so an older successful snapshot cannot reappear on a later turn.
 
-A bounded trusted grounding snapshot may be reused for conversational references in the same authorized conversation for up to 15 minutes; it is stored as conversation metadata, not treated as model-authored history. Snapshot price and inventory values are labeled as cached rather than guaranteed current. Direct current-price or availability questions require a successful catalog lookup during that turn. If the refresh fails, mutable cached facts are suppressed and the safe provider failure is returned. Relative follow-ups such as "Which is cheaper?" may use the recent snapshot but are explicitly described as based on previously verified, non-live catalog information. Structured responses include per-field `commerceDataFreshness` metadata for price and availability.
+A bounded trusted grounding snapshot may be reused for conversational references in the same authorized conversation for up to 15 minutes; it is stored as conversation metadata, not treated as model-authored history. It includes validated category names and the last discovery mode so short follow-ups can retain the catalog subject without trusting model text. Snapshot price and inventory values are labeled as cached rather than guaranteed current. Direct current-price or availability questions require a successful catalog lookup during that turn. If the refresh fails, mutable cached facts are suppressed and the safe provider failure is returned. Relative follow-ups such as "Which is cheaper?" may use the recent snapshot but are explicitly described as based on previously verified, non-live catalog information. Structured responses include per-field `commerceDataFreshness` metadata for price and availability.
 
-The response also contains structured, tool-grounded `products`, `product`, `productAvailability`, or `policies` data when applicable. Prices, currencies, availability, specifications, policies, and product URLs always originate from validated backend tool results. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
+The response also contains structured, tool-grounded `categories`, `catalogOverview`, `products`, `product`, `productAvailability`, or `policies` data when applicable. Category names, counts, prices, currencies, availability, specifications, policies, and product URLs always originate from validated backend tool results. Product links are returned only when an external response supplies an HTTPS URL whose hostname is in `canonicalProductHosts`.
 
 Conversation records use `businessId + channel + conversationId`. A website session is never joined to a WhatsApp customer because of a matching name or submitted phone number. Turns for one website conversation are sequenced in process, while unrelated conversations may run concurrently.
 
@@ -80,6 +83,28 @@ The website limiter enforces the configured `requestsPerMinute` across the whole
 ## External commerce API contract
 
 The external origin and paths are trusted business configuration. Paths must be origin-relative, redirects are rejected, requests use HTTPS, timeouts are bounded to 500–15,000 ms, and response bodies are limited to 512 KiB.
+
+General browsing calls the configured `paths.overview` with `limit` from 1–10. The backend returns a top-level object with unique category names, a bounded product selection, and totals:
+
+```json
+{
+  "categories": ["Appliances", "Hardware"],
+  "products": [
+    {
+      "id": "product-123",
+      "name": "Example product",
+      "price": 1250,
+      "currency": "GHS",
+      "available": true,
+      "canonicalUrl": "https://shop.example.com/products/product-123"
+    }
+  ],
+  "totalCategories": 2,
+  "totalProducts": 24
+}
+```
+
+`categories` is limited to 100 and `products` to the requested maximum of 10. Both totals must be at least the number of returned entries, category names and product IDs must be unique, and a nonempty category or product total must include a returned selection. OrderBridge explicitly labels truncated selections and never describes them as the entire inventory.
 
 Search accepts the following validated fields when the business API supports them:
 
@@ -126,6 +151,8 @@ The `Business` model owns unique e-commerce Wasender session and number fields. 
 
 Authenticated super administrators can create and inspect common business records through `/api/businesses`. When website chat is enabled and no integration key is supplied, creation returns a generated key once. Only its hash is persisted. Commerce API keys and Wasender tokens are never returned in serialized business records.
 
+New e-commerce business configuration requires `commerceIntegration.paths.overview`. Existing tenants created before catalog discovery must add that path before broad browsing is enabled; named searches continue to use `paths.search`, and a missing overview path fails safely without falling back to fabricated categories or products.
+
 Business configuration can be edited with `PATCH /api/businesses/:businessId`. The JSON body is a strict partial object containing any of `name`, `status`, owner/contact fields, `staff`, `timezone`, `agentInstructions`, `websiteIntegration`, `whatsappIntegration`, or `commerceIntegration`. Nested integration objects are also partial. Omitted fields are preserved, and an empty or whitespace-only commerce API key or Wasender token keeps the corresponding stored credential unchanged. Enabling WhatsApp requires a session ID, API token, valid sending number, and at least one valid owner/manager notification number. The WhatsApp channel entry is synchronized with the integration toggle while other channels and capabilities are preserved. Business type, slug, restaurant identity, capabilities, and website integration keys cannot be changed through this endpoint.
 
 Business responses never include the Wasender API token. The safe `hasWasenderApiToken` and `configurationComplete` flags report whether a token is stored and whether all required WhatsApp settings and notification recipients are present.
@@ -147,7 +174,10 @@ Purchase review invitations also require the configured commerce backend to expo
     "authType": "header",
     "apiKeyHeader": "x-api-key",
     "apiKey": "<new-catalog-api-key>",
-    "paths": { "search": "/catalog/search" },
+    "paths": {
+      "overview": "/catalog/overview",
+      "search": "/catalog/search"
+    },
     "canonicalProductHosts": ["shop.example.com"]
   }
 }
