@@ -4415,6 +4415,7 @@ const runAgentOrchestratorCore = async (
               normalizeText(finalMessage)
             );
           const allowProductlessSummary =
+            channel === "website" &&
             referencedProductIds.size === 0 &&
             currentTurnProductIds.size > 0 &&
             isConciseCommerceReply(finalMessage) &&
