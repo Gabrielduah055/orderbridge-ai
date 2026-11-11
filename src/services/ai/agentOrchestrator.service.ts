@@ -2882,6 +2882,12 @@ const buildSafeCommerceFallback = (
   allowStateProductFallback = true
 ): SafeCommerceFallback => {
   if (failureMessage) return { message: failureMessage, productIds: [] };
+  if (isGlobalCheapestCatalogRequest(userMessage)) {
+    return {
+      message: "I couldn't reach the verified catalog right now. Please try again shortly.",
+      productIds: []
+    };
+  }
   if (isPolicyQuestion(userMessage) && state.policies.size > 0) {
     return {
       message: state.policyOrder
@@ -3280,6 +3286,7 @@ const commerceGroundingToolNames = new Set([
 
 type CommerceDiscoveryIntent =
   | { kind: "overview" }
+  | { kind: "global_cheapest" }
   | { kind: "detail"; query: string }
   | {
       kind: "search";
@@ -3297,6 +3304,59 @@ type CommerceDiscoveryIntent =
       available?: boolean;
       sort?: "price_asc";
     };
+
+const hasCommerceSearchRequestPrefix = (
+  message: string,
+  matchIndex: number
+): boolean => {
+  const prefix = normalizeText(message.slice(0, matchIndex)).replace(/[’‘]/g, "'");
+  if (
+    !prefix ||
+    /^(?:(?:please|the|your|our|store'?s)\s*)*$/i.test(prefix) ||
+    /^(?:is|are)\s+(?:(?:the|your|our|store'?s)\s*)?$/i.test(prefix)
+  ) {
+    return true;
+  }
+  const possessiveScope =
+    /\b([A-Za-z0-9][A-Za-z0-9&-]*)'s\s*$/i.exec(prefix)?.[1];
+  if (
+    possessiveScope &&
+    !/^(?:store|shop|business)$/i.test(possessiveScope)
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:don't|didn't|can't|won't|wouldn't|shouldn't|isn't|aren't|do not|did not|cannot|not|never|without|already|bought|purchased|ordered|chose|selected|this|that|these|those|it|them|among|within)\b/i.test(
+      prefix
+    ) ||
+    /^(?:is|are|was|were|in|for|of|among|within)\b/i.test(prefix)
+  ) {
+    return false;
+  }
+  return /\b(?:what|which|show|find|give|tell|want|like|need|looking|search|have|get|recommend|suggest|prefer)\b/i.test(
+    prefix
+  );
+};
+
+const isGlobalCheapestCatalogRequest = (message: string): boolean => {
+  const normalized = normalizeText(message);
+  const forwardMatch =
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\b/i.exec(
+      normalized
+    );
+  const reverseMatch =
+    /\b(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:is\s+)?(?:the\s+)?(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.exec(
+      normalized
+    );
+  const match = forwardMatch ?? reverseMatch;
+  if (!match || match.index === undefined) return false;
+  if (!hasCommerceSearchRequestPrefix(normalized, match.index)) return false;
+
+  const trailingText = normalized.slice(match.index + match[0].length);
+  return /^(?:(?:\s+(?:is|available))|(?:\s+in stock)|(?:\s+(?:that\s+)?(?:you|the\s+store)\s+(?:have|sell|carry))|(?:\s+(?:in|across|from)\s+(?:the\s+)?(?:catalog|catalogue|store)))*[?.!]*$/i.test(
+    trailingText
+  );
+};
 
 const cleanCommerceDiscoveryTerm = (value: string): string =>
   normalizeText(value)
@@ -3391,6 +3451,153 @@ const getCommerceDiscoveryIntent = (
     )
   ) {
     return null;
+  }
+
+  const leadingScopedCheapest =
+    /^(in|within|among|of|for)\s+(?:the\s+)?(.+?)\s*[,;:]\s*(.+)$/i.exec(
+      normalized
+    );
+  if (
+    leadingScopedCheapest?.[1] &&
+    leadingScopedCheapest[2] &&
+    leadingScopedCheapest[3] &&
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.test(
+      leadingScopedCheapest[3]
+    )
+  ) {
+    const preposition = leadingScopedCheapest[1].toLocaleLowerCase("en");
+    const rawScope = cleanCommerceDiscoveryTerm(leadingScopedCheapest[2])
+      .replace(/\s+category$/i, "")
+      .trim();
+    const {
+      cleanedTerm: scope,
+      modifiers: scopeModifiers
+    } = parseCommerceConstraints(rawScope);
+    if (
+      scope &&
+      scope.length <= 120 &&
+      !/^(?:these|those|them)(?:\s+(?:items|products|options))?$/i.test(scope)
+    ) {
+      const { modifiers: requestModifiers } = parseCommerceConstraints(
+        leadingScopedCheapest[3]
+      );
+      const category = getGroundedCategory(state, scope);
+      if (
+        preposition === "in" ||
+        preposition === "within" ||
+        /\s+category$/i.test(leadingScopedCheapest[2]) ||
+        category
+      ) {
+        return {
+          kind: "category",
+          category: category?.name ?? scope,
+          ...scopeModifiers,
+          ...requestModifiers,
+          sort: "price_asc"
+        };
+      }
+      return {
+        kind: "search",
+        query: scope,
+        ...scopeModifiers,
+        ...requestModifiers,
+        sort: "price_asc"
+      };
+    }
+  }
+
+  if (isGlobalCheapestCatalogRequest(normalized)) {
+    return { kind: "global_cheapest" };
+  }
+
+  const wrappedScopedCheapest =
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(.+?)(?:\s+is)?[?.!]*$/i.exec(
+      normalized
+    );
+  const wrappedScopedCheapestScope =
+    wrappedScopedCheapest?.[1] &&
+    wrappedScopedCheapest.index !== undefined &&
+    hasCommerceSearchRequestPrefix(normalized, wrappedScopedCheapest.index)
+      ? wrappedScopedCheapest[1]
+      : undefined;
+  const wrappedReverseScopedCheapest =
+    /\b(?:which|what)\s+(.+?)\s+is\s+(?:the\s+)?(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)(?:\s+(?:available|in stock))?[?.!]*$/i.exec(
+      normalized
+    );
+  const wrappedReverseScopedCheapestScope =
+    wrappedReverseScopedCheapest?.[1] &&
+    wrappedReverseScopedCheapest.index !== undefined &&
+    hasCommerceSearchRequestPrefix(normalized, wrappedReverseScopedCheapest.index)
+      ? wrappedReverseScopedCheapest[1]
+      : undefined;
+  const scopedCheapestScope =
+    /^(?:please\s+)?(?:(?:what(?:'s| is)|which(?: is)?|show(?: me)?|find(?: me)?)\s+)?(?:(?:your|the\s+store'?s)\s+|(?:the\s+))?(?:cheapest|lowest[- ]priced|lowest price|least expensive|most affordable)\s+(.+?)[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    /^(?:please\s+)?(?:which|what)\s+(.+?)\s+is\s+(?:the\s+)?(?:cheapest|lowest[- ]priced|least expensive|most affordable)(?:\s+(?:available|in stock))?[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    wrappedReverseScopedCheapestScope ??
+    wrappedScopedCheapestScope;
+  if (scopedCheapestScope) {
+    const rawScope = scopedCheapestScope;
+    const explicitlyAvailable = /\b(?:available|in stock)\b/i.test(rawScope);
+    const explicitCategoryScope =
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+in\s+(?:the\s+)?(.+?)\s+category(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+in\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^in\s+(?:the\s+)?(.+?)\s+category(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^in\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1];
+    if (explicitCategoryScope) {
+      const { cleanedTerm, modifiers } = parseCommerceConstraints(
+        explicitCategoryScope
+      );
+      if (cleanedTerm && cleanedTerm.length <= 120) {
+        return {
+          kind: "category",
+          category: cleanedTerm,
+          ...modifiers,
+          ...(explicitlyAvailable ? { available: true } : {}),
+          sort: "price_asc"
+        };
+      }
+    }
+
+    const namedScope =
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:from|by)\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ?? rawScope;
+    const { cleanedTerm, modifiers } = parseCommerceConstraints(namedScope);
+    const category = getGroundedCategory(state, cleanedTerm);
+    if (category) {
+      return {
+        kind: "category",
+        category: category.name,
+        ...modifiers,
+        ...(explicitlyAvailable ? { available: true } : {}),
+        sort: "price_asc"
+      };
+    }
+    if (
+      cleanedTerm &&
+      cleanedTerm.length <= 120 &&
+      !/^(?:item|product|thing|option)$/i.test(cleanedTerm)
+    ) {
+      return {
+        kind: "search",
+        query: cleanedTerm,
+        ...modifiers,
+        ...(explicitlyAvailable ? { available: true } : {}),
+        sort: "price_asc"
+      };
+    }
   }
 
   if (
@@ -3570,6 +3777,23 @@ const buildCatalogSearchMessage = (
     ? `Here are ${displayedProducts} of ${result.total} verified matches for ${subject}:`
     : `Here ${displayedProducts === 1 ? "is" : "are"} ${displayedProducts} verified ${displayedProducts === 1 ? "match" : "matches"} for ${subject}:`;
   return [heading, ...formatCommerceProductLines(responseProducts, channel)].join("\n\n");
+};
+
+const buildGlobalCheapestProductMessage = (
+  result: Extract<GroundedCommerceResult, { kind: "search" }>,
+  channel: "website" | "whatsapp"
+): string => {
+  const cheapestProduct = result.products[0];
+  if (!cheapestProduct) {
+    return "I couldn't find any verified available products right now.";
+  }
+  if (channel === "website") {
+    return "I found the cheapest available product in the verified catalog. See the product card for its current price, availability, and details.";
+  }
+  return [
+    "The cheapest available product in the verified catalog is:",
+    ...formatCommerceProductLines([cheapestProduct], channel)
+  ].join("\n\n");
 };
 
 const buildCatalogDetailClarificationMessage = (
@@ -4024,6 +4248,28 @@ const runAgentOrchestratorCore = async (
       }
 
       if (
+        discoveryIntent.kind === "global_cheapest" &&
+        permittedToolNames.has("search_products")
+      ) {
+        const outcome = await executeDiscoveryTool("search_products", {
+          sort: "price_asc",
+          limit: 1,
+          available: true
+        });
+        if (!outcome.result.success || outcome.groundedResult?.kind !== "search") {
+          return finishDiscovery(
+            false,
+            getCommerceDiscoveryFailureMessage(outcome.result),
+            outcome.result.code
+          );
+        }
+        return finishDiscovery(
+          true,
+          buildGlobalCheapestProductMessage(outcome.groundedResult, channel)
+        );
+      }
+
+      if (
         discoveryIntent.kind === "category" &&
         permittedToolNames.has("get_catalog_overview") &&
         permittedToolNames.has("search_products")
@@ -4247,6 +4493,15 @@ const runAgentOrchestratorCore = async (
             false,
             channel
           )
+        );
+      }
+
+      if (discoveryIntent.kind === "global_cheapest") {
+        retainOnlyInternalCommerceGrounding();
+        return finishDiscovery(
+          false,
+          "I couldn't reach the verified catalog right now. Please try again shortly.",
+          "TOOL_FORBIDDEN"
         );
       }
     }

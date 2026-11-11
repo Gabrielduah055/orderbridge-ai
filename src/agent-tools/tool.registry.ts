@@ -4239,7 +4239,7 @@ export const commerceToolRegistry = {
     definition: {
       name: "search_products",
       description:
-        "Search the current business's authoritative external product catalog using optional price, category, availability, preference, and sort filters. The business backend performs authoritative filtering and ranking.",
+        "Search the current business's authoritative external product catalog using optional price, category, availability, preference, and sort filters. A queryless search is allowed only with an explicit price_asc or price_desc sort and remains bounded by limit. The business backend performs authoritative filtering and ranking.",
       parameters: {}
     },
     roles: toolPermissions.search_products,
@@ -4256,8 +4256,11 @@ export const commerceToolRegistry = {
       })
       .strict()
       .refine(
-        (args) => Boolean(args.query || args.category || args.preferences?.length),
-        "Provide a query, category, or at least one preference"
+        (args) =>
+          Boolean(args.query || args.category || args.preferences?.length) ||
+          args.sort === "price_asc" ||
+          args.sort === "price_desc",
+        "Provide a query, category, at least one preference, or an explicit price sort"
       )
       .refine(
         (args) =>
