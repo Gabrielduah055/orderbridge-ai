@@ -51,7 +51,8 @@ const recoverableToolCodes = new Set([
   "CAMPAIGN_INACTIVE_DAYS_REQUIRED",
   "CAMPAIGN_INACTIVE_DAYS_MISMATCH",
   "CAMPAIGN_TARGETING_MISMATCH",
-  "CAMPAIGN_TYPE_MISMATCH"
+  "CAMPAIGN_TYPE_MISMATCH",
+  "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED"
 ]);
 const campaignConfirmationPreviewToolNames = new Set([
   "create_campaign_draft",
@@ -3353,7 +3354,7 @@ const isGlobalCheapestCatalogRequest = (message: string): boolean => {
   if (!hasCommerceSearchRequestPrefix(normalized, match.index)) return false;
 
   const trailingText = normalized.slice(match.index + match[0].length);
-  return /^(?:(?:\s+(?:is|available))|(?:\s+in stock)|(?:\s+(?:that\s+)?(?:you|the\s+store)\s+(?:have|sell|carry))|(?:\s+(?:in|across|from)\s+(?:the\s+)?(?:catalog|catalogue|store)))*[?.!]*$/i.test(
+  return /^(?:(?:\s+(?:is|available))|(?:\s+in stock)|(?:\s+(?:that\s+)?(?:you|the\s+store)\s+(?:have|sell|carry))|(?:\s+(?:in|within|across|from)\s+(?:(?:the|your|our)\s+)?(?:(?:whole|entire)\s+)?(?:catalog|catalogue|store|shop))|(?:\s+store-wide))*[?.!]*$/i.test(
     trailingText
   );
 };
@@ -3426,7 +3427,27 @@ const parseCommerceNamedSearch = (
   return { query: cleanedTerm, ...modifiers };
 };
 
+const isCommerceDisplayedSelectionReference = (message: string): boolean => {
+  const normalized = normalizeText(message);
+  const asksForRelativeSelection =
+    /\b(?:cheaper|cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.test(
+      normalized
+    );
+  if (!asksForRelativeSelection) return false;
+
+  return (
+    /\b(?:these|those|them)\b/i.test(normalized) ||
+    /\b(?:shown|listed|above|previously\s+shown)\s+(?:products?|items?|options?)\b/i.test(
+      normalized
+    ) ||
+    /\b(?:which|what|cheapest|lowest[- ]priced|least expensive|most affordable)\b.{0,32}\bof\s+(?:the\s+)?(?:products?|items?|options?)\b/i.test(
+      normalized
+    )
+  );
+};
+
 const isContextualCommerceFollowUp = (message: string): boolean =>
+  isCommerceDisplayedSelectionReference(message) ||
   /^(?:please\s+)?(?:(?:show\s+me\s+)?(?:(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)(?:\s+(?:one|product|item|option))?|(?:that|this)(?:\s+(?:one|product|item))?|the\s+(?:one|product|item))|(?:(?:tell|show)\s+me\s+)?more(?:\s+(?:details?|info(?:rmation)?|about\s+(?:it|that|this)))?|number\s+\d+|(?:option|product|item)\s+\d+|(?:go\s+back|go\s+on|what\s+(?:about|else)))[?.!]*$/i.test(
     normalizeText(message)
   );
@@ -3450,6 +3471,14 @@ const getCommerceDiscoveryIntent = (
       normalized
     )
   ) {
+    return null;
+  }
+
+  if (isGlobalCheapestCatalogRequest(normalized)) {
+    return { kind: "global_cheapest" };
+  }
+
+  if (isCommerceDisplayedSelectionReference(normalized)) {
     return null;
   }
 
@@ -3504,10 +3533,6 @@ const getCommerceDiscoveryIntent = (
         sort: "price_asc"
       };
     }
-  }
-
-  if (isGlobalCheapestCatalogRequest(normalized)) {
-    return { kind: "global_cheapest" };
   }
 
   const wrappedScopedCheapest =
@@ -4931,6 +4956,17 @@ const runAgentOrchestratorCore = async (
             safeArguments,
             recentInactiveCampaignRequest
           );
+        const commerceSelectionGuardResult: ToolResult | null =
+          businessInput &&
+          toolName === "search_products" &&
+          isCommerceDisplayedSelectionReference(normalizedInputMessage)
+            ? {
+                success: false,
+                code: "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED",
+                message:
+                  "Please use the verified products already shown, or ask the customer which products they mean."
+              }
+            : null;
         const rawResult: ToolResult = toolCall.invalidArguments
           ? {
               success: false,
@@ -4942,6 +4978,7 @@ const runAgentOrchestratorCore = async (
             ? workflowConflictResult ??
               trustedReferenceGuardResult ??
               marketingMutationGuardResult ??
+              commerceSelectionGuardResult ??
               (await executeTool(
                 toolName,
                 safeArguments,
@@ -5034,6 +5071,10 @@ const runAgentOrchestratorCore = async (
                 groundedResult.productId
               );
             }
+            latestCommerceFailureMessage = undefined;
+          } else if (
+            result.code === "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED"
+          ) {
             latestCommerceFailureMessage = undefined;
           } else {
             if (toolName === "get_product_details") {
