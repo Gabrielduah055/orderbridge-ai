@@ -4414,6 +4414,14 @@ const runAgentOrchestratorCore = async (
             /^(?:which|what|why|how|could you clarify|can you clarify|would you clarify|please clarify|do you mean)\b/i.test(
               normalizeText(finalMessage)
             );
+          const requiresWhatsappVerifiedProductList =
+            channel === "whatsapp" &&
+            referencedProductIds.size === 0 &&
+            currentTurnProductIds.size > 0 &&
+            !isUnrelatedClarificationReply &&
+            /\b(?:options?|choices?|matches?|products?|items?|recommend(?:ation|ations|ed|s)?|best|top picks?)\b/i.test(
+              normalizeText(finalMessage)
+            );
           const allowProductlessSummary =
             channel === "website" &&
             referencedProductIds.size === 0 &&
@@ -4472,14 +4480,16 @@ const runAgentOrchestratorCore = async (
                 );
               }
             );
-            renderedCommerceResponse = renderValidatedCommerceResponse(
-              finalMessage,
-              normalizedInputMessage,
-              commerceGroundingState,
-              channel,
-              businessInput.commercePageContext,
-              allowProductlessSummary
-            );
+            renderedCommerceResponse = requiresWhatsappVerifiedProductList
+              ? null
+              : renderValidatedCommerceResponse(
+                  finalMessage,
+                  normalizedInputMessage,
+                  commerceGroundingState,
+                  channel,
+                  businessInput.commercePageContext,
+                  allowProductlessSummary
+                );
             usedCommerceFallback = !renderedCommerceResponse;
             if (renderedCommerceResponse) {
               finalMessage = renderedCommerceResponse;
