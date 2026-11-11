@@ -2828,6 +2828,12 @@ const renderValidatedCommerceResponse = (
     return null;
   }
   if (
+    isContextualCommerceDetailRequest(userMessage) &&
+    !tokens.some((token) => contract.productTokens.has(token))
+  ) {
+    return null;
+  }
+  if (
     state.products.size > 0 &&
     isProductQuestion(userMessage) &&
     !tokens.some((token) => contract.productTokens.has(token))
@@ -2860,41 +2866,58 @@ const renderValidatedCommerceResponse = (
     .join("\n");
 };
 
+interface SafeCommerceFallback {
+  message: string;
+  productIds: string[];
+}
+
 const buildSafeCommerceFallback = (
   userMessage: string,
   state: CommerceGroundingState,
   channel: "website" | "whatsapp",
   failureMessage?: string,
   preferredProductIds: ReadonlySet<string> = new Set()
-): string => {
-  if (failureMessage) return failureMessage;
+): SafeCommerceFallback => {
+  if (failureMessage) return { message: failureMessage, productIds: [] };
   if (isPolicyQuestion(userMessage) && state.policies.size > 0) {
-    return state.policyOrder
-      .map((key) => state.policies.get(key))
-      .filter((policy): policy is GroundedCommercePolicy => Boolean(policy))
-      .map((policy) =>
-        [policy.name, policy.content, policy.url].filter(Boolean).join(" — ")
-      )
-      .join("\n");
+    return {
+      message: state.policyOrder
+        .map((key) => state.policies.get(key))
+        .filter((policy): policy is GroundedCommercePolicy => Boolean(policy))
+        .map((policy) =>
+          [policy.name, policy.content, policy.url].filter(Boolean).join(" — ")
+        )
+        .join("\n"),
+      productIds: []
+    };
   }
   const products = state.productOrder
     .map((id) => state.products.get(id))
     .filter((product): product is GroundedCommerceProduct => Boolean(product));
   if (
     preferredProductIds.size === 0 &&
-    isContextualCommerceFollowUp(userMessage)
+    (isContextualCommerceFollowUp(userMessage) ||
+      isContextualCommerceDetailRequest(userMessage))
   ) {
-    return "Which product would you like me to use for that?";
+    return {
+      message: "Which product would you like me to use for that?",
+      productIds: []
+    };
   }
   const discussesProducts =
     preferredProductIds.size > 0 ||
     isProductQuestion(userMessage);
   if (!discussesProducts) {
-    return isStandaloneCommerceGreeting(userMessage)
-      ? "Hello! How can I help you today?"
-      : "What would you like help finding?";
+    return {
+      message: isStandaloneCommerceGreeting(userMessage)
+        ? "Hello! How can I help you today?"
+        : "What would you like help finding?",
+      productIds: []
+    };
   }
-  if (products.length === 0) return unsupportedProductClaimMessage;
+  if (products.length === 0) {
+    return { message: unsupportedProductClaimMessage, productIds: [] };
+  }
   const budgetMatch = /(?:under|below|budget(?: of)?|up to)\s*(?:GHS\s*)?([\d,]+(?:\.\d+)?)/i.exec(
     userMessage
   );
@@ -2913,37 +2936,53 @@ const buildSafeCommerceFallback = (
     .filter((product) => budget === undefined || product.price <= budget)
     .sort((first, second) => first.price - second.price);
   if (candidates.length === 0 && budget !== undefined) {
-    return `I couldn't find a verified option within GHS ${new Intl.NumberFormat("en", { maximumFractionDigits: 2 }).format(budget)}.`;
+    return {
+      message: `I couldn't find a verified option within GHS ${new Intl.NumberFormat("en", { maximumFractionDigits: 2 }).format(budget)}.`,
+      productIds: []
+    };
   }
   const selected = candidates.length > 0 ? candidates : relevantProducts;
-  if (channel === "website") {
-    const countLabel = selected.length === 1 ? "one verified option" : `${selected.length} verified options`;
-    return `I found ${countLabel} for your request. See the product ${selected.length === 1 ? "card" : "cards"} for current details.`;
-  }
-  const displayedProducts = selected.slice(0, 3);
   const asksForCheaper = /\b(?:cheaper|cheapest|lowest price|most affordable)\b/i.test(
     userMessage
   );
+  const displayedProducts = asksForCheaper
+    ? selected.slice(0, 1)
+    : selected.slice(
+        0,
+        channel === "website" ? commerceWebsiteProductCardLimit : 3
+      );
+  if (channel === "website") {
+    const countLabel = displayedProducts.length === 1
+      ? "one verified option"
+      : `${displayedProducts.length} verified options`;
+    return {
+      message: `I found ${countLabel} for your request. See the product ${displayedProducts.length === 1 ? "card" : "cards"} for current details.`,
+      productIds: displayedProducts.map((product) => product.id)
+    };
+  }
   const heading = asksForCheaper
     ? "The lowest verified price is:"
     : /\b(?:recommend|best|budget)\b/i.test(userMessage)
       ? "Based on the verified catalog, these are the strongest matches:"
       : "Here are the verified options:";
-  return [
-    heading,
-    ...displayedProducts.map((product, index) => {
-      const availabilityOverride = state.availability.get(product.id);
-      const availability = availabilityOverride?.failed
-        ? "availability could not be verified"
-        : (availabilityOverride?.available ?? product.available)
-          ? "available"
-          : "unavailable";
-      const specs = requestsDetailedCommerceReply(userMessage)
-        ? formatGroundedSpecifications(product.specifications)
-        : null;
-      return `${index + 1}. ${normalizeText(product.name)} — ${formatGroundedPrice(product.price, product.currency)} — ${availability}${specs ? ` — ${specs}` : ""} — ${product.canonicalUrl}`;
-    })
-  ].join("\n");
+  return {
+    message: [
+      heading,
+      ...displayedProducts.map((product, index) => {
+        const availabilityOverride = state.availability.get(product.id);
+        const availability = availabilityOverride?.failed
+          ? "availability could not be verified"
+          : (availabilityOverride?.available ?? product.available)
+            ? "available"
+            : "unavailable";
+        const specs = requestsDetailedCommerceReply(userMessage)
+          ? formatGroundedSpecifications(product.specifications)
+          : null;
+        return `${index + 1}. ${normalizeText(product.name)} — ${formatGroundedPrice(product.price, product.currency)} — ${availability}${specs ? ` — ${specs}` : ""} — ${product.canonicalUrl}`;
+      })
+    ].join("\n"),
+    productIds: displayedProducts.map((product) => product.id)
+  };
 };
 
 const getCommerceFreshnessRequirements = (
@@ -3333,6 +3372,10 @@ const isContextualCommerceFollowUp = (message: string): boolean =>
     normalizeText(message)
   );
 
+const isContextualCommerceDetailRequest = (message: string): boolean =>
+  requestsDetailedCommerceReply(message) &&
+  /\b(?:this|that|it|these|those|current)\b/i.test(normalizeText(message));
+
 const getCommerceDiscoveryIntent = (
   message: string,
   state: CommerceGroundingState
@@ -3373,8 +3416,21 @@ const getCommerceDiscoveryIntent = (
     if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
   }
 
-  if (isContextualCommerceFollowUp(normalized)) {
+  if (
+    isContextualCommerceFollowUp(normalized) ||
+    isContextualCommerceDetailRequest(normalized)
+  ) {
     return null;
+  }
+
+  const namedDetailRequest =
+    /^(?:please\s+)?(?:describe|explain|tell\s+me\s+(?:about|more\s+about)|give\s+me\s+(?:details?|information|info)\s+(?:about|on)|(?:description|details?|information|info)\s+(?:about|of|on))\s+(?:the\s+)?(.+?)[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    /^how\s+(?:does|do)\s+(.+?)\s+work[?.!]*$/i.exec(normalized)?.[1];
+  if (namedDetailRequest) {
+    const parsedSearch = parseCommerceNamedSearch(namedDetailRequest);
+    if (parsedSearch) return { kind: "search", ...parsedSearch };
   }
 
   const namedRequest =
@@ -3668,6 +3724,7 @@ const runAgentOrchestratorCore = async (
   let latestOrderList: GroundedOrderQueryResult | undefined;
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
   let latestCommerceFailureMessage: string | undefined;
+  let latestCommerceExactProductId: string | undefined;
   const commerceTurnVerification: CommerceTurnVerification = {
     freshPrices: new Set(),
     failedPrices: new Set(),
@@ -3699,6 +3756,25 @@ const runAgentOrchestratorCore = async (
         requestId: input.requestId,
         originalMessage: normalizedInputMessage
       };
+  const retainOnlyInternalCommerceGrounding = (): void => {
+    if (!businessInput) return;
+    importantData = mergeCommerceGroundingData(
+      importantData,
+      commerceGroundingState,
+      {
+        freshnessByProduct: getCommerceFreshnessByProduct(
+          commerceGroundingState,
+          commerceTurnVerification
+        ),
+        visibleProductIds: new Set(),
+        visibleProductOrder: [],
+        includeCategories: false,
+        includePolicies: false,
+        maxVisibleProducts:
+          channel === "website" ? commerceWebsiteProductCardLimit : undefined
+      }
+    );
+  };
 
   try {
     if (businessInput && isStandaloneCommerceGreeting(normalizedInputMessage)) {
@@ -3930,6 +4006,24 @@ const runAgentOrchestratorCore = async (
           discoveryIntent.category
         );
         if (!category) {
+          importantData = mergeCommerceGroundingData(
+            importantData,
+            commerceGroundingState,
+            {
+              freshnessByProduct: getCommerceFreshnessByProduct(
+                commerceGroundingState,
+                commerceTurnVerification
+              ),
+              visibleProductIds: new Set(),
+              visibleProductOrder: [],
+              includeCategories: true,
+              includePolicies: false,
+              maxVisibleProducts:
+                channel === "website"
+                  ? commerceWebsiteProductCardLimit
+                  : undefined
+            }
+          );
           importantData = {
             ...(importantData ?? {}),
             products: []
@@ -4187,57 +4281,42 @@ const runAgentOrchestratorCore = async (
             finalMessage,
             commerceContract
           );
-          const responseProductIds = new Set(
+          const referencedProductIds = new Set(
             responseProductMetadata.map(({ productId }) => productId)
           );
-          if (responseProductIds.size === 0) {
-            for (const productId of [
-              ...commerceTurnVerification.freshPrices,
-              ...commerceTurnVerification.freshAvailability
-            ]) {
-              if (commerceGroundingState.products.has(productId)) {
-                responseProductIds.add(productId);
+          const fallbackCandidateIds = new Set(referencedProductIds);
+          if (fallbackCandidateIds.size === 0) {
+            if (
+              isContextualCommerceDetailRequest(normalizedInputMessage) &&
+              latestCommerceExactProductId &&
+              commerceGroundingState.products.has(latestCommerceExactProductId)
+            ) {
+              fallbackCandidateIds.add(latestCommerceExactProductId);
+            } else if (
+              !isContextualCommerceDetailRequest(normalizedInputMessage)
+            ) {
+              for (const productId of [
+                ...commerceTurnVerification.freshPrices,
+                ...commerceTurnVerification.freshAvailability
+              ]) {
+                if (commerceGroundingState.products.has(productId)) {
+                  fallbackCandidateIds.add(productId);
+                }
               }
             }
           }
           if (
-            responseProductIds.size === 0 &&
+            fallbackCandidateIds.size === 0 &&
             isCommerceSelectionQuestion(normalizedInputMessage)
           ) {
             for (const productId of commerceGroundingState.productOrder) {
-              responseProductIds.add(productId);
+              fallbackCandidateIds.add(productId);
             }
           }
           const responseTokens = finalMessage.match(commerceTokenPattern) ?? [];
-          const visibleResponseProductIds = selectCommerceResponseProductIds(
-            commerceGroundingState,
-            responseProductIds,
-            channel
-          );
-          importantData = mergeCommerceGroundingData(
-            importantData,
-            commerceGroundingState,
-            {
-              freshnessByProduct,
-              requirements: freshnessRequirements,
-              visibleProductIds: visibleResponseProductIds,
-              visibleProductOrder: Array.from(visibleResponseProductIds),
-              includeCategories:
-                isCategoryQuestion(normalizedInputMessage) ||
-                responseTokens.some((token) =>
-                  commerceContract.categoryTokens.has(token)
-                ),
-              includePolicies:
-                isPolicyQuestion(normalizedInputMessage) ||
-                responseTokens.some((token) =>
-                  commerceContract.policyTokens.has(token)
-                ),
-              maxVisibleProducts:
-                channel === "website"
-                  ? commerceWebsiteProductCardLimit
-                  : undefined
-            }
-          );
+          let finalProductIds: ReadonlySet<string> = new Set();
+          let renderedCommerceResponse: string | null = null;
+          let usedCommerceFallback = false;
           if (freshnessFailureMessage) {
             finalMessage = freshnessFailureMessage;
           } else {
@@ -4252,25 +4331,36 @@ const runAgentOrchestratorCore = async (
                 );
               }
             );
-            const renderedCommerceResponse = renderValidatedCommerceResponse(
+            renderedCommerceResponse = renderValidatedCommerceResponse(
               finalMessage,
               normalizedInputMessage,
               commerceGroundingState,
               channel,
               businessInput.commercePageContext
             );
-            const usedCommerceFallback = !renderedCommerceResponse;
-            finalMessage = renderedCommerceResponse ?? buildSafeCommerceFallback(
-              normalizedInputMessage,
-              commerceGroundingState,
-              channel,
-              latestCommerceFailureMessage,
-              visibleResponseProductIds
-            );
+            usedCommerceFallback = !renderedCommerceResponse;
+            if (renderedCommerceResponse) {
+              finalMessage = renderedCommerceResponse;
+              finalProductIds = selectCommerceResponseProductIds(
+                commerceGroundingState,
+                referencedProductIds,
+                channel
+              );
+            } else {
+              const fallback = buildSafeCommerceFallback(
+                normalizedInputMessage,
+                commerceGroundingState,
+                channel,
+                latestCommerceFailureMessage,
+                fallbackCandidateIds
+              );
+              finalMessage = fallback.message;
+              finalProductIds = new Set(fallback.productIds);
+            }
             const fallbackUsesCachedFacts =
               usedCommerceFallback &&
               !latestCommerceFailureMessage &&
-              Array.from(visibleResponseProductIds).some(
+              Array.from(finalProductIds).some(
                 (productId) => {
                   const freshness = freshnessByProduct.get(productId);
                   return (
@@ -4279,10 +4369,43 @@ const runAgentOrchestratorCore = async (
                   );
                 }
               );
-            if (usesCachedMutableFact || fallbackUsesCachedFacts) {
+            if (
+              (usedCommerceFallback && fallbackUsesCachedFacts) ||
+              (!usedCommerceFallback && usesCachedMutableFact)
+            ) {
               finalMessage = `Based on previously verified catalog information, not a live refresh: ${finalMessage}`;
             }
           }
+          importantData = mergeCommerceGroundingData(
+            importantData,
+            commerceGroundingState,
+            {
+              freshnessByProduct,
+              requirements: freshnessRequirements,
+              visibleProductIds: finalProductIds,
+              visibleProductOrder: Array.from(finalProductIds),
+              includeCategories:
+                isCategoryQuestion(normalizedInputMessage) ||
+                Boolean(
+                  renderedCommerceResponse &&
+                  responseTokens.some((token) =>
+                    commerceContract.categoryTokens.has(token)
+                  )
+                ),
+              includePolicies:
+                isPolicyQuestion(normalizedInputMessage) ||
+                Boolean(
+                  renderedCommerceResponse &&
+                  responseTokens.some((token) =>
+                    commerceContract.policyTokens.has(token)
+                  )
+                ),
+              maxVisibleProducts:
+                channel === "website"
+                  ? commerceWebsiteProductCardLimit
+                  : undefined
+            }
+          );
         }
 
         const failedToolMessage = getFailedToolSuccessClaimMessage(
@@ -4480,6 +4603,7 @@ const runAgentOrchestratorCore = async (
                 commerceTurnVerification.failedAvailability.delete(product.id);
               }
             } else if (groundedResult.kind === "product") {
+              latestCommerceExactProductId = groundedResult.product.id;
               commerceTurnVerification.freshPrices.add(groundedResult.product.id);
               commerceTurnVerification.failedPrices.delete(
                 groundedResult.product.id
@@ -4500,6 +4624,9 @@ const runAgentOrchestratorCore = async (
             }
             latestCommerceFailureMessage = undefined;
           } else {
+            if (toolName === "get_product_details") {
+              latestCommerceExactProductId = undefined;
+            }
             const failedProductIds =
               toolName === "get_catalog_overview" ||
               toolName === "search_products"
@@ -4680,6 +4807,7 @@ const runAgentOrchestratorCore = async (
     }
 
     const recoverableMessage = getRecoverableToolFallbackMessage(executedTools);
+    retainOnlyInternalCommerceGrounding();
 
     return {
       success: false,
@@ -4705,6 +4833,7 @@ const runAgentOrchestratorCore = async (
       errorCode,
       error: error instanceof Error ? error.message : "Unknown agent orchestration error"
     });
+    retainOnlyInternalCommerceGrounding();
 
     return {
       success: false,
