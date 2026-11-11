@@ -1,7 +1,10 @@
 import type { IBusinessDocument } from "../models/business.model";
 import { saveAgentConversationMessage } from "./agentConversationHistory.service";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
-import type { AgentOrchestratorResult } from "./ai/ai.types";
+import type {
+  AgentOrchestratorResult,
+  CommercePageContext
+} from "./ai/ai.types";
 import type { ResolvedSender } from "../types/agent.types";
 import type { AgentChannel } from "../types/business.types";
 
@@ -27,6 +30,34 @@ export interface CommerceChatInput {
   requestId?: string;
   metadata?: Record<string, unknown>;
 }
+
+interface ParsedCommerceMessage {
+  customerMessage: string;
+  pageContext?: CommercePageContext;
+}
+
+const kawamaProductPageMessagePattern =
+  /^[^\r\n:]{1,120} catalog product page: (.{1,300}) \(product ID: ([^;\r\n]{1,200}); slug: ([^)\r\n]{1,200})\)\.\r?\nCustomer message: ([\s\S]+)$/;
+
+const parseCommerceMessage = (
+  channel: AgentChannel,
+  message: string
+): ParsedCommerceMessage => {
+  if (channel !== "website") return { customerMessage: message };
+  const match = kawamaProductPageMessagePattern.exec(message.trim());
+  if (!match) return { customerMessage: message };
+  const productName = match[1]?.trim();
+  const productId = match[2]?.trim();
+  const productSlug = match[3]?.trim();
+  const customerMessage = match[4]?.trim();
+  if (!productName || !productId || !productSlug || !customerMessage) {
+    return { customerMessage: message };
+  }
+  return {
+    customerMessage,
+    pageContext: { productId, productSlug, productName }
+  };
+};
 
 const conversationQueues = new Map<string, Promise<void>>();
 
@@ -66,7 +97,8 @@ export const handleCommerceChatMessage = async (
   dependencies: WebsiteChatDependencies = {}
 ): Promise<AgentOrchestratorResult> => {
   const businessId = String(input.business._id);
-  const message = input.message.trim().replace(/\s+/g, " ");
+  const parsedMessage = parseCommerceMessage(input.channel, input.message);
+  const message = parsedMessage.customerMessage.trim().replace(/\s+/g, " ");
   const conversationId = input.conversationId.trim();
   const saveMessage = dependencies.saveMessage ?? saveAgentConversationMessage;
 
@@ -88,6 +120,7 @@ export const handleCommerceChatMessage = async (
         },
         sender: input.sender,
         message,
+        commercePageContext: parsedMessage.pageContext,
         requestId: input.requestId
       });
 
@@ -101,6 +134,9 @@ export const handleCommerceChatMessage = async (
         content: message,
         metadata: {
           ...input.metadata,
+          ...(parsedMessage.pageContext
+            ? { commercePageContext: parsedMessage.pageContext }
+            : {}),
           source: input.source,
           requestId: input.requestId
         }

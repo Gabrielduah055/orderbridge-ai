@@ -94,10 +94,17 @@ export interface BusinessAgentOrchestratorInput {
   businessContext: TrustedBusinessContext;
   sender: ResolvedSender;
   message: string;
+  commercePageContext?: CommercePageContext;
   requestId?: string;
   quotedMessageId?: string;
   trustedCustomerReplyContext?: never;
   staffState?: never;
+}
+
+export interface CommercePageContext {
+  productId: string;
+  productSlug: string;
+  productName: string;
 }
 
 export type AgentOrchestratorInput =
