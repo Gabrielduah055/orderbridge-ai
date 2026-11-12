@@ -1824,6 +1824,7 @@ interface CommerceGroundingSnapshot {
   overviewReturnedProducts?: number;
   lastDiscoveryKind?: "overview" | "search" | "category";
   products: GroundedCommerceProduct[];
+  displayedProductIds: string[];
   availability: Array<GroundedAvailability & { productId: string }>;
   policies: GroundedCommercePolicy[];
 }
@@ -1839,6 +1840,7 @@ interface CommerceGroundingState {
   lastDiscoveryKind?: "overview" | "search" | "category";
   products: Map<string, GroundedCommerceProduct>;
   productOrder: string[];
+  displayedProductIds: string[];
   availability: Map<string, GroundedAvailability>;
   policies: Map<string, GroundedCommercePolicy>;
   policyOrder: string[];
@@ -1899,6 +1901,7 @@ const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
   categoryOrder: [],
   products: new Map(),
   productOrder: [],
+  displayedProductIds: [],
   availability: new Map(),
   policies: new Map(),
   policyOrder: []
@@ -2117,6 +2120,9 @@ const upsertGroundedProduct = (
       if (removedId) {
         state.products.delete(removedId);
         state.availability.delete(removedId);
+        state.displayedProductIds = state.displayedProductIds.filter(
+          (productId) => productId !== removedId
+        );
       }
     }
     state.productOrder.push(product.id);
@@ -2124,6 +2130,18 @@ const upsertGroundedProduct = (
   state.products.set(product.id, product);
   state.availability.delete(product.id);
   state.capturedAt = new Date().toISOString();
+};
+
+const setMostRecentlyDisplayedProducts = (
+  state: CommerceGroundingState,
+  productIds: readonly string[]
+): void => {
+  const uniqueProductIds = Array.from(new Set(productIds)).filter((productId) =>
+    state.products.has(productId)
+  );
+  if (uniqueProductIds.length > 0) {
+    state.displayedProductIds = uniqueProductIds;
+  }
 };
 
 const applyGroundedCommerceResult = (
@@ -2191,10 +2209,12 @@ const markCommerceToolFailure = (
     state.lastDiscoveryKind = undefined;
     state.products.clear();
     state.productOrder = [];
+    state.displayedProductIds = [];
     state.availability.clear();
   } else if (toolName === "search_products") {
     state.products.clear();
     state.productOrder = [];
+    state.displayedProductIds = [];
     state.availability.clear();
     state.totalProducts = undefined;
     state.overviewReturnedProducts = undefined;
@@ -2207,6 +2227,9 @@ const markCommerceToolFailure = (
     if (toolName === "get_product_details") {
       state.products.delete(args.productId);
       state.productOrder = state.productOrder.filter((id) => id !== args.productId);
+      state.displayedProductIds = state.displayedProductIds.filter(
+        (id) => id !== args.productId
+      );
     }
     state.availability.set(args.productId, { failed: true });
   } else if (toolName === "get_business_policies") {
@@ -2238,6 +2261,9 @@ const buildCommerceGroundingSnapshot = (
     .map((id) => state.products.get(id))
     .filter((product): product is GroundedCommerceProduct => Boolean(product))
     .slice(0, 20),
+  displayedProductIds: state.displayedProductIds
+    .filter((productId) => state.products.has(productId))
+    .slice(0, maxGroundedCommerceProducts),
   availability: Array.from(state.availability.entries())
     .map(([productId, availability]) => ({ productId, ...availability }))
     .slice(0, 20),
@@ -2315,6 +2341,21 @@ const restoreCommerceGroundingState = (
       upsertGroundedProduct(state, product);
     }
   }
+  const restoredDisplayedProductIds = new Set<string>();
+  for (const productId of Array.isArray(snapshot.displayedProductIds)
+    ? snapshot.displayedProductIds
+    : []) {
+    if (
+      typeof productId !== "string" ||
+      restoredDisplayedProductIds.has(productId) ||
+      !state.products.has(productId)
+    ) {
+      continue;
+    }
+    restoredDisplayedProductIds.add(productId);
+    state.displayedProductIds.push(productId);
+    if (state.displayedProductIds.length >= maxGroundedCommerceProducts) break;
+  }
   for (const entry of Array.isArray(snapshot.availability) ? snapshot.availability : []) {
     if (!entry || typeof entry !== "object") continue;
     const candidate = entry as unknown as Record<string, unknown>;
@@ -2345,7 +2386,8 @@ const restoreCommerceGroundingState = (
 };
 
 const buildCommerceResponseContract = (
-  state: CommerceGroundingState
+  state: CommerceGroundingState,
+  allowedProductIds?: ReadonlySet<string>
 ): CommerceResponseContract => {
   const replacements = new Map<string, string>();
   const productTokens = new Set<string>();
@@ -2358,6 +2400,7 @@ const buildCommerceResponseContract = (
   const lines: string[] = [];
 
   for (const [index, productId] of state.productOrder.entries()) {
+    if (allowedProductIds && !allowedProductIds.has(productId)) continue;
     const product = state.products.get(productId);
     if (!product) continue;
     const alias = `P${index + 1}`;
@@ -2787,9 +2830,10 @@ const renderValidatedCommerceResponse = (
   state: CommerceGroundingState,
   channel: "website" | "whatsapp",
   pageContext?: CommercePageContext,
-  allowProductlessSummary = false
+  allowProductlessSummary = false,
+  allowedProductIds?: ReadonlySet<string>
 ): string | null => {
-  const contract = buildCommerceResponseContract(state);
+  const contract = buildCommerceResponseContract(state, allowedProductIds);
   const tokens = rawMessage.match(commerceTokenPattern) ?? [];
   const productMetadata = getCommerceProductTokenMetadata(rawMessage, contract);
   const detailedReplyRequested = requestsDetailedCommerceReply(userMessage);
@@ -2886,6 +2930,15 @@ const buildSafeCommerceFallback = (
   if (isGlobalCheapestCatalogRequest(userMessage)) {
     return {
       message: "I couldn't reach the verified catalog right now. Please try again shortly.",
+      productIds: []
+    };
+  }
+  if (
+    isCommerceDisplayedSelectionReference(userMessage) &&
+    preferredProductIds.size === 0
+  ) {
+    return {
+      message: "Which products are you comparing?",
       productIds: []
     };
   }
@@ -3437,6 +3490,12 @@ const isCommerceDisplayedSelectionReference = (message: string): boolean => {
 
   return (
     /\b(?:these|those|them)\b/i.test(normalized) ||
+    /^(?:which|what)(?:\s+(?:one|item|product|option))?\s+(?:is\s+)?(?:the\s+)?(?:cheaper|cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)[?.!]*$/i.test(
+      normalized
+    ) ||
+    /^(?:the\s+)?(?:cheaper|cheapest|lowest[- ]priced|least expensive|most affordable)\s+(?:one|item|product|option)[?.!]*$/i.test(
+      normalized
+    ) ||
     /\b(?:shown|listed|above|previously\s+shown)\s+(?:products?|items?|options?)\b/i.test(
       normalized
     ) ||
@@ -3959,8 +4018,23 @@ const runAgentOrchestratorCore = async (
   const commerceGroundingState = businessInput
     ? restoreCommerceGroundingState(history, allowedCommerceHosts)
     : createEmptyCommerceGroundingState();
+  const normalizedInputMessage = normalizeText(input.message);
+  const isDisplayedSelectionReference = Boolean(
+    businessInput &&
+    isCommerceDisplayedSelectionReference(normalizedInputMessage)
+  );
+  const contextualSelectionProductIds = new Set(
+    commerceGroundingState.displayedProductIds.filter((productId) =>
+      commerceGroundingState.products.has(productId)
+    )
+  );
   const initialCommerceContract = businessInput
-    ? buildCommerceResponseContract(commerceGroundingState)
+    ? buildCommerceResponseContract(
+        commerceGroundingState,
+        isDisplayedSelectionReference
+          ? contextualSelectionProductIds
+          : undefined
+      )
     : undefined;
   const messages: AiMessage[] = [
     {
@@ -3974,7 +4048,6 @@ const runAgentOrchestratorCore = async (
       ? [{ role: "system" as const, content: initialCommerceContract.prompt }]
       : [])
   ];
-  const normalizedInputMessage = normalizeText(input.message);
   const latestHistoryMessage = history[history.length - 1];
   const recentInactiveCampaignRequest = getRecentInactiveCampaignRequest(
     history,
@@ -4241,16 +4314,43 @@ const runAgentOrchestratorCore = async (
         success: boolean,
         message: string,
         errorCode?: string
-      ): AgentOrchestratorResult => ({
-        success,
-        message,
-        data: importantData,
-        ...(errorCode ? { errorCode } : {}),
-        provider: provider.name,
-        model: provider.model,
-        executedTools,
-        usage
-      });
+      ): AgentOrchestratorResult => {
+        if (success && Array.isArray(importantData?.products)) {
+          const displayedProductIds = importantData.products
+            .map((product) =>
+              product &&
+              typeof product === "object" &&
+              typeof (product as Record<string, unknown>).id === "string"
+                ? String((product as Record<string, unknown>).id)
+                : undefined
+            )
+            .filter((productId): productId is string => Boolean(productId))
+            .slice(
+              0,
+              channel === "website" ? commerceWebsiteProductCardLimit : 3
+            );
+          setMostRecentlyDisplayedProducts(
+            commerceGroundingState,
+            displayedProductIds
+          );
+          importantData = {
+            ...(importantData ?? {}),
+            commerceGrounding: buildCommerceGroundingSnapshot(
+              commerceGroundingState
+            )
+          };
+        }
+        return {
+          success,
+          message,
+          data: importantData,
+          ...(errorCode ? { errorCode } : {}),
+          provider: provider.name,
+          model: provider.model,
+          executedTools,
+          usage
+        };
+      };
 
       if (
         discoveryIntent.kind === "overview" &&
@@ -4659,7 +4759,10 @@ const runAgentOrchestratorCore = async (
         }
         if (businessInput) {
           const commerceContract = buildCommerceResponseContract(
-            commerceGroundingState
+            commerceGroundingState,
+            isDisplayedSelectionReference
+              ? contextualSelectionProductIds
+              : undefined
           );
           const freshnessByProduct = getCommerceFreshnessByProduct(
             commerceGroundingState,
@@ -4709,8 +4812,11 @@ const runAgentOrchestratorCore = async (
             isConciseCommerceReply(finalMessage) &&
             !isUnrelatedClarificationReply &&
             !isStandaloneCommerceGreeting(normalizedInputMessage);
-          const fallbackCandidateIds = new Set(referencedProductIds);
+          const fallbackCandidateIds = isDisplayedSelectionReference
+            ? new Set(contextualSelectionProductIds)
+            : new Set(referencedProductIds);
           if (
+            !isDisplayedSelectionReference &&
             fallbackCandidateIds.size === 0 &&
             !isUnrelatedClarificationReply
           ) {
@@ -4734,6 +4840,7 @@ const runAgentOrchestratorCore = async (
             }
           }
           if (
+            !isDisplayedSelectionReference &&
             fallbackCandidateIds.size === 0 &&
             !isUnrelatedClarificationReply &&
             isCommerceSelectionQuestion(normalizedInputMessage)
@@ -4768,7 +4875,10 @@ const runAgentOrchestratorCore = async (
                   commerceGroundingState,
                   channel,
                   businessInput.commercePageContext,
-                  allowProductlessSummary
+                  allowProductlessSummary,
+                  isDisplayedSelectionReference
+                    ? contextualSelectionProductIds
+                    : undefined
                 );
             usedCommerceFallback = !renderedCommerceResponse;
             if (renderedCommerceResponse) {
@@ -4813,6 +4923,10 @@ const runAgentOrchestratorCore = async (
               finalMessage = `Based on previously verified catalog information, not a live refresh: ${finalMessage}`;
             }
           }
+          setMostRecentlyDisplayedProducts(
+            commerceGroundingState,
+            Array.from(finalProductIds)
+          );
           importantData = mergeCommerceGroundingData(
             importantData,
             commerceGroundingState,
@@ -5248,7 +5362,10 @@ const runAgentOrchestratorCore = async (
       }
       if (businessInput) {
         const commerceContract = buildCommerceResponseContract(
-          commerceGroundingState
+          commerceGroundingState,
+          isDisplayedSelectionReference
+            ? contextualSelectionProductIds
+            : undefined
         );
         if (commerceContract.prompt) {
           messages.push({
