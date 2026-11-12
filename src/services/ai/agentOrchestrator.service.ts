@@ -3393,7 +3393,10 @@ const hasCommerceSearchRequestPrefix = (
 };
 
 const isGlobalCheapestCatalogRequest = (message: string): boolean => {
-  const normalized = normalizeText(message);
+  const normalized = normalizeText(message)
+    .replace(/\b(?:wat|wht)\b/gi, "what")
+    .replace(/\b(?:wats|whats)\b/gi, "what's")
+    .replace(/\bu\b/gi, "you");
   const forwardMatch =
     /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\b/i.exec(
       normalized
@@ -3478,6 +3481,13 @@ const parseCommerceNamedSearch = (
   const { cleanedTerm, modifiers } = parseCommerceConstraints(value);
   if (!cleanedTerm || cleanedTerm.length > 120) return null;
   return { query: cleanedTerm, ...modifiers };
+};
+
+const isConversationalCommerceScopeFragment = (value: string): boolean => {
+  const normalized = normalizeText(value);
+  return /\b(?:u|ur|you|your|we|our|store|shop)\b.{0,32}\b(?:have|has|sell|carry|offer|stock|got)\b|\b(?:have|has|sell|carry|offer|stock|got)\b.{0,32}\b(?:u|ur|you|your|we|our|store|shop)\b/i.test(
+    normalized
+  );
 };
 
 const isCommerceDisplayedSelectionReference = (message: string): boolean => {
@@ -3625,6 +3635,7 @@ const getCommerceDiscoveryIntent = (
     wrappedScopedCheapestScope;
   if (scopedCheapestScope) {
     const rawScope = scopedCheapestScope;
+    if (isConversationalCommerceScopeFragment(rawScope)) return null;
     const explicitlyAvailable = /\b(?:available|in stock)\b/i.test(rawScope);
     const explicitCategoryScope =
       /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+in\s+(?:the\s+)?(.+?)\s+category(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
@@ -3728,6 +3739,7 @@ const getCommerceDiscoveryIntent = (
       normalized
     )?.[1];
   if (namedRequest) {
+    if (isConversationalCommerceScopeFragment(namedRequest)) return null;
     const parsedSearch = parseCommerceNamedSearch(namedRequest);
     const term = parsedSearch?.query ?? cleanCommerceDiscoveryTerm(namedRequest);
     if (
@@ -3745,6 +3757,8 @@ const getCommerceDiscoveryIntent = (
     if (parsedSearch) return { kind: "search", ...parsedSearch };
     return null;
   }
+
+  if (isConversationalCommerceScopeFragment(normalized)) return null;
 
   const words = lower.split(/\s+/).filter(Boolean);
   const isShortCatalogTerm =
