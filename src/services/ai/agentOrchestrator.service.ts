@@ -4793,6 +4793,18 @@ const runAgentOrchestratorCore = async (
               commerceGroundingState.products.has(productId)
             )
           );
+          const eligibleContextualSelectionProductIds = new Set(
+            Array.from(contextualSelectionProductIds).filter((productId) =>
+              commerceGroundingState.products.has(productId)
+            )
+          );
+          const eligibleCurrentTurnProductIds = isDisplayedSelectionReference
+            ? new Set(
+                Array.from(currentTurnProductIds).filter((productId) =>
+                  eligibleContextualSelectionProductIds.has(productId)
+                )
+              )
+            : currentTurnProductIds;
           const isUnrelatedClarificationReply =
             /^(?:which|what|why|how|could you clarify|can you clarify|would you clarify|please clarify|do you mean)\b/i.test(
               normalizeText(finalMessage)
@@ -4800,7 +4812,7 @@ const runAgentOrchestratorCore = async (
           const requiresWhatsappVerifiedProductList =
             channel === "whatsapp" &&
             referencedProductIds.size === 0 &&
-            currentTurnProductIds.size > 0 &&
+            eligibleCurrentTurnProductIds.size > 0 &&
             !isUnrelatedClarificationReply &&
             /\b(?:options?|choices?|matches?|products?|items?|recommend(?:ation|ations|ed|s)?|best|top picks?)\b/i.test(
               normalizeText(finalMessage)
@@ -4808,12 +4820,12 @@ const runAgentOrchestratorCore = async (
           const allowProductlessSummary =
             channel === "website" &&
             referencedProductIds.size === 0 &&
-            currentTurnProductIds.size > 0 &&
+            eligibleCurrentTurnProductIds.size > 0 &&
             isConciseCommerceReply(finalMessage) &&
             !isUnrelatedClarificationReply &&
             !isStandaloneCommerceGreeting(normalizedInputMessage);
           const fallbackCandidateIds = isDisplayedSelectionReference
-            ? new Set(contextualSelectionProductIds)
+            ? new Set(eligibleContextualSelectionProductIds)
             : new Set(referencedProductIds);
           if (
             !isDisplayedSelectionReference &&
@@ -4877,7 +4889,7 @@ const runAgentOrchestratorCore = async (
                   businessInput.commercePageContext,
                   allowProductlessSummary,
                   isDisplayedSelectionReference
-                    ? contextualSelectionProductIds
+                    ? eligibleContextualSelectionProductIds
                     : undefined
                 );
             usedCommerceFallback = !renderedCommerceResponse;
@@ -4888,7 +4900,7 @@ const runAgentOrchestratorCore = async (
                 referencedProductIds.size > 0
                   ? referencedProductIds
                   : allowProductlessSummary
-                    ? currentTurnProductIds
+                    ? eligibleCurrentTurnProductIds
                     : new Set(),
                 channel
               );
@@ -4903,6 +4915,31 @@ const runAgentOrchestratorCore = async (
               );
               finalMessage = fallback.message;
               finalProductIds = new Set(fallback.productIds);
+            }
+            if (isDisplayedSelectionReference) {
+              finalProductIds = new Set(
+                Array.from(finalProductIds).filter((productId) =>
+                  eligibleContextualSelectionProductIds.has(productId)
+                )
+              );
+              if (finalProductIds.size === 0) {
+                const fallback = buildSafeCommerceFallback(
+                  normalizedInputMessage,
+                  commerceGroundingState,
+                  channel,
+                  latestCommerceFailureMessage,
+                  eligibleContextualSelectionProductIds,
+                  false
+                );
+                finalMessage = fallback.message;
+                finalProductIds = new Set(
+                  fallback.productIds.filter((productId) =>
+                    eligibleContextualSelectionProductIds.has(productId)
+                  )
+                );
+                renderedCommerceResponse = null;
+                usedCommerceFallback = true;
+              }
             }
             const fallbackUsesCachedFacts =
               usedCommerceFallback &&
