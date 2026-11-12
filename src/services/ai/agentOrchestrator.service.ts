@@ -3393,7 +3393,10 @@ const hasCommerceSearchRequestPrefix = (
 };
 
 const isGlobalCheapestCatalogRequest = (message: string): boolean => {
-  const normalized = normalizeText(message);
+  const normalized = normalizeText(message)
+    .replace(/\b(?:wat|wht)\b/gi, "what")
+    .replace(/\b(?:wats|whats)\b/gi, "what's")
+    .replace(/\bu\b/gi, "you");
   const forwardMatch =
     /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\b/i.exec(
       normalized
@@ -3470,6 +3473,25 @@ const parseCommerceConstraints = (
       ...(sort ? { sort } : {})
     }
   };
+};
+
+const isPositivelyResolvedCommerceScope = (
+  value: string,
+  state: CommerceGroundingState
+): boolean => {
+  const normalized = cleanCommerceDiscoveryTerm(value);
+  if (!normalized || normalized.length > 120) return false;
+  const { cleanedTerm } = parseCommerceConstraints(normalized);
+  if (!cleanedTerm) return false;
+  if (getGroundedCategory(state, cleanedTerm)) return true;
+  const scopeKey = cleanCommerceDiscoveryTerm(cleanedTerm).toLocaleLowerCase("en");
+  return state.productOrder.some((productId) => {
+    const product = state.products.get(productId);
+    return product
+      ? cleanCommerceDiscoveryTerm(product.name).toLocaleLowerCase("en") ===
+          scopeKey
+      : false;
+  });
 };
 
 const parseCommerceNamedSearch = (
@@ -3557,6 +3579,7 @@ const getCommerceDiscoveryIntent = (
     const rawScope = cleanCommerceDiscoveryTerm(leadingScopedCheapest[2])
       .replace(/\s+category$/i, "")
       .trim();
+    if (!isPositivelyResolvedCommerceScope(rawScope, state)) return null;
     const {
       cleanedTerm: scope,
       modifiers: scopeModifiers
@@ -3643,7 +3666,10 @@ const getCommerceDiscoveryIntent = (
       const { cleanedTerm, modifiers } = parseCommerceConstraints(
         explicitCategoryScope
       );
-      if (cleanedTerm && cleanedTerm.length <= 120) {
+      if (
+        cleanedTerm &&
+        isPositivelyResolvedCommerceScope(explicitCategoryScope, state)
+      ) {
         return {
           kind: "category",
           category: cleanedTerm,
@@ -3658,6 +3684,7 @@ const getCommerceDiscoveryIntent = (
       /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:from|by)\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
         rawScope
       )?.[1] ?? rawScope;
+    if (!isPositivelyResolvedCommerceScope(namedScope, state)) return null;
     const { cleanedTerm, modifiers } = parseCommerceConstraints(namedScope);
     const category = getGroundedCategory(state, cleanedTerm);
     if (category) {
@@ -3703,7 +3730,13 @@ const getCommerceDiscoveryIntent = (
     /^(?:please\s+)?(?:the\s+)?(.+?)\s+category[?.!]*$/i.exec(normalized)?.[1];
   if (explicitCategory) {
     const { cleanedTerm: explicitTerm, modifiers: explicitModifiers } = parseCommerceConstraints(explicitCategory);
-    if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
+    if (
+      explicitTerm &&
+      isPositivelyResolvedCommerceScope(explicitCategory, state)
+    ) {
+      return { kind: "category", category: explicitTerm, ...explicitModifiers };
+    }
+    return null;
   }
 
   if (
@@ -3719,6 +3752,9 @@ const getCommerceDiscoveryIntent = (
     )?.[1] ??
     /^how\s+(?:does|do)\s+(.+?)\s+work[?.!]*$/i.exec(normalized)?.[1];
   if (namedDetailRequest) {
+    if (!isPositivelyResolvedCommerceScope(namedDetailRequest, state)) {
+      return null;
+    }
     const parsedSearch = parseCommerceNamedSearch(namedDetailRequest);
     if (parsedSearch) return { kind: "detail", query: parsedSearch.query };
   }
@@ -3731,12 +3767,13 @@ const getCommerceDiscoveryIntent = (
     const parsedSearch = parseCommerceNamedSearch(namedRequest);
     const term = parsedSearch?.query ?? cleanCommerceDiscoveryTerm(namedRequest);
     if (
-      /^(?:products?|items?|catalog(?:ue)?|categories|anything|what you have)$/i.test(
+      /^(?:products?|items?|catalog(?:ue)?|categories|what you have)$/i.test(
         term
       )
     ) {
       return hasNarrowingModifier ? null : { kind: "overview" };
     }
+    if (!isPositivelyResolvedCommerceScope(namedRequest, state)) return null;
     const category = getGroundedCategory(state, term);
     if (category) {
       const { query: _query, ...filters } = parsedSearch ?? { query: term };
@@ -3751,13 +3788,11 @@ const getCommerceDiscoveryIntent = (
     normalized.length <= 80 &&
     words.length >= 1 &&
     words.length <= 4 &&
-    /^[A-Za-z0-9][A-Za-z0-9&'\-/ ]*$/.test(normalized) &&
-    !/^(?:hi|hello|hey|thanks|thank you|yes|no|okay|ok|more|cheaper|first|second|that|this|it|those|them|which one)$/i.test(
-      normalized
-    );
+    /^[A-Za-z0-9][A-Za-z0-9&'\-/ ]*$/.test(normalized);
   if (!isShortCatalogTerm) return null;
 
   const { cleanedTerm: shortTerm, modifiers: shortModifiers } = parseCommerceConstraints(normalized);
+  if (!isPositivelyResolvedCommerceScope(normalized, state)) return null;
   const category = getGroundedCategory(state, shortTerm || normalized);
   if (category) return { kind: "category", category: category.name, ...shortModifiers };
   if (
