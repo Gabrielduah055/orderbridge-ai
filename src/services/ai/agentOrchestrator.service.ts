@@ -3475,19 +3475,43 @@ const parseCommerceConstraints = (
   };
 };
 
+const isConversationalCommerceScopeFragment = (value: string): boolean => {
+  const normalized = normalizeText(value);
+  return /\b(?:u|ur|you|your|we|our|store|shop)\b.{0,32}\b(?:have|has|sell|carry|offer|stock|got)\b|\b(?:have|has|sell|carry|offer|stock|got)\b.{0,32}\b(?:u|ur|you|your|we|our|store|shop)\b/i.test(
+    normalized
+  );
+};
+
+const isUnambiguousDeterministicCommerceScope = (value: string): boolean => {
+  const normalized = cleanCommerceDiscoveryTerm(value);
+  if (!normalized || normalized.length > 120) return false;
+  if (isConversationalCommerceScopeFragment(normalized)) return false;
+  if (
+    /\b(?:cheaper|less expensive|less costly|more affordable|more expensive|lower[- ]priced|lower price|lower cost|better|similar|another|alternative|affordable|best|recommend(?:ed|ation)?|suggest(?:ed|ion)?|budget-friendly)\b/i.test(
+      normalized
+    ) ||
+    /^(?:something|anything|whatever|whichever|this|that|these|those|it|them)\b/i.test(
+      normalized
+    )
+  ) {
+    return false;
+  }
+  const { cleanedTerm } = parseCommerceConstraints(normalized);
+  return Boolean(
+    cleanedTerm &&
+    !/\b(?:have|has|sell|carry|offer|got)\b/i.test(cleanedTerm) &&
+    !/^(?:(?:a|an|some|the)\s+)?(?:items?|products?|things?|options?|ones?|stuff|merchandise)$/i.test(
+      cleanedTerm
+    )
+  );
+};
+
 const parseCommerceNamedSearch = (
   value: string
 ): Omit<Extract<CommerceDiscoveryIntent, { kind: "search" }>, "kind"> | null => {
   const { cleanedTerm, modifiers } = parseCommerceConstraints(value);
   if (!cleanedTerm || cleanedTerm.length > 120) return null;
   return { query: cleanedTerm, ...modifiers };
-};
-
-const isConversationalCommerceScopeFragment = (value: string): boolean => {
-  const normalized = normalizeText(value);
-  return /\b(?:u|ur|you|your|we|our|store|shop)\b.{0,32}\b(?:have|has|sell|carry|offer|stock|got)\b|\b(?:have|has|sell|carry|offer|stock|got)\b.{0,32}\b(?:u|ur|you|your|we|our|store|shop)\b/i.test(
-    normalized
-  );
 };
 
 const isCommerceDisplayedSelectionReference = (message: string): boolean => {
@@ -3567,6 +3591,7 @@ const getCommerceDiscoveryIntent = (
     const rawScope = cleanCommerceDiscoveryTerm(leadingScopedCheapest[2])
       .replace(/\s+category$/i, "")
       .trim();
+    if (!isUnambiguousDeterministicCommerceScope(rawScope)) return null;
     const {
       cleanedTerm: scope,
       modifiers: scopeModifiers
@@ -3654,7 +3679,10 @@ const getCommerceDiscoveryIntent = (
       const { cleanedTerm, modifiers } = parseCommerceConstraints(
         explicitCategoryScope
       );
-      if (cleanedTerm && cleanedTerm.length <= 120) {
+      if (
+        cleanedTerm &&
+        isUnambiguousDeterministicCommerceScope(explicitCategoryScope)
+      ) {
         return {
           kind: "category",
           category: cleanedTerm,
@@ -3669,6 +3697,7 @@ const getCommerceDiscoveryIntent = (
       /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:from|by)\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
         rawScope
       )?.[1] ?? rawScope;
+    if (!isUnambiguousDeterministicCommerceScope(namedScope)) return null;
     const { cleanedTerm, modifiers } = parseCommerceConstraints(namedScope);
     const category = getGroundedCategory(state, cleanedTerm);
     if (category) {
@@ -3714,7 +3743,13 @@ const getCommerceDiscoveryIntent = (
     /^(?:please\s+)?(?:the\s+)?(.+?)\s+category[?.!]*$/i.exec(normalized)?.[1];
   if (explicitCategory) {
     const { cleanedTerm: explicitTerm, modifiers: explicitModifiers } = parseCommerceConstraints(explicitCategory);
-    if (explicitTerm && explicitTerm.length <= 120) return { kind: "category", category: explicitTerm, ...explicitModifiers };
+    if (
+      explicitTerm &&
+      isUnambiguousDeterministicCommerceScope(explicitCategory)
+    ) {
+      return { kind: "category", category: explicitTerm, ...explicitModifiers };
+    }
+    return null;
   }
 
   if (
@@ -3730,6 +3765,9 @@ const getCommerceDiscoveryIntent = (
     )?.[1] ??
     /^how\s+(?:does|do)\s+(.+?)\s+work[?.!]*$/i.exec(normalized)?.[1];
   if (namedDetailRequest) {
+    if (!isUnambiguousDeterministicCommerceScope(namedDetailRequest)) {
+      return null;
+    }
     const parsedSearch = parseCommerceNamedSearch(namedDetailRequest);
     if (parsedSearch) return { kind: "detail", query: parsedSearch.query };
   }
@@ -3743,12 +3781,13 @@ const getCommerceDiscoveryIntent = (
     const parsedSearch = parseCommerceNamedSearch(namedRequest);
     const term = parsedSearch?.query ?? cleanCommerceDiscoveryTerm(namedRequest);
     if (
-      /^(?:products?|items?|catalog(?:ue)?|categories|anything|what you have)$/i.test(
+      /^(?:products?|items?|catalog(?:ue)?|categories|what you have)$/i.test(
         term
       )
     ) {
       return hasNarrowingModifier ? null : { kind: "overview" };
     }
+    if (!isUnambiguousDeterministicCommerceScope(namedRequest)) return null;
     const category = getGroundedCategory(state, term);
     if (category) {
       const { query: _query, ...filters } = parsedSearch ?? { query: term };
@@ -3772,6 +3811,7 @@ const getCommerceDiscoveryIntent = (
   if (!isShortCatalogTerm) return null;
 
   const { cleanedTerm: shortTerm, modifiers: shortModifiers } = parseCommerceConstraints(normalized);
+  if (!isUnambiguousDeterministicCommerceScope(normalized)) return null;
   const category = getGroundedCategory(state, shortTerm || normalized);
   if (category) return { kind: "category", category: category.name, ...shortModifiers };
   if (
