@@ -118,7 +118,7 @@ Search accepts the following validated fields when the business API supports the
 - up to ten `preferences` values;
 - `sort` as `relevance`, `price_asc`, or `price_desc`.
 
-At least one of `query`, `category`, or `preferences` is required. OrderBridge forwards these as `query`, `limit`, `minPrice`, `maxPrice`, `category`, `available`, repeated `preference`, and `sort` query parameters. The external business backend remains authoritative for filtering, ranking, price, availability, and relevance. It returns:
+At least one of `query`, `category`, or `preferences` is required unless the bounded request includes an explicit `price_asc` or `price_desc` sort. OrderBridge forwards these as `query`, `limit`, `minPrice`, `maxPrice`, `category`, `available`, repeated `preference`, and `sort` query parameters. For a catalog-wide cheapest-item request, including whole-store wording such as “in your store,” OrderBridge performs a fresh queryless search with `sort=price_asc`, `limit=1`, and `available=true`. Explicit product or category scope is preserved. Selection references such as “which of these is cheapest?” and “cheapest of those” resolve only against the separately tracked set of products most recently displayed to the customer, or trigger one short clarification question when that set cannot be identified; they never widen to older grounded products, and pronoun phrases are never submitted as literal product searches. A limited catalog overview or conversation history is never sorted to claim that an item is globally cheapest; if the authoritative search fails, the customer receives a brief safe failure message. The external business backend remains authoritative for filtering, ranking, price, availability, and relevance. It returns:
 
 ```json
 {

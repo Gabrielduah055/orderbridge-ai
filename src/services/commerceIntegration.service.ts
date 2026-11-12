@@ -503,8 +503,36 @@ export const searchCommerceProducts = async (
     );
   }
 
+  const products = validateProducts(parsed.data.products, configuration);
+  const violatesRequestedLimit = products.length > limit;
+  const violatesAvailabilityFilter =
+    filters.available !== undefined &&
+    products.some((product) => product.available !== filters.available);
+  const violatesPriceSort =
+    filters.sort === "price_asc"
+      ? products.some(
+          (product, index) =>
+            index > 0 && products[index - 1].price > product.price
+        )
+      : filters.sort === "price_desc"
+        ? products.some(
+            (product, index) =>
+              index > 0 && products[index - 1].price < product.price
+          )
+        : false;
+  if (
+    violatesRequestedLimit ||
+    violatesAvailabilityFilter ||
+    violatesPriceSort
+  ) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_RESPONSE_INVALID",
+      "Product information is temporarily unavailable."
+    );
+  }
+
   return {
-    products: validateProducts(parsed.data.products, configuration),
+    products,
     total: parsed.data.total ?? parsed.data.products.length
   };
 };

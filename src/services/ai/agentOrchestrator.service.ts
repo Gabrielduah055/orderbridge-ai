@@ -51,7 +51,8 @@ const recoverableToolCodes = new Set([
   "CAMPAIGN_INACTIVE_DAYS_REQUIRED",
   "CAMPAIGN_INACTIVE_DAYS_MISMATCH",
   "CAMPAIGN_TARGETING_MISMATCH",
-  "CAMPAIGN_TYPE_MISMATCH"
+  "CAMPAIGN_TYPE_MISMATCH",
+  "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED"
 ]);
 const campaignConfirmationPreviewToolNames = new Set([
   "create_campaign_draft",
@@ -1823,6 +1824,7 @@ interface CommerceGroundingSnapshot {
   overviewReturnedProducts?: number;
   lastDiscoveryKind?: "overview" | "search" | "category";
   products: GroundedCommerceProduct[];
+  displayedProductIds: string[];
   availability: Array<GroundedAvailability & { productId: string }>;
   policies: GroundedCommercePolicy[];
 }
@@ -1838,6 +1840,7 @@ interface CommerceGroundingState {
   lastDiscoveryKind?: "overview" | "search" | "category";
   products: Map<string, GroundedCommerceProduct>;
   productOrder: string[];
+  displayedProductIds: string[];
   availability: Map<string, GroundedAvailability>;
   policies: Map<string, GroundedCommercePolicy>;
   policyOrder: string[];
@@ -1898,6 +1901,7 @@ const createEmptyCommerceGroundingState = (): CommerceGroundingState => ({
   categoryOrder: [],
   products: new Map(),
   productOrder: [],
+  displayedProductIds: [],
   availability: new Map(),
   policies: new Map(),
   policyOrder: []
@@ -2116,6 +2120,9 @@ const upsertGroundedProduct = (
       if (removedId) {
         state.products.delete(removedId);
         state.availability.delete(removedId);
+        state.displayedProductIds = state.displayedProductIds.filter(
+          (productId) => productId !== removedId
+        );
       }
     }
     state.productOrder.push(product.id);
@@ -2123,6 +2130,18 @@ const upsertGroundedProduct = (
   state.products.set(product.id, product);
   state.availability.delete(product.id);
   state.capturedAt = new Date().toISOString();
+};
+
+const setMostRecentlyDisplayedProducts = (
+  state: CommerceGroundingState,
+  productIds: readonly string[]
+): void => {
+  const uniqueProductIds = Array.from(new Set(productIds)).filter((productId) =>
+    state.products.has(productId)
+  );
+  if (uniqueProductIds.length > 0) {
+    state.displayedProductIds = uniqueProductIds;
+  }
 };
 
 const applyGroundedCommerceResult = (
@@ -2190,10 +2209,12 @@ const markCommerceToolFailure = (
     state.lastDiscoveryKind = undefined;
     state.products.clear();
     state.productOrder = [];
+    state.displayedProductIds = [];
     state.availability.clear();
   } else if (toolName === "search_products") {
     state.products.clear();
     state.productOrder = [];
+    state.displayedProductIds = [];
     state.availability.clear();
     state.totalProducts = undefined;
     state.overviewReturnedProducts = undefined;
@@ -2206,6 +2227,9 @@ const markCommerceToolFailure = (
     if (toolName === "get_product_details") {
       state.products.delete(args.productId);
       state.productOrder = state.productOrder.filter((id) => id !== args.productId);
+      state.displayedProductIds = state.displayedProductIds.filter(
+        (id) => id !== args.productId
+      );
     }
     state.availability.set(args.productId, { failed: true });
   } else if (toolName === "get_business_policies") {
@@ -2237,6 +2261,9 @@ const buildCommerceGroundingSnapshot = (
     .map((id) => state.products.get(id))
     .filter((product): product is GroundedCommerceProduct => Boolean(product))
     .slice(0, 20),
+  displayedProductIds: state.displayedProductIds
+    .filter((productId) => state.products.has(productId))
+    .slice(0, maxGroundedCommerceProducts),
   availability: Array.from(state.availability.entries())
     .map(([productId, availability]) => ({ productId, ...availability }))
     .slice(0, 20),
@@ -2314,6 +2341,21 @@ const restoreCommerceGroundingState = (
       upsertGroundedProduct(state, product);
     }
   }
+  const restoredDisplayedProductIds = new Set<string>();
+  for (const productId of Array.isArray(snapshot.displayedProductIds)
+    ? snapshot.displayedProductIds
+    : []) {
+    if (
+      typeof productId !== "string" ||
+      restoredDisplayedProductIds.has(productId) ||
+      !state.products.has(productId)
+    ) {
+      continue;
+    }
+    restoredDisplayedProductIds.add(productId);
+    state.displayedProductIds.push(productId);
+    if (state.displayedProductIds.length >= maxGroundedCommerceProducts) break;
+  }
   for (const entry of Array.isArray(snapshot.availability) ? snapshot.availability : []) {
     if (!entry || typeof entry !== "object") continue;
     const candidate = entry as unknown as Record<string, unknown>;
@@ -2344,7 +2386,8 @@ const restoreCommerceGroundingState = (
 };
 
 const buildCommerceResponseContract = (
-  state: CommerceGroundingState
+  state: CommerceGroundingState,
+  allowedProductIds?: ReadonlySet<string>
 ): CommerceResponseContract => {
   const replacements = new Map<string, string>();
   const productTokens = new Set<string>();
@@ -2357,6 +2400,7 @@ const buildCommerceResponseContract = (
   const lines: string[] = [];
 
   for (const [index, productId] of state.productOrder.entries()) {
+    if (allowedProductIds && !allowedProductIds.has(productId)) continue;
     const product = state.products.get(productId);
     if (!product) continue;
     const alias = `P${index + 1}`;
@@ -2786,9 +2830,10 @@ const renderValidatedCommerceResponse = (
   state: CommerceGroundingState,
   channel: "website" | "whatsapp",
   pageContext?: CommercePageContext,
-  allowProductlessSummary = false
+  allowProductlessSummary = false,
+  allowedProductIds?: ReadonlySet<string>
 ): string | null => {
-  const contract = buildCommerceResponseContract(state);
+  const contract = buildCommerceResponseContract(state, allowedProductIds);
   const tokens = rawMessage.match(commerceTokenPattern) ?? [];
   const productMetadata = getCommerceProductTokenMetadata(rawMessage, contract);
   const detailedReplyRequested = requestsDetailedCommerceReply(userMessage);
@@ -2882,6 +2927,21 @@ const buildSafeCommerceFallback = (
   allowStateProductFallback = true
 ): SafeCommerceFallback => {
   if (failureMessage) return { message: failureMessage, productIds: [] };
+  if (isGlobalCheapestCatalogRequest(userMessage)) {
+    return {
+      message: "I couldn't reach the verified catalog right now. Please try again shortly.",
+      productIds: []
+    };
+  }
+  if (
+    isCommerceDisplayedSelectionReference(userMessage) &&
+    preferredProductIds.size === 0
+  ) {
+    return {
+      message: "Which products are you comparing?",
+      productIds: []
+    };
+  }
   if (isPolicyQuestion(userMessage) && state.policies.size > 0) {
     return {
       message: state.policyOrder
@@ -3280,6 +3340,7 @@ const commerceGroundingToolNames = new Set([
 
 type CommerceDiscoveryIntent =
   | { kind: "overview" }
+  | { kind: "global_cheapest" }
   | { kind: "detail"; query: string }
   | {
       kind: "search";
@@ -3297,6 +3358,59 @@ type CommerceDiscoveryIntent =
       available?: boolean;
       sort?: "price_asc";
     };
+
+const hasCommerceSearchRequestPrefix = (
+  message: string,
+  matchIndex: number
+): boolean => {
+  const prefix = normalizeText(message.slice(0, matchIndex)).replace(/[’‘]/g, "'");
+  if (
+    !prefix ||
+    /^(?:(?:please|the|your|our|store'?s)\s*)*$/i.test(prefix) ||
+    /^(?:is|are)\s+(?:(?:the|your|our|store'?s)\s*)?$/i.test(prefix)
+  ) {
+    return true;
+  }
+  const possessiveScope =
+    /\b([A-Za-z0-9][A-Za-z0-9&-]*)'s\s*$/i.exec(prefix)?.[1];
+  if (
+    possessiveScope &&
+    !/^(?:store|shop|business)$/i.test(possessiveScope)
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:don't|didn't|can't|won't|wouldn't|shouldn't|isn't|aren't|do not|did not|cannot|not|never|without|already|bought|purchased|ordered|chose|selected|this|that|these|those|it|them|among|within)\b/i.test(
+      prefix
+    ) ||
+    /^(?:is|are|was|were|in|for|of|among|within)\b/i.test(prefix)
+  ) {
+    return false;
+  }
+  return /\b(?:what|which|show|find|give|tell|want|like|need|looking|search|have|get|recommend|suggest|prefer)\b/i.test(
+    prefix
+  );
+};
+
+const isGlobalCheapestCatalogRequest = (message: string): boolean => {
+  const normalized = normalizeText(message);
+  const forwardMatch =
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\b/i.exec(
+      normalized
+    );
+  const reverseMatch =
+    /\b(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:is\s+)?(?:the\s+)?(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.exec(
+      normalized
+    );
+  const match = forwardMatch ?? reverseMatch;
+  if (!match || match.index === undefined) return false;
+  if (!hasCommerceSearchRequestPrefix(normalized, match.index)) return false;
+
+  const trailingText = normalized.slice(match.index + match[0].length);
+  return /^(?:(?:\s+(?:is|available))|(?:\s+in stock)|(?:\s+(?:that\s+)?(?:you|the\s+store)\s+(?:have|sell|carry))|(?:\s+(?:in|within|across|from)\s+(?:(?:the|your|our)\s+)?(?:(?:whole|entire)\s+)?(?:catalog|catalogue|store|shop))|(?:\s+store-wide))*[?.!]*$/i.test(
+    trailingText
+  );
+};
 
 const cleanCommerceDiscoveryTerm = (value: string): string =>
   normalizeText(value)
@@ -3366,7 +3480,33 @@ const parseCommerceNamedSearch = (
   return { query: cleanedTerm, ...modifiers };
 };
 
+const isCommerceDisplayedSelectionReference = (message: string): boolean => {
+  const normalized = normalizeText(message);
+  const asksForRelativeSelection =
+    /\b(?:cheaper|cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.test(
+      normalized
+    );
+  if (!asksForRelativeSelection) return false;
+
+  return (
+    /\b(?:these|those|them)\b/i.test(normalized) ||
+    /^(?:which|what)(?:\s+(?:one|item|product|option))?\s+(?:is\s+)?(?:the\s+)?(?:cheaper|cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)[?.!]*$/i.test(
+      normalized
+    ) ||
+    /^(?:the\s+)?(?:cheaper|cheapest|lowest[- ]priced|least expensive|most affordable)\s+(?:one|item|product|option)[?.!]*$/i.test(
+      normalized
+    ) ||
+    /\b(?:shown|listed|above|previously\s+shown)\s+(?:products?|items?|options?)\b/i.test(
+      normalized
+    ) ||
+    /\b(?:which|what|cheapest|lowest[- ]priced|least expensive|most affordable)\b.{0,32}\bof\s+(?:the\s+)?(?:products?|items?|options?)\b/i.test(
+      normalized
+    )
+  );
+};
+
 const isContextualCommerceFollowUp = (message: string): boolean =>
+  isCommerceDisplayedSelectionReference(message) ||
   /^(?:please\s+)?(?:(?:show\s+me\s+)?(?:(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)(?:\s+(?:one|product|item|option))?|(?:that|this)(?:\s+(?:one|product|item))?|the\s+(?:one|product|item))|(?:(?:tell|show)\s+me\s+)?more(?:\s+(?:details?|info(?:rmation)?|about\s+(?:it|that|this)))?|number\s+\d+|(?:option|product|item)\s+\d+|(?:go\s+back|go\s+on|what\s+(?:about|else)))[?.!]*$/i.test(
     normalizeText(message)
   );
@@ -3391,6 +3531,157 @@ const getCommerceDiscoveryIntent = (
     )
   ) {
     return null;
+  }
+
+  if (isGlobalCheapestCatalogRequest(normalized)) {
+    return { kind: "global_cheapest" };
+  }
+
+  if (isCommerceDisplayedSelectionReference(normalized)) {
+    return null;
+  }
+
+  const leadingScopedCheapest =
+    /^(in|within|among|of|for)\s+(?:the\s+)?(.+?)\s*[,;:]\s*(.+)$/i.exec(
+      normalized
+    );
+  if (
+    leadingScopedCheapest?.[1] &&
+    leadingScopedCheapest[2] &&
+    leadingScopedCheapest[3] &&
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\b/i.test(
+      leadingScopedCheapest[3]
+    )
+  ) {
+    const preposition = leadingScopedCheapest[1].toLocaleLowerCase("en");
+    const rawScope = cleanCommerceDiscoveryTerm(leadingScopedCheapest[2])
+      .replace(/\s+category$/i, "")
+      .trim();
+    const {
+      cleanedTerm: scope,
+      modifiers: scopeModifiers
+    } = parseCommerceConstraints(rawScope);
+    if (
+      scope &&
+      scope.length <= 120 &&
+      !/^(?:these|those|them)(?:\s+(?:items|products|options))?$/i.test(scope)
+    ) {
+      const { modifiers: requestModifiers } = parseCommerceConstraints(
+        leadingScopedCheapest[3]
+      );
+      const category = getGroundedCategory(state, scope);
+      if (
+        preposition === "in" ||
+        preposition === "within" ||
+        /\s+category$/i.test(leadingScopedCheapest[2]) ||
+        category
+      ) {
+        return {
+          kind: "category",
+          category: category?.name ?? scope,
+          ...scopeModifiers,
+          ...requestModifiers,
+          sort: "price_asc"
+        };
+      }
+      return {
+        kind: "search",
+        query: scope,
+        ...scopeModifiers,
+        ...requestModifiers,
+        sort: "price_asc"
+      };
+    }
+  }
+
+  const wrappedScopedCheapest =
+    /\b(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)\s+(.+?)(?:\s+is)?[?.!]*$/i.exec(
+      normalized
+    );
+  const wrappedScopedCheapestScope =
+    wrappedScopedCheapest?.[1] &&
+    wrappedScopedCheapest.index !== undefined &&
+    hasCommerceSearchRequestPrefix(normalized, wrappedScopedCheapest.index)
+      ? wrappedScopedCheapest[1]
+      : undefined;
+  const wrappedReverseScopedCheapest =
+    /\b(?:which|what)\s+(.+?)\s+is\s+(?:the\s+)?(?:cheapest|lowest[- ]priced|lowest price|lowest[- ]cost|least expensive|least costly|most affordable)(?:\s+(?:available|in stock))?[?.!]*$/i.exec(
+      normalized
+    );
+  const wrappedReverseScopedCheapestScope =
+    wrappedReverseScopedCheapest?.[1] &&
+    wrappedReverseScopedCheapest.index !== undefined &&
+    hasCommerceSearchRequestPrefix(normalized, wrappedReverseScopedCheapest.index)
+      ? wrappedReverseScopedCheapest[1]
+      : undefined;
+  const scopedCheapestScope =
+    /^(?:please\s+)?(?:(?:what(?:'s| is)|which(?: is)?|show(?: me)?|find(?: me)?)\s+)?(?:(?:your|the\s+store'?s)\s+|(?:the\s+))?(?:cheapest|lowest[- ]priced|lowest price|least expensive|most affordable)\s+(.+?)[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    /^(?:please\s+)?(?:which|what)\s+(.+?)\s+is\s+(?:the\s+)?(?:cheapest|lowest[- ]priced|least expensive|most affordable)(?:\s+(?:available|in stock))?[?.!]*$/i.exec(
+      normalized
+    )?.[1] ??
+    wrappedReverseScopedCheapestScope ??
+    wrappedScopedCheapestScope;
+  if (scopedCheapestScope) {
+    const rawScope = scopedCheapestScope;
+    const explicitlyAvailable = /\b(?:available|in stock)\b/i.test(rawScope);
+    const explicitCategoryScope =
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+in\s+(?:the\s+)?(.+?)\s+category(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+in\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^in\s+(?:the\s+)?(.+?)\s+category(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ??
+      /^in\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1];
+    if (explicitCategoryScope) {
+      const { cleanedTerm, modifiers } = parseCommerceConstraints(
+        explicitCategoryScope
+      );
+      if (cleanedTerm && cleanedTerm.length <= 120) {
+        return {
+          kind: "category",
+          category: cleanedTerm,
+          ...modifiers,
+          ...(explicitlyAvailable ? { available: true } : {}),
+          sort: "price_asc"
+        };
+      }
+    }
+
+    const namedScope =
+      /^(?:available\s+|in-stock\s+)?(?:item|product|thing|option)\s+(?:from|by)\s+(?:the\s+)?(.+?)(?:\s+(?:that\s+(?:is|are)\s+)?(?:available|in stock))?$/i.exec(
+        rawScope
+      )?.[1] ?? rawScope;
+    const { cleanedTerm, modifiers } = parseCommerceConstraints(namedScope);
+    const category = getGroundedCategory(state, cleanedTerm);
+    if (category) {
+      return {
+        kind: "category",
+        category: category.name,
+        ...modifiers,
+        ...(explicitlyAvailable ? { available: true } : {}),
+        sort: "price_asc"
+      };
+    }
+    if (
+      cleanedTerm &&
+      cleanedTerm.length <= 120 &&
+      !/^(?:item|product|thing|option)$/i.test(cleanedTerm)
+    ) {
+      return {
+        kind: "search",
+        query: cleanedTerm,
+        ...modifiers,
+        ...(explicitlyAvailable ? { available: true } : {}),
+        sort: "price_asc"
+      };
+    }
   }
 
   if (
@@ -3572,6 +3863,23 @@ const buildCatalogSearchMessage = (
   return [heading, ...formatCommerceProductLines(responseProducts, channel)].join("\n\n");
 };
 
+const buildGlobalCheapestProductMessage = (
+  result: Extract<GroundedCommerceResult, { kind: "search" }>,
+  channel: "website" | "whatsapp"
+): string => {
+  const cheapestProduct = result.products[0];
+  if (!cheapestProduct) {
+    return "I couldn't find any verified available products right now.";
+  }
+  if (channel === "website") {
+    return "I found the cheapest available product in the verified catalog. See the product card for its current price, availability, and details.";
+  }
+  return [
+    "The cheapest available product in the verified catalog is:",
+    ...formatCommerceProductLines([cheapestProduct], channel)
+  ].join("\n\n");
+};
+
 const buildCatalogDetailClarificationMessage = (
   result: Extract<GroundedCommerceResult, { kind: "search" }>,
   subject: string,
@@ -3710,8 +4018,23 @@ const runAgentOrchestratorCore = async (
   const commerceGroundingState = businessInput
     ? restoreCommerceGroundingState(history, allowedCommerceHosts)
     : createEmptyCommerceGroundingState();
+  const normalizedInputMessage = normalizeText(input.message);
+  const isDisplayedSelectionReference = Boolean(
+    businessInput &&
+    isCommerceDisplayedSelectionReference(normalizedInputMessage)
+  );
+  const contextualSelectionProductIds = new Set(
+    commerceGroundingState.displayedProductIds.filter((productId) =>
+      commerceGroundingState.products.has(productId)
+    )
+  );
   const initialCommerceContract = businessInput
-    ? buildCommerceResponseContract(commerceGroundingState)
+    ? buildCommerceResponseContract(
+        commerceGroundingState,
+        isDisplayedSelectionReference
+          ? contextualSelectionProductIds
+          : undefined
+      )
     : undefined;
   const messages: AiMessage[] = [
     {
@@ -3725,7 +4048,6 @@ const runAgentOrchestratorCore = async (
       ? [{ role: "system" as const, content: initialCommerceContract.prompt }]
       : [])
   ];
-  const normalizedInputMessage = normalizeText(input.message);
   const latestHistoryMessage = history[history.length - 1];
   const recentInactiveCampaignRequest = getRecentInactiveCampaignRequest(
     history,
@@ -3992,16 +4314,43 @@ const runAgentOrchestratorCore = async (
         success: boolean,
         message: string,
         errorCode?: string
-      ): AgentOrchestratorResult => ({
-        success,
-        message,
-        data: importantData,
-        ...(errorCode ? { errorCode } : {}),
-        provider: provider.name,
-        model: provider.model,
-        executedTools,
-        usage
-      });
+      ): AgentOrchestratorResult => {
+        if (success && Array.isArray(importantData?.products)) {
+          const displayedProductIds = importantData.products
+            .map((product) =>
+              product &&
+              typeof product === "object" &&
+              typeof (product as Record<string, unknown>).id === "string"
+                ? String((product as Record<string, unknown>).id)
+                : undefined
+            )
+            .filter((productId): productId is string => Boolean(productId))
+            .slice(
+              0,
+              channel === "website" ? commerceWebsiteProductCardLimit : 3
+            );
+          setMostRecentlyDisplayedProducts(
+            commerceGroundingState,
+            displayedProductIds
+          );
+          importantData = {
+            ...(importantData ?? {}),
+            commerceGrounding: buildCommerceGroundingSnapshot(
+              commerceGroundingState
+            )
+          };
+        }
+        return {
+          success,
+          message,
+          data: importantData,
+          ...(errorCode ? { errorCode } : {}),
+          provider: provider.name,
+          model: provider.model,
+          executedTools,
+          usage
+        };
+      };
 
       if (
         discoveryIntent.kind === "overview" &&
@@ -4020,6 +4369,28 @@ const runAgentOrchestratorCore = async (
         return finishDiscovery(
           true,
           buildCatalogOverviewMessage(outcome.groundedResult, channel)
+        );
+      }
+
+      if (
+        discoveryIntent.kind === "global_cheapest" &&
+        permittedToolNames.has("search_products")
+      ) {
+        const outcome = await executeDiscoveryTool("search_products", {
+          sort: "price_asc",
+          limit: 1,
+          available: true
+        });
+        if (!outcome.result.success || outcome.groundedResult?.kind !== "search") {
+          return finishDiscovery(
+            false,
+            getCommerceDiscoveryFailureMessage(outcome.result),
+            outcome.result.code
+          );
+        }
+        return finishDiscovery(
+          true,
+          buildGlobalCheapestProductMessage(outcome.groundedResult, channel)
         );
       }
 
@@ -4249,6 +4620,15 @@ const runAgentOrchestratorCore = async (
           )
         );
       }
+
+      if (discoveryIntent.kind === "global_cheapest") {
+        retainOnlyInternalCommerceGrounding();
+        return finishDiscovery(
+          false,
+          "I couldn't reach the verified catalog right now. Please try again shortly.",
+          "TOOL_FORBIDDEN"
+        );
+      }
     }
 
     for (let round = 0; round < maxToolRounds; round += 1) {
@@ -4379,7 +4759,10 @@ const runAgentOrchestratorCore = async (
         }
         if (businessInput) {
           const commerceContract = buildCommerceResponseContract(
-            commerceGroundingState
+            commerceGroundingState,
+            isDisplayedSelectionReference
+              ? contextualSelectionProductIds
+              : undefined
           );
           const freshnessByProduct = getCommerceFreshnessByProduct(
             commerceGroundingState,
@@ -4410,6 +4793,18 @@ const runAgentOrchestratorCore = async (
               commerceGroundingState.products.has(productId)
             )
           );
+          const eligibleContextualSelectionProductIds = new Set(
+            Array.from(contextualSelectionProductIds).filter((productId) =>
+              commerceGroundingState.products.has(productId)
+            )
+          );
+          const eligibleCurrentTurnProductIds = isDisplayedSelectionReference
+            ? new Set(
+                Array.from(currentTurnProductIds).filter((productId) =>
+                  eligibleContextualSelectionProductIds.has(productId)
+                )
+              )
+            : currentTurnProductIds;
           const isUnrelatedClarificationReply =
             /^(?:which|what|why|how|could you clarify|can you clarify|would you clarify|please clarify|do you mean)\b/i.test(
               normalizeText(finalMessage)
@@ -4417,7 +4812,7 @@ const runAgentOrchestratorCore = async (
           const requiresWhatsappVerifiedProductList =
             channel === "whatsapp" &&
             referencedProductIds.size === 0 &&
-            currentTurnProductIds.size > 0 &&
+            eligibleCurrentTurnProductIds.size > 0 &&
             !isUnrelatedClarificationReply &&
             /\b(?:options?|choices?|matches?|products?|items?|recommend(?:ation|ations|ed|s)?|best|top picks?)\b/i.test(
               normalizeText(finalMessage)
@@ -4425,12 +4820,15 @@ const runAgentOrchestratorCore = async (
           const allowProductlessSummary =
             channel === "website" &&
             referencedProductIds.size === 0 &&
-            currentTurnProductIds.size > 0 &&
+            eligibleCurrentTurnProductIds.size > 0 &&
             isConciseCommerceReply(finalMessage) &&
             !isUnrelatedClarificationReply &&
             !isStandaloneCommerceGreeting(normalizedInputMessage);
-          const fallbackCandidateIds = new Set(referencedProductIds);
+          const fallbackCandidateIds = isDisplayedSelectionReference
+            ? new Set(eligibleContextualSelectionProductIds)
+            : new Set(referencedProductIds);
           if (
+            !isDisplayedSelectionReference &&
             fallbackCandidateIds.size === 0 &&
             !isUnrelatedClarificationReply
           ) {
@@ -4454,6 +4852,7 @@ const runAgentOrchestratorCore = async (
             }
           }
           if (
+            !isDisplayedSelectionReference &&
             fallbackCandidateIds.size === 0 &&
             !isUnrelatedClarificationReply &&
             isCommerceSelectionQuestion(normalizedInputMessage)
@@ -4488,7 +4887,10 @@ const runAgentOrchestratorCore = async (
                   commerceGroundingState,
                   channel,
                   businessInput.commercePageContext,
-                  allowProductlessSummary
+                  allowProductlessSummary,
+                  isDisplayedSelectionReference
+                    ? eligibleContextualSelectionProductIds
+                    : undefined
                 );
             usedCommerceFallback = !renderedCommerceResponse;
             if (renderedCommerceResponse) {
@@ -4498,7 +4900,7 @@ const runAgentOrchestratorCore = async (
                 referencedProductIds.size > 0
                   ? referencedProductIds
                   : allowProductlessSummary
-                    ? currentTurnProductIds
+                    ? eligibleCurrentTurnProductIds
                     : new Set(),
                 channel
               );
@@ -4513,6 +4915,31 @@ const runAgentOrchestratorCore = async (
               );
               finalMessage = fallback.message;
               finalProductIds = new Set(fallback.productIds);
+            }
+            if (isDisplayedSelectionReference) {
+              finalProductIds = new Set(
+                Array.from(finalProductIds).filter((productId) =>
+                  eligibleContextualSelectionProductIds.has(productId)
+                )
+              );
+              if (finalProductIds.size === 0) {
+                const fallback = buildSafeCommerceFallback(
+                  normalizedInputMessage,
+                  commerceGroundingState,
+                  channel,
+                  latestCommerceFailureMessage,
+                  eligibleContextualSelectionProductIds,
+                  false
+                );
+                finalMessage = fallback.message;
+                finalProductIds = new Set(
+                  fallback.productIds.filter((productId) =>
+                    eligibleContextualSelectionProductIds.has(productId)
+                  )
+                );
+                renderedCommerceResponse = null;
+                usedCommerceFallback = true;
+              }
             }
             const fallbackUsesCachedFacts =
               usedCommerceFallback &&
@@ -4533,6 +4960,10 @@ const runAgentOrchestratorCore = async (
               finalMessage = `Based on previously verified catalog information, not a live refresh: ${finalMessage}`;
             }
           }
+          setMostRecentlyDisplayedProducts(
+            commerceGroundingState,
+            Array.from(finalProductIds)
+          );
           importantData = mergeCommerceGroundingData(
             importantData,
             commerceGroundingState,
@@ -4676,6 +5107,17 @@ const runAgentOrchestratorCore = async (
             safeArguments,
             recentInactiveCampaignRequest
           );
+        const commerceSelectionGuardResult: ToolResult | null =
+          businessInput &&
+          toolName === "search_products" &&
+          isCommerceDisplayedSelectionReference(normalizedInputMessage)
+            ? {
+                success: false,
+                code: "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED",
+                message:
+                  "Please use the verified products already shown, or ask the customer which products they mean."
+              }
+            : null;
         const rawResult: ToolResult = toolCall.invalidArguments
           ? {
               success: false,
@@ -4687,6 +5129,7 @@ const runAgentOrchestratorCore = async (
             ? workflowConflictResult ??
               trustedReferenceGuardResult ??
               marketingMutationGuardResult ??
+              commerceSelectionGuardResult ??
               (await executeTool(
                 toolName,
                 safeArguments,
@@ -4779,6 +5222,10 @@ const runAgentOrchestratorCore = async (
                 groundedResult.productId
               );
             }
+            latestCommerceFailureMessage = undefined;
+          } else if (
+            result.code === "COMMERCE_CONTEXTUAL_SELECTION_REQUIRED"
+          ) {
             latestCommerceFailureMessage = undefined;
           } else {
             if (toolName === "get_product_details") {
@@ -4952,7 +5399,10 @@ const runAgentOrchestratorCore = async (
       }
       if (businessInput) {
         const commerceContract = buildCommerceResponseContract(
-          commerceGroundingState
+          commerceGroundingState,
+          isDisplayedSelectionReference
+            ? contextualSelectionProductIds
+            : undefined
         );
         if (commerceContract.prompt) {
           messages.push({
