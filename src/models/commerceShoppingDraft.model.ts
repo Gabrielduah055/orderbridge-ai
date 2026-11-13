@@ -29,7 +29,22 @@ export interface CommerceQuotedSnapshot {
   currency: "GHS";
   deliveryFee: "arranged_separately";
   expiresAt: Date;
-  confirmedAt?: Date;
+  presentation?: {
+    assistantTurnId: string;
+    customerRequestId: string;
+    presentedAt: Date;
+  };
+  confirmation?: {
+    assistantTurnId: string;
+    customerRequestId: string;
+    confirmedAt: Date;
+  };
+}
+
+export interface CommercePendingConsentQuestion {
+  assistantTurnId: string;
+  customerRequestId: string;
+  askedAt: Date;
 }
 
 export interface CommerceCheckoutState {
@@ -58,6 +73,7 @@ export interface ICommerceShoppingDraftDocument extends Document {
   orderNotes: string;
   version: number;
   appliedActionKeys: string[];
+  pendingConsentQuestion?: CommercePendingConsentQuestion;
   quote?: CommerceQuotedSnapshot;
   checkout?: CommerceCheckoutState;
   createdAt: Date;
@@ -123,7 +139,36 @@ const commerceShoppingDraftSchema = new Schema<ICommerceShoppingDraftDocument>(
           currency: { type: String, enum: ["GHS"], required: true },
           deliveryFee: { type: String, enum: ["arranged_separately"], required: true },
           expiresAt: { type: Date, required: true },
-          confirmedAt: { type: Date }
+          presentation: {
+            type: new Schema(
+              {
+                assistantTurnId: { type: String, required: true, trim: true },
+                customerRequestId: { type: String, required: true, trim: true },
+                presentedAt: { type: Date, required: true }
+              },
+              { _id: false }
+            )
+          },
+          confirmation: {
+            type: new Schema(
+              {
+                assistantTurnId: { type: String, required: true, trim: true },
+                customerRequestId: { type: String, required: true, trim: true },
+                confirmedAt: { type: Date, required: true }
+              },
+              { _id: false }
+            )
+          }
+        },
+        { _id: false }
+      )
+    },
+    pendingConsentQuestion: {
+      type: new Schema(
+        {
+          assistantTurnId: { type: String, required: true, trim: true },
+          customerRequestId: { type: String, required: true, trim: true },
+          askedAt: { type: Date, required: true }
         },
         { _id: false }
       )

@@ -144,7 +144,7 @@ export const summarizeCommerceDraft = (
     fullName: draft.customer.fullName,
     email: draft.customer.email,
     deliveryAddress: draft.customer.deliveryAddress,
-    whatsappConsent: draft.customer.whatsappConsent === true
+    whatsappConsent: draft.customer.whatsappConsent
   },
   orderNotes: draft.orderNotes,
   missing: [
@@ -164,7 +164,8 @@ export const summarizeCommerceDraft = (
         currency: draft.quote.currency,
         deliveryFee: draft.quote.deliveryFee,
         expiresAt: draft.quote.expiresAt,
-        confirmed: Boolean(draft.quote.confirmedAt),
+        presented: Boolean(draft.quote.presentation),
+        confirmed: Boolean(draft.quote.confirmation),
         current: draft.quote.draftVersion === draft.version
       }
     : undefined,
@@ -175,6 +176,61 @@ export const summarizeCommerceDraft = (
 export const getCommerceDraft = async (context: CommerceToolExecutionContext) =>
   summarizeCommerceDraft(await loadDraft(context));
 
+export const markCommerceQuotePresented = async (
+  context: CommerceToolExecutionContext,
+  assistantTurnId: string,
+  draftVersion: number
+): Promise<boolean> => {
+  const customerRequestId = context.requestId?.trim();
+  if (!customerRequestId || !assistantTurnId.trim()) return false;
+  const result = await CommerceShoppingDraft.updateOne(
+    {
+      ...scopedDraft(context),
+      version: draftVersion,
+      "quote.draftVersion": draftVersion,
+      "quote.expiresAt": { $gt: new Date() },
+      checkout: { $exists: false }
+    },
+    {
+      $set: {
+        "quote.presentation": {
+          assistantTurnId: assistantTurnId.trim(),
+          customerRequestId,
+          presentedAt: new Date()
+        }
+      },
+      $unset: { "quote.confirmation": "" }
+    }
+  );
+  return result.modifiedCount === 1;
+};
+
+export const markCommerceConsentQuestionPresented = async (
+  context: CommerceToolExecutionContext,
+  assistantTurnId: string,
+  draftVersion: number
+): Promise<boolean> => {
+  const customerRequestId = context.requestId?.trim();
+  if (!customerRequestId || !assistantTurnId.trim()) return false;
+  const result = await CommerceShoppingDraft.updateOne(
+    {
+      ...scopedDraft(context),
+      version: draftVersion,
+      "customer.whatsappConsent": { $exists: false }
+    },
+    {
+      $set: {
+        pendingConsentQuestion: {
+          assistantTurnId: assistantTurnId.trim(),
+          customerRequestId,
+          askedAt: new Date()
+        }
+      }
+    }
+  );
+  return result.modifiedCount === 1;
+};
+
 const mutateDraft = async (
   context: CommerceToolExecutionContext,
   action: string,
@@ -183,6 +239,11 @@ const mutateDraft = async (
     items?: CommerceDraftItem[];
     customer?: CommerceDraftCustomer;
     orderNotes?: string;
+    clearPendingConsentQuestion?: boolean;
+    expectedPendingConsentQuestion?: {
+      assistantTurnId: string;
+      customerRequestId: string;
+    };
   }
 ) => {
   const key = actionKey(context, action, input);
@@ -204,19 +265,41 @@ const mutateDraft = async (
       $inc: { version: 1 },
       $push: { appliedActionKeys: { $each: [key], $slice: -100 } }
     };
+    const unsetFields: Record<string, ""> = {};
+    if (changes.clearPendingConsentQuestion) {
+      unsetFields.pendingConsentQuestion = "";
+    }
     if (!draft.checkout || !unresolvedCheckoutStates.has(draft.checkout.lifecycle)) {
-      update.$unset = { quote: "", checkout: "" };
+      unsetFields.quote = "";
+      unsetFields.checkout = "";
+    }
+    if (Object.keys(unsetFields).length > 0) {
+      update.$unset = unsetFields;
     }
     const updated = await CommerceShoppingDraft.findOneAndUpdate(
       {
         ...scopedDraft(context),
         version: draft.version,
-        appliedActionKeys: { $ne: key }
+        appliedActionKeys: { $ne: key },
+        ...(changes.expectedPendingConsentQuestion
+          ? {
+              "pendingConsentQuestion.assistantTurnId":
+                changes.expectedPendingConsentQuestion.assistantTurnId,
+              "pendingConsentQuestion.customerRequestId":
+                changes.expectedPendingConsentQuestion.customerRequestId
+            }
+          : {})
       },
       update,
       { new: true }
     ).select("+appliedActionKeys +checkout.idempotencyKey");
     if (updated) return summarizeCommerceDraft(updated);
+    if (changes.expectedPendingConsentQuestion) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_WHATSAPP_CONSENT_QUESTION_CHANGED",
+        "The WhatsApp notification question changed. Please answer the latest question."
+      );
+    }
   }
   throw new CommerceIntegrationError(
     "COMMERCE_DRAFT_CONFLICT",
@@ -352,21 +435,68 @@ export const setCommerceDraftItemQuantity = async (
   });
 };
 
+const classifyContextualConsent = (
+  message: string | undefined
+): true | false | "ambiguous" => {
+  const normalized = message?.trim().toLowerCase().replace(/[’]/g, "'") ?? "";
+  const hasConditional = /\b(?:if|unless|provided|as long as|but only)\b/.test(normalized);
+  const affirmative = /^(?:yes(?: please)?(?:,?\s+(?:send|notify)(?:\s+me|\s+them)?)?|yep|yeah|sure|okay|ok|i agree|i consent|i accept)[.!]*$/.test(normalized) ||
+    /\b(?:i agree|i consent|i accept)\s+(?:to\s+)?(?:receive\s+)?whats?app\s+notifications?\b/.test(normalized);
+  const negative = /^(?:no(?: thanks)?|nope|decline|no,?\s+(?:please\s+)?(?:do not|don't|dont)\s+(?:send|notify).*)[.!]*$/.test(normalized) ||
+    /\b(?:no|do not|don't|dont|not|never|decline|refuse)\b.{0,32}\bwhats?app\b/.test(normalized) ||
+    /\bwhats?app\b.{0,32}\b(?:no|do not|don't|dont|not|never|decline|refuse)\b/.test(normalized);
+  if (hasConditional || affirmative === negative) return "ambiguous";
+  return affirmative ? true : false;
+};
+
 export const updateCommerceDraftCustomer = async (
   context: CommerceToolExecutionContext,
   input: Partial<CommerceDraftCustomer> & { orderNotes?: string }
-) => mutateDraft(context, "update_customer", input, (draft) => ({
-  customer: {
-    fullName: input.fullName ?? draft.customer.fullName,
-    email: input.email ?? draft.customer.email,
-    deliveryAddress: input.deliveryAddress ?? draft.customer.deliveryAddress,
-    whatsappConsent: input.whatsappConsent ?? draft.customer.whatsappConsent
-  },
-  orderNotes: input.orderNotes ?? draft.orderNotes
-}));
+) => mutateDraft(context, "update_customer", input, (draft) => {
+  let consentQuestion:
+    | { assistantTurnId: string; customerRequestId: string }
+    | undefined;
+  if (input.whatsappConsent !== undefined) {
+    const requestId = context.requestId?.trim();
+    const question = draft.pendingConsentQuestion;
+    const resolved = classifyContextualConsent(context.originalMessage);
+    if (!question || !requestId || question.customerRequestId === requestId) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_WHATSAPP_CONSENT_QUESTION_REQUIRED",
+        "Please answer the current WhatsApp notification question in a later message."
+      );
+    }
+    if (resolved === "ambiguous" || resolved !== input.whatsappConsent) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_WHATSAPP_CONSENT_AMBIGUOUS",
+        "Please answer the WhatsApp notification question with a clear yes or no."
+      );
+    }
+    consentQuestion = {
+      assistantTurnId: question.assistantTurnId,
+      customerRequestId: question.customerRequestId
+    };
+  }
+  return {
+    customer: {
+      fullName: input.fullName ?? draft.customer.fullName,
+      email: input.email ?? draft.customer.email,
+      deliveryAddress: input.deliveryAddress ?? draft.customer.deliveryAddress,
+      whatsappConsent: input.whatsappConsent ?? draft.customer.whatsappConsent
+    },
+    orderNotes: input.orderNotes ?? draft.orderNotes,
+    clearPendingConsentQuestion: input.whatsappConsent !== undefined,
+    expectedPendingConsentQuestion: consentQuestion
+  };
+});
 
 export const clearCommerceDraft = async (context: CommerceToolExecutionContext) =>
-  mutateDraft(context, "clear", {}, () => ({ items: [], customer: {}, orderNotes: "" }));
+  mutateDraft(context, "clear", {}, () => ({
+    items: [],
+    customer: {},
+    orderNotes: "",
+    clearPendingConsentQuestion: true
+  }));
 
 const requireCompleteDraft = (draft: ICommerceShoppingDraftDocument) => {
   const summary = summarizeCommerceDraft(draft);
@@ -475,6 +605,19 @@ const lifecycleFromStatus = (input: {
   return "pending";
 };
 
+const isUnambiguousQuoteConfirmation = (message: string | undefined): boolean => {
+  const normalized = message?.trim().toLowerCase().replace(/[’]/g, "'") ?? "";
+  if (
+    /\b(?:no|not|don't|dont|do not|never|cancel|stop|wait|later)\b/.test(normalized) ||
+    /\b(?:if|unless|provided|as long as|but only)\b/.test(normalized)
+  ) {
+    return false;
+  }
+  return /^(?:i\s+confirm(?:\s+(?:this|the|my)\s+quote)?|confirm\s+(?:this|the|my)\s+quote|yes,?\s+proceed(?:\s+(?:to|with)\s+payment)?|proceed\s+(?:to|with)\s+payment|go\s+ahead\s+with\s+(?:the\s+)?payment)[.!]*$/.test(
+    normalized
+  );
+};
+
 const saveCheckoutResponse = async (
   context: CommerceToolExecutionContext,
   checkout: CommerceCheckoutState,
@@ -521,22 +664,46 @@ const resumeCheckout = async (
     return saveCheckoutResponse(context, checkout, response);
   } catch (error) {
     if (error instanceof CommerceIntegrationError) {
+      const definitiveFailureCodes = new Set([
+        "ORDERBRIDGE_CHECKOUT_NOT_ENABLED",
+        "ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED",
+        "QUOTE_NOT_FOUND",
+        "QUOTE_ACCESS_DENIED",
+        "QUOTE_ALREADY_BOUND",
+        "PRODUCT_UNAVAILABLE",
+        "INSUFFICIENT_STOCK",
+        "CHECKOUT_INITIALIZATION_FAILED",
+        "PAYSTACK_NOT_CONFIGURED",
+        "PAYSTACK_INVALID_CONFIGURATION",
+        "PAYSTACK_AUTHENTICATION_FAILED",
+        "PAYSTACK_INITIALIZATION_REJECTED",
+        "PAYSTACK_INITIALIZATION_FAILED"
+      ]);
       const lifecycle: CommerceCheckoutState["lifecycle"] =
         error.code === "CHECKOUT_EXPIRED" || error.code === "QUOTE_EXPIRED" || error.code === "QUOTE_CHANGED"
           ? "expired"
-          : error.code === "CHECKOUT_INITIALIZATION_UNCERTAIN" ||
-              error.code === "CHECKOUT_INITIALIZING" ||
-              error.code === "COMMERCE_PROVIDER_TIMEOUT" ||
-              error.code === "COMMERCE_PROVIDER_UNAVAILABLE" ||
-              error.code === "COMMERCE_CHECKOUT_RESPONSE_INVALID" ||
-              error.code === "COMMERCE_RESPONSE_TOO_LARGE"
-            ? "uncertain"
-            : error.code === "QUOTE_BINDING_LOST" || error.code === "IDEMPOTENCY_KEY_CONFLICT"
-              ? "needs_attention"
-              : "failed";
+          : error.code === "QUOTE_BINDING_LOST" || error.code === "IDEMPOTENCY_KEY_CONFLICT"
+            ? "needs_attention"
+            : definitiveFailureCodes.has(error.code)
+              ? "failed"
+              : "uncertain";
       await CommerceShoppingDraft.updateOne(
         { ...scopedDraft(context), "checkout.idempotencyKey": checkout.idempotencyKey },
         { $set: { "checkout.lifecycle": lifecycle, "checkout.lastErrorCode": error.code } }
+      );
+    } else {
+      await CommerceShoppingDraft.updateOne(
+        { ...scopedDraft(context), "checkout.idempotencyKey": checkout.idempotencyKey },
+        {
+          $set: {
+            "checkout.lifecycle": "uncertain",
+            "checkout.lastErrorCode": "COMMERCE_CHECKOUT_UNKNOWN_ERROR"
+          }
+        }
+      );
+      throw new CommerceIntegrationError(
+        "COMMERCE_CHECKOUT_UNKNOWN_ERROR",
+        "Payment setup has an uncertain outcome. The original attempt was retained for recovery."
       );
     }
     throw error;
@@ -577,19 +744,39 @@ export const confirmCommerceDraftCheckout = async (
       "That quote is missing, changed, or expired. Please request and confirm a fresh quote."
     );
   }
+  const customerRequestId = context.requestId?.trim();
+  const presentation = draft.quote.presentation;
+  if (
+    !customerRequestId ||
+    !presentation ||
+    presentation.customerRequestId === customerRequestId ||
+    !isUnambiguousQuoteConfirmation(context.originalMessage)
+  ) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_EXPLICIT_CONFIRMATION_REQUIRED",
+      "Please confirm the exact displayed quote in a later message without conditions or negation."
+    );
+  }
   const idempotencyKey = randomUUID();
-  draft = await CommerceShoppingDraft.findOneAndUpdate(
+  const checkoutClaim = await CommerceShoppingDraft.findOneAndUpdate(
     {
       ...scopedDraft(context),
       version: draft.version,
       "quote.quoteId": draft.quote.quoteId,
       "quote.draftVersion": draft.version,
       "quote.expiresAt": { $gt: new Date() },
+      "quote.presentation.assistantTurnId": presentation.assistantTurnId,
+      "quote.presentation.customerRequestId": presentation.customerRequestId,
+      "quote.confirmation": { $exists: false },
       checkout: { $exists: false }
     },
     {
       $set: {
-        "quote.confirmedAt": new Date(),
+        "quote.confirmation": {
+          assistantTurnId: presentation.assistantTurnId,
+          customerRequestId,
+          confirmedAt: new Date()
+        },
         checkout: {
           quoteId: draft.quote.quoteId,
           idempotencyKey,
@@ -599,12 +786,13 @@ export const confirmCommerceDraftCheckout = async (
     },
     { new: true }
   ).select("+appliedActionKeys +checkout.idempotencyKey");
-  if (!draft) {
+  if (!checkoutClaim) {
     throw new CommerceIntegrationError(
       "COMMERCE_CHECKOUT_CONFLICT",
       "The quote changed or another checkout is already active."
     );
   }
+  draft = checkoutClaim;
   return resumeCheckout(context, draft);
 };
 

@@ -32,6 +32,12 @@ The draft collects full name, email, delivery address, order notes, and explicit
 WhatsApp consent. An unresolved identity may browse and build a draft but cannot
 quote until a trusted E.164 notification phone is available.
 
+Contextual WhatsApp-consent replies are bound to the current persisted assistant
+question. A later unambiguous `yes` or `no` is accepted; conflicting, negated, or
+conditional wording is rejected. Standalone action words such as `send` are not
+consent. The originating customer request and assistant turn are retained until
+the consent decision is applied atomically.
+
 ## Quote and checkout state
 
 The normal local flow is `draft -> quoted -> explicitly confirmed ->
@@ -40,8 +46,13 @@ initializing -> pending -> paid`. Recovery/terminal branches are `uncertain`,
 
 A quote stores its exact authoritative item snapshot, integer-pesewa totals,
 `GHS` currency, expiry, and draft version. Any purchase-detail mutation increments
-the version, so an older quote cannot be confirmed. The customer must explicitly
-confirm the exact current unexpired quote.
+the version, so an older quote cannot be confirmed. After the authoritative quote
+is actually rendered, its persisted presentation records the assistant turn and
+originating customer request. Checkout requires a different, later customer
+request with an unambiguous affirmative confirmation. Same-turn quote/confirmation,
+negated confirmation, and conditional confirmation are rejected. The confirmation
+record binds that later request to the exact quote, version, and assistant turn in
+the same atomic transition that reserves the checkout idempotency key.
 
 Before session creation, OrderBridge persists one UUID idempotency key beside the
 quote. A timeout, transport failure, `CHECKOUT_INITIALIZING`, or
@@ -50,6 +61,13 @@ The next confirmation/status attempt resumes the same backend operation. A new
 quote or payment cannot replace an unresolved checkout. Clearing or editing the
 local draft never claims to cancel a backend checkout, order, or payment;
 unresolved references remain recoverable.
+
+Generic HTTP 5xx responses, malformed/lost responses, transport failures, and
+unknown submission errors are also uncertain. Only documented definitive errors
+may move the local checkout to `failed`; expiry/change errors move it to `expired`,
+and binding/idempotency conflicts move it to `needs_attention`. Unknown outcomes
+retain the original quote, key, and recovery reference and block replacement
+payment attempts until authoritative recovery resolves them.
 
 Payment is authoritative only after customer-scoped status says `paid`. “I have
 paid” invokes the status tool. Checkout tools do not send receipts or alerts;

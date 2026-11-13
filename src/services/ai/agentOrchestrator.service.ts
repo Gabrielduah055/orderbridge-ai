@@ -1021,8 +1021,7 @@ const getTrustedOrderReferenceGuardResult = (
 
 const getCommercePurchaseIntentGuardResult = (
   input: AgentOrchestratorInput,
-  toolName: string,
-  args: Record<string, unknown>
+  toolName: string
 ): ToolResult | null => {
   if (!("business" in input) || !input.business) return null;
   const message = normalizeText(input.message).toLowerCase();
@@ -1035,25 +1034,6 @@ const getCommercePurchaseIntentGuardResult = (
         success: false,
         code: "COMMERCE_EXPLICIT_CONFIRMATION_REQUIRED",
         message: "Please explicitly confirm the current quote before I create the payment checkout."
-      };
-    }
-  }
-
-  if (
-    toolName === "update_commerce_order_customer" &&
-    typeof args.whatsappConsent === "boolean"
-  ) {
-    const consentMentioned = /\bwhats?app\b/i.test(message);
-    const explicitYes = /\b(?:yes|agree|consent|allow|okay|ok|notify|send)\b/i.test(message);
-    const explicitNo = /\b(?:no|decline|do\s+not|don't|refuse)\b/i.test(message);
-    if (
-      !consentMentioned ||
-      (args.whatsappConsent === true ? !explicitYes : !explicitNo)
-    ) {
-      return {
-        success: false,
-        code: "COMMERCE_WHATSAPP_CONSENT_EXPLICIT_REQUIRED",
-        message: "Please ask the customer to clearly accept or decline WhatsApp notifications."
       };
     }
   }
@@ -3437,6 +3417,8 @@ const buildTrustedCommercePurchaseReply = (
       [
         "CHECKOUT_INITIALIZATION_UNCERTAIN",
         "CHECKOUT_INITIALIZING",
+        "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN",
+        "COMMERCE_CHECKOUT_UNKNOWN_ERROR",
         "COMMERCE_PROVIDER_TIMEOUT",
         "COMMERCE_PROVIDER_UNAVAILABLE",
         "COMMERCE_CHECKOUT_RESPONSE_INVALID",
@@ -3531,10 +3513,23 @@ const buildTrustedCommercePurchaseReply = (
   const missing = Array.isArray(data.missing)
     ? data.missing.filter((value): value is string => typeof value === "string")
     : [];
+  const missingOtherThanConsent = missing.filter(
+    (value) => value !== "whatsappConsent"
+  );
+  const consentLine = customer.whatsappConsent === undefined
+    ? "May we send WhatsApp notifications for receipts and delivery coordination? Reply yes or no."
+    : customer.whatsappConsent === false
+      ? "WhatsApp notifications are declined, so checkout cannot continue unless you opt in."
+      : undefined;
   return [
     itemLines.length ? "Your cart:" : "Your cart is empty.",
     ...itemLines,
-    missing.length ? `Still needed: ${missing.join(", ")}.` : "Your details are complete.",
+    missingOtherThanConsent.length
+      ? `Still needed: ${missingOtherThanConsent.join(", ")}.`
+      : missing.length === 0
+        ? "Your details are complete."
+        : undefined,
+    consentLine,
     checkout ? "Your earlier checkout is still active and was not replaced." : undefined
   ].filter((line): line is string => Boolean(line)).join("\n");
 };
@@ -5412,8 +5407,7 @@ const runAgentOrchestratorCore = async (
             : null;
         const commercePurchaseIntentGuardResult = getCommercePurchaseIntentGuardResult(
           input,
-          toolName,
-          safeArguments
+          toolName
         );
         const rawResult: ToolResult = toolCall.invalidArguments
           ? {

@@ -437,6 +437,29 @@ const checkoutPaths = {
   sessions: "/api/integrations/orderbridge/checkout/sessions"
 } as const;
 
+const documentedCheckoutSubmissionCodes = new Set([
+  "ORDERBRIDGE_CHECKOUT_NOT_ENABLED",
+  "ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED",
+  "QUOTE_NOT_FOUND",
+  "QUOTE_ACCESS_DENIED",
+  "QUOTE_EXPIRED",
+  "QUOTE_ALREADY_BOUND",
+  "QUOTE_CHANGED",
+  "QUOTE_BINDING_LOST",
+  "IDEMPOTENCY_KEY_CONFLICT",
+  "PRODUCT_UNAVAILABLE",
+  "INSUFFICIENT_STOCK",
+  "CHECKOUT_INITIALIZING",
+  "CHECKOUT_EXPIRED",
+  "CHECKOUT_INITIALIZATION_FAILED",
+  "CHECKOUT_INITIALIZATION_UNCERTAIN",
+  "PAYSTACK_NOT_CONFIGURED",
+  "PAYSTACK_INVALID_CONFIGURATION",
+  "PAYSTACK_AUTHENTICATION_FAILED",
+  "PAYSTACK_INITIALIZATION_REJECTED",
+  "PAYSTACK_INITIALIZATION_FAILED"
+]);
+
 const requestCheckoutJson = async (
   business: IBusinessDocument,
   path: string,
@@ -496,12 +519,19 @@ const requestCheckoutJson = async (
       const error = source.error && typeof source.error === "object"
         ? source.error as Record<string, unknown>
         : {};
-      const providerCode = typeof error.code === "string" && /^[A-Z0-9_]{3,80}$/.test(error.code)
+      const rawProviderCode = typeof error.code === "string" && /^[A-Z0-9_]{3,80}$/.test(error.code)
         ? error.code
         : "COMMERCE_CHECKOUT_UNAVAILABLE";
+      const isCheckoutSubmission =
+        input.method === "POST" && path === checkoutPaths.sessions;
+      const providerCode = isCheckoutSubmission &&
+        (response.status >= 500 || !documentedCheckoutSubmissionCodes.has(rawProviderCode))
+        ? "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN"
+        : rawProviderCode;
       const recoverableCodes = new Set([
         "CHECKOUT_INITIALIZATION_UNCERTAIN",
         "CHECKOUT_INITIALIZING",
+        "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN",
         "CHECKOUT_EXPIRED",
         "QUOTE_EXPIRED",
         "QUOTE_CHANGED",
@@ -510,7 +540,9 @@ const requestCheckoutJson = async (
       ]);
       throw new CommerceIntegrationError(
         providerCode,
-        recoverableCodes.has(providerCode)
+        providerCode === "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN"
+          ? "Payment setup has an uncertain outcome. The original checkout attempt must be recovered."
+          : recoverableCodes.has(providerCode)
           ? typeof error.message === "string" && error.message.trim().length <= 500
             ? error.message.trim()
             : "The checkout needs to be refreshed or resumed."
