@@ -5,6 +5,7 @@ export const businessCapabilities = [
   "restaurant_operations",
   "restaurant_ordering",
   "commerce_catalog_read",
+  "commerce_ordering",
   "website_chat",
   "whatsapp_chat"
 ] as const;

@@ -95,9 +95,16 @@ export const createBusiness = async (input: CreateBusinessInput) => {
     business.enabledChannels = enabledChannels;
     if (business.type === "ecommerce") {
       const capabilities: BusinessCapability[] = business.capabilities.filter(
-        (capability) => capability !== "whatsapp_chat"
+        (capability) =>
+          capability !== "whatsapp_chat" && capability !== "commerce_ordering"
       );
       if (business.whatsappIntegration?.enabled) capabilities.push("whatsapp_chat");
+      if (
+        business.whatsappIntegration?.enabled &&
+        business.whatsappIntegration.commercePurchasingEnabled
+      ) {
+        capabilities.push("commerce_ordering");
+      }
       business.capabilities = capabilities;
     }
     validateEnabledWhatsappConfiguration(business);
@@ -192,6 +199,10 @@ export const updateBusiness = async (
     input.whatsappIntegration?.commerceNotificationsEnabled
   );
   setField(
+    "whatsappIntegration.commercePurchasingEnabled",
+    input.whatsappIntegration?.commercePurchasingEnabled
+  );
+  setField(
     "whatsappIntegration.wasenderSessionId",
     input.whatsappIntegration?.wasenderSessionId
   );
@@ -257,9 +268,16 @@ export const updateBusiness = async (
     }
     if (business.type === "ecommerce") {
       const capabilities: BusinessCapability[] = business.capabilities.filter(
-        (capability) => capability !== "whatsapp_chat"
+        (capability) =>
+          capability !== "whatsapp_chat" && capability !== "commerce_ordering"
       );
       if (business.whatsappIntegration?.enabled) capabilities.push("whatsapp_chat");
+      if (
+        business.whatsappIntegration?.enabled &&
+        business.whatsappIntegration.commercePurchasingEnabled
+      ) {
+        capabilities.push("commerce_ordering");
+      }
       if (capabilities.join("|") !== business.capabilities.join("|")) {
         setField("capabilities", capabilities);
       }

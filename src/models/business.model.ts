@@ -28,6 +28,7 @@ export interface WebsiteIntegrationConfiguration {
 export interface WhatsappIntegrationConfiguration {
   enabled: boolean;
   commerceNotificationsEnabled: boolean;
+  commercePurchasingEnabled: boolean;
   wasenderSessionId?: string;
   wasenderApiToken?: string;
   webhookSecretHash?: string;
@@ -143,6 +144,7 @@ const businessSchema = new Schema<IBusinessDocument>(
         {
           enabled: { type: Boolean, default: false },
           commerceNotificationsEnabled: { type: Boolean, default: false },
+          commercePurchasingEnabled: { type: Boolean, default: false },
           wasenderSessionId: { type: String, trim: true },
           wasenderApiToken: { type: String, trim: true, select: false },
           webhookSecretHash: { type: String, trim: true, select: false },

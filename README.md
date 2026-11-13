@@ -66,11 +66,13 @@ Customer OpenRouter tools are limited to customer-safe operations: reading the r
 
 ## E-commerce Website Chat
 
-E-commerce tenants use the additive `Business` model and do not need fake restaurant records. A website backend authenticates server-to-server at `POST /api/integrations/website-chat/:businessId/messages`; integration credentials must never be exposed in frontend JavaScript. Website and configured e-commerce WhatsApp customers share read-only catalog overview, product search/detail, availability, and policy discovery, with conversation history isolated by business, channel, and opaque customer/session identity.
+E-commerce tenants use the additive `Business` model and do not need fake restaurant records. A website backend authenticates server-to-server at `POST /api/integrations/website-chat/:businessId/messages`; integration credentials must never be exposed in frontend JavaScript. Website and configured e-commerce WhatsApp customers share read-only catalog overview, product search/detail, availability, and policy discovery, with conversation history isolated by business, channel, and opaque customer/session identity. Opted-in e-commerce WhatsApp customers can additionally maintain a persistent cart and use authoritative quote/checkout/status operations.
 
 Super administrators can update allowlisted business profile, status, website, and commerce configuration with `PATCH /api/businesses/:businessId`. The request is a strict partial JSON object; nested integration objects are partial, omitted values and stored secrets are preserved, and blank catalog API-key input leaves the current key unchanged.
 
 See [multi-business and channel architecture](docs/multi-business-channels.md) for provisioning, authentication, permissions, and the external commerce API contract. The paid-order intake boundary and the contract for its future notification consumer are documented separately in [commerce payment events](docs/commerce-payment-event-contract.md).
+
+The opt-in cart, quote, Paystack checkout, payment-status, and uncertain-outcome recovery flow is documented in [WhatsApp commerce ordering](docs/whatsapp-commerce-ordering.md).
 
 ## Order Confirmation Workflow
 

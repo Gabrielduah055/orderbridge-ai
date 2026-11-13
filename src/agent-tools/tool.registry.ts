@@ -154,6 +154,17 @@ import {
   getCommerceProduct,
   searchCommerceProducts
 } from "../services/commerceIntegration.service";
+import {
+  addCommerceDraftItem,
+  checkCommerceDraftPaymentStatus,
+  clearCommerceDraft,
+  confirmCommerceDraftCheckout,
+  getCommerceDraft,
+  removeCommerceDraftItem,
+  requestCommerceDraftQuote,
+  setCommerceDraftItemQuantity,
+  updateCommerceDraftCustomer
+} from "../services/commerceShoppingDraft.service";
 
 const emptySchema = z.object({}).strict();
 const getSenderRecipient = (context: ToolExecutionContext): string =>
@@ -4193,6 +4204,11 @@ const commerceProductIdSchema = z
   })
   .strict();
 
+const commerceOrderProductIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-f\d]{24}$/i, "A verified product ID is required");
+
 const toCommerceFailure = (error: unknown): ToolResult => {
   if (error instanceof CommerceIntegrationError) {
     return {
@@ -4355,6 +4371,169 @@ export const commerceToolRegistry = {
           message: "Business policies retrieved successfully.",
           data: await getCommercePolicies(context.business, args.topic)
         };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  get_commerce_order_draft: defineCommerceTool({
+    definition: {
+      name: "get_commerce_order_draft",
+      description: "Read the current customer's persistent WhatsApp shopping draft and any recoverable checkout state.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_commerce_order_draft,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      try {
+        return { success: true, message: "Shopping draft retrieved.", data: await getCommerceDraft(context) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  add_commerce_order_item: defineCommerceTool({
+    definition: {
+      name: "add_commerce_order_item",
+      description: "Add a verified catalog product to the current customer's persistent WhatsApp shopping draft. Resolve ambiguous product references with catalog tools before calling this.",
+      parameters: {}
+    },
+    roles: toolPermissions.add_commerce_order_item,
+    schema: z.object({
+      productId: commerceOrderProductIdSchema,
+      quantity: z.number().int().min(1).max(20).default(1)
+    }).strict(),
+    handler: async (args, context) => {
+      try {
+        return { success: true, message: "Cart updated.", data: await addCommerceDraftItem(context, args.productId, args.quantity) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  remove_commerce_order_item: defineCommerceTool({
+    definition: {
+      name: "remove_commerce_order_item",
+      description: "Remove one verified product from the current customer's persistent WhatsApp shopping draft.",
+      parameters: {}
+    },
+    roles: toolPermissions.remove_commerce_order_item,
+    schema: z.object({ productId: commerceOrderProductIdSchema }).strict(),
+    handler: async (args, context) => {
+      try {
+        return { success: true, message: "Product removed from the cart.", data: await removeCommerceDraftItem(context, args.productId) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  set_commerce_order_item_quantity: defineCommerceTool({
+    definition: {
+      name: "set_commerce_order_item_quantity",
+      description: "Set the quantity of one verified product already in the current customer's WhatsApp shopping draft.",
+      parameters: {}
+    },
+    roles: toolPermissions.set_commerce_order_item_quantity,
+    schema: z.object({
+      productId: commerceOrderProductIdSchema,
+      quantity: z.number().int().min(1).max(20)
+    }).strict(),
+    handler: async (args, context) => {
+      try {
+        return { success: true, message: "Quantity updated.", data: await setCommerceDraftItemQuantity(context, args.productId, args.quantity) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  update_commerce_order_customer: defineCommerceTool({
+    definition: {
+      name: "update_commerce_order_customer",
+      description: "Save customer checkout details on the persistent WhatsApp shopping draft. Record WhatsApp consent only from an explicit yes or no in the customer's message.",
+      parameters: {}
+    },
+    roles: toolPermissions.update_commerce_order_customer,
+    schema: z.object({
+      fullName: z.string().trim().min(2).max(120).optional(),
+      email: z.string().trim().toLowerCase().email().max(254).optional(),
+      deliveryAddress: z.string().trim().min(5).max(500).optional(),
+      whatsappConsent: z.boolean().optional(),
+      orderNotes: z.string().trim().max(500).optional()
+    }).strict().refine((args) => Object.keys(args).length > 0, "Provide at least one customer or order detail"),
+    handler: async (args, context) => {
+      try {
+        return { success: true, message: "Checkout details updated.", data: await updateCommerceDraftCustomer(context, args) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  clear_commerce_order_draft: defineCommerceTool({
+    definition: {
+      name: "clear_commerce_order_draft",
+      description: "Clear only the local shopping draft. This never cancels or changes an existing backend order, checkout, or payment.",
+      parameters: {}
+    },
+    roles: toolPermissions.clear_commerce_order_draft,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      try {
+        const data = await clearCommerceDraft(context);
+        return {
+          success: true,
+          message: data.checkout
+            ? "The local draft was cleared. The existing checkout or payment was not cancelled."
+            : "The local shopping draft was cleared.",
+          data
+        };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  request_commerce_quote: defineCommerceTool({
+    definition: {
+      name: "request_commerce_quote",
+      description: "Request an authoritative GHS quote only after the cart, full name, email, delivery address, and explicit WhatsApp consent are complete. The returned exact quote must be shown and explicitly confirmed before checkout.",
+      parameters: {}
+    },
+    roles: toolPermissions.request_commerce_quote,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      try {
+        return { success: true, message: "Authoritative quote created. Ask the customer to confirm this exact quote.", data: await requestCommerceDraftQuote(context) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  confirm_commerce_checkout: defineCommerceTool({
+    definition: {
+      name: "confirm_commerce_checkout",
+      description: "After the customer explicitly confirms the exact current unexpired quote, create or resume its checkout. Never call from an ambiguous confirmation. Reuses the server-held idempotency key on recovery.",
+      parameters: {}
+    },
+    roles: toolPermissions.confirm_commerce_checkout,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      try {
+        return { success: true, message: "Checkout created or resumed.", data: await confirmCommerceDraftCheckout(context) };
+      } catch (error) {
+        return toCommerceFailure(error);
+      }
+    }
+  }),
+  get_commerce_checkout_status: defineCommerceTool({
+    definition: {
+      name: "get_commerce_checkout_status",
+      description: "Check the current customer's server-authoritative checkout and payment status. Use this when the customer says they paid; never mark payment as paid from their statement.",
+      parameters: {}
+    },
+    roles: toolPermissions.get_commerce_checkout_status,
+    schema: emptySchema,
+    handler: async (_args, context) => {
+      try {
+        return { success: true, message: "Checkout status retrieved.", data: await checkCommerceDraftPaymentStatus(context) };
       } catch (error) {
         return toCommerceFailure(error);
       }

@@ -111,7 +111,23 @@ const trustedArgumentNames = new Set([
   "sessionKey",
   "session_key",
   "conversationKey",
-  "conversation_key"
+  "conversation_key",
+  "customerKey",
+  "customer_key",
+  "notificationPhone",
+  "notification_phone",
+  "whatsappNumber",
+  "whatsapp_number",
+  "quoteId",
+  "quote_id",
+  "checkoutSessionId",
+  "checkout_session_id",
+  "sessionId",
+  "session_id",
+  "idempotencyKey",
+  "idempotency_key",
+  "paymentUrl",
+  "payment_url"
 ]);
 
 const normalizeText = (value: string): string => value.trim().replace(/\s+/g, " ");
@@ -1003,6 +1019,48 @@ const getTrustedOrderReferenceGuardResult = (
   return null;
 };
 
+const getCommercePurchaseIntentGuardResult = (
+  input: AgentOrchestratorInput,
+  toolName: string,
+  args: Record<string, unknown>
+): ToolResult | null => {
+  if (!("business" in input) || !input.business) return null;
+  const message = normalizeText(input.message).toLowerCase();
+
+  if (toolName === "confirm_commerce_checkout") {
+    const explicitConfirmation =
+      /\b(?:i\s+confirm|confirm\s+(?:this|the|my)\s+quote|proceed\s+(?:to|with)\s+payment|go\s+ahead\s+with\s+(?:the\s+)?payment|yes,?\s+proceed)\b/i.test(message);
+    if (!explicitConfirmation) {
+      return {
+        success: false,
+        code: "COMMERCE_EXPLICIT_CONFIRMATION_REQUIRED",
+        message: "Please explicitly confirm the current quote before I create the payment checkout."
+      };
+    }
+  }
+
+  if (
+    toolName === "update_commerce_order_customer" &&
+    typeof args.whatsappConsent === "boolean"
+  ) {
+    const consentMentioned = /\bwhats?app\b/i.test(message);
+    const explicitYes = /\b(?:yes|agree|consent|allow|okay|ok|notify|send)\b/i.test(message);
+    const explicitNo = /\b(?:no|decline|do\s+not|don't|refuse)\b/i.test(message);
+    if (
+      !consentMentioned ||
+      (args.whatsappConsent === true ? !explicitYes : !explicitNo)
+    ) {
+      return {
+        success: false,
+        code: "COMMERCE_WHATSAPP_CONSENT_EXPLICIT_REQUIRED",
+        message: "Please ask the customer to clearly accept or decline WhatsApp notifications."
+      };
+    }
+  }
+
+  return null;
+};
+
 const toConversationMessage = (message: {
   role: string;
   content: string;
@@ -1178,6 +1236,10 @@ const getImportantData = (
       Array.isArray(data.policies)
     ) {
       nextData.policies = data.policies;
+    }
+
+    if (commercePurchasingToolNames.has(toolName)) {
+      nextData.commerceOrder = data;
     }
   }
 
@@ -3337,6 +3399,145 @@ const commerceGroundingToolNames = new Set([
   "check_product_availability",
   "get_business_policies"
 ]);
+const commercePurchasingToolNames = new Set([
+  "get_commerce_order_draft",
+  "add_commerce_order_item",
+  "remove_commerce_order_item",
+  "set_commerce_order_item_quantity",
+  "update_commerce_order_customer",
+  "clear_commerce_order_draft",
+  "request_commerce_quote",
+  "confirm_commerce_checkout",
+  "get_commerce_checkout_status"
+]);
+
+const formatCommercePesewas = (value: unknown): string | undefined =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? `GHS ${(value / 100).toFixed(2)}`
+    : undefined;
+
+const getTrustedPaymentUrl = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password
+      ? url.toString()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const buildTrustedCommercePurchaseReply = (
+  toolName: string,
+  result: ToolResult
+): string => {
+  if (!result.success) {
+    if (
+      [
+        "CHECKOUT_INITIALIZATION_UNCERTAIN",
+        "CHECKOUT_INITIALIZING",
+        "COMMERCE_PROVIDER_TIMEOUT",
+        "COMMERCE_PROVIDER_UNAVAILABLE",
+        "COMMERCE_CHECKOUT_RESPONSE_INVALID",
+        "COMMERCE_RESPONSE_TOO_LARGE"
+      ].includes(result.code ?? "") &&
+      (toolName === "confirm_commerce_checkout" ||
+        toolName === "get_commerce_checkout_status")
+    ) {
+      return "Payment setup is still being verified. I kept the same checkout attempt and did not create another payment.";
+    }
+    if (["CHECKOUT_EXPIRED", "QUOTE_EXPIRED", "QUOTE_CHANGED"].includes(result.code ?? "")) {
+      return "That quote or checkout has expired or changed. Please request and explicitly confirm a fresh quote.";
+    }
+    return result.message;
+  }
+  if (!result.data || typeof result.data !== "object") return result.message;
+  const data = result.data as Record<string, unknown>;
+  const items = Array.isArray(data.items)
+    ? data.items.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    : [];
+  const quote = data.quote && typeof data.quote === "object"
+    ? data.quote as Record<string, unknown>
+    : undefined;
+  const checkout = data.checkout && typeof data.checkout === "object"
+    ? data.checkout as Record<string, unknown>
+    : undefined;
+  const customer = data.customer && typeof data.customer === "object"
+    ? data.customer as Record<string, unknown>
+    : {};
+
+  if (toolName === "request_commerce_quote" && quote) {
+    const quoteItems = Array.isArray(quote.items)
+      ? quote.items.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      : [];
+    const lines = quoteItems.map((item) => {
+      const quantity = typeof item.quantity === "number" ? item.quantity : 0;
+      const name = typeof item.name === "string" ? item.name : "Product";
+      const lineTotal = formatCommercePesewas(item.lineTotalPesewas) ?? "GHS amount unavailable";
+      return `- ${quantity} × ${name} — ${lineTotal}`;
+    });
+    return [
+      "Here’s your quote:",
+      ...lines,
+      `Total: ${formatCommercePesewas(quote.totalPesewas) ?? "GHS amount unavailable"}`,
+      `Name: ${typeof customer.fullName === "string" ? customer.fullName : "not provided"}`,
+      `Email: ${typeof customer.email === "string" ? customer.email : "not provided"}`,
+      `Delivery: ${typeof customer.deliveryAddress === "string" ? customer.deliveryAddress : "not provided"}`,
+      "WhatsApp notifications: accepted.",
+      "Delivery fee: arranged separately.",
+      "Please explicitly confirm this exact quote to continue to payment."
+    ].join("\n");
+  }
+
+  if (toolName === "confirm_commerce_checkout" || toolName === "get_commerce_checkout_status") {
+    if (!checkout) return result.message;
+    const lifecycle = typeof checkout.lifecycle === "string" ? checkout.lifecycle : "pending";
+    const orderNumber = typeof checkout.orderNumber === "string"
+      ? ` Order ${checkout.orderNumber}.`
+      : "";
+    const amount = formatCommercePesewas(checkout.amountPesewas);
+    const paymentUrl = getTrustedPaymentUrl(checkout.paymentUrl);
+    if (lifecycle === "paid") {
+      return `Payment is confirmed${orderNumber}${amount ? ` Product total: ${amount}.` : ""} Delivery fee is arranged separately.`;
+    }
+    if (lifecycle === "failed") {
+      return `Payment failed${orderNumber} No paid status has been recorded.`;
+    }
+    if (lifecycle === "refunded") {
+      return `Payment was refunded${orderNumber}${amount ? ` Product total: ${amount}.` : ""}`;
+    }
+    if (lifecycle === "expired") {
+      return `This checkout has expired${orderNumber} Please request a fresh quote before trying again.`;
+    }
+    if (lifecycle === "needs_attention") {
+      return `This checkout needs attention${orderNumber} I can’t safely start another payment while it is unresolved.`;
+    }
+    if (lifecycle === "uncertain" || lifecycle === "initializing") {
+      return `Payment setup is still being verified${orderNumber} I kept the same checkout attempt and did not create another payment.`;
+    }
+    return [
+      `Payment is pending${orderNumber}${amount ? ` Product total: ${amount}.` : ""}`,
+      "Delivery fee is arranged separately.",
+      paymentUrl ? `Pay securely here: ${paymentUrl}` : "The payment link is not available yet; I can check again."
+    ].join("\n");
+  }
+
+  if (toolName === "clear_commerce_order_draft") return result.message;
+
+  const itemLines = items.map((item) =>
+    `- ${typeof item.quantity === "number" ? item.quantity : 0} × ${typeof item.name === "string" ? item.name : "Product"}`
+  );
+  const missing = Array.isArray(data.missing)
+    ? data.missing.filter((value): value is string => typeof value === "string")
+    : [];
+  return [
+    itemLines.length ? "Your cart:" : "Your cart is empty.",
+    ...itemLines,
+    missing.length ? `Still needed: ${missing.join(", ")}.` : "Your details are complete.",
+    checkout ? "Your earlier checkout is still active and was not replaced." : undefined
+  ].filter((line): line is string => Boolean(line)).join("\n");
+};
 
 type CommerceDiscoveryIntent =
   | { kind: "overview" }
@@ -4114,6 +4315,9 @@ const runAgentOrchestratorCore = async (
   let latestBusinessReport: GroundedBusinessReportResult | undefined;
   let latestCommerceFailureMessage: string | undefined;
   let latestCommerceExactProductId: string | undefined;
+  let latestCommercePurchaseResult:
+    | { toolName: string; result: ToolResult }
+    | undefined;
   const commerceTurnVerification: CommerceTurnVerification = {
     freshPrices: new Set(),
     failedPrices: new Set(),
@@ -4175,6 +4379,53 @@ const runAgentOrchestratorCore = async (
             commerceGroundingState
           )
         },
+        provider: provider.name,
+        model: provider.model,
+        executedTools,
+        usage
+      };
+    }
+
+    const requiresAuthoritativePaymentCheck = Boolean(
+      businessInput &&
+      channel === "whatsapp" &&
+      capabilities.includes("commerce_ordering") &&
+      /\b(?:i(?:'ve| have)?\s+paid|payment\s+(?:is\s+)?(?:done|made|complete)|check\s+(?:my\s+)?payment|payment\s+status)\b/i.test(
+        normalizedInputMessage
+      )
+    );
+    if (requiresAuthoritativePaymentCheck) {
+      const toolName = "get_commerce_checkout_status";
+      const result = await executeTool(toolName, {}, toolExecutionContext);
+      executedTools.push({
+        name: toolName,
+        success: result.success,
+        code: result.code,
+        message: result.message
+      });
+      importantData = getImportantData(importantData, result, toolName, {});
+      await saveMessage({
+        businessId,
+        businessType,
+        channel,
+        conversationId,
+        senderRole: input.sender.role,
+        direction: "tool",
+        content: JSON.stringify(buildToolResultForModel(toolName, result)),
+        metadata: {
+          source: "deterministic_commerce_payment_status",
+          provider: provider.name,
+          model: provider.model,
+          toolName,
+          success: result.success,
+          code: result.code
+        }
+      });
+      return {
+        success: result.success,
+        message: buildTrustedCommercePurchaseReply(toolName, result),
+        data: importantData,
+        ...(result.success ? {} : { errorCode: result.code }),
         provider: provider.name,
         model: provider.model,
         executedTools,
@@ -4792,7 +5043,13 @@ const runAgentOrchestratorCore = async (
             ? sanitizeStaffFacingFinalText(groundedAnswer)
             : finalMessage;
         }
-        if (businessInput) {
+        if (businessInput && latestCommercePurchaseResult) {
+          finalMessage = buildTrustedCommercePurchaseReply(
+            latestCommercePurchaseResult.toolName,
+            latestCommercePurchaseResult.result
+          );
+        }
+        if (businessInput && !latestCommercePurchaseResult) {
           const commerceContract = buildCommerceResponseContract(
             commerceGroundingState,
             isDisplayedSelectionReference
@@ -5153,6 +5410,11 @@ const runAgentOrchestratorCore = async (
                   "Please use the verified products already shown, or ask the customer which products they mean."
               }
             : null;
+        const commercePurchaseIntentGuardResult = getCommercePurchaseIntentGuardResult(
+          input,
+          toolName,
+          safeArguments
+        );
         const rawResult: ToolResult = toolCall.invalidArguments
           ? {
               success: false,
@@ -5165,6 +5427,7 @@ const runAgentOrchestratorCore = async (
               trustedReferenceGuardResult ??
               marketingMutationGuardResult ??
               commerceSelectionGuardResult ??
+              commercePurchaseIntentGuardResult ??
               (await executeTool(
                 toolName,
                 safeArguments,
@@ -5185,6 +5448,10 @@ const runAgentOrchestratorCore = async (
                   "The catalog lookup request was incomplete or invalid. Please name a product, choose a verified category, or ask to browse the catalog."
               }
             : rawResult;
+
+        if (businessInput && commercePurchasingToolNames.has(toolName)) {
+          latestCommercePurchaseResult = { toolName, result };
+        }
 
         if (
           result.success &&
@@ -5448,6 +5715,21 @@ const runAgentOrchestratorCore = async (
       }
     }
 
+    if (latestCommercePurchaseResult) {
+      return {
+        success: latestCommercePurchaseResult.result.success,
+        message: buildTrustedCommercePurchaseReply(
+          latestCommercePurchaseResult.toolName,
+          latestCommercePurchaseResult.result
+        ),
+        data: importantData,
+        provider: provider.name,
+        model: provider.model,
+        responseId,
+        executedTools,
+        usage
+      };
+    }
     const recoverableMessage = getRecoverableToolFallbackMessage(executedTools);
     retainOnlyInternalCommerceGrounding();
 
@@ -5475,6 +5757,22 @@ const runAgentOrchestratorCore = async (
       errorCode,
       error: error instanceof Error ? error.message : "Unknown agent orchestration error"
     });
+    if (latestCommercePurchaseResult) {
+      return {
+        success: latestCommercePurchaseResult.result.success,
+        message: buildTrustedCommercePurchaseReply(
+          latestCommercePurchaseResult.toolName,
+          latestCommercePurchaseResult.result
+        ),
+        data: importantData,
+        ...(latestCommercePurchaseResult.result.success ? {} : { errorCode }),
+        provider: provider.name,
+        model: provider.model,
+        responseId,
+        executedTools,
+        usage
+      };
+    }
     retainOnlyInternalCommerceGrounding();
 
     return {
