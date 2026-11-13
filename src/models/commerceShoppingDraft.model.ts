@@ -32,6 +32,8 @@ export interface CommerceQuotedSnapshot {
   presentation?: {
     assistantTurnId: string;
     customerRequestId: string;
+    outboundMessageId: string;
+    providerMessageId?: string;
     presentedAt: Date;
   };
   confirmation?: {
@@ -44,6 +46,7 @@ export interface CommerceQuotedSnapshot {
 export interface CommercePendingConsentQuestion {
   assistantTurnId: string;
   customerRequestId: string;
+  outboundMessageId: string;
   askedAt: Date;
 }
 
@@ -144,6 +147,8 @@ const commerceShoppingDraftSchema = new Schema<ICommerceShoppingDraftDocument>(
               {
                 assistantTurnId: { type: String, required: true, trim: true },
                 customerRequestId: { type: String, required: true, trim: true },
+                outboundMessageId: { type: String, required: true, trim: true },
+                providerMessageId: { type: String, trim: true },
                 presentedAt: { type: Date, required: true }
               },
               { _id: false }
@@ -168,6 +173,7 @@ const commerceShoppingDraftSchema = new Schema<ICommerceShoppingDraftDocument>(
         {
           assistantTurnId: { type: String, required: true, trim: true },
           customerRequestId: { type: String, required: true, trim: true },
+          outboundMessageId: { type: String, required: true, trim: true },
           askedAt: { type: Date, required: true }
         },
         { _id: false }

@@ -164,7 +164,7 @@ export const summarizeCommerceDraft = (
         currency: draft.quote.currency,
         deliveryFee: draft.quote.deliveryFee,
         expiresAt: draft.quote.expiresAt,
-        presented: Boolean(draft.quote.presentation),
+        presented: Boolean(draft.quote.presentation?.outboundMessageId),
         confirmed: Boolean(draft.quote.confirmation),
         current: draft.quote.draftVersion === draft.version
       }
@@ -176,59 +176,141 @@ export const summarizeCommerceDraft = (
 export const getCommerceDraft = async (context: CommerceToolExecutionContext) =>
   summarizeCommerceDraft(await loadDraft(context));
 
-export const markCommerceQuotePresented = async (
+export const buildCommerceReplyQueueMetadata = async (
   context: CommerceToolExecutionContext,
   assistantTurnId: string,
-  draftVersion: number
-): Promise<boolean> => {
+  draftVersion: number,
+  options: { quotePresented: boolean; consentQuestionAsked: boolean }
+): Promise<Record<string, unknown> | undefined> => {
   const customerRequestId = context.requestId?.trim();
-  if (!customerRequestId || !assistantTurnId.trim()) return false;
-  const result = await CommerceShoppingDraft.updateOne(
-    {
-      ...scopedDraft(context),
-      version: draftVersion,
-      "quote.draftVersion": draftVersion,
-      "quote.expiresAt": { $gt: new Date() },
-      checkout: { $exists: false }
-    },
-    {
-      $set: {
-        "quote.presentation": {
-          assistantTurnId: assistantTurnId.trim(),
-          customerRequestId,
-          presentedAt: new Date()
-        }
-      },
-      $unset: { "quote.confirmation": "" }
-    }
-  );
-  return result.modifiedCount === 1;
+  const normalizedTurnId = assistantTurnId.trim();
+  if (!customerRequestId || !normalizedTurnId) return undefined;
+  const draft = await CommerceShoppingDraft.findOne({
+    ...scopedDraft(context),
+    version: draftVersion
+  });
+  if (!draft) return undefined;
+  const scope = {
+    businessId: context.businessId,
+    customerKey: normalizeCustomerKey(context),
+    draftVersion,
+    assistantTurnId: normalizedTurnId,
+    customerRequestId
+  };
+  const metadata: Record<string, unknown> = {};
+  if (
+    options.quotePresented &&
+    draft.quote?.draftVersion === draftVersion &&
+    draft.quote.expiresAt.getTime() > Date.now() &&
+    !draft.checkout
+  ) {
+    metadata.commerceQuotePresentation = {
+      ...scope,
+      quoteId: draft.quote.quoteId
+    };
+  }
+  if (
+    options.consentQuestionAsked &&
+    draft.customer.whatsappConsent !== true
+  ) {
+    metadata.commerceConsentQuestion = scope;
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 };
 
-export const markCommerceConsentQuestionPresented = async (
-  context: CommerceToolExecutionContext,
-  assistantTurnId: string,
-  draftVersion: number
-): Promise<boolean> => {
-  const customerRequestId = context.requestId?.trim();
-  if (!customerRequestId || !assistantTurnId.trim()) return false;
-  const result = await CommerceShoppingDraft.updateOne(
-    {
-      ...scopedDraft(context),
-      version: draftVersion,
-      "customer.whatsappConsent": { $exists: false }
-    },
-    {
-      $set: {
-        pendingConsentQuestion: {
-          assistantTurnId: assistantTurnId.trim(),
-          customerRequestId,
-          askedAt: new Date()
+const readQueueString = (
+  value: Record<string, unknown>,
+  key: string
+): string | undefined =>
+  typeof value[key] === "string" && value[key].trim()
+    ? value[key].trim()
+    : undefined;
+
+export const recordSentCommerceReplyState = async (input: {
+  metadata?: Record<string, unknown>;
+  outboundMessageId: string;
+  providerMessageId?: string;
+  sentAt: Date;
+}): Promise<void> => {
+  const quote = input.metadata?.commerceQuotePresentation;
+  if (quote && typeof quote === "object") {
+    const value = quote as Record<string, unknown>;
+    const businessId = readQueueString(value, "businessId");
+    const customerKey = readQueueString(value, "customerKey");
+    const quoteId = readQueueString(value, "quoteId");
+    const assistantTurnId = readQueueString(value, "assistantTurnId");
+    const customerRequestId = readQueueString(value, "customerRequestId");
+    const draftVersion = typeof value.draftVersion === "number" &&
+      Number.isSafeInteger(value.draftVersion)
+      ? value.draftVersion
+      : undefined;
+    if (
+      businessId && customerKey && quoteId && assistantTurnId &&
+      customerRequestId && draftVersion !== undefined
+    ) {
+      await CommerceShoppingDraft.updateOne(
+        {
+          businessId,
+          customerKey,
+          version: draftVersion,
+          "quote.quoteId": quoteId,
+          "quote.draftVersion": draftVersion,
+          "quote.expiresAt": { $gt: input.sentAt },
+          checkout: { $exists: false }
+        },
+        {
+          $set: {
+            "quote.presentation": {
+              assistantTurnId,
+              customerRequestId,
+              outboundMessageId: input.outboundMessageId,
+              ...(input.providerMessageId
+                ? { providerMessageId: input.providerMessageId }
+                : {}),
+              presentedAt: input.sentAt
+            }
+          },
+          $unset: { "quote.confirmation": "" }
         }
-      }
+      );
     }
-  );
-  return result.modifiedCount === 1;
+  }
+
+  const consent = input.metadata?.commerceConsentQuestion;
+  if (consent && typeof consent === "object") {
+    const value = consent as Record<string, unknown>;
+    const businessId = readQueueString(value, "businessId");
+    const customerKey = readQueueString(value, "customerKey");
+    const assistantTurnId = readQueueString(value, "assistantTurnId");
+    const customerRequestId = readQueueString(value, "customerRequestId");
+    const draftVersion = typeof value.draftVersion === "number" &&
+      Number.isSafeInteger(value.draftVersion)
+      ? value.draftVersion
+      : undefined;
+    if (
+      businessId && customerKey && assistantTurnId && customerRequestId &&
+      draftVersion !== undefined
+    ) {
+      await CommerceShoppingDraft.updateOne(
+        {
+          businessId,
+          customerKey,
+          version: draftVersion,
+          "customer.whatsappConsent": { $ne: true }
+        },
+        {
+          $set: {
+            pendingConsentQuestion: {
+              assistantTurnId,
+              customerRequestId,
+              outboundMessageId: input.outboundMessageId,
+              askedAt: input.sentAt
+            }
+          }
+        }
+      );
+    }
+  }
 };
 
 const mutateDraft = async (
@@ -243,6 +325,7 @@ const mutateDraft = async (
     expectedPendingConsentQuestion?: {
       assistantTurnId: string;
       customerRequestId: string;
+      outboundMessageId: string;
     };
   }
 ) => {
@@ -286,7 +369,9 @@ const mutateDraft = async (
               "pendingConsentQuestion.assistantTurnId":
                 changes.expectedPendingConsentQuestion.assistantTurnId,
               "pendingConsentQuestion.customerRequestId":
-                changes.expectedPendingConsentQuestion.customerRequestId
+                changes.expectedPendingConsentQuestion.customerRequestId,
+              "pendingConsentQuestion.outboundMessageId":
+                changes.expectedPendingConsentQuestion.outboundMessageId
             }
           : {})
       },
@@ -454,13 +539,18 @@ export const updateCommerceDraftCustomer = async (
   input: Partial<CommerceDraftCustomer> & { orderNotes?: string }
 ) => mutateDraft(context, "update_customer", input, (draft) => {
   let consentQuestion:
-    | { assistantTurnId: string; customerRequestId: string }
+    | { assistantTurnId: string; customerRequestId: string; outboundMessageId: string }
     | undefined;
   if (input.whatsappConsent !== undefined) {
     const requestId = context.requestId?.trim();
     const question = draft.pendingConsentQuestion;
     const resolved = classifyContextualConsent(context.originalMessage);
-    if (!question || !requestId || question.customerRequestId === requestId) {
+    if (
+      !question ||
+      !question.outboundMessageId ||
+      !requestId ||
+      question.customerRequestId === requestId
+    ) {
       throw new CommerceIntegrationError(
         "COMMERCE_WHATSAPP_CONSENT_QUESTION_REQUIRED",
         "Please answer the current WhatsApp notification question in a later message."
@@ -474,7 +564,8 @@ export const updateCommerceDraftCustomer = async (
     }
     consentQuestion = {
       assistantTurnId: question.assistantTurnId,
-      customerRequestId: question.customerRequestId
+      customerRequestId: question.customerRequestId,
+      outboundMessageId: question.outboundMessageId
     };
   }
   return {
@@ -633,16 +724,34 @@ const saveCheckoutResponse = async (
     receipt?: { number?: string; url?: string };
   }
 ) => {
-  const next: CommerceCheckoutState = {
-    ...checkout,
-    lifecycle: lifecycleFromStatus(response),
-    ...response,
-    lastCheckedAt: new Date(),
-    lastErrorCode: undefined
+  const setFields: Record<string, unknown> = {
+    "checkout.lifecycle": lifecycleFromStatus(response),
+    "checkout.sessionId": response.sessionId,
+    "checkout.orderNumber": response.orderNumber,
+    "checkout.amountPesewas": response.amountPesewas,
+    "checkout.currency": response.currency,
+    "checkout.paymentStatus": response.paymentStatus,
+    "checkout.fulfillmentStatus": response.fulfillmentStatus,
+    "checkout.lastCheckedAt": new Date()
   };
+  if (response.paymentUrl !== undefined) {
+    setFields["checkout.paymentUrl"] = response.paymentUrl;
+  }
+  if (response.deliveryFeeStatus !== undefined) {
+    setFields["checkout.deliveryFeeStatus"] = response.deliveryFeeStatus;
+  }
+  if (response.receipt?.number !== undefined) {
+    setFields["checkout.receipt.number"] = response.receipt.number;
+  }
+  if (response.receipt?.url !== undefined) {
+    setFields["checkout.receipt.url"] = response.receipt.url;
+  }
   const draft = await CommerceShoppingDraft.findOneAndUpdate(
     { ...scopedDraft(context), "checkout.idempotencyKey": checkout.idempotencyKey },
-    { $set: { checkout: next } },
+    {
+      $set: setFields,
+      $unset: { "checkout.lastErrorCode": "" }
+    },
     { new: true }
   ).select("+appliedActionKeys +checkout.idempotencyKey");
   if (!draft) throw new Error("Checkout state could not be saved");
@@ -749,6 +858,7 @@ export const confirmCommerceDraftCheckout = async (
   if (
     !customerRequestId ||
     !presentation ||
+    !presentation.outboundMessageId ||
     presentation.customerRequestId === customerRequestId ||
     !isUnambiguousQuoteConfirmation(context.originalMessage)
   ) {
@@ -767,6 +877,7 @@ export const confirmCommerceDraftCheckout = async (
       "quote.expiresAt": { $gt: new Date() },
       "quote.presentation.assistantTurnId": presentation.assistantTurnId,
       "quote.presentation.customerRequestId": presentation.customerRequestId,
+      "quote.presentation.outboundMessageId": presentation.outboundMessageId,
       "quote.confirmation": { $exists: false },
       checkout: { $exists: false }
     },

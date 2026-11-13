@@ -9,10 +9,7 @@ import type {
 import type { ResolvedSender } from "../types/agent.types";
 import type { AgentChannel } from "../types/business.types";
 import type { CommerceToolExecutionContext } from "../types/agent.types";
-import {
-  markCommerceConsentQuestionPresented,
-  markCommerceQuotePresented
-} from "./commerceShoppingDraft.service";
+import { buildCommerceReplyQueueMetadata } from "./commerceShoppingDraft.service";
 
 export interface WebsiteChatInput {
   business: IBusinessDocument;
@@ -35,6 +32,10 @@ export interface CommerceChatInput {
   source: "website_chat" | "whatsapp_chat";
   requestId?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface CommerceChatResult extends AgentOrchestratorResult {
+  outboundQueueMetadata?: Record<string, unknown>;
 }
 
 interface ParsedCommerceMessage {
@@ -101,7 +102,7 @@ export const runWebsiteConversationSequentially = async <T>(
 export const handleCommerceChatMessage = async (
   input: CommerceChatInput,
   dependencies: WebsiteChatDependencies = {}
-): Promise<AgentOrchestratorResult> => {
+): Promise<CommerceChatResult> => {
   const businessId = String(input.business._id);
   const parsedMessage = parseCommerceMessage(input.channel, input.message);
   const message = parsedMessage.customerMessage.trim().replace(/\s+/g, " ");
@@ -200,9 +201,6 @@ export const handleCommerceChatMessage = async (
         const quote = orderData?.quote && typeof orderData.quote === "object"
           ? orderData.quote as Record<string, unknown>
           : undefined;
-        const customer = orderData?.customer && typeof orderData.customer === "object"
-          ? orderData.customer as Record<string, unknown>
-          : undefined;
         const context: CommerceToolExecutionContext = {
           businessId,
           businessType: "ecommerce",
@@ -214,25 +212,25 @@ export const handleCommerceChatMessage = async (
           requestId: input.requestId,
           originalMessage: message
         };
-        if (
-          draftVersion !== undefined &&
-          latestPurchasingTool?.name === "request_commerce_quote" &&
-          latestPurchasingTool.success &&
-          quote?.current === true &&
-          result.message.startsWith("Here’s your quote:")
-        ) {
-          await markCommerceQuotePresented(context, assistantTurnId, draftVersion);
-        }
-        if (
-          draftVersion !== undefined &&
-          customer?.whatsappConsent === undefined &&
-          result.message.includes("May we send WhatsApp notifications")
-        ) {
-          await markCommerceConsentQuestionPresented(
+        if (draftVersion !== undefined) {
+          const outboundQueueMetadata = await buildCommerceReplyQueueMetadata(
             context,
             assistantTurnId,
-            draftVersion
+            draftVersion,
+            {
+              quotePresented:
+                latestPurchasingTool?.name === "request_commerce_quote" &&
+                latestPurchasingTool.success &&
+                quote?.current === true &&
+                result.message.startsWith("Here’s your quote:"),
+              consentQuestionAsked: result.message.includes(
+                "May we send WhatsApp notifications"
+              )
+            }
           );
+          if (outboundQueueMetadata) {
+            return { ...result, outboundQueueMetadata };
+          }
         }
       }
 

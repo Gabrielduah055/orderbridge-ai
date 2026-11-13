@@ -242,6 +242,7 @@ export const processNextCommerceWhatsappWebhook = async (): Promise<boolean> => 
     let customerKey = event.customerKey;
     let recipientAddress = event.recipientAddress;
     let conversationId = event.conversationId;
+    let replyMetadata = event.replyMetadata;
 
     if (!generatedReply || !customerKey || !recipientAddress || !conversationId) {
       const webhook = normalizeIncomingWebhook(event.payload);
@@ -279,6 +280,7 @@ export const processNextCommerceWhatsappWebhook = async (): Promise<boolean> => 
         }
       });
       generatedReply = result.message;
+      replyMetadata = result.outboundQueueMetadata;
 
       const persisted = await WebhookEvent.findOneAndUpdate(
         {
@@ -293,6 +295,7 @@ export const processNextCommerceWhatsappWebhook = async (): Promise<boolean> => 
             customerKey,
             recipientAddress,
             conversationId,
+            ...(replyMetadata ? { replyMetadata } : {}),
             replyGeneratedAt: new Date()
           }
         },
@@ -310,6 +313,7 @@ export const processNextCommerceWhatsappWebhook = async (): Promise<boolean> => 
       apiKey: business.whatsappIntegration!.wasenderApiToken!,
       idempotencyKey: replyIdempotencyKey,
       metadata: {
+        ...(replyMetadata ?? {}),
         kind: commerceWhatsappChatReplyKind,
         businessId,
         providerMessageId: event.providerMessageId,

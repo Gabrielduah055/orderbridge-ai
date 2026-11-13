@@ -3408,9 +3408,28 @@ const getTrustedPaymentUrl = (value: unknown): string | undefined => {
   }
 };
 
+const requestsFreshWhatsappConsentQuestion = (message: string): boolean => {
+  const normalized = message.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) return false;
+  if (
+    /\b(?:do not|don't|never)\s+(?:want to\s+)?(?:opt(?: me)? in|enable|allow|receive)\b/.test(normalized) ||
+    /\b(?:disable|stop|decline|opt out)\b.{0,50}\b(?:whatsapp|notifications?)\b/.test(normalized)
+  ) {
+    return false;
+  }
+  return [
+    /\bopt(?: me)? in\b(?:.{0,50}\b(?:whatsapp|notifications?)\b)?/,
+    /\b(?:enable|allow|receive)\b.{0,50}\b(?:whatsapp|notifications?)\b/,
+    /\b(?:whatsapp|notifications?)\b.{0,50}\b(?:enable|allow|receive|opt in)\b/,
+    /\bask me (?:for consent|about (?:whatsapp )?notifications?|again)\b/,
+    /\bchange(?:d)? my mind\b.{0,50}\b(?:whatsapp|notifications?|opt in)\b/
+  ].some((pattern) => pattern.test(normalized));
+};
+
 const buildTrustedCommercePurchaseReply = (
   toolName: string,
-  result: ToolResult
+  result: ToolResult,
+  customerMessage = ""
 ): string => {
   if (!result.success) {
     if (
@@ -3516,7 +3535,10 @@ const buildTrustedCommercePurchaseReply = (
   const missingOtherThanConsent = missing.filter(
     (value) => value !== "whatsappConsent"
   );
-  const consentLine = customer.whatsappConsent === undefined
+  const freshConsentQuestionRequested =
+    customer.whatsappConsent === false &&
+    requestsFreshWhatsappConsentQuestion(customerMessage);
+  const consentLine = customer.whatsappConsent === undefined || freshConsentQuestionRequested
     ? "May we send WhatsApp notifications for receipts and delivery coordination? Reply yes or no."
     : customer.whatsappConsent === false
       ? "WhatsApp notifications are declined, so checkout cannot continue unless you opt in."
@@ -4418,7 +4440,7 @@ const runAgentOrchestratorCore = async (
       });
       return {
         success: result.success,
-        message: buildTrustedCommercePurchaseReply(toolName, result),
+        message: buildTrustedCommercePurchaseReply(toolName, result, normalizedInputMessage),
         data: importantData,
         ...(result.success ? {} : { errorCode: result.code }),
         provider: provider.name,
@@ -5041,7 +5063,8 @@ const runAgentOrchestratorCore = async (
         if (businessInput && latestCommercePurchaseResult) {
           finalMessage = buildTrustedCommercePurchaseReply(
             latestCommercePurchaseResult.toolName,
-            latestCommercePurchaseResult.result
+            latestCommercePurchaseResult.result,
+            normalizedInputMessage
           );
         }
         if (businessInput && !latestCommercePurchaseResult) {
@@ -5714,7 +5737,8 @@ const runAgentOrchestratorCore = async (
         success: latestCommercePurchaseResult.result.success,
         message: buildTrustedCommercePurchaseReply(
           latestCommercePurchaseResult.toolName,
-          latestCommercePurchaseResult.result
+          latestCommercePurchaseResult.result,
+          normalizedInputMessage
         ),
         data: importantData,
         provider: provider.name,
@@ -5756,7 +5780,8 @@ const runAgentOrchestratorCore = async (
         success: latestCommercePurchaseResult.result.success,
         message: buildTrustedCommercePurchaseReply(
           latestCommercePurchaseResult.toolName,
-          latestCommercePurchaseResult.result
+          latestCommercePurchaseResult.result,
+          normalizedInputMessage
         ),
         data: importantData,
         ...(latestCommercePurchaseResult.result.success ? {} : { errorCode }),
