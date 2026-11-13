@@ -69,6 +69,7 @@ import {
 } from "./commerceNotificationConfiguration.service";
 import { ensureCommerceReviewInvitationJobForSentReceipt } from "./commerceReviewInvitationJob.service";
 import { resolveCurrentBusinessWhatsappRecipient } from "./businessWasenderIdentity.service";
+import { recordSentCommerceReplyState } from "./commerceShoppingDraft.service";
 
 export interface EnqueueWasenderMessageInput {
   restaurantId?: string;
@@ -2226,13 +2227,24 @@ export const processNextQueuedWasenderMessage = async (
   }
 
   if (result.success) {
+    const sentAt = new Date();
     locked.status = "sent";
-    locked.sentAt = new Date();
+    locked.sentAt = sentAt;
     locked.lastStatus = result.status;
     locked.providerData = result.data;
     locked.providerMessageId = extractWasenderProviderMessageId(result.data);
     locked.lastError = undefined;
     await locked.save();
+    if (locked.metadata?.kind === commerceWhatsappChatReplyKind) {
+      await recordSentCommerceReplyState({
+        metadata: locked.metadata,
+        outboundMessageId: String(locked._id),
+        ...(locked.providerMessageId
+          ? { providerMessageId: locked.providerMessageId }
+          : {}),
+        sentAt
+      });
+    }
     if (
       locked.metadata?.kind === commercePaidOrderReceiptNotificationKind &&
       locked.metadata.reviewInvitationEligible === true

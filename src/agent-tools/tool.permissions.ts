@@ -63,7 +63,16 @@ export const toolPermissions = {
   search_products: ["customer"],
   get_product_details: ["customer"],
   check_product_availability: ["customer"],
-  get_business_policies: ["customer"]
+  get_business_policies: ["customer"],
+  get_commerce_order_draft: ["customer"],
+  add_commerce_order_item: ["customer"],
+  remove_commerce_order_item: ["customer"],
+  set_commerce_order_item_quantity: ["customer"],
+  update_commerce_order_customer: ["customer"],
+  clear_commerce_order_draft: ["customer"],
+  request_commerce_quote: ["customer"],
+  confirm_commerce_checkout: ["customer"],
+  get_commerce_checkout_status: ["customer"]
 } as const satisfies Record<string, SenderRole[]>;
 
 export type ToolName = keyof typeof toolPermissions;
@@ -72,7 +81,16 @@ export type CommerceToolName =
   | "search_products"
   | "get_product_details"
   | "check_product_availability"
-  | "get_business_policies";
+  | "get_business_policies"
+  | "get_commerce_order_draft"
+  | "add_commerce_order_item"
+  | "remove_commerce_order_item"
+  | "set_commerce_order_item_quantity"
+  | "update_commerce_order_customer"
+  | "clear_commerce_order_draft"
+  | "request_commerce_quote"
+  | "confirm_commerce_checkout"
+  | "get_commerce_checkout_status";
 export type RestaurantToolName = Exclude<ToolName, CommerceToolName>;
 
 const commerceToolNames = new Set<ToolName>([
@@ -80,7 +98,28 @@ const commerceToolNames = new Set<ToolName>([
   "search_products",
   "get_product_details",
   "check_product_availability",
-  "get_business_policies"
+  "get_business_policies",
+  "get_commerce_order_draft",
+  "add_commerce_order_item",
+  "remove_commerce_order_item",
+  "set_commerce_order_item_quantity",
+  "update_commerce_order_customer",
+  "clear_commerce_order_draft",
+  "request_commerce_quote",
+  "confirm_commerce_checkout",
+  "get_commerce_checkout_status"
+]);
+
+const commercePurchasingToolNames = new Set<ToolName>([
+  "get_commerce_order_draft",
+  "add_commerce_order_item",
+  "remove_commerce_order_item",
+  "set_commerce_order_item_quantity",
+  "update_commerce_order_customer",
+  "clear_commerce_order_draft",
+  "request_commerce_quote",
+  "confirm_commerce_checkout",
+  "get_commerce_checkout_status"
 ]);
 
 const requiredCapabilityByTool: Partial<Record<ToolName, BusinessCapability>> = {
@@ -88,7 +127,16 @@ const requiredCapabilityByTool: Partial<Record<ToolName, BusinessCapability>> = 
   search_products: "commerce_catalog_read",
   get_product_details: "commerce_catalog_read",
   check_product_availability: "commerce_catalog_read",
-  get_business_policies: "commerce_catalog_read"
+  get_business_policies: "commerce_catalog_read",
+  get_commerce_order_draft: "commerce_ordering",
+  add_commerce_order_item: "commerce_ordering",
+  remove_commerce_order_item: "commerce_ordering",
+  set_commerce_order_item_quantity: "commerce_ordering",
+  update_commerce_order_customer: "commerce_ordering",
+  clear_commerce_order_draft: "commerce_ordering",
+  request_commerce_quote: "commerce_ordering",
+  confirm_commerce_checkout: "commerce_ordering",
+  get_commerce_checkout_status: "commerce_ordering"
 };
 
 export const isCommerceToolName = (toolName: string): toolName is CommerceToolName =>
@@ -108,7 +156,9 @@ export const isToolAllowedForContext = (
     const requiredCapability = requiredCapabilityByTool[toolName];
     return (
       context.businessType === "ecommerce" &&
-      (context.channel === "website" || context.channel === "whatsapp") &&
+      (commercePurchasingToolNames.has(toolName)
+        ? context.channel === "whatsapp"
+        : context.channel === "website" || context.channel === "whatsapp") &&
       Boolean(requiredCapability && context.capabilities.includes(requiredCapability))
     );
   }

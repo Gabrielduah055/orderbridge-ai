@@ -28,7 +28,7 @@ Tool exposure and execution both evaluate the same trusted permission context:
 3. channel;
 4. enabled capabilities.
 
-Legacy role-only helpers continue to mean a restaurant WhatsApp context, preserving existing callers and evaluations. E-commerce customers on an enabled website or WhatsApp channel receive only these read-only tools when `commerce_catalog_read` is enabled:
+Legacy role-only helpers continue to mean a restaurant WhatsApp context, preserving existing callers and evaluations. E-commerce customers on an enabled website or WhatsApp channel receive these read-only tools when `commerce_catalog_read` is enabled:
 
 - `get_catalog_overview`;
 - `search_products`;
@@ -161,6 +161,8 @@ Business responses never include the Wasender API token. The safe `hasWasenderAp
 
 Commerce paid-order notifications additionally require `whatsappIntegration.commerceNotificationsEnabled: true`. It defaults to `false`; turning it off pauses commerce notification enqueueing and delivery while leaving restaurant messaging unchanged.
 
+WhatsApp checkout additionally requires `whatsappIntegration.commercePurchasingEnabled: true`. It defaults to `false` and derives `commerce_ordering` only while the e-commerce WhatsApp integration is enabled. Website chat remains read-only, restaurant permissions are unchanged, and the flag is separate from paid-order notifications. The later superadmin PR should expose this setting; the tool/state/API/recovery contract is in [WhatsApp commerce ordering](whatsapp-commerce-ordering.md).
+
 Purchase review invitations also require the configured commerce backend to expose `POST /api/integrations/orderbridge/orders/{orderId}/review-links`. OrderBridge supplies `order.externalOrderId` as `orderId` and authenticates with `commerceIntegration.apiKey` in the `Authorization: Bearer ...` header. Review URLs must use HTTPS and a hostname listed in `commerceIntegration.canonicalProductHosts`; the website integration key is not used.
 
 ```json
@@ -170,6 +172,9 @@ Purchase review invitations also require the configured commerce backend to expo
     "enabled": true,
     "allowedOrigins": ["https://shop.example.com"],
     "requestsPerMinute": 120
+  },
+  "whatsappIntegration": {
+    "commercePurchasingEnabled": true
   },
   "commerceIntegration": {
     "baseUrl": "https://api.example.com",

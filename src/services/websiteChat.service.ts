@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import type { IBusinessDocument } from "../models/business.model";
 import { saveAgentConversationMessage } from "./agentConversationHistory.service";
 import { runAgentOrchestrator } from "./ai/agentOrchestrator.service";
@@ -7,6 +8,8 @@ import type {
 } from "./ai/ai.types";
 import type { ResolvedSender } from "../types/agent.types";
 import type { AgentChannel } from "../types/business.types";
+import type { CommerceToolExecutionContext } from "../types/agent.types";
+import { buildCommerceReplyQueueMetadata } from "./commerceShoppingDraft.service";
 
 export interface WebsiteChatInput {
   business: IBusinessDocument;
@@ -29,6 +32,10 @@ export interface CommerceChatInput {
   source: "website_chat" | "whatsapp_chat";
   requestId?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface CommerceChatResult extends AgentOrchestratorResult {
+  outboundQueueMetadata?: Record<string, unknown>;
 }
 
 interface ParsedCommerceMessage {
@@ -95,7 +102,7 @@ export const runWebsiteConversationSequentially = async <T>(
 export const handleCommerceChatMessage = async (
   input: CommerceChatInput,
   dependencies: WebsiteChatDependencies = {}
-): Promise<AgentOrchestratorResult> => {
+): Promise<CommerceChatResult> => {
   const businessId = String(input.business._id);
   const parsedMessage = parseCommerceMessage(input.channel, input.message);
   const message = parsedMessage.customerMessage.trim().replace(/\s+/g, " ");
@@ -141,6 +148,7 @@ export const handleCommerceChatMessage = async (
           requestId: input.requestId
         }
       });
+      const assistantTurnId = randomUUID();
       await saveMessage({
         businessId,
         businessType: "ecommerce",
@@ -159,9 +167,72 @@ export const handleCommerceChatMessage = async (
           responseId: result.responseId,
           executedTools: result.executedTools,
           usage: result.usage,
-          commerceGrounding: result.data?.commerceGrounding
+          commerceGrounding: result.data?.commerceGrounding,
+          assistantTurnId
         }
       });
+
+      if (
+        input.channel === "whatsapp" &&
+        input.requestId?.trim() &&
+        input.sender.customerKey?.trim()
+      ) {
+        const purchasingTools = new Set([
+          "get_commerce_order_draft",
+          "add_commerce_order_item",
+          "remove_commerce_order_item",
+          "set_commerce_order_item_quantity",
+          "update_commerce_order_customer",
+          "clear_commerce_order_draft",
+          "request_commerce_quote",
+          "confirm_commerce_checkout",
+          "get_commerce_checkout_status"
+        ]);
+        const latestPurchasingTool = [...result.executedTools]
+          .reverse()
+          .find((tool) => purchasingTools.has(tool.name));
+        const commerceOrder = result.data?.commerceOrder;
+        const orderData = commerceOrder && typeof commerceOrder === "object"
+          ? commerceOrder as Record<string, unknown>
+          : undefined;
+        const draftVersion = typeof orderData?.version === "number"
+          ? orderData.version
+          : undefined;
+        const quote = orderData?.quote && typeof orderData.quote === "object"
+          ? orderData.quote as Record<string, unknown>
+          : undefined;
+        const context: CommerceToolExecutionContext = {
+          businessId,
+          businessType: "ecommerce",
+          business: input.business,
+          channel: input.channel,
+          capabilities: [...input.business.capabilities],
+          conversationId,
+          sender: input.sender,
+          requestId: input.requestId,
+          originalMessage: message
+        };
+        if (draftVersion !== undefined) {
+          const outboundQueueMetadata = await buildCommerceReplyQueueMetadata(
+            context,
+            assistantTurnId,
+            draftVersion,
+            {
+              quotePresented:
+                latestPurchasingTool?.name === "request_commerce_quote" &&
+                latestPurchasingTool.success &&
+                quote?.current === true &&
+                result.message.startsWith("Here’s your quote:"),
+              consentQuestionAsked: result.message.includes(
+                "May we send WhatsApp notifications"
+              )
+            }
+          );
+          if (outboundQueueMetadata) {
+            return { ...result, outboundQueueMetadata };
+          }
+        }
+      }
 
       return result;
     }

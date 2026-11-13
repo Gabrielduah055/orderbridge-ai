@@ -31,6 +31,7 @@ export interface IWebhookEvent {
   recipientAddress?: string;
   conversationId?: string;
   generatedReply?: string;
+  replyMetadata?: Record<string, unknown>;
   replyGeneratedAt?: Date;
   enqueueCompletedAt?: Date;
 }
@@ -100,6 +101,7 @@ const webhookEventSchema = new Schema<IWebhookEventDocument>(
     recipientAddress: { type: String, trim: true },
     conversationId: { type: String, trim: true },
     generatedReply: { type: String },
+    replyMetadata: { type: Schema.Types.Mixed },
     replyGeneratedAt: { type: Date },
     enqueueCompletedAt: { type: Date }
   },

@@ -109,6 +109,114 @@ const policiesResponseSchema = z
     policies: z.array(policySchema).max(20)
   });
 
+const checkoutMessageSchema = z.string().trim().min(1).max(1_000);
+const checkoutItemSchema = z
+  .object({
+    productId: z.string().trim().min(1).max(200),
+    name: z.string().trim().min(1).max(300),
+    unitPricePesewas: z.number().int().nonnegative().safe(),
+    quantity: z.number().int().min(1).max(20),
+    lineTotalPesewas: z.number().int().nonnegative().safe()
+  })
+  .strict();
+const checkoutQuoteResponseSchema = z
+  .object({
+    message: checkoutMessageSchema,
+    data: z
+      .object({
+        quoteId: z.string().regex(/^[a-f\d]{24}$/i),
+        items: z.array(checkoutItemSchema).min(1).max(20),
+        subtotalPesewas: z.number().int().nonnegative().safe(),
+        totalPesewas: z.number().int().nonnegative().safe(),
+        currency: z.literal("GHS"),
+        deliveryFee: z.literal("arranged_separately"),
+        expiresAt: z.string().datetime()
+      })
+      .strict()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const total = value.data.items.reduce(
+      (sum, item) => sum + item.lineTotalPesewas,
+      0
+    );
+    for (const [index, item] of value.data.items.entries()) {
+      if (item.lineTotalPesewas !== item.unitPricePesewas * item.quantity) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["data", "items", index, "lineTotalPesewas"],
+          message: "Line total does not match quantity and unit price"
+        });
+      }
+    }
+    if (
+      !Number.isSafeInteger(total) ||
+      total !== value.data.subtotalPesewas ||
+      value.data.totalPesewas !== value.data.subtotalPesewas
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["data", "totalPesewas"],
+        message: "Quote totals do not match the item lines"
+      });
+    }
+  });
+
+const paymentStatusSchema = z.enum([
+  "pending",
+  "paid",
+  "failed",
+  "refunded",
+  "needs_attention"
+]);
+const fulfillmentStatusSchema = z.enum([
+  "awaiting_payment",
+  "paid_awaiting_delivery",
+  "processing",
+  "out_for_delivery",
+  "delivered",
+  "cancelled",
+  "needs_attention"
+]);
+const safeExternalUrlSchema = z.string().url().max(2_048).refine((value) => {
+  const url = new URL(value);
+  return url.protocol === "https:" && !url.username && !url.password;
+}, "A credential-free HTTPS URL is required");
+const checkoutSessionDataSchema = z
+  .object({
+    created: z.boolean(),
+    sessionId: z.string().trim().min(16).max(100).regex(/^[A-Za-z0-9._-]+$/),
+    orderNumber: z.string().trim().min(1).max(200),
+    amountPesewas: z.number().int().nonnegative().safe(),
+    currency: z.literal("GHS"),
+    paymentStatus: paymentStatusSchema,
+    fulfillmentStatus: fulfillmentStatusSchema,
+    deliveryFee: z.literal("arranged_separately"),
+    paymentUrl: safeExternalUrlSchema.optional()
+  })
+  .strict();
+const checkoutSessionResponseSchema = z
+  .object({ message: checkoutMessageSchema, data: checkoutSessionDataSchema })
+  .strict();
+const checkoutStatusResponseSchema = z
+  .object({
+    message: checkoutMessageSchema,
+    data: checkoutSessionDataSchema
+      .omit({ created: true, paymentUrl: true })
+      .extend({
+        deliveryFeeStatus: z.enum(["not_quoted", "quoted", "collected", "waived"]),
+        receipt: z
+          .object({
+            number: z.string().trim().min(1).max(200).optional(),
+            url: safeExternalUrlSchema.optional()
+          })
+          .strict()
+          .optional()
+      })
+      .strict()
+  })
+  .strict();
+
 const reviewLinksResponseSchema = z
   .object({
     orderNumber: z.string().trim().min(1).max(200),
@@ -135,6 +243,9 @@ export type CommercePolicy = z.infer<typeof policySchema>;
 export type CommerceReviewLink = z.infer<
   typeof reviewLinksResponseSchema
 >["products"][number];
+export type CommerceCheckoutQuote = z.infer<typeof checkoutQuoteResponseSchema>["data"];
+export type CommerceCheckoutSession = z.infer<typeof checkoutSessionResponseSchema>["data"];
+export type CommerceCheckoutStatus = z.infer<typeof checkoutStatusResponseSchema>["data"];
 
 export class CommerceIntegrationError extends Error {
   constructor(
@@ -319,6 +430,226 @@ const requestJson = async (
   } finally {
     clearTimeout(timeout);
   }
+};
+
+const checkoutPaths = {
+  quotes: "/api/integrations/orderbridge/checkout/quotes",
+  sessions: "/api/integrations/orderbridge/checkout/sessions"
+} as const;
+
+const documentedCheckoutSubmissionCodes = new Set([
+  "ORDERBRIDGE_CHECKOUT_NOT_ENABLED",
+  "ORDERBRIDGE_CHECKOUT_NOT_CONFIGURED",
+  "QUOTE_NOT_FOUND",
+  "QUOTE_ACCESS_DENIED",
+  "QUOTE_EXPIRED",
+  "QUOTE_ALREADY_BOUND",
+  "QUOTE_CHANGED",
+  "QUOTE_BINDING_LOST",
+  "IDEMPOTENCY_KEY_CONFLICT",
+  "PRODUCT_UNAVAILABLE",
+  "INSUFFICIENT_STOCK",
+  "CHECKOUT_INITIALIZING",
+  "CHECKOUT_EXPIRED",
+  "CHECKOUT_INITIALIZATION_FAILED",
+  "CHECKOUT_INITIALIZATION_UNCERTAIN",
+  "PAYSTACK_NOT_CONFIGURED",
+  "PAYSTACK_INVALID_CONFIGURATION",
+  "PAYSTACK_AUTHENTICATION_FAILED",
+  "PAYSTACK_INITIALIZATION_REJECTED",
+  "PAYSTACK_INITIALIZATION_FAILED"
+]);
+
+const requestCheckoutJson = async (
+  business: IBusinessDocument,
+  path: string,
+  input: {
+    method: "GET" | "POST";
+    body?: unknown;
+    idempotencyKey?: string;
+    configureUrl?: (url: URL) => void;
+  },
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<unknown> => {
+  const configuration = getConfiguration(business);
+  const url = buildApiUrl(configuration, path);
+  input.configureUrl?.(url);
+  const controller = new AbortController();
+  const timeoutMs = Math.min(Math.max(configuration.timeoutMs || 5_000, 500), 15_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await (dependencies.fetch ?? fetch)(url, {
+      method: input.method,
+      headers: {
+        ...buildHeaders(configuration, true),
+        ...(input.body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...(input.idempotencyKey ? { "Idempotency-Key": input.idempotencyKey } : {})
+      },
+      ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
+      signal: controller.signal,
+      redirect: "error"
+    });
+    const announcedLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(announcedLength) && announcedLength > maxResponseBytes) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_RESPONSE_TOO_LARGE",
+        "Checkout information is temporarily unavailable."
+      );
+    }
+    const rawBody = await response.text();
+    if (Buffer.byteLength(rawBody, "utf8") > maxResponseBytes) {
+      throw new CommerceIntegrationError(
+        "COMMERCE_RESPONSE_TOO_LARGE",
+        "Checkout information is temporarily unavailable."
+      );
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody) as unknown;
+    } catch {
+      throw new CommerceIntegrationError(
+        "COMMERCE_CHECKOUT_RESPONSE_INVALID",
+        "Checkout information is temporarily unavailable."
+      );
+    }
+    if (!response.ok) {
+      const source = payload && typeof payload === "object"
+        ? payload as Record<string, unknown>
+        : {};
+      const error = source.error && typeof source.error === "object"
+        ? source.error as Record<string, unknown>
+        : {};
+      const rawProviderCode = typeof error.code === "string" && /^[A-Z0-9_]{3,80}$/.test(error.code)
+        ? error.code
+        : "COMMERCE_CHECKOUT_UNAVAILABLE";
+      const isCheckoutSubmission =
+        input.method === "POST" && path === checkoutPaths.sessions;
+      const providerCode = isCheckoutSubmission &&
+        (response.status >= 500 || !documentedCheckoutSubmissionCodes.has(rawProviderCode))
+        ? "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN"
+        : rawProviderCode;
+      const recoverableCodes = new Set([
+        "CHECKOUT_INITIALIZATION_UNCERTAIN",
+        "CHECKOUT_INITIALIZING",
+        "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN",
+        "CHECKOUT_EXPIRED",
+        "QUOTE_EXPIRED",
+        "QUOTE_CHANGED",
+        "PRODUCT_UNAVAILABLE",
+        "INSUFFICIENT_STOCK"
+      ]);
+      throw new CommerceIntegrationError(
+        providerCode,
+        providerCode === "COMMERCE_CHECKOUT_SUBMISSION_UNCERTAIN"
+          ? "Payment setup has an uncertain outcome. The original checkout attempt must be recovered."
+          : recoverableCodes.has(providerCode)
+          ? typeof error.message === "string" && error.message.trim().length <= 500
+            ? error.message.trim()
+            : "The checkout needs to be refreshed or resumed."
+          : "Checkout information is temporarily unavailable."
+      );
+    }
+    return payload;
+  } catch (error) {
+    if (error instanceof CommerceIntegrationError) throw error;
+    const code = error instanceof Error && error.name === "AbortError"
+      ? "COMMERCE_PROVIDER_TIMEOUT"
+      : "COMMERCE_PROVIDER_UNAVAILABLE";
+    throw new CommerceIntegrationError(
+      code,
+      "Checkout information is temporarily unavailable."
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+export const createCommerceCheckoutQuote = async (
+  business: IBusinessDocument,
+  input: {
+    customerKey: string;
+    customer: {
+      fullName: string;
+      email: string;
+      whatsappNumber: string;
+      deliveryAddress: string;
+      whatsappConsent: true;
+    };
+    orderNotes: string;
+    items: Array<{ productId: string; quantity: number }>;
+  },
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<CommerceCheckoutQuote> => {
+  const payload = await requestCheckoutJson(
+    business,
+    checkoutPaths.quotes,
+    { method: "POST", body: input },
+    dependencies
+  );
+  const parsed = checkoutQuoteResponseSchema.safeParse(payload);
+  const expiresAt = parsed.success
+    ? new Date(parsed.data.data.expiresAt).getTime()
+    : Number.NaN;
+  if (
+    !parsed.success ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt <= Date.now() ||
+    expiresAt > Date.now() + 15 * 60 * 1_000
+  ) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_CHECKOUT_RESPONSE_INVALID",
+      "The checkout quote was invalid. Please try again."
+    );
+  }
+  return parsed.data.data;
+};
+
+export const createCommerceCheckoutSession = async (
+  business: IBusinessDocument,
+  input: { quoteId: string; customerKey: string },
+  idempotencyKey: string,
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<CommerceCheckoutSession> => {
+  const payload = await requestCheckoutJson(
+    business,
+    checkoutPaths.sessions,
+    { method: "POST", body: input, idempotencyKey },
+    dependencies
+  );
+  const parsed = checkoutSessionResponseSchema.safeParse(payload);
+  if (!parsed.success) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_CHECKOUT_RESPONSE_INVALID",
+      "The checkout response was invalid. Please try again."
+    );
+  }
+  return parsed.data.data;
+};
+
+export const getCommerceCheckoutStatus = async (
+  business: IBusinessDocument,
+  sessionId: string,
+  customerKey: string,
+  dependencies: CommerceIntegrationDependencies = {}
+): Promise<CommerceCheckoutStatus> => {
+  const path = `${checkoutPaths.sessions}/${encodeURIComponent(sessionId)}/status`;
+  const payload = await requestCheckoutJson(
+    business,
+    path,
+    {
+      method: "GET",
+      configureUrl: (url) => url.searchParams.set("customerKey", customerKey)
+    },
+    dependencies
+  );
+  const parsed = checkoutStatusResponseSchema.safeParse(payload);
+  if (!parsed.success || parsed.data.data.sessionId !== sessionId) {
+    throw new CommerceIntegrationError(
+      "COMMERCE_CHECKOUT_RESPONSE_INVALID",
+      "The payment status response was invalid. Please try again."
+    );
+  }
+  return parsed.data.data;
 };
 
 export const getCommerceReviewLinks = async (
